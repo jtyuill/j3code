@@ -3,6 +3,7 @@
 
 use std::{
     cell::Cell,
+    path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
     time::Duration,
@@ -20,16 +21,19 @@ const SHUTDOWN_WAIT: Duration = Duration::from_secs(8);
 pub struct Services {
     runtime: Handle,
     local: Arc<LocalServer>,
+    /// `desktop.json`; `None` when the system has no config directory.
+    config_path: Option<PathBuf>,
     quitting: Rc<Cell<bool>>,
 }
 
 impl Global for Services {}
 
 impl Services {
-    pub fn new(runtime: Handle, local: Arc<LocalServer>) -> Self {
+    pub fn new(runtime: Handle, local: Arc<LocalServer>, config_path: Option<PathBuf>) -> Self {
         Self {
             runtime,
             local,
+            config_path,
             quitting: Rc::new(Cell::new(false)),
         }
     }
@@ -40,6 +44,10 @@ impl Services {
 
     pub fn runtime(&self) -> &Handle {
         &self.runtime
+    }
+
+    pub fn config_path(&self) -> Option<&Path> {
+        self.config_path.as_deref()
     }
 
     pub fn local(&self) -> &Arc<LocalServer> {

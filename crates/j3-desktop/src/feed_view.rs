@@ -4,11 +4,13 @@
 use std::{
     collections::{HashMap, HashSet},
     rc::Rc,
+    sync::Arc,
 };
 
 use gpui_kit::component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt as _,
     h_flex,
+    button::{Button, ButtonVariants as _},
     spinner::Spinner,
     text::{TextView, TextViewState},
     v_flex,
@@ -17,13 +19,16 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, Entity, ImageSource, InteractiveElement as _, IntoElement, ObjectFit,
     ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _,
-    StyledImage as _, WeakEntity, Window, div, img, relative,
+    StyledImage as _, TestSupportExt as _, WeakEntity, Window, div, img, relative,
 };
-use j3_client::t3::{
-    chat_attachment::ChatAttachment,
-    orchestration::{
-        PlanStepStatus, TurnItem, TurnItemKind, TurnItemStatus, UserInputRequestItem,
-        UserMessageInputIntent,
+use j3_client::{
+    ThreadState,
+    t3::{
+        chat_attachment::ChatAttachment,
+        orchestration::{
+            PlanStepStatus, SubagentItem, SubagentStatus, TurnItem, TurnItemKind, TurnItemStatus,
+            UserInputRequestItem, UserMessageInputIntent,
+        },
     },
 };
 use serde_json::Value;
@@ -43,6 +48,8 @@ pub struct RowContext {
     pub expanded: Rc<HashSet<String>>,
     pub view: WeakEntity<ThreadView>,
     pub environment: Entity<Environment>,
+    /// The thread the rows belong to, for entities items refer to (subagents).
+    pub state: Arc<ThreadState>,
 }
 
 pub fn render_item(item: &TurnItem, row: &RowContext, _: &mut Window, cx: &mut App) -> AnyElement {
@@ -124,18 +131,161 @@ pub fn render_item(item: &TurnItem, row: &RowContext, _: &mut Window, cx: &mut A
         | TurnItemKind::FileSearch(_)
         | TurnItemKind::WebSearch(_)
         | TurnItemKind::DynamicTool(_) => tool_row(item, row, cx),
+        TurnItemKind::Subagent(subagent) => subagent_row(item, subagent, row, cx),
         // Stop requests, unknown kinds and kinds added later render nothing
         // (`feed::is_hidden` also drops them before rendering).
         _ => {
             div().into_any_element()
         }
     };
+    // Messages are named by their text so the row is identifiable to
+    // accessibility clients (and UI tests) like the text on screen.
+    let label = match &item.kind {
+        TurnItemKind::UserMessage(message) => Some(message.text.clone()),
+        TurnItemKind::AssistantMessage(message) => Some(message.text.clone()),
+        _ => None,
+    };
     div()
         .id(SharedString::from(format!("feed-{id}")))
+        .test_support()
+        .when_some(label, |this, label| this.aria_label(label))
         .w_full()
         .px_4()
         .pb_3()
         .child(content)
+        .into_any_element()
+}
+
+fn subagent_status_label(status: SubagentStatus) -> &'static str {
+    match status {
+        SubagentStatus::Idle => "Idle",
+        SubagentStatus::Pending => "Starting",
+        SubagentStatus::Running => "Running",
+        SubagentStatus::Waiting => "Waiting",
+        SubagentStatus::Completed => "Done",
+        SubagentStatus::Failed => "Failed",
+        SubagentStatus::Cancelled => "Stopped",
+        SubagentStatus::Interrupted => "Interrupted",
+    }
+}
+
+/// A subagent the agent started: title, model, status, live progress, and
+/// (expanded) its assignment and final answer; Stop while it runs.
+fn subagent_row(item: &TurnItem, subagent: &SubagentItem, row: &RowContext, cx: &App) -> AnyElement {
+    let id = item.id.clone();
+    let entity = row.state.subagent(&subagent.subagent_id);
+    let status = entity.map(|s| s.status);
+    let active = status.is_some_and(SubagentStatus::is_active);
+    let title = entity
+        .and_then(|s| s.title.clone())
+        .or_else(|| item.title.clone())
+        .filter(|t| !t.trim().is_empty())
+        .unwrap_or_else(|| "Subagent".to_owned());
+    let model = entity.and_then(|s| s.model.clone());
+    let progress = entity
+        .and_then(|s| s.progress.clone())
+        .or_else(|| subagent.progress.clone());
+    let result = entity
+        .and_then(|s| s.result.clone())
+        .or_else(|| subagent.result.clone());
+    let failed = matches!(status, Some(SubagentStatus::Failed));
+    let expanded = row.expanded.contains(&id);
+    let theme = cx.theme();
+    let stop = entity
+        .filter(|_| active)
+        .and_then(|s| Some((s.run_id.clone()?, s.id.clone())))
+        .map(|(run_id, subagent_id)| {
+            let view = row.view.clone();
+            Button::new(SharedString::from(format!("stop-subagent-{subagent_id}")))
+                .xsmall()
+                .ghost()
+                .icon(IconName::Square)
+                .label("Stop")
+                .on_click(move |_, window, cx| {
+                    cx.stop_propagation();
+                    let (run_id, subagent_id) = (run_id.clone(), subagent_id.clone());
+                    let _ = view.update(cx, |view, cx| view.stop_subagent(run_id, subagent_id, window, cx));
+                })
+        });
+    let mono = theme.mono_font_family.clone();
+    let summary = result.as_deref().map(crate::feed::one_line);
+    let mut label = format!("{title}, {}", status.map_or("Unknown", subagent_status_label));
+    if let Some(progress) = progress.as_deref().filter(|_| active || summary.is_none()) {
+        label.push_str(&format!(", {progress}"));
+    }
+    if let Some(summary) = &summary {
+        label.push_str(&format!(", {summary}"));
+    }
+    v_flex()
+        .id(SharedString::from(format!("subagent-{}", subagent.subagent_id)))
+        .test_support()
+        .aria_label(label)
+        .gap_1()
+        .px_3()
+        .py_2()
+        .rounded(theme.radius_lg)
+        .border_1()
+        .border_color(if failed { theme.danger } else { theme.border })
+        .child(
+            h_flex()
+                .id(SharedString::from(format!("subagent-toggle-{id}")))
+                .gap_2()
+                .text_sm()
+                .on_click(toggle(&row.view, id.clone()))
+                .child(Icon::new(IconName::Bot).small().text_color(theme.muted_foreground))
+                .child(div().flex_1().min_w_0().truncate().font_medium().child(title))
+                .when_some(model, |this, model| {
+                    this.child(
+                        div()
+                            .flex_shrink_0()
+                            .text_xs()
+                            .font_family(mono.clone())
+                            .text_color(theme.muted_foreground)
+                            .child(model),
+                    )
+                })
+                .when(active, |this| this.child(Spinner::new().xsmall()))
+                .when_some(status, |this, status| {
+                    this.child(
+                        div()
+                            .flex_shrink_0()
+                            .text_xs()
+                            .text_color(if failed { theme.danger } else { theme.muted_foreground })
+                            .child(subagent_status_label(status)),
+                    )
+                })
+                .children(stop)
+                .child(disclosure(expanded, cx)),
+        )
+        .when_some(progress.filter(|_| active || summary.is_none()), |this, progress| {
+            this.child(
+                div()
+                    .pl_6()
+                    .text_xs()
+                    .truncate()
+                    .text_color(theme.muted_foreground)
+                    .child(progress),
+            )
+        })
+        .when(expanded, |this| {
+            this.child(
+                v_flex()
+                    .pl_6()
+                    .gap_1()
+                    .text_xs()
+                    .child(div().text_color(theme.muted_foreground).child("Assignment"))
+                    .child(div().whitespace_normal().child(subagent.prompt.clone()))
+                    .when_some(result, |this, result| {
+                        this.child(div().pt_1().text_color(theme.muted_foreground).child("Result"))
+                            .child(div().whitespace_normal().child(result))
+                    }),
+            )
+        })
+        .when(!expanded, |this| {
+            this.when_some(summary, |this, summary| {
+                this.child(div().pl_6().text_xs().truncate().child(summary))
+            })
+        })
         .into_any_element()
 }
 

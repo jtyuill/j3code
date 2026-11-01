@@ -20,6 +20,8 @@ mod services;
 mod sidebar;
 mod thread_view;
 mod workspace;
+#[cfg(test)]
+mod ui_tests;
 
 use std::sync::Arc;
 
@@ -43,7 +45,11 @@ fn main() {
     // Starting is fast (SQLite open, bind); doing it before the window means
     // the local connection's first attempt already finds the server.
     let local = Arc::new(runtime.block_on(LocalServer::start()));
-    let services = Services::new(runtime.handle().clone(), local);
+    let config_path = environments::config_path()
+        .inspect_err(|e| tracing::warn!("{e}"))
+        .ok();
+    let services = Services::new(runtime.handle().clone(), local, config_path);
+    let termination = runtime.block_on(termination_signal());
 
     gpui_kit::application()
         .with_assets(Assets)
@@ -51,10 +57,41 @@ fn main() {
             gpui_kit::init(cx);
             cx.set_global(services);
             actions::init(cx);
+            // SIGTERM (logout, systemd) and SIGINT take the same orderly path
+            // as ⌘Q, so omp sessions are stopped instead of orphaned.
+            cx.spawn(async move |cx| {
+                if termination.await.is_ok() {
+                    tracing::info!("termination signal received; quitting");
+                    cx.update(actions::quit);
+                }
+            })
+            .detach();
             open_main_window(cx);
             cx.activate(true);
         });
-    drop(runtime);
+    // Never wait on a stuck blocking task (e.g. an omp call) at exit.
+    runtime.shutdown_timeout(std::time::Duration::from_secs(1));
+}
+
+/// Resolves when the process receives SIGTERM or SIGINT. The listeners are
+/// installed before this returns, so no signal is missed while the app boots.
+async fn termination_signal() -> tokio::sync::oneshot::Receiver<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let listeners = signal(SignalKind::terminate()).and_then(|term| Ok((term, signal(SignalKind::interrupt())?)));
+    match listeners {
+        Ok((mut term, mut int)) => {
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = term.recv() => {}
+                    _ = int.recv() => {}
+                }
+                let _ = tx.send(());
+            });
+        }
+        Err(e) => tracing::warn!("signal handlers unavailable: {e}"),
+    }
+    rx
 }
 
 fn open_main_window(cx: &mut App) {

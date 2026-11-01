@@ -13,6 +13,7 @@ use gpui_kit::component::{
     h_flex,
     input::{Input, InputEvent, InputState},
     menu::DropdownMenu as _,
+    notification::{Notification, NotificationType},
     message_scroller::{MessageScroller, MessageScrollerState},
     questionnaire::{
         Questionnaire, QuestionnaireActions, QuestionnaireChoice, QuestionnaireChoiceDefinition,
@@ -23,6 +24,7 @@ use gpui_kit::component::{
         QuestionnaireTitle,
     },
     spinner::Spinner,
+    WindowExt as _,
     text::TextViewState,
     v_flex,
 };
@@ -30,11 +32,14 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, Entity, FocusHandle, Focusable,
     InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, div, rems,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Task, TestSupportExt as _, Window,
+    div, rems,
 };
 use j3_client::{
     Answer, SendMode, ThreadHandle, ThreadState, ThreadSync,
-    t3::orchestration::{PlanStepStatus, TurnItemKind, UserInputQuestion},
+    t3::orchestration::{
+        PlanStepStatus, ProviderGoal, ProviderGoalStatus, TurnItemKind, UserInputQuestion,
+    },
 };
 
 use crate::{
@@ -59,6 +64,13 @@ struct QuestionCard {
     _subscription: Option<Subscription>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GoalCommand {
+    Pause,
+    Resume,
+    Drop,
+}
+
 struct QueueEdit {
     run_id: String,
     input: Entity<InputState>,
@@ -79,7 +91,6 @@ pub struct ThreadView {
     question: Option<QuestionCard>,
     editing: Option<QueueEdit>,
     todo_open: bool,
-    error: Option<SharedString>,
     _watch: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
@@ -146,7 +157,6 @@ impl ThreadView {
             question: None,
             editing: None,
             todo_open: true,
-            error: None,
             _watch: watch,
             _subscriptions: subscriptions,
         };
@@ -198,24 +208,102 @@ impl ThreadView {
         self.run_action(window, cx, async move { connection.stop(&thread_id).await.map(drop) });
     }
 
-    /// Runs a thread command, showing its error under the feed.
+    /// Runs a thread command; a failure (often omp's reason, such as a
+    /// goal already being active) shows as a notification.
     fn run_action(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
         action: impl Future<Output = Result<(), j3_client::Error>> + 'static,
     ) {
-        self.error = None;
-        cx.spawn_in(window, async move |this, cx| {
+        cx.spawn_in(window, async move |_, cx| {
             if let Err(e) = action.await {
-                let _ = this.update(cx, |this, cx| {
-                    this.error = Some(e.to_string().into());
-                    cx.notify();
+                let _ = cx.update(|window, cx| {
+                    window.push_notification(
+                        Notification::new()
+                            .message(e.to_string())
+                            .with_type(NotificationType::Error),
+                        cx,
+                    );
                 });
             }
         })
         .detach();
-        cx.notify();
+    }
+
+    pub fn stop_subagent(&mut self, run_id: String, subagent_id: String, window: &mut Window, cx: &mut Context<Self>) {
+        let connection = self.connection(cx);
+        let thread_id = self.thread_id().to_owned();
+        self.run_action(window, cx, async move {
+            connection
+                .stop_subagent(&thread_id, &run_id, &subagent_id)
+                .await
+                .map(drop)
+        });
+    }
+
+    fn goal_command(&mut self, command: GoalCommand, window: &mut Window, cx: &mut Context<Self>) {
+        let connection = self.connection(cx);
+        let thread_id = self.thread_id().to_owned();
+        self.run_action(window, cx, async move {
+            match command {
+                GoalCommand::Pause => connection.pause_goal(&thread_id).await,
+                GoalCommand::Resume => connection.resume_goal(&thread_id).await,
+                GoalCommand::Drop => connection.drop_goal(&thread_id).await,
+            }
+            .map(drop)
+        });
+    }
+
+    /// Asks for an objective and optional token budget, then creates the goal.
+    pub fn open_goal_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let objective = cx.new(|cx| InputState::new(window, cx).placeholder("What should omp keep working towards?"));
+        let budget = cx.new(|cx| InputState::new(window, cx).placeholder("No limit"));
+        let view = cx.weak_entity();
+        let (dialog_objective, dialog_budget) = (objective.clone(), budget.clone());
+        window.open_dialog(cx, move |dialog, _, _| {
+            let (objective, budget, view) = (dialog_objective.clone(), dialog_budget.clone(), view.clone());
+            dialog
+                .title("Set goal")
+                .child(
+                    v_flex()
+                        .gap_3()
+                        .child(
+                            v_flex()
+                                .gap_1()
+                                .child(div().text_sm().font_medium().child("Objective"))
+                                .child(Input::new(&dialog_objective).small()),
+                        )
+                        .child(
+                            v_flex()
+                                .gap_1()
+                                .child(div().text_sm().font_medium().child("Token budget"))
+                                .child(Input::new(&dialog_budget).small()),
+                        ),
+                )
+                .footer(crate::dialogs::footer("Set Goal"))
+                .on_ok(move |_, window, cx| {
+                    let text = objective.read(cx).value().trim().to_owned();
+                    let Ok(token_budget) = parse_budget(&budget.read(cx).value()) else {
+                        return false;
+                    };
+                    if text.is_empty() {
+                        return false;
+                    }
+                    let _ = view.update(cx, |this, cx| {
+                        let connection = this.connection(cx);
+                        let thread_id = this.thread_id().to_owned();
+                        this.run_action(window, cx, async move {
+                            connection
+                                .create_goal(&thread_id, &text, token_budget)
+                                .await
+                                .map(drop)
+                        });
+                    });
+                    true
+                })
+        });
+        objective.update(cx, |input, cx| input.focus(window, cx));
     }
 
     fn on_state(&mut self, state: Arc<ThreadState>, window: &mut Window, cx: &mut Context<Self>) {
@@ -533,6 +621,16 @@ impl ThreadView {
                     .child(location),
             )
             .child(div().flex_1())
+            .when(self.state.goal().is_none(), |this| {
+                this.child(
+                    Button::new("set-goal")
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::Star)
+                        .label("Set goal…")
+                        .on_click(cx.listener(|this, _, window, cx| this.open_goal_dialog(window, cx))),
+                )
+            })
             .child(
                 Button::new("thread-actions")
                     .ghost()
@@ -588,6 +686,7 @@ impl ThreadView {
             expanded: self.expanded.clone(),
             view: cx.weak_entity(),
             environment: self.environment.clone(),
+            state: self.state.clone(),
         });
         MessageScroller::new("feed", self.scroller.clone(), move |ix, window, cx| {
             let item = &state.feed()[visible[ix]].item;
@@ -776,6 +875,9 @@ impl ThreadView {
                     .into_any_element(),
             };
             h_flex()
+                .id(SharedString::from(format!("queued-{run_id}")))
+                .test_support()
+                .aria_label(text)
                 .gap_2()
                 .child(Icon::new(IconName::Inbox).xsmall().text_color(theme.muted_foreground))
                 .child(body)
@@ -879,6 +981,8 @@ impl ThreadView {
         };
         Some(
             v_flex()
+                .id("question-card")
+                .test_support()
                 .gap_2()
                 .px_3()
                 .py_2()
@@ -914,6 +1018,113 @@ impl ThreadView {
                 .child(label)
                 .into_any_element(),
         )
+    }
+
+    fn render_goal(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let goal = self.state.goal()?;
+        let theme = cx.theme();
+        let status = goal.status;
+        let color = match status {
+            ProviderGoalStatus::Active => theme.primary,
+            ProviderGoalStatus::Complete => theme.success,
+            ProviderGoalStatus::Blocked
+            | ProviderGoalStatus::UsageLimited
+            | ProviderGoalStatus::BudgetLimited => theme.warning,
+            ProviderGoalStatus::Paused => theme.muted_foreground,
+        };
+        let usage = goal_usage(goal);
+        let command = |id: &'static str, label: &'static str, command: GoalCommand| {
+            Button::new(id)
+                .xsmall()
+                .ghost()
+                .label(label)
+                .on_click(cx.listener(move |this, _, window, cx| this.goal_command(command, window, cx)))
+        };
+        Some(
+            h_flex()
+                .id("goal")
+                .test_support()
+                .aria_label(format!("{}, {}", goal.objective, goal_status_label(status)))
+                .gap_2()
+                .px_3()
+                .py_1p5()
+                .rounded(theme.radius_lg)
+                .border_1()
+                .border_color(theme.border)
+                .text_sm()
+                .child(Icon::new(IconName::Star).xsmall().text_color(color))
+                .child(div().flex_1().min_w_0().truncate().child(goal.objective.clone()))
+                .child(div().flex_shrink_0().text_xs().text_color(color).child(goal_status_label(status)))
+                .when(!usage.is_empty(), |this| {
+                    this.child(div().flex_shrink_0().text_xs().text_color(theme.muted_foreground).child(usage))
+                })
+                .when(status == ProviderGoalStatus::Active, |this| {
+                    this.child(command("goal-pause", "Pause", GoalCommand::Pause))
+                })
+                .when(
+                    matches!(status, ProviderGoalStatus::Paused | ProviderGoalStatus::BudgetLimited),
+                    |this| this.child(command("goal-resume", "Resume", GoalCommand::Resume)),
+                )
+                .child(command(
+                    "goal-drop",
+                    if status == ProviderGoalStatus::Complete { "Clear" } else { "Drop" },
+                    GoalCommand::Drop,
+                ))
+                .into_any_element(),
+        )
+    }
+}
+
+/// The token budget typed in the goal dialog: empty means none.
+fn parse_budget(text: &str) -> Result<Option<u64>, std::num::ParseIntError> {
+    let digits: String = text.chars().filter(|c| !matches!(c, ',' | '_' | ' ')).collect();
+    if digits.is_empty() {
+        Ok(None)
+    } else {
+        digits.parse().map(Some)
+    }
+}
+
+/// A token count like `950`, `12.3k` or `1.2M`.
+pub fn format_tokens(tokens: u64) -> String {
+    match tokens {
+        0..1_000 => tokens.to_string(),
+        1_000..1_000_000 => format!("{:.1}k", tokens as f64 / 1_000.),
+        _ => format!("{:.1}M", tokens as f64 / 1_000_000.),
+    }
+}
+
+/// What the goal card says about usage: tokens of budget and time.
+fn goal_usage(goal: &ProviderGoal) -> String {
+    let mut parts = Vec::new();
+    match (goal.tokens_used, goal.token_budget.flatten()) {
+        (Some(used), Some(budget)) => parts.push(format!(
+            "{} / {} tokens",
+            format_tokens(used),
+            format_tokens(budget)
+        )),
+        (Some(used), None) => parts.push(format!("{} tokens", format_tokens(used))),
+        (None, Some(budget)) => parts.push(format!("budget {} tokens", format_tokens(budget))),
+        (None, None) => {}
+    }
+    if let Some(seconds) = goal.time_used_seconds.filter(|s| *s > 0) {
+        parts.push(if seconds < 60 {
+            format!("{seconds}s")
+        } else {
+            format!("{}m", seconds / 60)
+        });
+    }
+    parts.join(" · ")
+}
+
+fn goal_status_label(status: ProviderGoalStatus) -> &'static str {
+    match status {
+        ProviderGoalStatus::Active => "Active",
+        ProviderGoalStatus::Paused => "Paused",
+        ProviderGoalStatus::Blocked => "Blocked",
+        ProviderGoalStatus::UsageLimited => "Usage limited",
+        ProviderGoalStatus::BudgetLimited => "Budget reached",
+        ProviderGoalStatus::Complete => "Complete",
     }
 }
 
@@ -978,6 +1189,7 @@ impl Render for ThreadView {
         let queue = self.render_queue(cx);
         let question = self.render_question(cx);
         let activity = self.render_activity(cx);
+        let goal = self.render_goal(cx);
         let theme = cx.theme();
         v_flex()
             .size_full()
@@ -994,9 +1206,7 @@ impl Render for ThreadView {
                         .children(queue)
                         .children(question)
                         .children(activity)
-                        .when_some(self.error.clone(), |this, error| {
-                            this.child(div().px_1().text_xs().text_color(theme.danger).child(error))
-                        })
+                        .children(goal)
                         .child(self.composer.clone()),
                 ),
             )

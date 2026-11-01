@@ -1,7 +1,7 @@
 //! The window root: sidebar plus the main pane (a thread, a new thread, or
 //! archived threads). Owns the environments and every workspace command.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use gpui_kit::component::{
     ActiveTheme as _, StyledExt as _, Theme, WindowExt as _,
@@ -25,8 +25,7 @@ use crate::{
     archived::{ArchivedView, Unarchived},
     dialogs::{EnvironmentForm, ProjectCreated, ProjectPicker, footer},
     environment::{Environment, EnvironmentKind, LOCAL_KEY},
-    environments::{DesktopConfig, config_path},
-    local_server::LOCAL_URL,
+    environments::DesktopConfig,
     new_thread::{NewThreadEvent, NewThreadView},
     services::Services,
     sidebar::{Sidebar, SidebarEvent},
@@ -61,25 +60,31 @@ pub struct Workspace {
 
 impl Workspace {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let local_status = Services::global(cx).local().status().clone();
+        let services = Services::global(cx);
+        let local_status = services.local().status().clone();
+        let local_url = services.local().url().to_owned();
+        let config_path = services.config_path().map(Path::to_path_buf);
         let hostname = gethostname::gethostname().to_string_lossy().into_owned();
         let local = cx.new(|cx| {
             Environment::new(
                 LOCAL_KEY,
                 hostname,
-                LOCAL_URL,
+                &local_url,
                 EnvironmentKind::Local(local_status),
                 cx,
             )
         });
         let mut environments = vec![local];
 
-        let (config, config_path, config_error) = match config_path() {
-            Ok(path) => match DesktopConfig::load_or_create(&path) {
-                Ok(config) => (config, Some(path), None),
-                Err(e) => (DesktopConfig { environments: Vec::new() }, Some(path), Some(e.to_string())),
+        let (config, config_error) = match &config_path {
+            Some(path) => match DesktopConfig::load_or_create(path) {
+                Ok(config) => (config, None),
+                Err(e) => (DesktopConfig { environments: Vec::new() }, Some(e.to_string())),
             },
-            Err(e) => (DesktopConfig { environments: Vec::new() }, None, Some(e.to_string())),
+            None => (
+                DesktopConfig { environments: Vec::new() },
+                Some("No config directory; remote environments can’t be saved.".to_owned()),
+            ),
         };
         for remote in &config.environments {
             environments.push(cx.new(|cx| {

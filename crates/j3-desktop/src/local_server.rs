@@ -49,6 +49,8 @@ impl LocalServerStatus {
 /// The running server, if any. Taken once at shutdown.
 pub struct LocalServer {
     status: LocalServerStatus,
+    /// What the local environment connects to.
+    url: String,
     server: Mutex<Option<Server>>,
 }
 
@@ -67,8 +69,25 @@ impl LocalServer {
         }
         Self {
             status,
+            url: LOCAL_URL.to_owned(),
             server: Mutex::new(server),
         }
+    }
+
+    /// Wraps a server bound elsewhere (tests bind an ephemeral port); the
+    /// local environment connects to its first address.
+    #[cfg(test)]
+    pub fn from_server(server: Server) -> Self {
+        let addrs = server.addrs().to_vec();
+        Self {
+            url: format!("http://{}", addrs[0]),
+            status: LocalServerStatus::Serving(addrs),
+            server: Mutex::new(Some(server)),
+        }
+    }
+
+    pub fn url(&self) -> &str {
+        &self.url
     }
 
     async fn try_start() -> Result<Server, LocalServerStatus> {

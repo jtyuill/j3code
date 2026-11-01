@@ -97,7 +97,8 @@ pub fn init(cx: &mut App) {
     ]);
 }
 
-fn quit(cx: &mut App) {
+/// Closes connections, stops the local server (bounded) and quits.
+pub fn quit(cx: &mut App) {
     let connections = Workspace::global_connections(cx);
     Services::quit(connections, cx);
 }
