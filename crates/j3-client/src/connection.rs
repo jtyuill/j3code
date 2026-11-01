@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-use j3_protocol::j3::{GoalCommand, GoalCreateCommand};
+use j3_protocol::j3::{GET_USAGE, GoalCommand, GoalCreateCommand, UsageSnapshot};
 use j3_protocol::t3::{
     self,
     assets::{
@@ -926,6 +926,12 @@ impl Connection {
             state.workspaces.insert(cwd, stored);
         });
         Ok(commands)
+    }
+
+    /// The server host's provider usage limits (`j3.getUsage`, which runs
+    /// `omp usage --json` there).
+    pub async fn usage(&self) -> Result<UsageSnapshot, Error> {
+        self.call(GET_USAGE, &EmptyInput {}).await
     }
 }
 

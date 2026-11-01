@@ -27,8 +27,17 @@ pub enum Shelf {
     Settled,
 }
 
+/// Default width of the conversation text and composer, in rem.
+pub const DEFAULT_TEXT_MEASURE: f32 = 38.;
+/// Narrowest and widest text measure the setting accepts, in rem.
+pub const TEXT_MEASURE_MIN: f32 = 28.;
+pub const TEXT_MEASURE_MAX: f32 = 64.;
+
+/// The zoom levels the zoom commands step through; 1 is 100%.
+pub const ZOOM_LEVELS: [f32; 9] = [0.75, 0.8, 0.9, 1., 1.1, 1.25, 1.5, 1.75, 2.];
+
 /// The `"ui"` object of `desktop.json`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct UiSettings {
     pub workflow: Workflow,
@@ -46,6 +55,18 @@ pub struct UiSettings {
     /// T3 shelves the user expanded; like t3 web, every shelf starts
     /// collapsed.
     pub expanded_shelves: Vec<Shelf>,
+    /// Widest the conversation text and composer get, in rem. Narrower
+    /// columns are easier to read.
+    pub text_measure: f32,
+    /// Interface font family; `None` is the system font.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ui_font: Option<String>,
+    /// Monospace (code, tool output) font family; `None` is the platform's
+    /// default monospace font.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mono_font: Option<String>,
+    /// Scale of the whole interface; 1 is 100%.
+    pub zoom: f32,
 }
 
 impl Default for UiSettings {
@@ -58,6 +79,10 @@ impl Default for UiSettings {
             toasts: true,
             sounds: true,
             expanded_shelves: Vec::new(),
+            text_measure: DEFAULT_TEXT_MEASURE,
+            ui_font: None,
+            mono_font: None,
+            zoom: 1.,
         }
     }
 }
@@ -72,6 +97,37 @@ impl UiSettings {
         if expanded {
             self.expanded_shelves.push(shelf);
         }
+    }
+
+    /// The text measure, kept inside the range the setting offers (a file
+    /// edited by hand could hold anything).
+    pub fn measure(&self) -> f32 {
+        self.text_measure.clamp(TEXT_MEASURE_MIN, TEXT_MEASURE_MAX)
+    }
+
+    /// The zoom, kept inside the levels the setting offers.
+    pub fn zoom(&self) -> f32 {
+        self.zoom
+            .clamp(ZOOM_LEVELS[0], ZOOM_LEVELS[ZOOM_LEVELS.len() - 1])
+    }
+
+    /// The zoom one level in (`steps` > 0) or out (< 0) from the current
+    /// one; a zoom between levels moves to the nearest level that way.
+    pub fn zoom_step(&self, steps: i32) -> f32 {
+        let zoom = self.zoom();
+        let next = if steps > 0 {
+            ZOOM_LEVELS
+                .iter()
+                .copied()
+                .find(|&level| level > zoom + 1e-3)
+        } else {
+            ZOOM_LEVELS
+                .iter()
+                .rev()
+                .copied()
+                .find(|&level| level < zoom - 1e-3)
+        };
+        next.unwrap_or(zoom)
     }
 }
 
@@ -88,6 +144,8 @@ mod tests {
         assert_eq!(ui.status_indicators, StatusIndicators::Dots);
         assert_eq!(ui.agent_order, AgentOrder::Spaces);
         assert!(ui.toasts && ui.sounds && ui.working_shelf);
+        assert_eq!(ui.text_measure, DEFAULT_TEXT_MEASURE);
+        assert_eq!((ui.zoom, ui.ui_font.as_deref()), (1., None));
         assert!(!ui.is_expanded(Shelf::Settled));
 
         let ui: UiSettings =
@@ -95,6 +153,34 @@ mod tests {
         assert_eq!(ui.workflow, Workflow::Herdr);
         assert!(!ui.sounds);
         assert!(ui.toasts);
+    }
+
+    #[test]
+    fn the_measure_stays_in_range() {
+        let mut ui = UiSettings::default();
+        ui.text_measure = 10.;
+        assert_eq!(ui.measure(), TEXT_MEASURE_MIN);
+        ui.text_measure = 200.;
+        assert_eq!(ui.measure(), TEXT_MEASURE_MAX);
+        ui.text_measure = 42.;
+        assert_eq!(ui.measure(), 42.);
+    }
+
+    #[test]
+    fn zoom_steps_through_the_levels_and_stops_at_the_ends() {
+        let mut ui = UiSettings::default();
+        assert_eq!(ui.zoom_step(1), 1.1);
+        assert_eq!(ui.zoom_step(-1), 0.9);
+        // Between levels: the nearest level in that direction.
+        ui.zoom = 1.2;
+        assert_eq!(ui.zoom_step(1), 1.25);
+        assert_eq!(ui.zoom_step(-1), 1.1);
+        ui.zoom = 2.;
+        assert_eq!(ui.zoom_step(1), 2.);
+        ui.zoom = 9.;
+        assert_eq!(ui.zoom(), 2.);
+        ui.zoom = 0.75;
+        assert_eq!(ui.zoom_step(-1), 0.75);
     }
 
     #[test]
@@ -107,6 +193,10 @@ mod tests {
             toasts: false,
             sounds: true,
             expanded_shelves: Vec::new(),
+            text_measure: 42.,
+            ui_font: Some("Inter".into()),
+            mono_font: None,
+            zoom: 1.25,
         };
         ui.set_expanded(Shelf::Settled, true);
         ui.set_expanded(Shelf::Working, true);
@@ -116,7 +206,8 @@ mod tests {
             value,
             json!({"workflow": "herdr", "workingShelf": false, "statusIndicators": "symbols",
                 "agentOrder": "attention", "toasts": false, "sounds": true,
-                "expandedShelves": ["settled"]})
+                "expandedShelves": ["settled"], "textMeasure": 42.0, "uiFont": "Inter",
+                "zoom": 1.25})
         );
         assert_eq!(serde_json::from_value::<UiSettings>(value).unwrap(), ui);
         assert!(ui.is_expanded(Shelf::Settled));

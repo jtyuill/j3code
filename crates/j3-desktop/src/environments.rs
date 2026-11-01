@@ -21,7 +21,7 @@ pub struct RemoteEnvironment {
 }
 
 /// The contents of `desktop.json`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DesktopConfig {
     pub environments: Vec<RemoteEnvironment>,
     /// Absent in files from before the preferences existed.

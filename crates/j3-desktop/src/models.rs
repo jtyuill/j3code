@@ -18,6 +18,9 @@ pub struct ModelChoice {
     /// `(provider instance id, model slug)`: the model's identity.
     pub key: (String, String),
     pub name: String,
+    /// The upstream provider serving it (omp's `anthropic`, `openai-codex`,
+    /// …): the model's `subProvider`, else the slug's `<provider>/` prefix.
+    pub provider: String,
     pub is_default: bool,
 }
 
@@ -47,10 +50,28 @@ pub fn model_choices(config: &ServerConfig) -> Vec<ModelChoice> {
             provider.models.iter().map(|model| ModelChoice {
                 key: (provider.instance_id.clone(), model.slug.clone()),
                 name: model.name.clone(),
+                provider: model
+                    .sub_provider
+                    .clone()
+                    .or_else(|| Some(model.slug.split_once('/')?.0.to_owned()))
+                    .unwrap_or_else(|| provider.instance_id.clone()),
                 is_default: model.is_default == Some(true),
             })
         })
         .collect()
+}
+
+/// `choices` grouped by provider, groups in order of first appearance:
+/// `(provider, indices into choices)`.
+pub fn by_provider(choices: &[ModelChoice]) -> Vec<(&str, Vec<usize>)> {
+    let mut groups: Vec<(&str, Vec<usize>)> = Vec::new();
+    for (ix, choice) in choices.iter().enumerate() {
+        match groups.iter_mut().find(|(p, _)| *p == choice.provider) {
+            Some((_, rows)) => rows.push(ix),
+            None => groups.push((&choice.provider, vec![ix])),
+        }
+    }
+    groups
 }
 
 /// The choice to preselect: `preferred` if the server still offers it,
@@ -167,10 +188,11 @@ mod tests {
                 {"instanceId":"omp","driver":"pi","enabled":true,"installed":true,"version":"1","status":"ready",
                  "auth":{"status":"authenticated"},"checkedAt":"t","models":[
                     {"slug":"a/one","name":"One","isCustom":false,"capabilities":null},
-                    {"slug":"b/two","name":"Two","isCustom":false,"isDefault":true,"capabilities":{"optionDescriptors":[
+                    {"slug":"b/two","name":"Two","subProvider":"bee","isCustom":false,"isDefault":true,"capabilities":{"optionDescriptors":[
                         {"type":"boolean","id":"fast","label":"Fast"},
                         {"type":"select","id":"thinking","label":"Thinking","options":[
-                            {"id":"off","label":"Off"},{"id":"medium","label":"Medium","isDefault":true},{"id":"high","label":"High"}]}]}}]}
+                            {"id":"off","label":"Off"},{"id":"medium","label":"Medium","isDefault":true},{"id":"high","label":"High"}]}]}},
+                    {"slug":"a/three","name":"Three","isCustom":false,"capabilities":null}]}
             ]
         }))
         .unwrap()
@@ -181,7 +203,10 @@ mod tests {
         let config = config();
         let choices = model_choices(&config);
         let slugs: Vec<&str> = choices.iter().map(|c| c.slug()).collect();
-        assert_eq!(slugs, ["a/one", "b/two"]);
+        assert_eq!(slugs, ["a/one", "b/two", "a/three"]);
+        // The subProvider wins over the slug prefix; groups keep first-seen order.
+        let groups: Vec<(&str, Vec<usize>)> = by_provider(&choices);
+        assert_eq!(groups, [("a", vec![0, 2]), ("bee", vec![1])]);
         assert_eq!(initial_choice(&choices, None), Some(1));
         let preferred = ModelSelection {
             instance_id: "omp".into(),

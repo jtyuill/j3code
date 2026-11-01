@@ -18,7 +18,7 @@ use gpui_kit::component::{ActiveTheme as _, v_flex};
 use gpui_kit::{
     App, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement as _,
     IntoElement, ParentElement as _, Render, SharedString, Styled as _, Subscription, Task,
-    TestSupportExt as _, Window,
+    TestSupportExt as _, Window, div,
 };
 use j3_client::ConnectionState;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -82,6 +82,8 @@ pub enum SidebarEvent {
     OpenThread(ThreadKey),
     /// The new-thread composer, preset to a project when one is given.
     NewThread(Option<ProjectKey>),
+    /// Add a project (and open a new thread in it).
+    AddProject,
     /// Commands to run in order (a drop can touch several threads).
     Commands(Vec<(ThreadKey, ThreadCommand)>),
     /// Ask for a custom wake time, then snooze.
@@ -301,10 +303,13 @@ impl Focusable for Sidebar {
 }
 
 impl Render for Sidebar {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The sidebar is the window's left edge: its header clears the
+        // traffic lights.
+        let inset = crate::titlebar::traffic_lights_inset(window);
         let body = match &self.rows {
-            Rows::T3(rows) => self.render_t3(rows.clone(), cx),
-            Rows::Herdr(rows) => self.render_herdr(rows.clone(), cx),
+            Rows::T3(rows) => self.render_t3(rows.clone(), inset, cx),
+            Rows::Herdr(rows) => self.render_herdr(rows.clone(), inset, cx),
         };
         let theme = cx.theme();
         v_flex()
@@ -315,7 +320,7 @@ impl Render for Sidebar {
             .size_full()
             .bg(theme.sidebar)
             .text_color(theme.sidebar_foreground)
-            .child(body)
+            .child(div().flex_1().min_h_0().child(body))
     }
 }
 

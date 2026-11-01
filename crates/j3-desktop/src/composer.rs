@@ -1,31 +1,37 @@
 //! The message composer: multi-line text, pasted images (uploaded as they
-//! are added), model and thinking pickers, and `/` completion. It reports a
+//! are added), one model-and-thinking picker, and `/` completion. It reports a
 //! [`Submission`]; its owner sends it and calls [`Composer::finish`].
 
 use std::{path::Path, sync::Arc};
 
+use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, IconName, Sizable as _,
+    ActiveTheme as _, Disableable as _, Icon, IconName, IndexPath, Sizable as _,
     button::{Button, ButtonVariants as _},
+    combobox::{Combobox, ComboboxEvent, ComboboxState},
     h_flex,
     input::{Enter, Escape, IndentInline, InputEvent, MoveDown, MoveUp, Textarea, TextareaState},
-    select::{Select, SelectEvent, SelectItem, SelectState},
+    popover::Popover,
+    searchable_list::{SearchableListDelegate, SearchableListItem},
     spinner::Spinner,
     v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, ClipboardEntry, ClipboardItem, Context, Entity, EventEmitter,
-    FocusHandle, Focusable, Image, ImageFormat, ImageSource, InteractiveElement as _, IntoElement,
-    ObjectFit, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
-    Styled as _, StyledImage as _, Subscription, WeakEntity, Window, div, img, rems,
+    Anchor, AnyElement, App, AppContext as _, ClipboardEntry, ClipboardItem, Context, Entity,
+    EventEmitter, FocusHandle, Focusable, Image, ImageFormat, ImageSource, InteractiveElement as _,
+    IntoElement, ObjectFit, ParentElement as _, Render, SharedString,
+    StatefulInteractiveElement as _, Styled as _, StyledImage as _, Subscription, Task,
+    TestSupportExt as _, WeakEntity, Window, div, img, px, rems,
 };
 use j3_client::t3::{chat_attachment::ChatAttachment, model::ModelSelection};
 
 use crate::{
     completion::{self, Catalog, Completion, CompletionKind},
     environment::Environment,
+    logos,
     models::{self, ModelChoice},
+    usage::{self, UsagePanel, UsageStore},
 };
 
 /// Largest image the composer uploads (the server's image limit).
@@ -71,7 +77,7 @@ struct PendingImage {
 #[derive(Clone)]
 struct ModelItem(ModelChoice);
 
-impl SelectItem for ModelItem {
+impl SearchableListItem for ModelItem {
     type Value = (String, String);
 
     fn title(&self) -> SharedString {
@@ -79,22 +85,141 @@ impl SelectItem for ModelItem {
     }
 
     fn render(&self, _: &mut Window, cx: &mut App) -> impl IntoElement {
-        v_flex().child(self.0.name.clone()).child(
-            div()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(self.0.slug().to_owned()),
-        )
+        let id = self
+            .0
+            .slug()
+            .split_once('/')
+            .map_or(self.0.slug(), |(_, id)| id);
+        h_flex()
+            .gap_2()
+            .min_w_0()
+            .child(div().flex_none().child(self.0.name.clone()))
+            .when(id != self.0.name, |this| {
+                this.child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(id.to_owned()),
+                )
+            })
     }
 
     fn value(&self) -> &Self::Value {
-        // The pair is stored inline so the select can compare by reference.
         &self.0.key
     }
 
     fn matches(&self, query: &str) -> bool {
-        let query = query.to_lowercase();
-        self.0.name.to_lowercase().contains(&query) || self.0.slug().to_lowercase().contains(&query)
+        self.0.name.to_lowercase().contains(query) || self.0.slug().to_lowercase().contains(query)
+    }
+}
+
+/// The model list, one section per provider, headed by its logo and name.
+struct ModelGroups {
+    /// `(provider, models)`.
+    groups: Vec<(String, Vec<ModelItem>)>,
+    /// The shown sections after the last search: `(group, shown rows)`.
+    shown: Vec<(usize, Vec<usize>)>,
+}
+
+impl ModelGroups {
+    fn new(choices: &[ModelChoice]) -> Self {
+        let groups: Vec<(String, Vec<ModelItem>)> = models::by_provider(choices)
+            .into_iter()
+            .map(|(provider, rows)| {
+                let items = rows
+                    .into_iter()
+                    .map(|ix| ModelItem(choices[ix].clone()))
+                    .collect();
+                (provider.to_owned(), items)
+            })
+            .collect();
+        let shown = groups
+            .iter()
+            .enumerate()
+            .map(|(ix, (_, items))| (ix, (0..items.len()).collect()))
+            .collect();
+        Self { groups, shown }
+    }
+}
+
+impl SearchableListDelegate for ModelGroups {
+    type Item = ModelItem;
+
+    fn sections_count(&self, _: &App) -> usize {
+        self.shown.len()
+    }
+
+    fn items_count(&self, section: usize) -> usize {
+        self.shown.get(section).map_or(0, |(_, rows)| rows.len())
+    }
+
+    fn item(&self, ix: IndexPath) -> Option<&ModelItem> {
+        let (group, rows) = self.shown.get(ix.section)?;
+        self.groups[*group].1.get(*rows.get(ix.row)?)
+    }
+
+    fn position<V>(&self, value: &V) -> Option<IndexPath>
+    where
+        ModelItem: SearchableListItem<Value = V>,
+        V: PartialEq,
+    {
+        self.shown
+            .iter()
+            .enumerate()
+            .find_map(|(section, (group, rows))| {
+                let items = &self.groups[*group].1;
+                let row = rows.iter().position(|&row| items[row].value() == value)?;
+                Some(IndexPath::default().section(section).row(row))
+            })
+    }
+
+    /// A query naming the provider shows all its models.
+    fn perform_search(&mut self, query: &str, _: &mut Window, _: &mut App) -> Task<()> {
+        let query = query.trim().to_lowercase();
+        self.shown = self
+            .groups
+            .iter()
+            .enumerate()
+            .filter_map(|(ix, (provider, items))| {
+                let rows: Vec<usize> = if provider.contains(&query)
+                    || logos::provider_name(provider)
+                        .to_lowercase()
+                        .contains(&query)
+                {
+                    (0..items.len()).collect()
+                } else {
+                    (0..items.len())
+                        .filter(|&row| items[row].matches(&query))
+                        .collect()
+                };
+                (!rows.is_empty()).then_some((ix, rows))
+            })
+            .collect();
+        Task::ready(())
+    }
+
+    fn render_section_header(
+        &self,
+        section: usize,
+        _: &mut Window,
+        cx: &mut App,
+    ) -> Option<AnyElement> {
+        let (group, _) = self.shown.get(section)?;
+        let provider = &self.groups[*group].0;
+        Some(
+            h_flex()
+                .gap_1p5()
+                .px_2()
+                .pt_1p5()
+                .pb_0p5()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(logos::provider_logo(provider, px(14.), cx))
+                .child(logos::provider_name(provider).to_owned())
+                .into_any_element(),
+        )
     }
 }
 
@@ -104,18 +229,6 @@ struct LevelItem {
     label: SharedString,
 }
 
-impl SelectItem for LevelItem {
-    type Value = String;
-
-    fn title(&self) -> SharedString {
-        self.label.clone()
-    }
-
-    fn value(&self) -> &String {
-        &self.id
-    }
-}
-
 pub struct Composer {
     environment: Entity<Environment>,
     cwd: String,
@@ -123,9 +236,14 @@ pub struct Composer {
     images: Vec<PendingImage>,
     next_image: u64,
     choices: Vec<ModelChoice>,
-    model: Entity<SelectState<Vec<ModelItem>>>,
+    /// The model picker; the chosen thinking level is in its footer.
+    model: Entity<ComboboxState<ModelGroups>>,
     level_descriptor: Option<String>,
-    levels: Entity<SelectState<Vec<LevelItem>>>,
+    levels: Vec<LevelItem>,
+    level: Option<String>,
+    /// The usage button's popover: this environment, the model's provider.
+    usage: Entity<UsagePanel>,
+    usage_store: Entity<UsageStore>,
     preferred: Option<ModelSelection>,
     catalog: Catalog,
     workspace_requested: bool,
@@ -154,26 +272,34 @@ impl Composer {
                 .submit_on_enter(true)
                 .placeholder("Message omp…")
         });
-        let model = cx.new(|cx| SelectState::new(Vec::new(), None, window, cx).searchable(true));
-        let levels = cx.new(|cx| SelectState::new(Vec::new(), None, window, cx));
+        let model = cx.new(|cx| {
+            ComboboxState::new(ModelGroups::new(&[]), Vec::new(), window, cx).searchable(true)
+        });
+        let usage = cx.new(|cx| UsagePanel::new(environment.clone(), cx));
+        let usage_store = UsageStore::global(cx);
         let subscriptions = vec![
             cx.subscribe_in(&input, window, Self::on_input_event),
             cx.subscribe_in(
                 &model,
                 window,
-                |this, _, event: &SelectEvent<Vec<ModelItem>>, window, cx| {
-                    let SelectEvent::Confirm(Some(key)) = event else {
+                |this, _, event: &ComboboxEvent<ModelGroups>, _, cx| {
+                    let ComboboxEvent::Change(keys) = event else {
+                        return;
+                    };
+                    let Some(key) = keys.first() else {
                         return;
                     };
                     if let Some(choice) = this.choices.iter().find(|c| &c.key == key).cloned() {
                         this.preferred = Some(models::model_selection(&choice, None));
-                        this.sync_levels(&choice, window, cx);
+                        this.sync_levels(&choice, cx);
                     }
                 },
             ),
             cx.observe_in(&environment, window, |this, _, window, cx| {
                 this.sync_config(window, cx)
             }),
+            // The button shows the cached peak.
+            cx.observe(&usage_store, |_, _, cx| cx.notify()),
         ];
         let mut composer = Self {
             environment,
@@ -184,7 +310,10 @@ impl Composer {
             choices: Vec::new(),
             model,
             level_descriptor: None,
-            levels,
+            levels: Vec::new(),
+            level: None,
+            usage,
+            usage_store,
             preferred,
             catalog: Catalog::default(),
             workspace_requested: false,
@@ -323,14 +452,17 @@ impl Composer {
         cx.notify();
     }
 
+    /// The chosen model.
+    fn choice(&self, cx: &App) -> Option<&ModelChoice> {
+        let key = self.model.read(cx).selected_value()?;
+        self.choices.iter().find(|c| c.key == key)
+    }
+
     /// The model selection to send, with the chosen thinking level.
     pub fn selection(&self, cx: &App) -> Option<ModelSelection> {
-        let key = self.model.read(cx).selected_value()?;
-        let choice = self.choices.iter().find(|c| &c.key == key)?;
-        let level = self.levels.read(cx).selected_value().cloned();
         Some(models::model_selection(
-            choice,
-            self.level_descriptor.as_deref().zip(level.as_deref()),
+            self.choice(cx)?,
+            self.level_descriptor.as_deref().zip(self.level.as_deref()),
         ))
     }
 
@@ -364,30 +496,30 @@ impl Composer {
             let current = self.selection(cx).or_else(|| self.preferred.clone());
             let initial = models::initial_choice(&choices, current.as_ref());
             self.choices = choices;
-            let items: Vec<ModelItem> = self.choices.iter().cloned().map(ModelItem).collect();
-            self.model.update(cx, |select, cx| {
-                select.set_items(items, window, cx);
-                select.set_selected_index(
-                    initial.map(gpui_kit::component::IndexPath::new),
-                    window,
-                    cx,
-                );
+            let key = initial.map(|ix| self.choices[ix].key.clone());
+            let items = ModelGroups::new(&self.choices);
+            self.model.update(cx, |model, cx| {
+                model.set_items(items, window, cx);
+                model.set_selected_values(key.as_slice(), window, cx);
             });
             if let Some(choice) = initial.map(|ix| self.choices[ix].clone()) {
-                self.sync_levels(&choice, window, cx);
+                self.sync_levels(&choice, cx);
             }
         }
         cx.notify();
     }
 
-    fn sync_levels(&mut self, choice: &ModelChoice, window: &mut Window, cx: &mut Context<Self>) {
+    fn sync_levels(&mut self, choice: &ModelChoice, cx: &mut Context<Self>) {
+        let provider = Some(choice.provider.clone());
+        self.usage
+            .update(cx, |usage, cx| usage.set_provider(provider, cx));
         let state = self.environment.read(cx).state().clone();
         let descriptor = state
             .config
             .as_ref()
             .and_then(|config| models::thinking_descriptor(config, choice))
             .cloned();
-        let preferred_level = self.levels.read(cx).selected_value().cloned().or_else(|| {
+        let preferred_level = self.level.clone().or_else(|| {
             let descriptor = descriptor.as_ref()?;
             self.preferred
                 .as_ref()
@@ -395,7 +527,7 @@ impl Composer {
                 .map(str::to_owned)
         });
         self.level_descriptor = descriptor.as_ref().map(|d| d.id.clone());
-        let items: Vec<LevelItem> = descriptor
+        self.levels = descriptor
             .iter()
             .flat_map(|d| &d.options)
             .map(|option| LevelItem {
@@ -403,16 +535,9 @@ impl Composer {
                 label: option.label.clone().into(),
             })
             .collect();
-        let initial = descriptor
+        self.level = descriptor
             .as_ref()
             .and_then(|d| models::initial_level(d, preferred_level.as_deref()));
-        self.levels.update(cx, |select, cx| {
-            select.set_items(items, window, cx);
-            match &initial {
-                Some(level) => select.set_selected_value(level, window, cx),
-                None => select.set_selected_index(None, window, cx),
-            }
-        });
         cx.notify();
     }
 
@@ -669,6 +794,146 @@ impl Composer {
                 .into_any_element(),
         )
     }
+
+    /// One button for both the model and its thinking level: it shows the
+    /// provider logo, model and level; its menu lists models by provider
+    /// with the levels in the footer.
+    fn render_model_picker(&self, cx: &mut Context<Self>) -> AnyElement {
+        let choice = self.choice(cx);
+        let provider = choice.map(|choice| choice.provider.clone());
+        let name: SharedString = choice.map_or("Model".into(), |c| c.name.clone().into());
+        let level_label = self
+            .level
+            .as_ref()
+            .and_then(|id| self.levels.iter().find(|level| &level.id == id))
+            .map(|level| level.label.clone());
+        let levels = self.levels.clone();
+        let level = self.level.clone();
+        let weak = cx.weak_entity();
+        div()
+            .flex_none()
+            .max_w(rems(22.))
+            .child(
+                Combobox::new(&self.model)
+                    .xsmall()
+                    .appearance(false)
+                    .search_placeholder("Search models")
+                    .menu_width(rems(24.))
+                    .menu_max_h(rems(26.))
+                    .render_trigger(move |_, _, cx| {
+                        let muted = cx.theme().muted_foreground;
+                        h_flex()
+                            .gap_1p5()
+                            .min_w_0()
+                            .when_some(provider.as_deref(), |this, provider| {
+                                this.child(logos::provider_logo(provider, px(14.), cx))
+                            })
+                            .child(div().min_w_0().truncate().child(name.clone()))
+                            .when_some(level_label.clone(), |this, label| {
+                                this.child(div().flex_none().text_color(muted).child(label))
+                            })
+                            .child(
+                                Icon::new(IconName::ChevronDown)
+                                    .xsmall()
+                                    .flex_none()
+                                    .text_color(muted),
+                            )
+                    })
+                    .when(!levels.is_empty(), |this| {
+                        this.footer(move |_, cx| {
+                            render_levels(&levels, level.as_deref(), &weak, cx)
+                        })
+                    }),
+            )
+            .into_any_element()
+    }
+
+    /// The gauge beside the model: the model provider's highest cached
+    /// usage on this environment; opening it refreshes and lists the limits.
+    fn render_usage_button(&self, cx: &mut Context<Self>) -> AnyElement {
+        let env = self.environment.read(cx);
+        let choice = self.choice(cx);
+        let peak = choice.and_then(|choice| {
+            let snapshot = self.usage_store.read(cx).snapshot(env.key())?;
+            usage::peak(snapshot, &choice.provider)
+        });
+        let tooltip = match choice {
+            Some(choice) => format!(
+                "{} usage limits on {}",
+                logos::provider_name(&choice.provider),
+                env.label()
+            ),
+            None => "Usage limits".to_owned(),
+        };
+        let panel = self.usage.clone();
+        let refresh = self.usage.downgrade();
+        Popover::new("usage-popover")
+            .anchor(Anchor::BottomLeft)
+            .trigger(
+                Button::new("usage")
+                    .ghost()
+                    .xsmall()
+                    .icon(Icon::new(Lucide::Gauge))
+                    .when_some(peak, |this, peak| {
+                        this.label(format!("{:.0}%", peak * 100.))
+                    })
+                    .tooltip(tooltip),
+            )
+            .on_open_change(move |open, _, cx| {
+                if *open {
+                    let _ = refresh.update(cx, |usage, cx| usage.refresh(cx));
+                }
+            })
+            .content(move |_, _, _| panel.clone())
+            .into_any_element()
+    }
+}
+
+/// The model menu's footer: the thinking levels, `level` highlighted.
+fn render_levels(
+    levels: &[LevelItem],
+    level: Option<&str>,
+    composer: &WeakEntity<Composer>,
+    cx: &App,
+) -> AnyElement {
+    let theme = cx.theme();
+    h_flex()
+        .flex_wrap()
+        .gap_1()
+        .px_1()
+        .py_0p5()
+        .text_xs()
+        .child(
+            div()
+                .mr_1()
+                .text_color(theme.muted_foreground)
+                .child("Thinking"),
+        )
+        .children(levels.iter().map(|item| {
+            let selected = level == Some(item.id.as_str());
+            let id = item.id.clone();
+            let composer = composer.clone();
+            div()
+                .id(SharedString::from(format!("thinking-{id}")))
+                .px_1p5()
+                .py_0p5()
+                .rounded(theme.radius)
+                .cursor_pointer()
+                .when(selected, |this| {
+                    this.bg(theme.accent).text_color(theme.accent_foreground)
+                })
+                .when(!selected, |this| {
+                    this.hover(|this| this.bg(theme.accent.opacity(0.5)))
+                })
+                .child(item.label.clone())
+                .on_click(move |_, _, cx| {
+                    let _ = composer.update(cx, |this, cx| {
+                        this.level = Some(id.clone());
+                        cx.notify();
+                    });
+                })
+        }))
+        .into_any_element()
 }
 
 fn format_for_path(path: &Path) -> Option<ImageFormat> {
@@ -692,27 +957,36 @@ impl Render for Composer {
         let weak = cx.weak_entity();
         let running = matches!(self.run_state, RunState::Running { .. });
         let can_steer = matches!(self.run_state, RunState::Running { can_steer: true });
-        let has_levels = self.level_descriptor.is_some();
         let completions = self.render_completions(cx);
         let images = self.render_images(cx);
+        let model_picker = self.render_model_picker(cx);
+        let usage_button = self.render_usage_button(cx);
         let key = |keys: &str| crate::actions::shortcut(keys, cx);
-        let (enter, queue_key, newline) =
-            (key("enter"), key("secondary-enter"), key("shift-enter"));
         let stop_tooltip = format!("Stop the run ({})", key("secondary-."));
-        let queue_tooltip = format!("Queue after the current run ({queue_key})");
-        let hint = if running {
-            if can_steer {
-                format!("{enter} steer · {queue_key} queue")
-            } else {
-                format!("{enter} queue")
-            }
+        let queue_tooltip = format!("Queue after the current run ({})", key("secondary-enter"));
+        // An empty catalog is nearly always a server problem (e.g. omp not
+        // found); say what the server reported instead of showing nothing.
+        let catalog_note: Option<SharedString> = if self.choices.is_empty() {
+            let state = self.environment.read(cx).state();
+            state
+                .config
+                .as_ref()
+                .and_then(|config| config.providers.first())
+                .map(|provider| {
+                    provider
+                        .message
+                        .clone()
+                        .unwrap_or_else(|| "Loading models…".to_owned())
+                        .into()
+                })
         } else {
-            format!("{enter} send · {newline} newline")
+            None
         };
         let theme = cx.theme();
         let completions_open = !self.completions.is_empty();
         v_flex()
             .id("composer")
+            .test_support()
             .key_context("Composer")
             .relative()
             .w_full()
@@ -763,39 +1037,25 @@ impl Render for Composer {
             .when_some(self.error.clone(), |this, error| {
                 this.child(div().px_3().text_xs().text_color(theme.danger).child(error))
             })
+            .when_some(catalog_note, |this, note| {
+                this.child(
+                    div()
+                        .px_3()
+                        .pb_1()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(note),
+                )
+            })
             .child(
                 h_flex()
                     .gap_1()
                     .px_2()
                     .pb_2()
                     .pt_1()
-                    .child(
-                        Select::new(&self.model)
-                            .xsmall()
-                            .appearance(false)
-                            .placeholder("Model")
-                            .search_placeholder("Search models")
-                            .menu_width(rems(20.))
-                            .accessibility_label("Model")
-                            .w(rems(12.)),
-                    )
-                    .when(has_levels, |this| {
-                        this.child(
-                            Select::new(&self.levels)
-                                .xsmall()
-                                .appearance(false)
-                                .title_prefix("Thinking: ")
-                                .accessibility_label("Thinking level")
-                                .w(rems(9.)),
-                        )
-                    })
+                    .child(model_picker)
+                    .child(usage_button)
                     .child(div().flex_1())
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(hint),
-                    )
                     .when(running, |this| {
                         this.child(
                             Button::new("stop-run")

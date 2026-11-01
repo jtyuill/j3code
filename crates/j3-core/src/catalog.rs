@@ -286,6 +286,7 @@ impl Catalog {
         let checked_at = t3::now_iso();
         let models = match self.query_models().await {
             Ok((models, commands)) => {
+                tracing::info!(models = models.len(), "loaded the omp model catalog");
                 let cwd = self.default_cwd.to_string_lossy().into_owned();
                 self.put_commands(&cwd, &commands);
                 Models {

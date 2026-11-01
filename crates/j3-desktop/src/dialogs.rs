@@ -22,7 +22,7 @@ use j3_client::{
 };
 use time::OffsetDateTime;
 
-use crate::environment::Environment;
+use crate::environment::{Environment, distinct_environments};
 
 /// The footer every dialog here uses: Cancel and the primary result.
 pub fn footer(confirm: &'static str) -> DialogFooter {
@@ -32,14 +32,16 @@ pub fn footer(confirm: &'static str) -> DialogFooter {
         .child(DialogAction::new().child(Button::new("dialog-confirm").primary().label(confirm)))
 }
 
-/// A project's default title: the last segment of its path.
+/// A project's default title: the last segment of its path. The home
+/// directory (`~`) names nothing.
 pub fn title_from_path(path: &str) -> String {
-    path.trim()
+    let last = path
+        .trim()
         .trim_end_matches('/')
         .rsplit('/')
         .next()
-        .unwrap_or_default()
-        .to_owned()
+        .unwrap_or_default();
+    if last == "~" { "" } else { last }.to_owned()
 }
 
 enum Listing {
@@ -53,11 +55,16 @@ enum Listing {
 
 /// Emitted once the project exists.
 pub struct ProjectCreated {
+    /// The environment the project was added on.
+    pub env: SharedString,
     pub project_id: String,
 }
 
-/// Picks a directory on an environment's host and creates a project there.
+/// Picks a device (any configured environment that is online), a directory
+/// on it, and creates a project there.
 pub struct ProjectPicker {
+    /// Every configured environment, one per server.
+    environments: Vec<Entity<Environment>>,
     environment: Entity<Environment>,
     path: Entity<InputState>,
     title: Entity<InputState>,
@@ -72,18 +79,31 @@ pub struct ProjectPicker {
 impl EventEmitter<ProjectCreated> for ProjectPicker {}
 
 impl ProjectPicker {
+    /// Starts on `environment` when it is online, else the first device that
+    /// is.
     pub fn new(
+        environments: &[Entity<Environment>],
         environment: Entity<Environment>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let environments = distinct_environments(environments, cx);
+        let environment = if environment.read(cx).is_live() {
+            environment
+        } else {
+            environments
+                .iter()
+                .find(|env| env.read(cx).is_live())
+                .cloned()
+                .unwrap_or(environment)
+        };
         let path = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("~/Developer/project")
                 .default_value("~/")
         });
         let title = cx.new(|cx| InputState::new(window, cx).placeholder("Name"));
-        let subscriptions = vec![
+        let mut subscriptions = vec![
             cx.subscribe_in(&path, window, |this, _, event: &InputEvent, window, cx| {
                 if let InputEvent::Change = event {
                     this.on_path_changed(window, cx);
@@ -95,7 +115,14 @@ impl ProjectPicker {
                 }
             }),
         ];
+        // Devices come and go online while the dialog is open.
+        subscriptions.extend(
+            environments
+                .iter()
+                .map(|env| cx.observe(env, |_, _, cx| cx.notify())),
+        );
         let mut picker = Self {
+            environments,
             environment,
             path,
             title,
@@ -108,6 +135,57 @@ impl ProjectPicker {
         };
         picker.browse(cx);
         picker
+    }
+
+    /// Switches device: its directories start again from home.
+    fn set_environment(
+        &mut self,
+        environment: Entity<Environment>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if environment == self.environment {
+            return;
+        }
+        self.environment = environment;
+        self.error = None;
+        self.path
+            .update(cx, |input, cx| input.set_value("~/", window, cx));
+        self.on_path_changed(window, cx);
+        self.focus(window, cx);
+    }
+
+    /// One button per online device, the chosen one selected. A chosen
+    /// device that went offline stays listed so the choice stays visible.
+    fn render_devices(&self, cx: &mut Context<Self>) -> ButtonGroup {
+        let devices: Vec<Entity<Environment>> = self
+            .environments
+            .iter()
+            .filter(|env| env.read(cx).is_live() || **env == self.environment)
+            .cloned()
+            .collect();
+        let buttons: Vec<Button> = devices
+            .iter()
+            .map(|env| {
+                let env = env.read(cx);
+                let label = match env.status_label() {
+                    Some(status) => format!("{} ({status})", env.label()),
+                    None => env.label().to_string(),
+                };
+                Button::new(SharedString::from(format!("project-device-{}", env.key())))
+                    .label(label)
+                    .selected(env.key() == self.environment.read(cx).key())
+            })
+            .collect();
+        ButtonGroup::new("project-device")
+            .outline()
+            .small()
+            .children(buttons)
+            .on_click(cx.listener(move |this, clicked: &Vec<usize>, window, cx| {
+                if let Some(env) = clicked.first().and_then(|&ix| devices.get(ix)) {
+                    this.set_environment(env.clone(), window, cx);
+                }
+            }))
     }
 
     pub fn focus(&self, window: &mut Window, cx: &mut gpui_kit::App) {
@@ -176,7 +254,9 @@ impl ProjectPicker {
         } else {
             title
         };
-        let connection = self.environment.read(cx).connection().clone();
+        let env = self.environment.read(cx);
+        let key = env.key().clone();
+        let connection = env.connection().clone();
         self.creating = true;
         self.error = None;
         cx.spawn(async move |this, cx| {
@@ -185,6 +265,7 @@ impl ProjectPicker {
                 this.creating = false;
                 match result {
                     Ok(project) => cx.emit(ProjectCreated {
+                        env: key,
                         project_id: project.id,
                     }),
                     Err(e) => this.error = Some(e.to_string().into()),
@@ -199,6 +280,7 @@ impl ProjectPicker {
 
 impl Render for ProjectPicker {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let devices = self.render_devices(cx);
         let theme = cx.theme();
         let listing = match &self.listing {
             Listing::Loading => h_flex()
@@ -254,6 +336,12 @@ impl Render for ProjectPicker {
         };
         v_flex()
             .gap_3()
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(div().text_sm().font_medium().child("Device"))
+                    .child(devices),
+            )
             .child(
                 v_flex()
                     .gap_1()
@@ -513,5 +601,6 @@ mod tests {
         assert_eq!(title_from_path("/tmp/j3-desktop-smoke"), "j3-desktop-smoke");
         assert_eq!(title_from_path("  /srv/app// "), "app");
         assert_eq!(title_from_path("/"), "");
+        assert_eq!(title_from_path("~/"), "");
     }
 }

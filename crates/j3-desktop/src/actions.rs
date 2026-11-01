@@ -59,6 +59,12 @@ actions!(
         NextThread,
         /// Open the previous thread of the sidebar.
         PreviousThread,
+        /// Make the whole interface larger.
+        ZoomIn,
+        /// Make the whole interface smaller.
+        ZoomOut,
+        /// Back to 100%.
+        ResetZoom,
     ]
 );
 
@@ -115,6 +121,10 @@ pub fn init(cx: &mut App) {
         bind("secondary-shift-[", PreviousThread, ws, cx),
         bind("down", NextThread, Some(SIDEBAR), cx),
         bind("up", PreviousThread, Some(SIDEBAR), cx),
+        // `+` is shift-= on most layouts; both zoom in.
+        bind("secondary-=", ZoomIn, ws, cx),
+        bind("secondary-+", ZoomIn, ws, cx),
+        bind("secondary--", ZoomOut, ws, cx),
     ];
     bindings.extend((1..=9).map(|n| bind(&format!("secondary-{n}"), JumpToThread(n), ws, cx)));
     cx.bind_keys(bindings);
@@ -161,6 +171,10 @@ pub fn init(cx: &mut App) {
         Menu::new("View").items([
             MenuItem::action("Focus Composer", FocusComposer),
             MenuItem::action("Focus Sidebar", FocusSidebar),
+            MenuItem::separator(),
+            MenuItem::action("Zoom In", ZoomIn),
+            MenuItem::action("Zoom Out", ZoomOut),
+            MenuItem::action("Actual Size", ResetZoom),
         ]),
     ]);
 }

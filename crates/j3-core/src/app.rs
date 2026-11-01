@@ -14,6 +14,7 @@ use futures_util::{
     future::BoxFuture,
     stream::{self, BoxStream},
 };
+use j3_protocol::j3::{self as j3, UsageError, UsageSnapshot};
 use j3_protocol::t3::{
     self,
     commands::{
@@ -108,6 +109,8 @@ struct Inner {
     hub: Arc<Hub>,
     attachments: Arc<AttachmentStore>,
     catalog: Arc<Catalog>,
+    /// For `omp usage` (`j3.getUsage`).
+    omp: OmpLauncher,
     actor_config: ActorConfig,
     actors: Mutex<HashMap<String, ThreadHandle>>,
     descriptor: Value,
@@ -337,6 +340,7 @@ impl App {
             descriptor,
             home,
             data_dir: config.data_dir,
+            omp: config.omp,
         });
         inner.recover()?;
         Ok(Arc::new(App { inner }))
@@ -618,7 +622,21 @@ impl Inner {
                 Ok(input) => Response::ok(json!({"entries": vec![Value::Null; input.paths.len()]})),
                 Err(response) => response,
             },
+            j3::GET_USAGE => self.usage().await,
             other => Response::die(format!("{other} is not supported by this server")),
+        }
+    }
+
+    /// `j3.getUsage`: this host's `omp usage --json`, as a [`UsageSnapshot`].
+    async fn usage(&self) -> Response {
+        let snapshot = match self.omp.usage().await {
+            Ok(stdout) => serde_json::from_slice::<UsageSnapshot>(&stdout)
+                .map_err(|error| format!("unexpected omp usage output: {error}")),
+            Err(error) => Err(error.to_string()),
+        };
+        match snapshot {
+            Ok(snapshot) => Response::ok(to_value(&snapshot)),
+            Err(message) => Response::fail(to_value(&UsageError { message })),
         }
     }
 

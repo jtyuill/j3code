@@ -1,5 +1,6 @@
 //! The app's icon assets: GPUI Kit's component icons plus the Lucide icons
-//! the thread sidebars use (the same ones t3code's sidebar shows).
+//! the thread sidebars use (the same ones t3code's sidebar shows), the
+//! composer's usage gauge, and the model picker's provider logos.
 
 use std::borrow::Cow;
 
@@ -11,9 +12,12 @@ gpui_kit::assets::icon_assets!(
         AlarmClock,
         AlarmClockOff,
         Archive,
+        Bot,
         CircleDashed,
         CircleDotDashed,
         Clock,
+        FolderPlus,
+        Gauge,
         ListFilter,
         Mail,
         MessageCircleQuestionMark,
@@ -24,12 +28,15 @@ gpui_kit::assets::icon_assets!(
     ]
 );
 
-/// [`SidebarIcons`] first, then GPUI Kit's [`Assets`].
+/// [`SidebarIcons`] and the provider logos first, then GPUI Kit's [`Assets`].
 pub struct AppAssets;
 
 impl AssetSource for AppAssets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
         if let Some(bytes) = SidebarIcons.load(path)? {
+            return Ok(Some(bytes));
+        }
+        if let Some(bytes) = crate::logos::load(path) {
             return Ok(Some(bytes));
         }
         Assets.load(path)
@@ -38,6 +45,7 @@ impl AssetSource for AppAssets {
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
         let mut paths = Assets.list(path)?;
         paths.extend(SidebarIcons.list(path)?);
+        paths.extend(crate::logos::list(path).map(SharedString::from));
         paths.sort();
         paths.dedup();
         Ok(paths)

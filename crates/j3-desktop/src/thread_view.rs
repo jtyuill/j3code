@@ -12,7 +12,7 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState},
-    menu::DropdownMenu as _,
+    menu::{DropdownMenu as _, PopupMenuItem},
     message_scroller::{MessageScroller, MessageScrollerState},
     notification::{Notification, NotificationType},
     questionnaire::{
@@ -47,10 +47,9 @@ use crate::{
     environment::Environment,
     feed::is_hidden,
     feed_view::{RowContext, render_item},
+    preferences::Preferences,
+    titlebar,
 };
-
-/// Widest the feed and composer get, so lines stay readable.
-const CONTENT_MAX_WIDTH: f32 = 52.;
 
 struct QuestionCard {
     request_id: String,
@@ -78,6 +77,8 @@ struct QueueEdit {
 
 pub struct ThreadView {
     environment: Entity<Environment>,
+    /// The window's preferences, for the text measure.
+    preferences: Entity<Preferences>,
     handle: ThreadHandle,
     state: Arc<ThreadState>,
     /// Indices into `state.feed()` of the rows shown.
@@ -97,6 +98,7 @@ pub struct ThreadView {
 impl ThreadView {
     pub fn new(
         environment: Entity<Environment>,
+        preferences: Entity<Preferences>,
         thread_id: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -133,6 +135,7 @@ impl ThreadView {
         let subscriptions = vec![
             cx.subscribe_in(&composer, window, Self::on_composer_event),
             cx.observe(&environment, |_, _, cx| cx.notify()),
+            cx.observe(&preferences, |_, _, cx| cx.notify()),
         ];
         let connection = environment.read(cx).connection().clone();
         let visited = thread_id.to_owned();
@@ -145,6 +148,7 @@ impl ThreadView {
 
         let mut view = Self {
             environment,
+            preferences,
             handle,
             state: Arc::new(ThreadState::clone(&state)),
             visible: Rc::default(),
@@ -646,9 +650,11 @@ impl ThreadView {
             .unwrap_or_else(|| env.label().to_string())
             .into();
         let theme = cx.theme();
+        let has_goal = self.state.goal().is_some();
+        let view = cx.weak_entity();
         h_flex()
             .flex_shrink_0()
-            .h_10()
+            .h(rems(titlebar::ROW_HEIGHT))
             .px_4()
             .gap_2()
             .border_b_1()
@@ -669,27 +675,28 @@ impl ThreadView {
                     .child(location),
             )
             .child(div().flex_1())
-            .when(self.state.goal().is_none(), |this| {
-                this.child(
-                    Button::new("set-goal")
-                        .ghost()
-                        .xsmall()
-                        .icon(IconName::Star)
-                        .label("Set goal…")
-                        .on_click(
-                            cx.listener(|this, _, window, cx| this.open_goal_dialog(window, cx)),
-                        ),
-                )
-            })
             .child(
                 Button::new("thread-actions")
                     .ghost()
                     .xsmall()
                     .icon(IconName::Ellipsis)
                     .tooltip("Thread actions")
-                    .dropdown_menu(|menu, _, _| {
-                        menu.menu("Rename…", Box::new(RenameThread))
-                            .menu("Archive", Box::new(ArchiveThread))
+                    .dropdown_menu(move |menu, _, _| {
+                        let menu = menu.menu("Rename…", Box::new(RenameThread));
+                        // A goal is created from the actions menu; the header
+                        // stays quiet, and one goal at a time is enough.
+                        let menu = if has_goal {
+                            menu
+                        } else {
+                            let view = view.clone();
+                            menu.item(PopupMenuItem::new("Set goal…").on_click(
+                                move |_, window, cx| {
+                                    let _ = view
+                                        .update(cx, |this, cx| this.open_goal_dialog(window, cx));
+                                },
+                            ))
+                        };
+                        menu.menu("Archive", Box::new(ArchiveThread))
                             .separator()
                             .menu("Delete…", Box::new(DeleteThread))
                     }),
@@ -731,6 +738,7 @@ impl ThreadView {
         }
         let state = self.state.clone();
         let visible = self.visible.clone();
+        let measure = self.preferences.read(cx).ui().measure();
         let row = Rc::new(RowContext {
             markdown: self.markdown_snapshot.clone(),
             expanded: self.expanded.clone(),
@@ -739,14 +747,19 @@ impl ThreadView {
             state: self.state.clone(),
         });
         MessageScroller::new("feed", self.scroller.clone(), move |ix, window, cx| {
-            let item = &state.feed()[visible[ix]].item;
+            let feed = state.feed();
+            let item = &feed[visible[ix]].item;
+            let previous = ix.checked_sub(1).map(|prev| &feed[visible[prev]].item);
             h_flex().w_full().justify_center().child(
                 div()
                     .w_full()
-                    .max_w(rems(CONTENT_MAX_WIDTH))
-                    .child(render_item(item, &row, window, cx)),
+                    .max_w(rems(measure))
+                    .child(render_item(item, previous, &row, window, cx)),
             )
         })
+        // `render_item` spaces rows itself (tool calls sit close together),
+        // so drop the scroller's fixed gap between rows.
+        .with_row_style(gpui_kit::StyleRefinement::default().pb_0())
         .size_full()
         .into_any_element()
     }
@@ -1292,24 +1305,32 @@ impl Render for ThreadView {
         let activity = self.render_activity(cx);
         let goal = self.render_goal(cx);
         let theme = cx.theme();
+        let measure = self.preferences.read(cx).ui().measure();
         v_flex()
             .size_full()
             .bg(theme.background)
             .child(header)
             .child(div().flex_1().min_h_0().pt_3().child(feed))
             .child(
-                h_flex().w_full().justify_center().px_4().pb_3().child(
-                    v_flex()
-                        .w_full()
-                        .max_w(rems(CONTENT_MAX_WIDTH))
-                        .gap_2()
-                        .children(todo)
-                        .children(queue)
-                        .children(question)
-                        .children(activity)
-                        .children(goal)
-                        .child(self.composer.clone()),
-                ),
+                // Extra air between the last message and the composer.
+                h_flex()
+                    .w_full()
+                    .justify_center()
+                    .px_4()
+                    .pt_4()
+                    .pb_3()
+                    .child(
+                        v_flex()
+                            .w_full()
+                            .max_w(rems(measure))
+                            .gap_2()
+                            .children(todo)
+                            .children(queue)
+                            .children(question)
+                            .children(activity)
+                            .children(goal)
+                            .child(self.composer.clone()),
+                    ),
             )
     }
 }

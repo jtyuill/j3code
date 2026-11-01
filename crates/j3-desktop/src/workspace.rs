@@ -5,8 +5,9 @@
 use std::path::Path;
 
 use gpui_kit::component::{
-    ActiveTheme as _, StyledExt as _, Theme, WindowExt as _,
-    button::ButtonVariant,
+    ActiveTheme as _, IconName, Sizable as _, StyledExt as _, Theme, WindowExt as _,
+    button::{Button, ButtonVariant, ButtonVariants as _},
+    h_flex,
     input::{Input, InputState},
     notification::{Notification, NotificationType},
     resizable::{h_resizable, resizable_panel},
@@ -14,10 +15,10 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Context, Entity, FocusHandle, Focusable, Global,
-    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
+    AnyElement, App, AppContext as _, Context, Decorations, Entity, FocusHandle, Focusable, Global,
+    InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Render, SharedString,
     StatefulInteractiveElement as _, Styled as _, Subscription, TestSupportExt as _, WeakEntity,
-    Window, div,
+    Window, base::InteractiveElementExt as _, div, px,
 };
 use j3_client::{
     Connection,
@@ -30,7 +31,7 @@ use crate::{
     actions::{
         AddEnvironment, AddProject, ArchiveThread, DeleteThread, FocusComposer, FocusSidebar,
         GotoAgent, JumpToThread, NewThread, NextThread, OpenSettings, PreviousThread, RenameThread,
-        SettleThread, ShowArchived, StopRun, WORKSPACE,
+        ResetZoom, SettleThread, ShowArchived, StopRun, WORKSPACE, ZoomIn, ZoomOut,
     },
     attention::{Alert, AttentionMonitor},
     dialogs::{EnvironmentForm, ProjectCreated, ProjectPicker, SnoozeForm, footer},
@@ -42,6 +43,7 @@ use crate::{
     settings_view::{SettingsEvent, SettingsPage, SettingsView},
     sidebar::{ProjectKey, Sidebar, SidebarEvent, ThreadCommand, ThreadKey},
     thread_view::ThreadView,
+    titlebar,
 };
 
 /// The workspace of the (single) window, for app-level commands.
@@ -70,6 +72,9 @@ pub struct Workspace {
     /// open, so a completion is acknowledged once.
     visited_completion: Option<(ThreadKey, String)>,
     focus_handle: FocusHandle,
+    /// The header row height the traffic lights were last centred on.
+    #[cfg(target_os = "macos")]
+    traffic_lights_row: gpui_kit::Pixels,
     _main_subscription: Option<Subscription>,
     _settings_subscription: Option<Subscription>,
     /// Keeps the open dialog's subscription alive.
@@ -111,11 +116,17 @@ impl Workspace {
         let sidebar = cx.new(|cx| Sidebar::new(environments.clone(), preferences.clone(), cx));
         let subscriptions = vec![
             cx.subscribe_in(&sidebar, window, Self::on_sidebar_event),
-            cx.observe(&preferences, |_, _, cx| cx.notify()),
-            cx.observe_window_appearance(window, |_, window, cx| {
+            cx.observe(&preferences, |_, preferences, cx| {
+                crate::appearance::apply(&preferences, cx);
+                cx.notify();
+            }),
+            cx.observe_window_appearance(window, |this, window, cx| {
                 Theme::sync_system_appearance(Some(window), cx);
+                // The reloaded theme brings its own fonts.
+                crate::appearance::apply(&this.preferences, cx);
             }),
         ];
+        crate::appearance::apply(&preferences, cx);
         let handle = WorkspaceHandle(cx.weak_entity());
         cx.set_global(handle);
         // Start with keyboard focus in the sidebar so arrows and the
@@ -131,6 +142,8 @@ impl Workspace {
             attention: AttentionMonitor::default(),
             visited_completion: None,
             focus_handle: cx.focus_handle(),
+            #[cfg(target_os = "macos")]
+            traffic_lights_row: px(0.),
             _main_subscription: None,
             _settings_subscription: None,
             _dialog_subscription: None,
@@ -193,6 +206,19 @@ impl Workspace {
         }
     }
 
+    /// Zooms one level in (`steps` > 0) or out (< 0), or back to 100% (0),
+    /// and saves it.
+    fn zoom(&mut self, steps: i32, cx: &mut Context<Self>) {
+        self.preferences.update(cx, |preferences, cx| {
+            preferences.update_ui(
+                |ui| {
+                    ui.zoom = if steps == 0 { 1. } else { ui.zoom_step(steps) };
+                },
+                cx,
+            )
+        });
+    }
+
     /// The open thread.
     fn open_key(&self, cx: &App) -> Option<ThreadKey> {
         let view = self.current_thread()?.read(cx);
@@ -245,7 +271,8 @@ impl Workspace {
         let Some(env) = self.environment(&key.env, cx) else {
             return;
         };
-        let view = cx.new(|cx| ThreadView::new(env, &key.thread_id, window, cx));
+        let preferences = self.preferences.clone();
+        let view = cx.new(|cx| ThreadView::new(env, preferences, &key.thread_id, window, cx));
         self.set_main(Main::Thread(view), None, cx);
     }
 
@@ -258,7 +285,9 @@ impl Workspace {
     ) {
         self.close_settings(window, cx);
         let environments = self.environments.clone();
-        let view = cx.new(|cx| NewThreadView::new(environments, env, project_id, window, cx));
+        let preferences = self.preferences.clone();
+        let view =
+            cx.new(|cx| NewThreadView::new(environments, env, preferences, project_id, window, cx));
         let subscription = cx.subscribe_in(
             &view,
             window,
@@ -352,6 +381,10 @@ impl Workspace {
         match event {
             SidebarEvent::OpenThread(key) => self.open_thread(key, window, cx),
             SidebarEvent::NewThread(scope) => self.new_thread_in(scope.clone(), window, cx),
+            SidebarEvent::AddProject => {
+                let (env, _) = self.target_context(cx);
+                self.add_project(env, true, window, cx);
+            }
             SidebarEvent::Commands(commands) => {
                 self.run_thread_commands(commands.clone(), window, cx)
             }
@@ -815,8 +848,9 @@ impl Workspace {
         });
     }
 
-    /// Adds a project through the directory picker; from the main window,
-    /// a new thread opens there afterwards.
+    /// Adds a project through the directory picker, starting on `env` (any
+    /// online device can be chosen there); from the main window, a new
+    /// thread opens in it afterwards.
     fn add_project(
         &mut self,
         env: Entity<Environment>,
@@ -824,15 +858,14 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let label = env.read(cx).label().clone();
-        let key = env.read(cx).key().clone();
-        let picker = cx.new(|cx| ProjectPicker::new(env, window, cx));
+        let environments = self.environments.clone();
+        let picker = cx.new(|cx| ProjectPicker::new(&environments, env, window, cx));
         let subscription = cx.subscribe_in(
             &picker,
             window,
             move |this, _, event: &ProjectCreated, window, cx| {
                 window.close_dialog(cx);
-                if then_new_thread && let Some(env) = this.environment(&key, cx) {
+                if then_new_thread && let Some(env) = this.environment(&event.env, cx) {
                     this.new_thread(env, Some(event.project_id.clone()), window, cx);
                 }
             },
@@ -843,7 +876,7 @@ impl Workspace {
         window.open_dialog(cx, move |dialog, _, _| {
             let picker = dialog_picker.clone();
             dialog
-                .title(format!("Add project on {label}"))
+                .title("Add project")
                 .w(width)
                 .child(dialog_picker.clone())
                 .footer(footer("Add Project"))
@@ -982,6 +1015,79 @@ impl Workspace {
         }
     }
 
+    /// The window's own titlebar under Linux client-side decorations, with
+    /// the window buttons and dragging done here. Under a server-drawn
+    /// titlebar (X11 without a compositor) it draws nothing, and on macOS the
+    /// panes' header row is the titlebar (see `titlebar`).
+    fn render_titlebar(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let linux_client = cfg!(target_os = "linux")
+            && matches!(window.window_decorations(), Decorations::Client { .. });
+        if !linux_client {
+            return div().into_any_element();
+        }
+        let theme = cx.theme();
+        let control = |id: &'static str, icon: IconName, label: &'static str| {
+            Button::new(id).ghost().xsmall().icon(icon).tooltip(label)
+        };
+        h_flex()
+            .id("titlebar")
+            .test_support()
+            .flex_shrink_0()
+            .h(px(36.))
+            .w_full()
+            .bg(theme.title_bar)
+            .border_b_1()
+            .border_color(theme.title_bar_border)
+            .child(
+                h_flex()
+                    .id("titlebar-drag")
+                    .flex_1()
+                    .h_full()
+                    .items_center()
+                    .pl(px(12.))
+                    .on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move())
+                    .on_double_click(|_, window, _| window.zoom_window())
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_medium()
+                            .text_color(theme.muted_foreground)
+                            .child("j3"),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .flex_shrink_0()
+                    .h_full()
+                    .items_center()
+                    .gap_1()
+                    .pr_2()
+                    .child(
+                        control("titlebar-minimize", IconName::WindowMinimize, "Minimize")
+                            .on_click(|_, window, cx| {
+                                cx.stop_propagation();
+                                window.minimize_window();
+                            }),
+                    )
+                    .child(
+                        control("titlebar-maximize", IconName::WindowMaximize, "Maximize")
+                            .on_click(|_, window, cx| {
+                                cx.stop_propagation();
+                                window.zoom_window();
+                            }),
+                    )
+                    .child(
+                        control("titlebar-close", IconName::WindowClose, "Close").on_click(
+                            |_, window, cx| {
+                                cx.stop_propagation();
+                                window.remove_window();
+                            },
+                        ),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn render_main(&self, cx: &mut Context<Self>) -> AnyElement {
         match &self.main {
             Main::Thread(view) => view.clone().into_any_element(),
@@ -1051,13 +1157,29 @@ impl Render for Workspace {
                 .child(resizable_panel().child(self.render_main(cx)))
                 .into_any_element(),
         };
-        div()
+        let titlebar = self.render_titlebar(window, cx);
+        // The header row scales with the zoom; keep the traffic lights
+        // centred on it.
+        #[cfg(target_os = "macos")]
+        {
+            let row = titlebar::row_height(window);
+            if row != self.traffic_lights_row {
+                self.traffic_lights_row = row;
+                window.set_traffic_light_position(titlebar::traffic_light_position(row));
+            }
+        }
+        v_flex()
             .id("workspace")
             .key_context(WORKSPACE)
             .track_focus(&self.focus_handle)
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
+            .child(titlebar)
+            .child(div().flex_1().min_h_0().child(content))
+            .when(cfg!(target_os = "macos"), |this| {
+                this.on_mouse_down(MouseButton::Left, titlebar::double_click)
+            })
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
                 if this.settings.is_some() {
                     this.close_settings(window, cx);
@@ -1118,6 +1240,9 @@ impl Render for Workspace {
                     Main::Empty => {}
                 }
             }))
+            .on_action(cx.listener(|this, _: &ZoomIn, _, cx| this.zoom(1, cx)))
+            .on_action(cx.listener(|this, _: &ZoomOut, _, cx| this.zoom(-1, cx)))
+            .on_action(cx.listener(|this, _: &ResetZoom, _, cx| this.zoom(0, cx)))
             .on_action(cx.listener(|this, _: &FocusSidebar, window, cx| {
                 this.close_settings(window, cx);
                 this.sidebar
@@ -1137,6 +1262,5 @@ impl Render for Workspace {
                     }
                 }),
             )
-            .child(content)
     }
 }

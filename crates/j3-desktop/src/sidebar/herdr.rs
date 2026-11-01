@@ -12,8 +12,8 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, Context, Hsla, InteractiveElement as _, IntoElement, ParentElement as _,
-    SharedString, StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, div,
+    AnyElement, Context, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, Pixels,
+    SharedString, StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, div, rems,
 };
 use j3_client::workflow::{
     AgentOrder, AgentStatus, EnvThread, StatusIndicators, agent_status, is_listed, rollup,
@@ -21,7 +21,7 @@ use j3_client::workflow::{
 };
 
 use super::{EnvSnapshot, ProjectKey, Sidebar, SidebarEvent, ThreadKey};
-use crate::ui_settings::UiSettings;
+use crate::{titlebar, ui_settings::UiSettings};
 
 /// One project.
 pub struct SpaceRow {
@@ -193,6 +193,7 @@ impl Sidebar {
     pub(super) fn render_herdr(
         &self,
         rows: std::rc::Rc<HerdrRows>,
+        inset: Option<Pixels>,
         cx: &Context<Self>,
     ) -> AnyElement {
         let theme = cx.theme();
@@ -321,8 +322,9 @@ impl Sidebar {
             .child(
                 h_flex()
                     .flex_shrink_0()
-                    .h_9()
+                    .h(rems(titlebar::ROW_HEIGHT))
                     .px_3()
+                    .when_some(inset, |this, inset| this.pl(inset))
                     .justify_between()
                     .border_b_1()
                     .border_color(theme.sidebar_border)

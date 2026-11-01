@@ -52,7 +52,31 @@ pub struct RowContext {
     pub state: Arc<ThreadState>,
 }
 
-pub fn render_item(item: &TurnItem, row: &RowContext, _: &mut Window, cx: &mut App) -> AnyElement {
+/// Rows of agent activity (tool calls, thinking, plan updates) that read as
+/// one list when they follow each other.
+fn is_activity(item: &TurnItem) -> bool {
+    matches!(
+        item.kind,
+        TurnItemKind::CommandExecution(_)
+            | TurnItemKind::FileChange(_)
+            | TurnItemKind::FileSearch(_)
+            | TurnItemKind::WebSearch(_)
+            | TurnItemKind::DynamicTool(_)
+            | TurnItemKind::Reasoning(_)
+            | TurnItemKind::TodoList(_)
+    )
+}
+
+/// `previous` is the row shown above, which sets the space between them.
+/// The space sits above a row, not below it, so appending a row never
+/// changes the height of the one before.
+pub fn render_item(
+    item: &TurnItem,
+    previous: Option<&TurnItem>,
+    row: &RowContext,
+    _: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
     let id = item.id.clone();
     let content = match &item.kind {
         TurnItemKind::UserMessage(message) => user_message(
@@ -150,7 +174,12 @@ pub fn render_item(item: &TurnItem, row: &RowContext, _: &mut Window, cx: &mut A
         .when_some(label, |this, label| this.aria_label(label))
         .w_full()
         .px_4()
-        .pb_3()
+        .map(|this| match previous {
+            None => this,
+            Some(previous) if is_activity(previous) && is_activity(item) => this.pt_1(),
+            // The 44px messages always had between them.
+            Some(_) => this.pt_11(),
+        })
         .child(content)
         .into_any_element()
 }

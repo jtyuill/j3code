@@ -13,6 +13,7 @@ use std::{
     process::{Command as Process, Stdio},
     sync::Arc,
     thread,
+    time::Duration,
 };
 
 pub use omp_rpc;
@@ -38,7 +39,16 @@ pub enum Error {
     },
     #[error("omp reported no session file; is persistence disabled?")]
     NoSessionFile,
+    #[error("running omp usage: {0}")]
+    UsageSpawn(std::io::Error),
+    #[error("omp usage did not finish within {}s", USAGE_TIMEOUT.as_secs())]
+    UsageTimeout,
+    #[error("omp usage failed ({status}): {stderr}")]
+    UsageFailed { status: String, stderr: String },
 }
+
+/// How long `omp usage` may take; uncached reports query every provider.
+const USAGE_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -144,6 +154,30 @@ impl OmpLauncher {
                 .ok_or(Error::NoSessionFile)?;
         }
         Ok((session, events))
+    }
+
+    /// Runs `omp usage --json` and returns its stdout. omp answers from its
+    /// own short-lived report cache when it can and queries the providers
+    /// otherwise. Uses the launcher's environment, not its extra arguments
+    /// (those are for `--mode rpc`).
+    pub async fn usage(&self) -> Result<Vec<u8>> {
+        let mut process = tokio::process::Command::new(&self.program);
+        process
+            .args(["usage", "--json"])
+            .envs(self.env.iter().map(|(k, v)| (k, v)))
+            .stdin(Stdio::null())
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(USAGE_TIMEOUT, process.output())
+            .await
+            .map_err(|_| Error::UsageTimeout)?
+            .map_err(Error::UsageSpawn)?;
+        if !output.status.success() {
+            return Err(Error::UsageFailed {
+                status: output.status.to_string(),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            });
+        }
+        Ok(output.stdout)
     }
 
     fn command(&self, cwd: &Path, mode: Persistence<'_>) -> Result<Process> {

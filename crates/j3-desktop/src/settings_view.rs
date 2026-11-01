@@ -3,13 +3,16 @@
 //! changes apply and save at once; environment and project commands go to
 //! the workspace.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, rc::Rc};
 
 use gpui_kit::component::{
     ActiveTheme as _, IconName, Selectable as _, Sizable as _, StyledExt as _,
     button::{Button, ButtonGroup, ButtonVariants as _},
     h_flex,
-    setting::{SelectIndex, SettingField, SettingGroup, SettingItem, SettingPage, Settings},
+    setting::{
+        NumberFieldOptions, SelectIndex, SettingField, SettingGroup, SettingItem, SettingPage,
+        Settings,
+    },
     tooltip::Tooltip,
     v_flex,
 };
@@ -17,7 +20,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     App, AppContext as _, Context, ElementId, Entity, EventEmitter, FocusHandle, Focusable,
     InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Subscription, WeakEntity, Window, div,
+    StatefulInteractiveElement as _, Styled as _, Subscription, WeakEntity, Window, div, rems,
 };
 use j3_client::workflow::{AgentOrder, StatusIndicators};
 
@@ -26,7 +29,10 @@ use crate::{
     archived::{ArchivedView, Unarchived},
     environment::{Environment, distinct_environments},
     preferences::Preferences,
-    ui_settings::{UiSettings, Workflow},
+    titlebar,
+    ui_settings::{
+        DEFAULT_TEXT_MEASURE, TEXT_MEASURE_MAX, TEXT_MEASURE_MIN, UiSettings, Workflow, ZOOM_LEVELS,
+    },
 };
 
 /// A request from Settings; the workspace carries it out.
@@ -77,6 +83,8 @@ pub struct SettingsView {
     generation: u64,
     page: SettingsPage,
     focus_handle: FocusHandle,
+    /// Installed font families, for the font pickers.
+    fonts: Rc<[SharedString]>,
     _environment_subscriptions: Vec<Subscription>,
     _subscriptions: Vec<Subscription>,
 }
@@ -99,6 +107,12 @@ impl SettingsView {
             generation,
             page,
             focus_handle: cx.focus_handle(),
+            fonts: cx
+                .text_system()
+                .all_font_names()
+                .into_iter()
+                .map(SharedString::from)
+                .collect(),
             _environment_subscriptions: Vec::new(),
             _subscriptions: subscriptions,
         };
@@ -263,6 +277,116 @@ impl SettingsView {
                         },
                     )),
             )
+            .group(self.appearance_group())
+            .group(SettingGroup::new().title("Conversation").item({
+                let read = preferences.clone();
+                let write = preferences.clone();
+                SettingItem::new(
+                    "Text width",
+                    SettingField::number_input(
+                        NumberFieldOptions {
+                            min: TEXT_MEASURE_MIN as f64,
+                            max: TEXT_MEASURE_MAX as f64,
+                            step: 2.,
+                        },
+                        move |cx| read.read(cx).ui().text_measure as f64,
+                        move |value, cx| {
+                            write.update(cx, |preferences, cx| {
+                                preferences.update_ui(
+                                    |ui| ui.text_measure = value as f32,
+                                    cx,
+                                )
+                            })
+                        },
+                    )
+                    .default_value(DEFAULT_TEXT_MEASURE as f64),
+                )
+                .description(
+                    "Widest the conversation text and composer get, in rem (16 px). Lower is a tighter, easier-to-read column.",
+                )
+            }))
+    }
+
+    /// Zoom and the two font families.
+    fn appearance_group(&self) -> SettingGroup {
+        let font_item = |title: &'static str,
+                         description: &'static str,
+                         default_label: &'static str,
+                         get: fn(&UiSettings) -> Option<&str>,
+                         set: fn(&mut UiSettings, Option<String>)| {
+            let options = std::iter::once((SharedString::default(), default_label.into()))
+                .chain(self.fonts.iter().map(|font| (font.clone(), font.clone())))
+                .collect();
+            let read = self.preferences.clone();
+            let write = self.preferences.clone();
+            SettingItem::new(
+                title,
+                SettingField::scrollable_dropdown(
+                    options,
+                    move |cx| {
+                        get(read.read(cx).ui())
+                            .unwrap_or_default()
+                            .to_owned()
+                            .into()
+                    },
+                    move |value: SharedString, cx| {
+                        let font = (!value.is_empty()).then(|| value.to_string());
+                        write.update(cx, |preferences, cx| {
+                            preferences.update_ui(|ui| set(ui, font), cx)
+                        })
+                    },
+                )
+                .default_value(SharedString::default()),
+            )
+            .description(description)
+        };
+        let read = self.preferences.clone();
+        let write = self.preferences.clone();
+        SettingGroup::new()
+            .title("Appearance")
+            .item(
+                SettingItem::new(
+                    "Zoom",
+                    SettingField::dropdown(
+                        ZOOM_LEVELS
+                            .iter()
+                            .map(|level| {
+                                (
+                                    SharedString::from(level.to_string()),
+                                    SharedString::from(format!("{:.0}%", level * 100.)),
+                                )
+                            })
+                            .collect(),
+                        move |cx| read.read(cx).ui().zoom().to_string().into(),
+                        move |value: SharedString, cx| {
+                            let Ok(zoom) = value.parse::<f32>() else {
+                                return;
+                            };
+                            write.update(cx, |preferences, cx| {
+                                preferences.update_ui(|ui| ui.zoom = zoom, cx)
+                            })
+                        },
+                    )
+                    .default_value(SharedString::from(1f32.to_string())),
+                )
+                .description(
+                    "Scales the whole window. View › Zoom In and Zoom Out step through the sizes.",
+                ),
+            )
+            .item(font_item(
+                "Interface font",
+                "Used for messages, the sidebar and controls.",
+                "System default",
+                |ui| ui.ui_font.as_deref(),
+                |ui, font| ui.ui_font = font,
+            ))
+            .item(font_item(
+                "Code font",
+                "Used for tool calls, their output and code.",
+                "Default monospace",
+                |ui| ui.mono_font.as_deref(),
+                |ui, font| ui.mono_font = font,
+            ))
     }
 
     fn notifications_page(&self) -> SettingPage {
@@ -519,7 +643,7 @@ impl Focusable for SettingsView {
 }
 
 impl Render for SettingsView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let pages = [
             self.general_page(),
             self.notifications_page(),
@@ -527,6 +651,9 @@ impl Render for SettingsView {
             self.projects_page(cx),
             self.archived_page(cx),
         ];
+        // Settings covers the whole window, so its header row clears the
+        // traffic lights.
+        let inset = titlebar::traffic_lights_inset(window);
         let theme = cx.theme();
         v_flex()
             .id("settings-view")
@@ -539,8 +666,9 @@ impl Render for SettingsView {
             .child(
                 h_flex()
                     .flex_shrink_0()
-                    .h_10()
+                    .h(rems(titlebar::ROW_HEIGHT))
                     .px_4()
+                    .when_some(inset, |this, inset| this.pl(inset))
                     .justify_between()
                     .border_b_1()
                     .border_color(theme.border)

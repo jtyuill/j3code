@@ -31,3 +31,9 @@ SOFTWARE.
 
 j3code depends on omp-rpc from Oh My Pi (https://github.com/can1357/oh-my-pi),
 licensed under the MIT License.
+
+The desktop model picker's provider logos (crates/j3-desktop/assets/logos)
+come from LobeHub Icons (https://github.com/lobehub/lobe-icons, MIT License,
+Copyright (c) 2023 LobeHub) and OpenCode (https://github.com/anomalyco/opencode,
+MIT License, Copyright (c) 2025 opencode). The logos are trademarks of their
+respective owners.

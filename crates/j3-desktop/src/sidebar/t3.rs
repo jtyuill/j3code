@@ -7,7 +7,7 @@ use std::{collections::HashMap, rc::Rc, time::Duration};
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::{
-    ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt as _, Theme,
+    ActiveTheme as _, Icon, IconName, Selectable as _, Sizable as _, StyledExt as _, Theme,
     button::{Button, ButtonVariants as _},
     h_flex,
     list::ListItem,
@@ -17,8 +17,8 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, Hsla, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
-    TestSupportExt as _, WeakEntity, Window, div,
+    ParentElement as _, Pixels, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
+    TestSupportExt as _, WeakEntity, Window, div, rems,
 };
 use j3_client::{
     t3::orchestration::{SettledOverride, ThreadShell},
@@ -38,6 +38,7 @@ use super::{
 use crate::{
     actions::AddProject,
     feed::age_since,
+    titlebar,
     ui_settings::{Shelf, UiSettings},
 };
 
@@ -140,7 +141,8 @@ pub struct T3Rows {
     pub active_keys: HashMap<ThreadKey, String>,
     /// The filter menu: every project, with its label.
     pub projects: Vec<(ProjectKey, SharedString)>,
-    pub filter_label: SharedString,
+    /// The filtered-to project's label; `None` shows every project.
+    pub filter_label: Option<SharedString>,
     pub filter: Option<ProjectKey>,
     pub has_projects: bool,
     pub note: Option<SharedString>,
@@ -310,14 +312,12 @@ impl T3Rows {
             items: Vec::new(),
             pinned_keys,
             active_keys,
-            filter_label: filter
-                .and_then(|filter| {
-                    projects
-                        .iter()
-                        .find(|(key, _)| key == filter)
-                        .map(|(_, label)| label.clone())
-                })
-                .unwrap_or_else(|| "All projects".into()),
+            filter_label: filter.and_then(|filter| {
+                projects
+                    .iter()
+                    .find(|(key, _)| key == filter)
+                    .map(|(_, label)| label.clone())
+            }),
             filter: filter.cloned(),
             has_projects: !projects.is_empty(),
             projects,
@@ -533,14 +533,19 @@ impl Sidebar {
         }
     }
 
-    pub(super) fn render_t3(&self, rows: Rc<T3Rows>, cx: &Context<Self>) -> AnyElement {
+    pub(super) fn render_t3(
+        &self,
+        rows: Rc<T3Rows>,
+        inset: Option<Pixels>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
         let now = OffsetDateTime::now_utc();
         let dragging = cx.has_active_drag();
         let theme = cx.theme();
         let muted = theme.muted_foreground;
         let weak = cx.weak_entity();
 
-        let header = self.render_t3_header(&rows, cx);
+        let header = self.render_t3_header(&rows, inset, cx);
         let row = |row: &T3Row, over: Option<usize>| self.render_row(row, over, now, &weak, cx);
         let index = |key: &ThreadKey| rows.thread_index(key);
 
@@ -709,15 +714,23 @@ impl Sidebar {
             .into_any_element()
     }
 
-    fn render_t3_header(&self, rows: &T3Rows, cx: &Context<Self>) -> impl IntoElement {
+    fn render_t3_header(
+        &self,
+        rows: &T3Rows,
+        inset: Option<Pixels>,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
         let theme = cx.theme();
         let weak = cx.weak_entity();
+        let add_project = cx.weak_entity();
         let projects = rows.projects.clone();
         let filter = rows.filter.clone();
+        let filtered = filter.is_some();
         h_flex()
             .flex_shrink_0()
-            .h_9()
+            .h(rems(titlebar::ROW_HEIGHT))
             .px_2()
+            .when_some(inset, |this, inset| this.pl(inset))
             .gap_1()
             .border_b_1()
             .border_color(theme.sidebar_border)
@@ -726,7 +739,7 @@ impl Sidebar {
                     .ghost()
                     .xsmall()
                     .icon(Icon::new(Lucide::ListFilter))
-                    .label(rows.filter_label.clone())
+                    .selected(filtered)
                     .tooltip("Filter threads by project")
                     .dropdown_menu(move |menu, _, _| {
                         let item = |label: SharedString, value: Option<ProjectKey>| {
@@ -746,12 +759,58 @@ impl Sidebar {
                         } else {
                             menu.separator()
                         };
-                        projects.iter().fold(menu, |menu, (key, label)| {
+                        let menu = projects.iter().fold(menu, |menu, (key, label)| {
                             menu.item(item(label.clone(), Some(key.clone())))
-                        })
+                        });
+                        // Projects are added from this menu too: the filter
+                        // is where the project list lives.
+                        menu.separator().item(
+                            PopupMenuItem::new("Add project…")
+                                .icon(Icon::new(Lucide::FolderPlus))
+                                .on_click({
+                                    let add_project = add_project.clone();
+                                    move |_, _, cx| {
+                                        let _ = add_project
+                                            .update(cx, |_, cx| cx.emit(SidebarEvent::AddProject));
+                                    }
+                                }),
+                        )
                     }),
             )
+            // The active filter shows as a chip next to it, which clears it.
+            .when_some(rows.filter_label.clone(), |this, label| {
+                this.child(
+                    h_flex()
+                        .id("project-filter-chip")
+                        .min_w_0()
+                        .h_6()
+                        .pl_2()
+                        .gap_0p5()
+                        .rounded(theme.radius)
+                        .bg(theme.secondary)
+                        .text_xs()
+                        .child(div().min_w_0().truncate().child(label))
+                        .child(
+                            Button::new("clear-project-filter")
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::Close)
+                                .tooltip("Show all projects")
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.set_project_filter(None, cx)),
+                                ),
+                        ),
+                )
+            })
             .child(div().flex_1())
+            .child(
+                Button::new("add-project")
+                    .ghost()
+                    .xsmall()
+                    .icon(Icon::new(Lucide::FolderPlus))
+                    .tooltip("Add project")
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::AddProject))),
+            )
             .child(
                 Button::new("new-thread")
                     .ghost()
@@ -772,7 +831,11 @@ impl Sidebar {
         } else if !rows.has_projects {
             "No projects yet".into()
         } else if rows.filter.is_some() {
-            format!("No threads in {} yet", rows.filter_label).into()
+            format!(
+                "No threads in {} yet",
+                rows.filter_label.clone().unwrap_or_default()
+            )
+            .into()
         } else {
             "No threads yet".into()
         };

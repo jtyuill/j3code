@@ -14,6 +14,8 @@ use gpui_kit::{
 use crate::{
     composer::{Composer, ComposerEvent, Submission},
     environment::{Environment, distinct_environments},
+    preferences::Preferences,
+    titlebar,
 };
 
 pub enum NewThreadEvent {
@@ -72,6 +74,7 @@ impl SelectItem for ProjectItem {
 pub struct NewThreadView {
     environments: Vec<Entity<Environment>>,
     environment: Entity<Environment>,
+    preferences: Entity<Preferences>,
     project_id: Option<String>,
     environment_select: Entity<SelectState<Vec<EnvironmentItem>>>,
     project_select: Entity<SelectState<Vec<ProjectItem>>>,
@@ -89,6 +92,7 @@ impl NewThreadView {
     pub fn new(
         environments: Vec<Entity<Environment>>,
         environment: Entity<Environment>,
+        preferences: Entity<Preferences>,
         project_id: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -147,6 +151,7 @@ impl NewThreadView {
         let mut view = Self {
             environments,
             environment,
+            preferences: preferences.clone(),
             project_id,
             environment_select,
             project_select,
@@ -157,6 +162,8 @@ impl NewThreadView {
             _environment_subscription: environment_subscription,
             _subscriptions: subscriptions,
         };
+        view._subscriptions
+            .push(cx.observe(&preferences, |_, _, cx| cx.notify()));
         view.sync_projects(window, cx);
         view
     }
@@ -318,13 +325,14 @@ impl Render for NewThreadView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let has_projects = !self.projects.is_empty();
+        let measure = self.preferences.read(cx).ui().measure();
         v_flex()
             .size_full()
             .bg(theme.background)
             .child(
                 h_flex()
                     .flex_shrink_0()
-                    .h_10()
+                    .h(rems(titlebar::ROW_HEIGHT))
                     .px_4()
                     .border_b_1()
                     .border_color(theme.border)
@@ -342,7 +350,7 @@ impl Render for NewThreadView {
                     .child(
                         v_flex()
                             .w_full()
-                            .max_w(rems(52.))
+                            .max_w(rems(measure))
                             .gap_2()
                             .child(
                                 h_flex()

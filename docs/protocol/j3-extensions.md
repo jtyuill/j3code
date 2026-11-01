@@ -1,10 +1,10 @@
-# j3 protocol extensions: omp goals and subagents
+# j3 protocol extensions: omp goals, subagents and usage
 
-j3 adds two omp features to the t3 wire protocol (`ios-surface.md`): **goal mode** and **subagents**. Rust types: `j3_protocol::t3::orchestration::{ProviderGoal, Subagent, SubagentItem}`, `j3_protocol::t3::commands::SubagentStopCommand`, `j3_protocol::j3`. Server mapping: `crates/j3-core/src/engine/model/agents.rs`. Client API: `j3_client::ThreadState::{goal, subagents, subagent}` and `j3_client::Connection::{create_goal, pause_goal, resume_goal, drop_goal, stop_subagent}`.
+j3 adds three omp features to the t3 wire protocol (`ios-surface.md`): **goal mode**, **subagents** and **usage limits**. Rust types: `j3_protocol::t3::orchestration::{ProviderGoal, Subagent, SubagentItem}`, `j3_protocol::t3::commands::SubagentStopCommand`, `j3_protocol::j3`. Server mapping: `crates/j3-core/src/engine/model/agents.rs`. Client API: `j3_client::ThreadState::{goal, subagents, subagent}` and `j3_client::Connection::{create_goal, pause_goal, resume_goal, drop_goal, stop_subagent, usage}`.
 
 ## Placement
 
-Everything the server sends uses shapes the t3 contracts already define. `packages/contracts` decodes every frame and the iOS client renders it as it is. Only the commands are new: four `j3.goal.*` variants of `orchestration.dispatchCommand`, which t3 clients never send.
+Everything the server sends on t3's methods uses shapes the t3 contracts already define. `packages/contracts` decodes every frame and the iOS client renders it as it is. Only two things are new: four `j3.goal.*` variants of `orchestration.dispatchCommand`, and the `j3.getUsage` method ([Usage](#usage)). t3 clients never send either.
 
 | Data | Wire shape | Why |
 |---|---|---|
@@ -98,3 +98,17 @@ All of them go through `orchestration.dispatchCommand`, succeed with `{sequence}
 | `subagent.stop` (t3) | `runId`, `subagentId` | `cancel_subagent {subagentId}`; refused unless that subagent of this thread is running. The `aborted` lifecycle frame then sets it `cancelled`. |
 
 j3 applies the result of each `goal` command right away. omp's `goal_updated` frame carries the same state.
+
+## Usage
+
+`j3.getUsage` (payload `{}`) runs `omp usage --json` on the server host, with the omp binary and environment the server launches omp with, and answers with the part of omp's snapshot j3 clients show (`j3_protocol::j3::UsageSnapshot`). Every environment reports its own host's omp logins, like the model list. omp answers from its own report cache when it can, so a report's `fetchedAt` can be older than the snapshot's `generatedAt`. Failures (omp missing, non-zero exit, 60 s timeout, unexpected output) are a typed `{"_tag":"J3UsageError","message":…}`. Servers older than this method answer with a `Die`: `j3.getUsage is not supported by this server`. Client API: `j3_client::Connection::usage`.
+
+```json
+{"generatedAt":1793566616901,"reports":[{"provider":"anthropic","fetchedAt":1793566332008,
+ "metadata":{"email":"me@example.com","planType":"max"},
+ "limits":[{"id":"anthropic:5h","label":"Claude 5 Hour","status":"ok",
+  "window":{"label":"5 Hour","resetsAt":1793573042000},
+  "amount":{"usedFraction":0.78,"used":78,"limit":100,"unit":"percent"}}]}]}
+```
+
+The desktop's sidebar footer has a **Usage** button. Nothing is fetched until it is pressed. Each press opens a popover and asks every environment for a new snapshot. The last snapshot per environment is cached in `usage.json` next to `desktop.json` and stays on screen while a request is in flight and when one fails.

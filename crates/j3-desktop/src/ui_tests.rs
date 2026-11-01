@@ -329,6 +329,7 @@ fn fake_omp_script() -> String {
     let model = model_info().to_string();
     format!(
         r#"#!/bin/sh
+if [ "$1" = usage ]; then exec cat "$(dirname "$0")/usage.json"; fi
 printf '%s\n' '{{"type":"ready"}}'
 while IFS= read -r line; do
   id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
@@ -720,6 +721,104 @@ fn thread_row(thread_id: &str) -> String {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[gpui_kit::test]
+async fn the_titlebar_and_text_measure_frame_the_thread(cx: &mut TestAppContext) {
+    let app = Harness::start("frame", cx).await;
+    let project_id = app.project(cx).await;
+    app.open_running_thread(cx, &project_id, "framed").await;
+    app.update(cx, |window, _| {
+        // The panes' header row is the top of the window (on macOS, its
+        // titlebar), and the sidebar's header clears the traffic lights.
+        let row = crate::titlebar::row_height(window);
+        assert_eq!(window.find("t3-list").bounds().top(), row);
+        let filter = window.find("project-filter").bounds();
+        assert!(filter.bottom() <= row);
+        if let Some(inset) = crate::titlebar::traffic_lights_inset(window) {
+            assert!(filter.left() >= inset);
+        }
+        // T3's header offers adding a project next to the new-thread button.
+        assert!(window.try_find("add-project").is_some());
+        // The conversation uses the (tighter) default measure.
+        assert_eq!(
+            window.find("composer").bounds().size.width,
+            window.rem_size() * crate::ui_settings::DEFAULT_TEXT_MEASURE
+        );
+    });
+    app.stop(cx);
+}
+
+#[gpui_kit::test]
+async fn usage_shows_the_model_provider_refreshes_on_press_and_keeps_the_cache_on_failure(
+    cx: &mut TestAppContext,
+) {
+    let app = Harness::start("usage", cx).await;
+    let cache = app.config_dir.join("usage.json");
+    let omp_usage = app.data_dir.join("usage.json");
+    let limit = |id: &str, label: &str, used: f64| {
+        json!({"id": id, "label": label, "status": "ok",
+            "window": {"id": "5h", "label": "5 Hour", "resetsAt": 1_793_573_042_000_i64},
+            "amount": {"usedFraction": used, "unit": "percent"}})
+    };
+    std::fs::write(
+        &omp_usage,
+        json!({"generatedAt": 1_793_566_275_810_i64, "reports": [
+            {"provider": "anthropic", "metadata": {"email": "me@example.com"},
+             "limits": [limit("anthropic:5h", "Claude 5 Hour", 0.5)]},
+            {"provider": "opencode-go", "metadata": {},
+             "limits": [limit("go:5h", "5 Hour limit", 0.78)]},
+        ]})
+        .to_string(),
+    )
+    .unwrap();
+    app.project(cx).await;
+    let connection = app.connection.clone();
+    app.until(cx, move |_, _| {
+        connection
+            .state()
+            .borrow()
+            .config
+            .as_ref()
+            .is_some_and(|config| config.providers.iter().any(|p| !p.models.is_empty()))
+    })
+    .await;
+    // The button sits beside the composer's model picker.
+    app.update(cx, |window, cx| window.click("new-thread", cx));
+    app.until(cx, |window, _| window.try_find("usage").is_some())
+        .await;
+    // Nothing is fetched until the button is pressed.
+    assert!(!cache.exists());
+
+    app.update(cx, |window, cx| window.click("usage", cx));
+    // Only the model's provider (opencode-go, report 1) is listed.
+    app.until(cx, |window, _| window.try_find("usage-local-1-0").is_some())
+        .await;
+    app.update(cx, |window, _| {
+        assert!(window.try_find("usage-local-0-0").is_none());
+    });
+    let cached: Value = serde_json::from_slice(&std::fs::read(&cache).unwrap()).unwrap();
+    assert_eq!(
+        cached["local"]["reports"][1]["limits"][0]["amount"]["usedFraction"],
+        0.78
+    );
+
+    // A failed refresh shows its error next to the cached snapshot.
+    std::fs::remove_file(&omp_usage).unwrap();
+    app.update(cx, |window, cx| window.click("usage", cx));
+    app.until(cx, |window, _| window.try_find("usage-panel").is_none())
+        .await;
+    app.update(cx, |window, cx| window.click("usage", cx));
+    app.until(cx, |window, _| {
+        window.try_find("usage-error-local").is_some()
+    })
+    .await;
+    app.update(cx, |window, _| {
+        assert!(window.try_find("usage-local-1-0").is_some());
+    });
+    let after: Value = serde_json::from_slice(&std::fs::read(&cache).unwrap()).unwrap();
+    assert_eq!(after, cached);
+    app.stop(cx);
+}
 
 #[gpui_kit::test]
 async fn settings_switch_the_workflow_and_persist(cx: &mut TestAppContext) {
@@ -1143,10 +1242,8 @@ async fn new_thread_launches_from_the_composer_and_streams_the_reply(cx: &mut Te
     );
 
     // The launched thread opens with the first message; the draft clears.
-    app.until(cx, |window, _| {
-        feed_row(window, "Say hi").is_some() && window.try_find("set-goal").is_some()
-    })
-    .await;
+    app.until(cx, |window, _| feed_row(window, "Say hi").is_some())
+        .await;
     app.update(cx, |window, _| {
         assert_eq!(window.find_by_label("Message").value(), Some(""));
     });
@@ -1371,11 +1468,14 @@ async fn goal_chip_controls_and_subagent_progress(cx: &mut TestAppContext) {
     let project_id = app.project(cx).await;
     app.open_running_thread(cx, &project_id, "delegate").await;
 
-    // Set a goal through the header button and its dialog.
+    // Set a goal from the thread-actions menu and its dialog.
     app.update(cx, |window, cx| {
         assert!(window.try_find("goal").is_none());
-        window.click("set-goal", cx);
+        window.click("thread-actions", cx);
     });
+    app.until(cx, |window, _| has_label(window, "Set goal…"))
+        .await;
+    app.update(cx, |window, cx| click_label(window, "Set goal…", cx));
     app.until(cx, |window, _| window.try_find("dialog-confirm").is_some())
         .await;
     app.update(cx, |window, cx| {
@@ -1387,7 +1487,6 @@ async fn goal_chip_controls_and_subagent_progress(cx: &mut TestAppContext) {
     })
     .await;
     app.update(cx, |window, _| {
-        assert!(window.try_find("set-goal").is_none());
         assert!(window.try_find("goal-resume").is_none());
     });
 
@@ -1404,10 +1503,8 @@ async fn goal_chip_controls_and_subagent_progress(cx: &mut TestAppContext) {
     })
     .await;
     app.update(cx, |window, cx| window.click("goal-drop", cx));
-    app.until(cx, |window, _| {
-        window.try_find("goal").is_none() && window.try_find("set-goal").is_some()
-    })
-    .await;
+    app.until(cx, |window, _| window.try_find("goal").is_none())
+        .await;
     assert_eq!(
         app.script
             .calls()
