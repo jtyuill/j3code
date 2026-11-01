@@ -595,7 +595,14 @@ impl Inner {
                     "otlpMetricsEnabled": false,
                     "otlpLogsEnabled": false,
                 },
-                "settings": {},
+                // The contracts treat an instance missing from `providerInstances` as
+                // enabled only for codex/claudeAgent; `omp` (driver pi) must be listed
+                // or clients drop its models (`resolveProjectProviderInstanceEnabled`).
+                "settings": {
+                    "providerInstances": {
+                        "omp": {"driver": "pi", "displayName": "omp", "enabled": true},
+                    },
+                },
             }))
             .expect("server config matches ServerConfig");
             to_value(&config)
