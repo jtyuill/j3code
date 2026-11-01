@@ -24,6 +24,7 @@ pub mod commands;
 pub mod environment;
 pub mod environment_http;
 pub mod filesystem;
+pub mod git;
 pub mod ids;
 pub mod methods;
 pub mod model;

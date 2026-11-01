@@ -21,7 +21,7 @@ use omp_rpc::{
     Client, ClientOptions, Command, Event, ExtensionUiResponse, GetStateCommand, RpcInbound,
     SetAskDialogCommand,
 };
-use tokio::{sync::mpsc, task};
+use tokio::{io::AsyncWriteExt, sync::mpsc, task};
 
 /// Frames from an omp process that are not responses to our own commands.
 pub type OmpEvents = mpsc::UnboundedReceiver<Event>;
@@ -45,10 +45,18 @@ pub enum Error {
     UsageTimeout,
     #[error("omp usage failed ({status}): {stderr}")]
     UsageFailed { status: String, stderr: String },
+    #[error("running omp: {0}")]
+    TextSpawn(std::io::Error),
+    #[error("omp did not answer within {}s", TEXT_TIMEOUT.as_secs())]
+    TextTimeout,
+    #[error("omp failed ({status}): {stderr}")]
+    TextFailed { status: String, stderr: String },
 }
 
 /// How long `omp usage` may take; uncached reports query every provider.
 const USAGE_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long a one-shot text generation (`omp -p`) may take.
+const TEXT_TIMEOUT: Duration = Duration::from_secs(90);
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -178,6 +186,58 @@ impl OmpLauncher {
             });
         }
         Ok(output.stdout)
+    }
+
+    /// Runs a one-shot, tool-less `omp -p` in `cwd` with omp's fast model
+    /// (`pi/smol`) and returns its reply. `prompt` goes on stdin; `system`
+    /// replaces omp's system prompt. Uses the launcher's environment, not its
+    /// extra arguments (those are for `--mode rpc`).
+    pub async fn generate_text(&self, prompt: &str, system: &str, cwd: &Path) -> Result<String> {
+        let mut process = tokio::process::Command::new(&self.program);
+        process
+            .current_dir(cwd)
+            .args([
+                "-p",
+                "--no-session",
+                "--no-tools",
+                "--no-skills",
+                "--no-rules",
+                "--no-context-files",
+                "--no-extensions",
+                "--no-lsp",
+                "--no-title",
+                "--thinking",
+                "off",
+                "--model",
+                "pi/smol",
+                "--system-prompt",
+            ])
+            .arg(system)
+            .envs(self.env.iter().map(|(k, v)| (k, v)))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = process.spawn().map_err(Error::TextSpawn)?;
+        let mut stdin = child.stdin.take().expect("stdin is piped");
+        let prompt = prompt.to_owned();
+        // Write concurrently with reading so a large prompt cannot deadlock
+        // against a full stdout pipe. omp may exit without reading it all.
+        let writer = tokio::spawn(async move {
+            let _ = stdin.write_all(prompt.as_bytes()).await;
+        });
+        let output = tokio::time::timeout(TEXT_TIMEOUT, child.wait_with_output())
+            .await
+            .map_err(|_| Error::TextTimeout)?
+            .map_err(Error::TextSpawn)?;
+        writer.abort();
+        if !output.status.success() {
+            return Err(Error::TextFailed {
+                status: output.status.to_string(),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            });
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
     fn command(&self, cwd: &Path, mode: Persistence<'_>) -> Result<Process> {

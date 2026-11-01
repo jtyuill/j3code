@@ -16,6 +16,7 @@ mod environment;
 mod environments;
 mod feed;
 mod feed_view;
+mod git_control;
 mod goto;
 mod local_server;
 mod logos;

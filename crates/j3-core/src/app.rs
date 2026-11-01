@@ -28,6 +28,7 @@ use j3_protocol::t3::{
         FilesystemBrowseEntry, FilesystemBrowseError, FilesystemBrowseFailure,
         FilesystemBrowseInput, FilesystemBrowseResult, FilesystemGetMetadataInput,
     },
+    git::{GitRunStackedActionInput, VcsCwdInput},
     methods::{
         ArchivedShellSnapshot, ForceStopOutcome, ForceStopThreadInput, ForceStopThreadResult,
         GetThreadProjectionInput, GetTurnItemInput, GetTurnItemResult, SubscribeThreadInput,
@@ -59,7 +60,7 @@ use crate::{
         session::{OmpFactory, SessionFactory},
         streams::{self, SnapshotFn},
     },
-    http,
+    git, http,
     hub::{Commit, Hub, ShellChange},
     omp::OmpLauncher,
     rpc::{Response, RpcHandler, StreamItem},
@@ -109,7 +110,8 @@ struct Inner {
     hub: Arc<Hub>,
     attachments: Arc<AttachmentStore>,
     catalog: Arc<Catalog>,
-    /// For `omp usage` (`j3.getUsage`).
+    /// For `omp usage` (`j3.getUsage`) and commit messages
+    /// (`git.runStackedAction`).
     omp: OmpLauncher,
     actor_config: ActorConfig,
     actors: Mutex<HashMap<String, ThreadHandle>>,
@@ -233,6 +235,14 @@ fn projection_error(thread_id: &str, message: &str) -> Value {
 fn decode<T: serde::de::DeserializeOwned>(tag: &str, payload: Value) -> Result<T, Response> {
     serde_json::from_value(payload)
         .map_err(|error| Response::die(format!("invalid {tag} payload: {error}")))
+}
+
+/// A unary git method's answer: the value, or its `GitManagerServiceError`.
+fn git_response<T: Serialize>(result: git::GitResult<T>) -> Response {
+    match result {
+        Ok(value) => Response::ok(to_value(&value)),
+        Err(error) => Response::fail(to_value(&error)),
+    }
 }
 
 /// The thread projection as stored.
@@ -623,6 +633,20 @@ impl Inner {
                 Err(response) => response,
             },
             j3::GET_USAGE => self.usage().await,
+            t3::git::VCS_REFRESH_STATUS => match decode::<VcsCwdInput>(tag, payload) {
+                Ok(input) => git_response(git::status(&input.cwd).await),
+                Err(response) => response,
+            },
+            t3::git::VCS_PULL => match decode::<VcsCwdInput>(tag, payload) {
+                Ok(input) => git_response(git::pull(&input.cwd).await),
+                Err(response) => response,
+            },
+            t3::git::GIT_RUN_STACKED_ACTION => {
+                match decode::<GitRunStackedActionInput>(tag, payload) {
+                    Ok(input) => Response::Stream(git::run_stacked_action(self.omp.clone(), input)),
+                    Err(response) => response,
+                }
+            }
             other => Response::die(format!("{other} is not supported by this server")),
         }
     }

@@ -1628,3 +1628,67 @@ async fn a_remote_that_is_the_local_server_is_listed_once(cx: &mut TestAppContex
     other_runtime.shutdown_background();
     let _ = std::fs::remove_dir_all(other_dir);
 }
+
+/// Runs `git` in `dir`; returns its trimmed stdout.
+fn git(dir: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("run git");
+    assert!(output.status.success(), "git {args:?}: {output:?}");
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+#[gpui_kit::test]
+async fn the_header_commits_uncommitted_changes(cx: &mut TestAppContext) {
+    let app = Harness::start("git", cx).await;
+    // A repository without a remote, with one uncommitted file.
+    git(&app.project_dir, &["init", "-q"]);
+    git(&app.project_dir, &["config", "user.name", "j3 test"]);
+    git(
+        &app.project_dir,
+        &["config", "user.email", "test@j3.invalid"],
+    );
+    std::fs::write(app.project_dir.join("notes.txt"), "one\ntwo\n").unwrap();
+    let project_id = app.project(cx).await;
+    app.open_running_thread(cx, &project_id, "write notes")
+        .await;
+
+    // Changes and no remote: the quick action commits.
+    app.until(cx, |window, _| {
+        label_of(window, "git-quick-action").as_deref() == Some("Commit")
+    })
+    .await;
+
+    // Commit… opens the dialog listing the file; a typed message is used as is.
+    app.update(cx, |window, cx| click_label(window, "Git actions", cx));
+    app.until(cx, |window, _| has_label(window, "Commit…"))
+        .await;
+    app.update(cx, |window, cx| click_label(window, "Commit…", cx));
+    app.until(cx, |window, _| window.try_find("git-commit").is_some())
+        .await;
+    app.update(cx, |window, cx| {
+        assert!(window.try_find("git-commit-files").is_some());
+        window.input("Add notes", cx);
+        window.click("git-commit", cx);
+    });
+    let dir = app.project_dir.clone();
+    app.until(cx, move |_, _| {
+        std::process::Command::new("git")
+            .args(["log", "-1", "--format=%s"])
+            .current_dir(&dir)
+            .output()
+            .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).trim() == "Add notes")
+    })
+    .await;
+    assert_eq!(git(&app.project_dir, &["status", "--porcelain"]), "");
+    // The action ended: the button is back, with nothing left to commit.
+    app.until(cx, |window, _| {
+        label_of(window, "git-quick-action").as_deref() == Some("Commit")
+            && !has_label(window, "Commit…")
+    })
+    .await;
+
+    app.stop(cx);
+}

@@ -4,6 +4,7 @@ pub mod app;
 pub mod attachments;
 pub mod catalog;
 pub mod engine;
+pub mod git;
 pub mod http;
 pub mod hub;
 pub mod omp;

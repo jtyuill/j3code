@@ -28,6 +28,11 @@ use j3_protocol::t3::{
         ThreadUserReasonCommand, ThreadVisitCommand, UserInputDismissCommand, UserReason,
     },
     filesystem::{FilesystemBrowseInput, FilesystemBrowseResult},
+    git::{
+        GIT_RUN_STACKED_ACTION, GitActionProgress, GitActionProgressEvent,
+        GitRunStackedActionInput, GitRunStackedActionResult, GitStackedAction, VCS_PULL,
+        VCS_REFRESH_STATUS, VcsCwdInput, VcsPullResult, VcsStatusResult,
+    },
     methods::{ArchivedShellSnapshot, EmptyInput},
     model::ModelSelection,
     orchestration::{
@@ -44,6 +49,95 @@ use crate::{
     ConnectionState, Error, ThreadState, WorkspaceCommands,
     supervisor::{self, Command, SessionSlot, Shared, encode},
 };
+
+/// What a running git action reports (see [`Connection::run_git_action`]).
+#[derive(Debug, Clone)]
+pub enum GitActionUpdate {
+    /// A progress event: `action_started`, `phase_started` or hook output.
+    Progress(GitActionProgressEvent),
+    /// The action ended with `action_finished`'s result, or why it failed
+    /// (the server's error, else its `action_failed` message). Always last.
+    Finished(Result<Box<GitRunStackedActionResult>, Error>),
+}
+
+/// A running `git.runStackedAction`. Dropping it interrupts the action.
+pub struct GitAction {
+    updates: mpsc::UnboundedReceiver<GitActionUpdate>,
+    task: tokio::task::AbortHandle,
+    finished: bool,
+}
+
+impl GitAction {
+    /// The next update, from any executor; `None` after
+    /// [`GitActionUpdate::Finished`].
+    pub async fn next(&mut self) -> Option<GitActionUpdate> {
+        if self.finished {
+            return None;
+        }
+        let update = self
+            .updates
+            .recv()
+            .await
+            .unwrap_or(GitActionUpdate::Finished(Err(Error::Closed)));
+        self.finished = matches!(update, GitActionUpdate::Finished(_));
+        Some(update)
+    }
+}
+
+impl Drop for GitAction {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Streams one stacked action, forwarding progress to `updates`. Dropping
+/// the future (aborting its task) drops the stream, which interrupts it.
+async fn drive_git_action(
+    shared: &Shared,
+    payload: Value,
+    updates: &mpsc::UnboundedSender<GitActionUpdate>,
+) -> Result<Box<GitRunStackedActionResult>, Error> {
+    let decode = |e: serde_json::Error| Error::Decode(format!("{GIT_RUN_STACKED_ACTION}: {e}"));
+    let session = shared.ready_session().await?;
+    let mut stream = session.stream(GIT_RUN_STACKED_ACTION, payload)?;
+    let (mut result, mut failed) = (None, None);
+    let ended = loop {
+        match stream.next().await {
+            None => break None,
+            Some(Err(error)) => break Some(error),
+            Some(Ok(values)) => {
+                for value in values {
+                    let event: GitActionProgressEvent =
+                        serde_json::from_value(value).map_err(decode)?;
+                    match event.progress {
+                        GitActionProgress::ActionFinished { result: finished } => {
+                            result = Some(finished)
+                        }
+                        GitActionProgress::ActionFailed { message, .. } => failed = Some(message),
+                        progress => {
+                            let _ =
+                                updates.send(GitActionUpdate::Progress(GitActionProgressEvent {
+                                    progress,
+                                    ..event
+                                }));
+                        }
+                    }
+                }
+            }
+        }
+    };
+    if let Some(result) = result {
+        return Ok(result);
+    }
+    Err(match (ended, failed) {
+        (Some(error @ Error::Rejected { .. }), _) => error,
+        (_, Some(message)) => Error::rejected(serde_json::json!({ "message": message })),
+        (Some(error), None) => error,
+        (None, None) => Error::Decode(format!(
+            "{GIT_RUN_STACKED_ACTION}: the stream ended without a result"
+        )),
+    })
+}
 
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -932,6 +1026,63 @@ impl Connection {
     /// `omp usage --json` there).
     pub async fn usage(&self) -> Result<UsageSnapshot, Error> {
         self.call(GET_USAGE, &EmptyInput {}).await
+    }
+
+    // -----------------------------------------------------------------------
+    // Git
+    // -----------------------------------------------------------------------
+
+    /// The git status of `cwd`, freshly computed (`vcs.refreshStatus`).
+    pub async fn git_status(&self, cwd: &str) -> Result<VcsStatusResult, Error> {
+        self.call(
+            VCS_REFRESH_STATUS,
+            &VcsCwdInput {
+                cwd: cwd.to_owned(),
+            },
+        )
+        .await
+    }
+
+    /// Fast-forwards `cwd`'s branch from its upstream (`vcs.pull`).
+    pub async fn pull(&self, cwd: &str) -> Result<VcsPullResult, Error> {
+        self.call(
+            VCS_PULL,
+            &VcsCwdInput {
+                cwd: cwd.to_owned(),
+            },
+        )
+        .await
+    }
+
+    /// Starts a commit/push (`git.runStackedAction`) in `cwd` on the
+    /// connection's runtime. `commit_message` `None` lets the server write
+    /// one. Progress and outcome arrive through the returned [`GitAction`];
+    /// dropping it interrupts the action.
+    pub fn run_git_action(
+        &self,
+        cwd: &str,
+        action: GitStackedAction,
+        commit_message: Option<String>,
+    ) -> GitAction {
+        let shared = Arc::clone(&self.inner.shared);
+        let payload = encode(&GitRunStackedActionInput {
+            action_id: new_id(),
+            cwd: cwd.to_owned(),
+            action,
+            commit_message,
+            feature_branch: None,
+            file_paths: None,
+        });
+        let (tx, updates) = mpsc::unbounded_channel();
+        let task = self.inner.shared.runtime.spawn(async move {
+            let outcome = drive_git_action(&shared, payload, &tx).await;
+            let _ = tx.send(GitActionUpdate::Finished(outcome));
+        });
+        GitAction {
+            updates,
+            task: task.abort_handle(),
+            finished: false,
+        }
     }
 }
 

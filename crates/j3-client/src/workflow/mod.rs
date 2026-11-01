@@ -7,10 +7,13 @@
 //! - **herdr mode** ports herdr's agent states (herdr v0.9.5): Working /
 //!   Blocked / Done / Idle / Unknown, attention priority, space rollup,
 //!   ordering and notifications.
+//! - [`git`] ports t3code's git quick action and menu (commit/push/pull).
 //!
 //! Every list helper takes [`EnvThread`]s so lists merge across
 //! environments. Instants are UTC [`time::OffsetDateTime`]s; local calendar
 //! math (snooze menus) takes a [`TimeZone`], usually `TimeZone::system()`.
+
+pub mod git;
 
 mod herdr;
 mod order;

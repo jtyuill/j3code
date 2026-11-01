@@ -1,7 +1,8 @@
 //! `j3-client` against a real in-process `j3_core` server on an ephemeral port
 //! with a scripted omp session: handshake, projects, launch + streaming,
 //! questions, queue/steer/interrupt, reconnect after a dropped socket, image
-//! upload, workspace commands, the settle workflow calls.
+//! upload, workspace commands, the settle workflow calls, git status and
+//! streamed git actions.
 
 use std::{
     collections::BTreeMap,
@@ -14,9 +15,10 @@ use std::{
 
 use futures_util::future::BoxFuture;
 use j3_client::{
-    Answer, Connection, ConnectionState, ConnectionStatus, Error, SendMode, ThreadState,
-    ThreadSync,
+    Answer, Connection, ConnectionState, ConnectionStatus, Error, GitActionUpdate, SendMode,
+    ThreadState, ThreadSync,
     t3::{
+        git::{GitActionProgress, GitActionProgressPhase, GitCommitStepStatus, GitStackedAction},
         model::ModelSelection,
         orchestration::{
             ProviderGoalStatus, RunStatus, SettledOverride, SubagentStatus, ThreadShell,
@@ -1237,6 +1239,88 @@ async fn uploads_an_image_and_serves_it() {
     let loaded = wait_state(&mut state, "the thread", |s| !s.feed().is_empty()).await;
     assert!(matches!(&loaded.feed()[0].item.kind,
         TurnItemKind::UserMessage(m) if m.attachments == vec![attachment.clone()]));
+
+    server.stop().await;
+}
+
+/// Runs `git` in `dir`, which must succeed.
+fn git(dir: &str, args: &[&str]) {
+    let status = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .status()
+        .expect("run git");
+    assert!(status.success(), "git {args:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn git_status_and_streamed_actions() {
+    let server = TestServer::start("git").await;
+    let connection = Connection::open(server.url(), tokio::runtime::Handle::current());
+    live(&connection).await;
+    let dir = server.project_dir();
+    git(&dir, &["init", "-q"]);
+    git(&dir, &["config", "user.name", "j3 test"]);
+    git(&dir, &["config", "user.email", "test@j3.invalid"]);
+    std::fs::write(Path::new(&dir).join("notes.txt"), "one\ntwo\n").unwrap();
+
+    let status = connection.git_status(&dir).await.unwrap();
+    assert!(status.is_repo && status.has_working_tree_changes);
+    assert!(!status.has_primary_remote && !status.has_upstream);
+    let files: Vec<_> = status
+        .working_tree
+        .files
+        .iter()
+        .map(|file| (file.path.as_str(), file.insertions, file.deletions))
+        .collect();
+    assert_eq!(files, [("notes.txt", 2, 0)]);
+    assert_eq!(
+        workflow::git::quick_action(Some(&status), false).kind,
+        workflow::git::QuickActionKind::Run(GitStackedAction::Commit)
+    );
+
+    // A commit with a message: its phases stream, then the result.
+    let mut run =
+        connection.run_git_action(&dir, GitStackedAction::Commit, Some("Add notes".into()));
+    let mut progress = Vec::new();
+    let result = loop {
+        match run.next().await.expect("an outcome") {
+            GitActionUpdate::Progress(event) => progress.push(event.progress),
+            GitActionUpdate::Finished(outcome) => break outcome.unwrap(),
+        }
+    };
+    assert!(run.next().await.is_none());
+    assert_eq!(
+        progress,
+        [
+            GitActionProgress::ActionStarted {
+                phases: vec![GitActionProgressPhase::Commit],
+            },
+            GitActionProgress::PhaseStarted {
+                phase: GitActionProgressPhase::Commit,
+                label: "Committing...".into(),
+            },
+        ]
+    );
+    assert_eq!(result.commit.status, GitCommitStepStatus::Created);
+    assert_eq!(result.commit.subject.as_deref(), Some("Add notes"));
+    let status = connection.git_status(&dir).await.unwrap();
+    assert!(!status.has_working_tree_changes && status.working_tree.files.is_empty());
+
+    // Pull requests are cut: the action fails with the server's sentence.
+    let mut run = connection.run_git_action(&dir, GitStackedAction::CreatePr, None);
+    let outcome = loop {
+        if let GitActionUpdate::Finished(outcome) = run.next().await.expect("an outcome") {
+            break outcome;
+        }
+    };
+    match outcome {
+        Err(Error::Rejected { tag, message, .. }) => {
+            assert_eq!(tag.as_deref(), Some("GitManagerError"));
+            assert!(message.starts_with("Git manager failed in "), "{message}");
+        }
+        other => panic!("expected a rejection, got {other:?}"),
+    }
 
     server.stop().await;
 }

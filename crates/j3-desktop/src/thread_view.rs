@@ -47,6 +47,7 @@ use crate::{
     environment::Environment,
     feed::is_hidden,
     feed_view::{RowContext, render_item},
+    git_control::GitControl,
     preferences::Preferences,
     titlebar,
 };
@@ -88,6 +89,7 @@ pub struct ThreadView {
     markdown_snapshot: Rc<HashMap<String, Entity<TextViewState>>>,
     expanded: Rc<HashSet<String>>,
     composer: Entity<Composer>,
+    git: Entity<GitControl>,
     question: Option<QuestionCard>,
     editing: Option<QueueEdit>,
     todo_open: bool,
@@ -131,6 +133,7 @@ impl ThreadView {
             }
         });
         let composer = cx.new(|cx| Composer::new(environment.clone(), cwd, preferred, window, cx));
+        let git = cx.new(|cx| GitControl::new(environment.clone(), thread_id, cx));
         let scroller = cx.new(|cx| MessageScrollerState::new(0, cx));
         let subscriptions = vec![
             cx.subscribe_in(&composer, window, Self::on_composer_event),
@@ -157,6 +160,7 @@ impl ThreadView {
             markdown_snapshot: Rc::default(),
             expanded: Rc::default(),
             composer,
+            git,
             question: None,
             editing: None,
             todo_open: true,
@@ -412,6 +416,11 @@ impl ThreadView {
                 .any(|queued| queued.run.id == edit.run_id)
         {
             self.editing = None;
+        }
+
+        // A finished run may have changed files: the git control rereads.
+        if self.state.active_run().is_some() && state.active_run().is_none() {
+            self.git.update(cx, |git, cx| git.refresh(cx));
         }
 
         let run_state = match state.active_run() {
@@ -675,6 +684,7 @@ impl ThreadView {
                     .child(location),
             )
             .child(div().flex_1())
+            .child(self.git.clone())
             .child(
                 Button::new("thread-actions")
                     .ghost()

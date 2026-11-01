@@ -1058,7 +1058,7 @@ Other large kept files that import cut modules: `ThreadRouteScreen.tsx` (12 cut 
 - `…/transcript`, `/api/projects*`, mcpOAuth, webhooks
 
 **WS methods:** every entry in `WS_METHODS` (`C/rpc.ts:407-612`) and `ORCHESTRATION_V2_WS_METHODS` (`OV2:3549-3569`) other than M1–M22 and G1–G10, i.e.:
-- `vcs.*`, `git.*`, `review.*`, `terminal.*`, `preview.*`, `device.*`
+- `vcs.*`, `git.*` (except the three below), `review.*`, `terminal.*`, `preview.*`, `device.*`
 - `pullRequests.*`, `scheduledTasks.*`, `peerLinks.*`, `mcpApps.*`
 - `provider.*`, `cloud.*`, `guestShare.*`, `sourceControl.*`, `projectClone.*`, `agentSessions.*`
 - `shell.openInEditor`
@@ -1066,5 +1066,7 @@ Other large kept files that import cut modules: `ThreadRouteScreen.tsx` (12 cut 
 - `server.*` except `probe`, `refreshProviders`, `reportClientActivity`, `updateSettings` and `getConfig`
 - every `subscribe*` except `subscribeServerConfig`
 - `orchestration.getTurnDiff`, `getFullThreadDiff`, `searchThread`, `searchThreadStream`, `getWorkflowScript`, `getWorktreeThreadIds`
+
+The server does serve `vcs.refreshStatus`, `vcs.pull` and `git.runStackedAction` (actions `commit`, `push`, `commit_push`) for j3's own clients (the desktop git controls). Pull-request actions (`create_pr`, `commit_push_pr`) and `featureBranch: true` fail with a `GitManagerError`, and statuses always carry `pr: null`. Generated commit messages come from a one-shot `omp -p --model pi/smol` with t3's commit prompt. The iOS git UI above stays cut. Wire types: `j3_protocol::t3::git`; implementation: `crates/j3-core/src/git.rs`.
 
 **Commands:** the 29 variants in §3.6.
