@@ -1,0 +1,17 @@
+[package]
+name = "j3-server"
+description = "Headless j3code server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+axum.workspace = true
+clap.workspace = true
+gethostname.workspace = true
+j3-core.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

@@ -1,0 +1,24 @@
+{
+  "name": "j3-conformance",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=26"
+  },
+  "scripts": {
+    "postinstall": "ln -sfn ../../tests/conformance/node_modules ../../packages/contracts/node_modules",
+    "conformance": "node src/main.ts",
+    "typecheck": "tsc --noEmit -p ."
+  },
+  "dependencies": {
+    "@effect/platform-node": "4.0.5",
+    "@effect/platform-node-shared": "4.0.5",
+    "@t3tools/contracts": "file:../../packages/contracts",
+    "effect": "4.0.5"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.6",
+    "typescript": "6.0.3"
+  }
+}

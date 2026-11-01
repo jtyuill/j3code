@@ -1,0 +1,21 @@
+# systemd user unit for the headless j3 server.
+#   install:  cp contrib/systemd/j3-server.service ~/.config/systemd/user/
+#             systemctl --user daemon-reload && systemctl --user enable --now j3-server
+# Needs `loginctl enable-linger $USER` to run without a login session.
+[Unit]
+Description=j3 server (omp agents over Tailscale)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=%h/.nix-profile/bin/j3-server serve --tailscale
+# omp lives in ~/.local/bin; agents' tools need a normal PATH.
+Environment=PATH=%h/.local/bin:%h/.nix-profile/bin:/usr/local/bin:/usr/bin:/bin
+Restart=on-failure
+RestartSec=5
+# omp children run in their own process groups; stop them with the server.
+KillMode=control-group
+TimeoutStopSec=20
+
+[Install]
+WantedBy=default.target
