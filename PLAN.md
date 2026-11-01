@@ -72,7 +72,7 @@ contrib/systemd/    user unit for j3-server
 ```
 
 Protocol check against a running server (uses real omp and spends tokens):
-`cd tests/conformance && npm ci && npm run conformance -- --url http://127.0.0.1:3780 --model <provider/id> --project <dir on that host>`.
+`cd tests/conformance && pnpm conformance --url http://127.0.0.1:3780 --model <provider/id> --project <dir on that host>` (after `pnpm install` at the root).
 
 ## omp integration
 

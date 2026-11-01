@@ -164,6 +164,7 @@ export function HomeRouteScreen() {
         catalogState={catalogState}
         environments={environments}
         onAddConnection={() => openSettings(navigation, "SettingsEnvironmentNew")}
+        onAddProject={() => navigation.navigate("AddProject")}
         onArchiveThread={archiveThread}
         onDeleteThread={confirmDeleteThread}
         onRenameThread={renameThread}

@@ -1,6 +1,6 @@
 import type { ExpoConfig } from "expo/config";
 
-// Icons are still the T3 Code production artwork, copied from t3code's root `assets/prod`.
+// The icon is the "3" of t3code's glyph with a "j": a flat PNG and an Icon Composer project.
 const ICON_PNG = "./assets/brand/ios-icon-1024.png";
 const ICON_COMPOSER_PROJECT = "./assets/brand/app-icon.icon";
 

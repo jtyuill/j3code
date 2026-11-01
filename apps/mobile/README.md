@@ -22,7 +22,21 @@ pnpm start          # Metro only, for a build that is already installed
 ```
 
 `pnpm ios:release` builds the Release configuration with the JS bundle embedded, so it runs
-without Metro.
+without Metro. The same build with `xcodebuild` directly (a cold build takes about 20 minutes):
+
+```sh
+EXPO_NO_GIT_STATUS=1 pnpm exec expo prebuild --clean --platform ios
+cd ios
+xcodebuild -workspace j3.xcworkspace -scheme j3 -configuration Release \
+  -sdk iphonesimulator -destination "generic/platform=iOS Simulator" \
+  -derivedDataPath /tmp/j3-dd build
+xcrun simctl install booted /tmp/j3-dd/Build/Products/Release-iphonesimulator/j3.app
+xcrun simctl launch booted dev.jacobyuill.j3code
+```
+
+Expo modules ship precompiled iOS frameworks tied to one `expo-modules-core` build, so the
+root `pnpm-workspace.yaml` pins the `expo-*` patch versions; a newer one aborts at launch with a
+dyld "Symbol not found" in an `Expo*.framework`.
 
 ## Run on your iPhone with a personal team
 
@@ -36,6 +50,18 @@ own free Apple ID team, change `appleTeamId` (and the bundle id if it is taken),
    ```sh
    EXPO_NO_GIT_STATUS=1 pnpm exec expo prebuild --clean --platform ios
    pnpm exec expo run:ios --device --configuration Release
+   ```
+
+   Or without the Expo CLI, from `ios/`:
+
+   ```sh
+   xcodebuild -workspace j3.xcworkspace -scheme j3 -configuration Release -sdk iphoneos \
+     -destination "generic/platform=iOS" -derivedDataPath /tmp/j3-dd-device \
+     -allowProvisioningUpdates DEVELOPMENT_TEAM=8NY34B669X CODE_SIGN_STYLE=Automatic build
+   xcrun devicectl list devices
+   xcrun devicectl device install app --device <udid> \
+     /tmp/j3-dd-device/Build/Products/Release-iphoneos/j3.app
+   xcrun devicectl device process launch --device <udid> dev.jacobyuill.j3code
    ```
 
 4. On first launch, trust the developer profile under Settings > General > VPN & Device

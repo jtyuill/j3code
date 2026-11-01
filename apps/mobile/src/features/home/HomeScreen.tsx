@@ -80,6 +80,7 @@ interface HomeScreenProps {
   readonly onEnvironmentChange: (environmentId: EnvironmentId | null) => void;
   readonly onProjectChange: (projectKey: string | null) => void;
   readonly onAddConnection: () => void;
+  readonly onAddProject: () => void;
   readonly onSelectThread: (thread: EnvironmentThreadShell) => void;
   readonly onArchiveThread: (thread: EnvironmentThreadShell) => void;
   readonly onDeleteThread: (thread: EnvironmentThreadShell) => void;
@@ -150,7 +151,7 @@ function deriveEmptyState(props: {
   if (props.projectCount === 0 && catalogState.hasLoadedShellSnapshot) {
     return {
       title: "No projects found",
-      detail: "The connected environment did not report any projects.",
+      detail: "Add a folder on the environment as a project to start a thread there.",
       loading: false,
     };
   }
@@ -486,6 +487,7 @@ export function HomeScreen(props: HomeScreenProps) {
     catalogState: props.catalogState,
     projectCount: props.projects.length,
   });
+  const noProjects = props.projects.length === 0 && props.catalogState.hasLoadedShellSnapshot;
 
   if (!hasAnyThreads) {
     return (
@@ -503,8 +505,20 @@ export function HomeScreen(props: HomeScreenProps) {
             <EmptyState
               title={emptyState.title}
               detail={emptyState.detail}
-              actionLabel={!props.catalogState.hasReadyEnvironment ? "Add environment" : undefined}
-              onAction={!props.catalogState.hasReadyEnvironment ? props.onAddConnection : undefined}
+              actionLabel={
+                !props.catalogState.hasReadyEnvironment
+                  ? "Add environment"
+                  : noProjects
+                    ? "Add project"
+                    : undefined
+              }
+              onAction={
+                !props.catalogState.hasReadyEnvironment
+                  ? props.onAddConnection
+                  : noProjects
+                    ? props.onAddProject
+                    : undefined
+              }
               variant="plain"
             />
             {emptyState.loading ? (
