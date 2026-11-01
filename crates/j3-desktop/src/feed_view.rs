@@ -184,7 +184,7 @@ pub fn render_item(
         .into_any_element()
 }
 
-fn subagent_status_label(status: SubagentStatus) -> &'static str {
+pub(crate) fn subagent_status_label(status: SubagentStatus) -> &'static str {
     match status {
         SubagentStatus::Idle => "Idle",
         SubagentStatus::Pending => "Starting",

@@ -8,7 +8,9 @@
 //!   [`OrchestrationV2Command`](crate::t3::commands::OrchestrationV2Command))
 //!   that j3 clients send and t3 clients never do. Their `type`s carry the
 //!   `j3.` prefix so they can never collide with a t3 command.
-//! - the `j3.getUsage` method ([`GET_USAGE`]), which t3 clients never call.
+//! - the `j3.getUsage` method ([`GET_USAGE`]) and the
+//!   `j3.getSubagentTranscript` method ([`GET_SUBAGENT_TRANSCRIPT`]), which
+//!   t3 clients never call.
 
 use serde::{Deserialize, Serialize};
 
@@ -127,5 +129,81 @@ pub struct UsageAmount {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "_tag", rename = "J3UsageError")]
 pub struct UsageError {
+    pub message: String,
+}
+
+/// Method tag of one subagent's transcript, read incrementally from its omp
+/// session file. Payload [`SubagentTranscriptInput`]; succeeds with a
+/// [`SubagentTranscript`], fails with a [`SubagentTranscriptError`].
+pub const GET_SUBAGENT_TRANSCRIPT: &str = "j3.getSubagentTranscript";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentTranscriptInput {
+    pub thread_id: ThreadId,
+    /// The subagent's id (`Subagent.id`).
+    pub subagent_id: String,
+    /// Byte offset to continue from: the previous answer's `nextByte`.
+    /// Omitted or `0` reads from the start.
+    #[serde(default)]
+    pub from_byte: u64,
+}
+
+/// Transcript entries appended since `fromByte`. Only whole lines are read,
+/// so a line omp is still writing comes with the next call.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentTranscript {
+    /// Pass as the next `fromByte`.
+    pub next_byte: u64,
+    /// The file is shorter than `fromByte` (rewritten): reading restarted at
+    /// zero and the client must drop what it has.
+    pub reset: bool,
+    /// More whole lines follow `nextByte` already (the read was capped).
+    pub more: bool,
+    pub entries: Vec<TranscriptEntry>,
+}
+
+/// One displayable part of a subagent message, in transcript order.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum TranscriptEntry {
+    /// The assignment and any steering messages.
+    User {
+        text: String,
+    },
+    Assistant {
+        text: String,
+    },
+    Thinking {
+        text: String,
+    },
+    /// `arguments` is the call's JSON arguments, compact.
+    #[serde(rename_all = "camelCase")]
+    ToolCall {
+        id: String,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        intent: Option<String>,
+        arguments: String,
+    },
+    #[serde(rename_all = "camelCase")]
+    ToolResult {
+        tool_call_id: String,
+        name: String,
+        text: String,
+        is_error: bool,
+    },
+    /// A failed model request (the assistant message's `errorMessage`).
+    Error {
+        text: String,
+    },
+}
+
+/// `j3.getSubagentTranscript` failure: unknown thread, no omp session yet,
+/// or the transcript file cannot be read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "_tag", rename = "J3SubagentTranscriptError")]
+pub struct SubagentTranscriptError {
     pub message: String,
 }

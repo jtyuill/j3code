@@ -14,7 +14,9 @@ use futures_util::{
     future::BoxFuture,
     stream::{self, BoxStream},
 };
-use j3_protocol::j3::{self as j3, UsageError, UsageSnapshot};
+use j3_protocol::j3::{
+    self as j3, SubagentTranscriptError, SubagentTranscriptInput, UsageError, UsageSnapshot,
+};
 use j3_protocol::t3::{
     self,
     commands::{
@@ -65,6 +67,7 @@ use crate::{
     omp::OmpLauncher,
     rpc::{Response, RpcHandler, StreamItem},
     store::{self, Store, random_hex},
+    transcript,
 };
 
 /// Close a thread's omp after it has been settled this long.
@@ -633,6 +636,10 @@ impl Inner {
                 Err(response) => response,
             },
             j3::GET_USAGE => self.usage().await,
+            j3::GET_SUBAGENT_TRANSCRIPT => match decode::<SubagentTranscriptInput>(tag, payload) {
+                Ok(input) => self.subagent_transcript(input).await,
+                Err(response) => response,
+            },
             t3::git::VCS_REFRESH_STATUS => match decode::<VcsCwdInput>(tag, payload) {
                 Ok(input) => git_response(git::status(&input.cwd).await),
                 Err(response) => response,
@@ -661,6 +668,30 @@ impl Inner {
         match snapshot {
             Ok(snapshot) => Response::ok(to_value(&snapshot)),
             Err(message) => Response::fail(to_value(&UsageError { message })),
+        }
+    }
+
+    /// `j3.getSubagentTranscript`: the subagent's session file next to the
+    /// thread's, from `fromByte`.
+    async fn subagent_transcript(&self, input: SubagentTranscriptInput) -> Response {
+        let fail = |message: String| Response::fail(to_value(&SubagentTranscriptError { message }));
+        let row = match self.hub.read(|store| store.thread(&input.thread_id)) {
+            Ok(Some(row)) if !row.deleted => row,
+            Ok(_) => return fail(format!("thread {} not found", input.thread_id)),
+            Err(error) => return fail(error.to_string()),
+        };
+        let Some(session_file) = row.session_file else {
+            return fail("the thread has no omp session yet".to_owned());
+        };
+        let Some(path) = transcript::subagent_file(Path::new(&session_file), &input.subagent_id)
+        else {
+            return fail(format!("invalid subagent id {:?}", input.subagent_id));
+        };
+        let from_byte = input.from_byte;
+        match tokio::task::spawn_blocking(move || transcript::read(&path, from_byte)).await {
+            Ok(Ok(transcript)) => Response::ok(to_value(&transcript)),
+            Ok(Err(error)) => fail(format!("cannot read the subagent transcript: {error}")),
+            Err(error) => fail(error.to_string()),
         }
     }
 

@@ -1362,15 +1362,19 @@ async fn enter_steers_and_secondary_enter_queues_while_running(cx: &mut TestAppC
     app.click_composer(cx);
     app.update(cx, |window, cx| {
         assert_eq!(window.find("send-message").label(), Some("Steer"));
-        window.input("steer this", cx);
+        // Shift+Enter breaks the line and sends nothing.
+        window.input("steer", cx);
+        window.press("shift-enter", cx);
+        assert_eq!(window.find_by_label("Message").value(), Some("steer\n"));
+        window.input("this", cx);
         window.press("enter", cx);
     });
-    app.until_called(cx, "steer:steer this").await;
-    app.until(cx, |window, _| feed_row(window, "steer this").is_some())
+    app.until_called(cx, "steer:steer\nthis").await;
+    app.until(cx, |window, _| feed_row(window, "steer\nthis").is_some())
         .await;
     app.until_thread(cx, &thread_id, |state| {
         state.feed().iter().any(|row| matches!(&row.item.kind,
-            TurnItemKind::UserMessage(m) if m.input_intent == UserMessageInputIntent::Steer && m.text == "steer this"))
+            TurnItemKind::UserMessage(m) if m.input_intent == UserMessageInputIntent::Steer && m.text == "steer\nthis"))
     })
     .await;
     app.update(cx, |window, _| {
@@ -1543,6 +1547,43 @@ async fn goal_chip_controls_and_subagent_progress(cx: &mut TestAppContext) {
     app.update(cx, |window, _| {
         assert!(window.try_find("stop-subagent-Pinger").is_none());
     });
+
+    // ←← in the empty composer opens the agents hub with the transcript
+    // omp wrote next to the thread's session; Esc closes it.
+    let dir = Path::new("/tmp/j3-desktop-fake-session");
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(
+        dir.join("Pinger.jsonl"),
+        concat!(
+            r#"{"type":"message","message":{"role":"user","content":"Reply PONG."}}"#,
+            "\n",
+            r#"{"type":"message","message":{"role":"assistant","content":[{"type":"toolCall","id":"c1","name":"bash","arguments":{"command":"echo PONG"}}]}}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    app.click_composer(cx);
+    app.update(cx, |window, cx| window.press("left", cx));
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    app.update(cx, |window, cx| window.press("left", cx));
+    app.until(cx, |window, _| window.try_find("agent-hub").is_some())
+        .await;
+    app.until(cx, |window, _| {
+        label_of(window, "hub-agent-Pinger").as_deref() == Some("Pinger, Answer PONG, Done")
+    })
+    .await;
+    app.until(cx, |window, _| {
+        window.try_find("hub-entry-Pinger/1").is_some()
+    })
+    .await;
+    app.update(cx, |window, cx| {
+        assert!(window.try_find("composer").is_none());
+        window.press("escape", cx);
+    });
+    app.until(cx, |window, _| {
+        window.try_find("agent-hub").is_none() && window.try_find("composer").is_some()
+    })
+    .await;
 
     app.stop(cx);
 }

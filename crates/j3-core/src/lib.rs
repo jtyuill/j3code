@@ -11,3 +11,4 @@ pub mod omp;
 pub mod rpc;
 pub mod serve;
 pub mod store;
+pub mod transcript;

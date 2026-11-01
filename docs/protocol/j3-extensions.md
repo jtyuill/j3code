@@ -1,10 +1,10 @@
 # j3 protocol extensions: omp goals, subagents and usage
 
-j3 adds three omp features to the t3 wire protocol (`ios-surface.md`): **goal mode**, **subagents** and **usage limits**. Rust types: `j3_protocol::t3::orchestration::{ProviderGoal, Subagent, SubagentItem}`, `j3_protocol::t3::commands::SubagentStopCommand`, `j3_protocol::j3`. Server mapping: `crates/j3-core/src/engine/model/agents.rs`. Client API: `j3_client::ThreadState::{goal, subagents, subagent}` and `j3_client::Connection::{create_goal, pause_goal, resume_goal, drop_goal, stop_subagent, usage}`.
+j3 adds three omp features to the t3 wire protocol (`ios-surface.md`): **goal mode**, **subagents** and **usage limits**. Rust types: `j3_protocol::t3::orchestration::{ProviderGoal, Subagent, SubagentItem}`, `j3_protocol::t3::commands::SubagentStopCommand`, `j3_protocol::j3`. Server mapping: `crates/j3-core/src/engine/model/agents.rs`. Client API: `j3_client::ThreadState::{goal, subagents, subagent}` and `j3_client::Connection::{create_goal, pause_goal, resume_goal, drop_goal, stop_subagent, subagent_transcript, usage}`.
 
 ## Placement
 
-Everything the server sends on t3's methods uses shapes the t3 contracts already define. `packages/contracts` decodes every frame and the iOS client renders it as it is. Only two things are new: four `j3.goal.*` variants of `orchestration.dispatchCommand`, and the `j3.getUsage` method ([Usage](#usage)). t3 clients never send either.
+Everything the server sends on t3's methods uses shapes the t3 contracts already define. `packages/contracts` decodes every frame and the iOS client renders it as it is. Only three things are new: four `j3.goal.*` variants of `orchestration.dispatchCommand`, the `j3.getUsage` method ([Usage](#usage)) and the `j3.getSubagentTranscript` method ([Subagent transcripts](#subagent-transcripts)). t3 clients never send any of them.
 
 | Data | Wire shape | Why |
 |---|---|---|
@@ -98,6 +98,23 @@ All of them go through `orchestration.dispatchCommand`, succeed with `{sequence}
 | `subagent.stop` (t3) | `runId`, `subagentId` | `cancel_subagent {subagentId}`; refused unless that subagent of this thread is running. The `aborted` lifecycle frame then sets it `cancelled`. |
 
 j3 applies the result of each `goal` command right away. omp's `goal_updated` frame carries the same state.
+
+## Subagent transcripts
+
+`j3.getSubagentTranscript` (payload `{threadId, subagentId, fromByte?}`) reads one subagent's omp session file, `<thread session stem>/<subagentId>.jsonl` next to the thread's own session file, from byte `fromByte` (default 0). It reads the file directly, so it works while the thread's omp process is stopped and after server restarts. Only whole lines are read, at most 4 MiB per call. The answer is `{nextByte, reset, more, entries}`: pass `nextByte` as the next `fromByte`; `reset` means the file got shorter than `fromByte`, so reading restarted at zero and the client drops what it has; `more` means the read was capped and more lines are already waiting. Each `message` line becomes `entries` in order, tagged by `kind` (`j3_protocol::j3::TranscriptEntry`):
+
+| `kind` | Fields | From |
+|---|---|---|
+| `user` | `text` | user messages (the assignment, steering) |
+| `assistant` | `text` | assistant text blocks |
+| `thinking` | `text` | assistant thinking blocks |
+| `toolCall` | `id`, `name`, `intent?`, `arguments` (compact JSON) | assistant tool calls |
+| `toolResult` | `toolCallId`, `name`, `text`, `isError` | tool results (text blocks only) |
+| `error` | `text` | an assistant message's `errorMessage` |
+
+Failures (unknown thread, no omp session yet, an invalid id, a missing or unreadable file) are a typed `{"_tag":"J3SubagentTranscriptError","message":…}`. Server: `crates/j3-core/src/transcript.rs`. Client API: `j3_client::Connection::subagent_transcript`.
+
+The desktop's agents hub uses it. Double-tap ← (40–500 ms apart) in an empty composer of a thread with subagents opens the hub in place of the feed. The roster on the left lists the subagents, running ones first. The detail on the right shows the selected subagent's transcript, polled every 500 ms while it runs. ↑/↓ or j/k select, PageUp/PageDown scroll, x stops the selected subagent (`subagent.stop`), and Esc or ←← closes the hub.
 
 ## Usage
 

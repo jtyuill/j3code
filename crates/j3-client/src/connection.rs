@@ -9,7 +9,10 @@ use std::{
     time::Duration,
 };
 
-use j3_protocol::j3::{GET_USAGE, GoalCommand, GoalCreateCommand, UsageSnapshot};
+use j3_protocol::j3::{
+    GET_SUBAGENT_TRANSCRIPT, GET_USAGE, GoalCommand, GoalCreateCommand, SubagentTranscript,
+    SubagentTranscriptInput, UsageSnapshot,
+};
 use j3_protocol::t3::{
     self,
     assets::{
@@ -1026,6 +1029,23 @@ impl Connection {
     /// `omp usage --json` there).
     pub async fn usage(&self) -> Result<UsageSnapshot, Error> {
         self.call(GET_USAGE, &EmptyInput {}).await
+    }
+
+    /// Subagent `subagent_id`'s transcript entries from byte `from_byte` of
+    /// its session file (`j3.getSubagentTranscript`); pass the answer's
+    /// `next_byte` to continue.
+    pub async fn subagent_transcript(
+        &self,
+        thread_id: &str,
+        subagent_id: &str,
+        from_byte: u64,
+    ) -> Result<SubagentTranscript, Error> {
+        let input = SubagentTranscriptInput {
+            thread_id: thread_id.to_owned(),
+            subagent_id: subagent_id.to_owned(),
+            from_byte,
+        };
+        self.call(GET_SUBAGENT_TRANSCRIPT, &input).await
     }
 
     // -----------------------------------------------------------------------

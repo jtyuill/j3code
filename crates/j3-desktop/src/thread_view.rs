@@ -43,6 +43,7 @@ use j3_client::{
 
 use crate::{
     actions::{ArchiveThread, DeleteThread, RenameThread},
+    agent_hub::{AgentHub, CloseHub},
     composer::{Composer, ComposerEvent, RunState, Submission},
     environment::Environment,
     feed::is_hidden,
@@ -93,6 +94,8 @@ pub struct ThreadView {
     question: Option<QuestionCard>,
     editing: Option<QueueEdit>,
     todo_open: bool,
+    /// The agents hub, shown instead of the feed and composer.
+    hub: Option<(Entity<AgentHub>, Subscription)>,
     _watch: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
@@ -164,6 +167,7 @@ impl ThreadView {
             question: None,
             editing: None,
             todo_open: true,
+            hub: None,
             _watch: watch,
             _subscriptions: subscriptions,
         };
@@ -434,6 +438,10 @@ impl ThreadView {
         });
 
         self.visible = Rc::new(visible);
+        if let Some((hub, _)) = &self.hub {
+            let state = state.clone();
+            hub.update(cx, |hub, cx| hub.set_state(state, cx));
+        }
         self.state = state;
         cx.notify();
     }
@@ -569,7 +577,29 @@ impl ThreadView {
         match event {
             ComposerEvent::Stop => self.stop(window, cx),
             ComposerEvent::Submit(submission) => self.send(submission.clone(), window, cx),
+            ComposerEvent::OpenAgentHub => self.open_hub(window, cx),
         }
+    }
+
+    /// Opens the agents hub; like omp, only when there are subagents.
+    pub fn open_hub(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.hub.is_some() || self.state.subagents().is_empty() {
+            return;
+        }
+        let (environment, thread_id, state) = (
+            self.environment.clone(),
+            self.thread_id().to_owned(),
+            self.state.clone(),
+        );
+        let hub = cx.new(|cx| AgentHub::new(environment, thread_id, state, window, cx));
+        let subscription = cx.subscribe_in(&hub, window, |this, _, _: &CloseHub, window, cx| {
+            this.hub = None;
+            this.focus_composer(window, cx);
+            cx.notify();
+        });
+        hub.update(cx, |hub, cx| hub.focus(window, cx));
+        self.hub = Some((hub, subscription));
+        cx.notify();
     }
 
     fn send(&mut self, submission: Submission, window: &mut Window, cx: &mut Context<Self>) {
@@ -1308,6 +1338,13 @@ impl Focusable for ThreadView {
 impl Render for ThreadView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let header = self.render_header(cx);
+        if let Some((hub, _)) = &self.hub {
+            return v_flex()
+                .size_full()
+                .bg(cx.theme().background)
+                .child(header)
+                .child(div().flex_1().min_h_0().child(hub.clone()));
+        }
         let feed = self.render_feed(cx);
         let todo = self.render_todo(cx);
         let queue = self.render_queue(cx);

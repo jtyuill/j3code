@@ -5,6 +5,7 @@
 #![recursion_limit = "256"]
 
 mod actions;
+mod agent_hub;
 mod appearance;
 mod archived;
 mod assets;

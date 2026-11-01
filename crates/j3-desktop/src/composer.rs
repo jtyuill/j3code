@@ -2,7 +2,7 @@
 //! are added), one model-and-thinking picker, and `/` completion. It reports a
 //! [`Submission`]; its owner sends it and calls [`Composer::finish`].
 
-use std::{path::Path, sync::Arc};
+use std::{path::Path, sync::Arc, time::Instant};
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::{
@@ -20,13 +20,14 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     Anchor, AnyElement, App, AppContext as _, ClipboardEntry, ClipboardItem, Context, Entity,
     EventEmitter, FocusHandle, Focusable, Image, ImageFormat, ImageSource, InteractiveElement as _,
-    IntoElement, ObjectFit, ParentElement as _, Render, SharedString,
+    IntoElement, KeyDownEvent, ObjectFit, ParentElement as _, Render, SharedString,
     StatefulInteractiveElement as _, Styled as _, StyledImage as _, Subscription, Task,
     TestSupportExt as _, WeakEntity, Window, div, img, px, rems,
 };
 use j3_client::t3::{chat_attachment::ChatAttachment, model::ModelSelection};
 
 use crate::{
+    agent_hub::DoubleTap,
     completion::{self, Catalog, Completion, CompletionKind},
     environment::Environment,
     logos,
@@ -52,6 +53,8 @@ pub struct Submission {
 pub enum ComposerEvent {
     Submit(Submission),
     Stop,
+    /// ←← in the empty composer: open the agents hub.
+    OpenAgentHub,
 }
 
 /// Whether the thread has an active run, which changes what Enter does.
@@ -252,6 +255,8 @@ pub struct Composer {
     run_state: RunState,
     busy: bool,
     error: Option<SharedString>,
+    /// ← taps in the empty composer.
+    left: DoubleTap,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -322,6 +327,7 @@ impl Composer {
             run_state: RunState::Idle,
             busy: false,
             error: None,
+            left: DoubleTap::default(),
             _subscriptions: subscriptions,
         };
         composer.sync_config(window, cx);
@@ -406,8 +412,32 @@ impl Composer {
                 }
                 cx.notify();
             }
-            InputEvent::PressEnter { secondary, .. } => self.submit(*secondary, window, cx),
-            InputEvent::Focus | InputEvent::Blur => {}
+            // Shift+Enter inserts a newline, yet the textarea still reports it.
+            InputEvent::PressEnter {
+                secondary,
+                shift: false,
+            } => self.submit(*secondary, window, cx),
+            InputEvent::PressEnter { .. } | InputEvent::Focus | InputEvent::Blur => {}
+        }
+    }
+
+    /// omp's ←← in an empty composer opens the agents hub; any other key
+    /// or a non-empty composer breaks the pair.
+    fn on_capture_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let keystroke = &event.keystroke;
+        let left = keystroke.key == "left"
+            && !keystroke.modifiers.modified()
+            && !event.is_held
+            && self.input.read(cx).value().is_empty();
+        if !left {
+            self.left.reset();
+        } else if self.left.tap(Instant::now()) {
+            cx.emit(ComposerEvent::OpenAgentHub);
         }
     }
 
@@ -988,6 +1018,7 @@ impl Render for Composer {
             .id("composer")
             .test_support()
             .key_context("Composer")
+            .capture_key_down(cx.listener(Self::on_capture_key_down))
             .relative()
             .w_full()
             .bg(theme.background)
