@@ -6,6 +6,8 @@
 
 mod actions;
 mod archived;
+mod assets;
+mod attention;
 mod completion;
 mod composer;
 mod dialogs;
@@ -13,26 +15,31 @@ mod environment;
 mod environments;
 mod feed;
 mod feed_view;
+mod goto;
 mod local_server;
 mod models;
 mod new_thread;
+mod preferences;
 mod services;
+mod settings_view;
 mod sidebar;
 mod thread_view;
+mod ui_settings;
 #[cfg(test)]
 mod ui_tests;
 mod workspace;
 
 use std::sync::Arc;
 
-use gpui_kit::assets::Assets;
 use gpui_kit::component::Theme;
 use gpui_kit::{
     App, AppContext as _, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size,
 };
 use tracing_subscriber::EnvFilter;
 
-use crate::{local_server::LocalServer, services::Services, workspace::Workspace};
+use crate::{
+    assets::AppAssets, local_server::LocalServer, services::Services, workspace::Workspace,
+};
 
 fn main() {
     tracing_subscriber::fmt()
@@ -54,7 +61,7 @@ fn main() {
     let termination = runtime.block_on(termination_signal());
 
     gpui_kit::application()
-        .with_assets(Assets)
+        .with_assets(AppAssets)
         .run(move |cx: &mut App| {
             gpui_kit::init(cx);
             cx.set_global(services);

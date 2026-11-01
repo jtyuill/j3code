@@ -1,9 +1,9 @@
 //! Dialog bodies: adding a project through a remote directory browser,
-//! adding a remote environment, and renaming a thread.
+//! adding a remote environment, and a custom snooze time.
 
 use gpui_kit::component::{
-    ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt as _,
-    button::{Button, ButtonVariants as _},
+    ActiveTheme as _, Icon, IconName, Selectable as _, Sizable as _, StyledExt as _,
+    button::{Button, ButtonGroup, ButtonVariants as _},
     dialog::{DialogAction, DialogClose, DialogFooter},
     h_flex,
     input::{Input, InputEvent, InputState},
@@ -16,7 +16,11 @@ use gpui_kit::{
     ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
     Subscription, Window, div, rems,
 };
-use j3_client::t3::filesystem::FilesystemBrowseEntry;
+use j3_client::{
+    t3::filesystem::FilesystemBrowseEntry,
+    workflow::{CustomSnooze, SnoozeUnit, TimeZone, resolve_custom_snooze},
+};
+use time::OffsetDateTime;
 
 use crate::environment::Environment;
 
@@ -347,6 +351,152 @@ impl Render for EnvironmentForm {
                             .child("Port 3780 is used when none is given."),
                     ),
             )
+            .when_some(self.error.clone(), |this, error| {
+                this.child(div().text_xs().text_color(theme.danger).child(error))
+            })
+    }
+}
+
+/// How a custom snooze is given (t3's "Schedule type").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnoozeSchedule {
+    At,
+    After,
+}
+
+/// t3's custom snooze: a local date and time, or a duration from now.
+pub struct SnoozeForm {
+    schedule: SnoozeSchedule,
+    date: Entity<InputState>,
+    time: Entity<InputState>,
+    amount: Entity<InputState>,
+    unit: SnoozeUnit,
+    error: Option<SharedString>,
+}
+
+impl SnoozeForm {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self {
+            schedule: SnoozeSchedule::After,
+            date: cx.new(|cx| InputState::new(window, cx).placeholder("YYYY-MM-DD")),
+            time: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("HH:MM")
+                    .default_value("09:00")
+            }),
+            amount: cx.new(|cx| InputState::new(window, cx).default_value("1")),
+            unit: SnoozeUnit::Hours,
+            error: None,
+        }
+    }
+
+    pub fn focus(&self, window: &mut Window, cx: &mut gpui_kit::App) {
+        let input = match self.schedule {
+            SnoozeSchedule::At => &self.date,
+            SnoozeSchedule::After => &self.amount,
+        };
+        input.update(cx, |input, cx| input.focus(window, cx));
+    }
+
+    /// The wake time, or why the input has none (shown under the form).
+    pub fn wake(&mut self, cx: &mut Context<Self>) -> Option<OffsetDateTime> {
+        let date = self.date.read(cx).value();
+        let time = self.time.read(cx).value();
+        let amount = self.amount.read(cx).value();
+        let input = match self.schedule {
+            SnoozeSchedule::At => CustomSnooze::At {
+                date: date.trim(),
+                time: time.trim(),
+            },
+            SnoozeSchedule::After => CustomSnooze::After {
+                amount: amount.trim(),
+                unit: self.unit,
+            },
+        };
+        let wake = resolve_custom_snooze(input, OffsetDateTime::now_utc(), &TimeZone::system());
+        self.error = wake
+            .is_none()
+            .then(|| "That snooze time has passed or isn’t valid. Choose another time.".into());
+        cx.notify();
+        wake
+    }
+
+    fn segmented<T: Copy + PartialEq + 'static>(
+        id: &'static str,
+        options: &[(T, &'static str)],
+        current: T,
+        cx: &mut Context<Self>,
+        set: fn(&mut Self, T),
+    ) -> ButtonGroup {
+        let values: Vec<T> = options.iter().map(|(value, _)| *value).collect();
+        ButtonGroup::new(id)
+            .outline()
+            .small()
+            .children(options.iter().map(|(value, label)| {
+                Button::new(SharedString::from(format!("{id}-{}", label.to_lowercase())))
+                    .label(*label)
+                    .selected(*value == current)
+            }))
+            .on_click(cx.listener(move |this, clicked: &Vec<usize>, window, cx| {
+                if let Some(&ix) = clicked.first() {
+                    set(this, values[ix]);
+                    this.error = None;
+                    this.focus(window, cx);
+                    cx.notify();
+                }
+            }))
+    }
+}
+
+impl Render for SnoozeForm {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let schedule = Self::segmented(
+            "snooze-schedule",
+            &[
+                (SnoozeSchedule::After, "Duration"),
+                (SnoozeSchedule::At, "Date and time"),
+            ],
+            self.schedule,
+            cx,
+            |this, value| this.schedule = value,
+        );
+        let unit = Self::segmented(
+            "snooze-unit",
+            &[
+                (SnoozeUnit::Minutes, "Minutes"),
+                (SnoozeUnit::Hours, "Hours"),
+                (SnoozeUnit::Days, "Days"),
+            ],
+            self.unit,
+            cx,
+            |this, value| this.unit = value,
+        );
+        let theme = cx.theme();
+        let field = |label: &'static str, input: &Entity<InputState>| {
+            v_flex()
+                .gap_1()
+                .flex_1()
+                .child(div().text_sm().font_medium().child(label))
+                .child(Input::new(input).small())
+        };
+        v_flex()
+            .gap_3()
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child("Choose when the thread returns."),
+            )
+            .child(schedule)
+            .map(|this| match self.schedule {
+                SnoozeSchedule::At => this.child(
+                    h_flex()
+                        .gap_2()
+                        .child(field("Date", &self.date))
+                        .child(field("Time", &self.time)),
+                ),
+                SnoozeSchedule::After => this.child(field("Amount", &self.amount)).child(unit),
+            })
             .when_some(self.error.clone(), |this, error| {
                 this.child(div().text_xs().text_color(theme.danger).child(error))
             })

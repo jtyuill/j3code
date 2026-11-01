@@ -14,10 +14,11 @@ mod rpc;
 mod shell;
 mod supervisor;
 mod thread;
+pub mod workflow;
 
 pub use connection::{Answer, Connection, SendMode, ThreadHandle};
 pub use error::Error;
 /// The wire types (`j3_protocol::t3`).
 pub use j3_protocol::t3;
-pub use shell::{ConnectionState, ConnectionStatus, ShellState, ThreadActivity, WorkspaceCommands};
+pub use shell::{ConnectionState, ConnectionStatus, ShellState, WorkspaceCommands};
 pub use thread::{PendingUserInput, QueuedRun, ThreadState, ThreadSync, TodoPlan};

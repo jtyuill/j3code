@@ -15,7 +15,7 @@ use j3_protocol::t3::commands::*;
 use j3_protocol::t3::methods::*;
 use j3_protocol::t3::model::*;
 use j3_protocol::t3::orchestration::*;
-use j3_protocol::t3::{iso_from_unix_ms, now_iso};
+use j3_protocol::t3::{iso_from_unix_ms, now_iso, unix_ms_from_iso};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -233,6 +233,7 @@ fn every_accepted_command_type_is_typed() {
         base("thread.unpin", json!({})),
         base("thread.pin.reorder", json!({"orderKey":"a1"})),
         base("thread.active.reorder", json!({"orderKey":"a2"})),
+        base("thread.mark-unread", json!({})),
         base(
             "message.dispatch",
             json!({"createdBy":"user","creationSource":"mobile","messageId":"m","text":"q","attachments":[],
@@ -274,8 +275,8 @@ fn every_accepted_command_type_is_typed() {
         );
         types.insert(command.tag().unwrap().to_owned());
     }
-    assert_eq!(types.len(), 31);
-    assert_eq!(OrchestrationV2Command::KNOWN_TAGS.len(), 31);
+    assert_eq!(types.len(), 32);
+    assert_eq!(OrchestrationV2Command::KNOWN_TAGS.len(), 32);
 }
 
 #[test]
@@ -903,4 +904,15 @@ fn iso_timestamps() {
     let now = now_iso();
     assert_eq!(now.len(), 24, "{now}");
     assert!(now.ends_with('Z') && now.as_bytes()[10] == b'T' && now.as_bytes()[19] == b'.');
+    assert_eq!(
+        unix_ms_from_iso("2026-11-01T12:00:00.123Z"),
+        Some(1_793_534_400_123)
+    );
+    assert_eq!(
+        unix_ms_from_iso("2026-11-01T13:00:00+01:00"),
+        Some(1_793_534_400_000)
+    );
+    assert_eq!(unix_ms_from_iso("1969-12-31T23:59:59.999Z"), Some(-1));
+    assert_eq!(unix_ms_from_iso(&now).map(iso_from_unix_ms), Some(now));
+    assert_eq!(unix_ms_from_iso("yesterday"), None);
 }

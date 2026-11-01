@@ -34,8 +34,8 @@ Sources are t3code @ `8760d063` and omp RPC (`/tmp/omp-src`). Citation prefixes:
 |---|---|---|---|
 | HTTP endpoints (§1) | 5: descriptor, `/ws` upgrade, `/api/auth/session`, attachment upload POST, asset GET | 3: shell snapshot, bounded thread snapshot, thread history (return 501) | 2: `/oauth/token`, `/api/auth/websocket-ticket[/rpc]` |
 | WS RPC methods (§2) | 13 | 9 | 10 more are reachable only through server flags j3 does not set, or through UI the trim removes; answer them with a per-request failure |
-| `dispatchCommand` variants (§3) | 17, plus `orchestration.launchThread` for creating threads | 9 triage/list commands that only need to succeed (or be trimmed out of the UI) | 29 others (55 in the union: 17 + 9 + 29) |
-| Stream item kinds (§4) | `subscribeServerConfig`: 1 (`snapshot`), optionally 1 more (`providerStatuses`). `subscribeShell`: 6. `subscribeThread`: 3 frame kinds carrying 20 domain-event types and 15 TurnItem kinds | | |
+| `dispatchCommand` variants (§3) | 17, plus `orchestration.launchThread` for creating threads; 10 more triage commands (§3.5, the settle workflow together with D17) | | 28 others (55 in the union: 17 + 10 + 28) |
+| Stream item kinds (§4) | `subscribeServerConfig`: 1 (`snapshot`), optionally 1 more (`providerStatuses`). `subscribeShell`: 6. `subscribeThread`: 3 frame kinds carrying 32 domain-event types and 15 TurnItem kinds | | |
 
 ### Ground rules for the wire
 
@@ -102,13 +102,16 @@ Reconnect backoff runs from 1 s up to 300 s and resets after 30 s connected (`CR
   - `attachmentUploads:true`.
   - `providerWorkspaceSnapshotsOnDemand:true`. Merges per-cwd slash commands and skills from `server.refreshProviders` (`CR/state/server.ts:685-709`).
   - Optionally `fileAttachments:{maxUploadBytes:N}`. Leave it out to hide non-image file attachments (`M/features/threads/ThreadComposer.tsx:977-983`).
-  - **Do not set** `commandOutputStreaming`, `threadForceStop` or `threadSettlement`.
+  - The thread triage capabilities, once the §3.5 commands are real (j3 sets them): `threadSettlement`, `threadAutoSettlement`, `threadSnooze`, `threadPinning`, `threadPinReorder`, `threadActiveReorder`, `threadAutoSettleOptOut` (mobile shows the per-thread auto-settle switch only with it, `M/state/thread-list-environments.ts:74`), `threadVisitedTracking`.
+  - **Do not set** `commandOutputStreaming`, `threadForceStop`, or `threadAutoSettlementScope` (it gates per-project auto-settle settings, and j3 has no server settings).
 
 ```json
 {"environmentId":"env-shieldy-3f9a","label":"shieldy","platform":{"os":"linux","arch":"x64"},
  "serverVersion":"0.1.0","orchestrationProtocolVersion":2,
  "capabilities":{"repositoryIdentity":false,"attachmentUploads":true,"threadStop":true,
-   "providerWorkspaceSnapshotsOnDemand":true}}
+   "providerWorkspaceSnapshotsOnDemand":true,"threadSettlement":true,"threadAutoSettlement":true,
+   "threadSnooze":true,"threadPinning":true,"threadPinReorder":true,"threadActiveReorder":true,
+   "threadAutoSettleOptOut":true,"threadVisitedTracking":true}}
 ```
 
 #### H2. `GET /ws`: MUST be real
@@ -542,7 +545,7 @@ Every variant carries `type` and `commandId`. The user message the server projec
 | D14 | `queued-message.promote-to-steer` | `OV2:3209-3215` | `threadId`, `queuedRunId`, `targetRunId` | `M/features/threads/ThreadQueueControl.tsx:135` |
 | D15 | `queue.resume` | `OV2:3216-3220` | `threadId` | "Resume" after a held queue (`CR/operations/commands.ts:1025-1035`) |
 | D16 | `queued-run.start` | `OV2:3221-3226` | `threadId`, `runId` | "send now" on one queued run |
-| D17 | `thread.visit` | `OV2:3005-3014` | `threadId`, `visitedAt: IsoDateTime`, `opened?`, `searchQuery? ≤200` | fires automatically when a thread opens (`M/features/threads/ThreadDetailScreen.tsx:342-345`). **It must succeed**; a no-op that returns the current sequence is enough. |
+| D17 | `thread.visit` | `OV2:3005-3014` | `threadId`, `visitedAt: IsoDateTime`, `opened?`, `searchQuery? ≤200` | fires automatically when a thread opens (`M/features/threads/ThreadDetailScreen.tsx:342-345`). It must succeed. j3 implements it as t3 does (§3.5). |
 
 How the composer's mode maps to D1 (`CR/operations/commands.ts:733-781`):
 
@@ -574,23 +577,29 @@ For j3, whose session reports `supportsActiveSteering:true`: `auto` with a runni
 {"type":"queued-message.promote-to-steer","commandId":"…","threadId":"…","queuedRunId":"run_18","targetRunId":"run_17"}
 ```
 
-### 3.5 No-op accepts (9)
+### 3.5 Thread triage (t3's settle workflow, 11 commands)
 
-The trim should remove the list UI for these (§6). Until then, return the current sequence (or `{sequence:0}`) without changing anything:
+j3 implements these with t3's reducer semantics (`S/orchestration-v2/Orchestrator.ts:2760-2818` visit, `:3119-3530` the rest, t3code @ 8760d063). Each success emits one thread domain event whose payload is the whole `OrchestrationV2AppThread`, and updates the shell row. Rejections are `OrchestrationV2DispatchCommandError` with a user-facing `message`. Archived threads refuse every command except `thread.visit` and `thread.mark-unread`.
 
-| `type` | Def | Fields |
-|---|---|---|
-| `thread.settle` | `OV2:2945` | `threadId` |
-| `thread.unsettle` | `OV2:2959` | `threadId`, `reason:"user"` |
-| `thread.snooze` | `OV2:2965` | `threadId`, `snoozedUntil` |
-| `thread.unsnooze` | `OV2:2971` | `threadId`, `reason` |
-| `thread.auto-settle.set` | `OV2:2977` | `enabled` |
-| `thread.pin` | `OV2:2983` | `threadId`, `orderKey?` |
-| `thread.unpin` | `OV2:2989` | `threadId` |
-| `thread.pin.reorder` | `OV2:2994` | `orderKey` |
-| `thread.active.reorder` | `OV2:3000` | `orderKey` |
+| `type` | Def | Fields | Event | Effect | Refused when |
+|---|---|---|---|---|---|
+| `thread.settle` | `OV2:2945` | `threadId`, `settledAt?` | `thread.settled` | `settledOverride:"settled"`, `settledAt = settledAt ?? now` (kept when it was already settled and unpinned), clears `unsettledAt`, `pinnedAt`, `pinOrderKey`, `activeOrderKey`, `snoozedUntil`, `snoozedAt`. A repeat settle keeps `updatedAt`. | a runtime request is pending, a run is active, or a message is queued |
+| `thread.unsettle` | `OV2:2959` | `threadId`, `reason:"user"` | `thread.unsettled` | `settledOverride:"active"`, `settledAt:null`, `unsettledAt = now` (kept when already `"active"`) | |
+| `thread.snooze` | `OV2:2965` | `threadId`, `snoozedUntil` | `thread.snoozed` | `snoozedUntil`, `snoozedAt = now` | the wake time is not in the future; a request is pending; a message is queued |
+| `thread.unsnooze` | `OV2:2971` | `threadId`, `reason:"user"` | `thread.unsnoozed` | clears `snoozedUntil`, `snoozedAt`; `lastSnoozeWakeAt = now` when it was snoozed | |
+| `thread.auto-settle.set` | `OV2:2977` | `threadId`, `enabled` | `thread.auto-settle-set` | `autoSettleDisabledAt = enabled ? null : (autoSettleDisabledAt ?? now)` | |
+| `thread.pin` | `OV2:2983` | `threadId`, `orderKey?` | `thread.pinned` | `pinnedAt = now` (+ `pinOrderKey`) unless already pinned; a settled thread becomes `"active"`, a snoozed one wakes (`lastSnoozeWakeAt = now`) | blank `orderKey` |
+| `thread.unpin` | `OV2:2989` | `threadId` | `thread.unpinned` | clears `pinnedAt`, `pinOrderKey` | |
+| `thread.pin.reorder` | `OV2:2994` | `threadId`, `orderKey` | `thread.pin-reordered` | `pinOrderKey` | not pinned; blank key |
+| `thread.active.reorder` | `OV2:3000` | `threadId`, `orderKey` | `thread.active-reordered` | `activeOrderKey`; never moves `updatedAt` | pinned or settled; blank key |
+| `thread.mark-unread` | `OV2:3016` | `threadId` | `thread.marked-unread` | `lastVisitedAt = latestRunCompletedAt − 1 ms`; a snooze whose wake already passed is retired (`lastSnoozeWakeAt = snoozedUntil`) | no completed run |
+| `thread.visit` (D17) | `OV2:3005` | `threadId`, `visitedAt`, `opened?`, `searchQuery?` | `thread.visited` | `lastVisitedAt` only moves forward; never moves `updatedAt`. j3 does not record `opens` (search ranking). | invalid `visitedAt` |
 
-Callers: `M/features/home/useThreadListActions.ts:89-93,213-220,566-569`; `M/features/threads/ThreadDetailScreen.tsx:548-549`.
+Sending a message also changes triage state (`dispatchMessage`, `Orchestrator.ts:5353-5445`). Every accepted `message.dispatch`, and `launchThread` with an `initialMessage`, does three things. If `lastVisitedAt` is null, it sets it to now − 1 ms. It clears an explicit `settledOverride` (`settledAt:null`, `unsettledAt = now` when the thread was settled). It ends a snooze (`snoozedUntil`/`snoozedAt:null`). j3 has no automatic wakes, so every message counts. The commit carries one thread event, the last that applies: `thread.unsnoozed`, `thread.unsettled` or `thread.metadata-updated`.
+
+**Auto-settle** (`ThreadSettlementService.ts:96-245`, without pull requests). At startup and every 5 minutes, j3 settles each thread that meets three conditions. It is not archived, has no settled override, is not pinned and has not opted out. It has no pending request, no active run and no message sent in the last 2 minutes that has no run yet. It is not snoozed (a failed run after snoozing, or a pending request, wakes it). The thread settles once its latest activity is more than 3 days old (t3's default `sidebarAutoSettleAfterDays`). Activity is the newest of `latestUserMessageAt`, the latest run's requested/started/completed times, `lastSnoozeWakeAt` and an expired `snoozedUntil`. `settledAt` is that activity time. The thread's actor checks again on live state and refuses when the thread changed after the sweep's snapshot. The settle commits with receipt `server:auto-settle:<threadId>:<shell updatedAt>` and emits `thread.settled`. `thread.auto-settle` stays server-internal (§3.6).
+
+Callers: `M/features/home/useThreadListActions.ts:89-93,213-220,566-569`; `M/features/threads/ThreadDetailScreen.tsx:548-549`; the desktop sidebar (`j3_client::Connection`).
 
 ### 3.6 Cut variants (answer with `OrchestrationV2DispatchCommandError`)
 
@@ -598,8 +607,7 @@ Callers: `M/features/home/useThreadListActions.ts:89-93,213-220,566-569`; `M/fea
 |---|---|
 | `thread.create` | No mobile caller; mobile uses `launchThread`. |
 | `thread.guest-share.close`, `thread.guest-message.dismiss` | Guest share. |
-| `thread.auto-settle` | Server-internal. |
-| `thread.mark-unread` | No mobile caller. |
+| `thread.auto-settle` | Server-internal. j3's own sweep settles threads (§3.5). |
 | `thread.pull-request.link`, `.unlink`, `-link.sync`, `.watch`, `.sync` | PRs. |
 | `thread.title.regeneration.complete` | Server-internal. |
 | `thread.model-selection.set` | Mobile sends the model per turn on D1 (`CR/operations/commands.ts:636-643`). Optional. |
@@ -802,6 +810,7 @@ Assistant messages use `createdBy:"agent"`, `creationSource:"provider"` (`PI/ada
   - `createdAt`, `updatedAt`
   - `archivedAt`, `settledOverride`, `settledAt`, `deletedAt`: NullOr
 - Useful optionals: `activityRunStatus` (`preparing|starting|running|waiting`|null), `latestRunCompletedAt`, `latestRunStopRequested`, `lastError`.
+- Triage optionals (§3.5), copied from the thread: `unsettledAt`, `snoozedUntil`, `snoozedAt`, `pinnedAt`, `autoSettleDisabledAt`, `pinOrderKey`, `activeOrderKey`, `lastVisitedAt` (j3 always sends it). They are omitted until a triage change first sets them, then `null` or a value. The shell has no `lastSnoozeWakeAt`; only `OrchestrationV2AppThread` does.
 - How the client presents it (`CR/state/models.ts:223-350`):
   - running state = `activityRunStatus ?? status`
   - `hasPendingUserInput` = `pendingRuntimeRequest.kind == "user_input"`
@@ -836,12 +845,13 @@ Forward-compatibility:
 - Unknown item types inside `turnItems` / `visibleTurnItems` are dropped (`OV2:1810-1829`).
 - **A known type with a bad payload is a hard failure** (`OV2:1837`).
 
-The 21 event types j3 emits (`OV2:1851-1994`):
+The 32 event types j3 emits (`OV2:1851-1994`):
 
 | `type` | payload | used for |
 |---|---|---|
 | `thread.created` | AppThread | launch |
 | `thread.archived`, `thread.unarchived`, `thread.deleted`, `thread.metadata-updated`, `thread.runtime-mode-updated`, `thread.interaction-mode-updated`, `thread.model-selection-updated` | AppThread (the full thread) | D4–D9; model change |
+| `thread.settled`, `thread.unsettled`, `thread.snoozed`, `thread.unsnoozed`, `thread.pinned`, `thread.auto-settle-set`, `thread.unpinned`, `thread.pin-reordered`, `thread.active-reordered`, `thread.visited`, `thread.marked-unread` | AppThread (the full thread) | triage (§3.5) |
 | `run.created`, `run.updated` | Run (full) | turn lifecycle, queue |
 | `run-attempt.created`, `run-attempt.updated` | RunAttempt | turn lifecycle |
 | `provider-session.attached`, `provider-session.updated` | ProviderSession | steer gating |
@@ -997,7 +1007,7 @@ Paths are relative to `apps/mobile/`.
 | `src/features/sharing`, `plugins/withShareExtensionDisplayName.cjs`, `ThreadGuestShareBar`, `guestMessageStyle` | `guestShare.create`, `thread.guest-*` commands |
 | `src/features/voice-input`, `src/native/voiceTranscription*.ts` | none (local only) |
 | `src/features/prompt-links`, `shortcuts`, `showcase`, `development` | none |
-| `turnThreadIntoProject`, `CustomSnoozeSheet*`, `thread-handoff-row`, `ThreadInlineFilePreview`, `thread-inspector-preview` | `projects.createFromThread`; `thread.snooze` UI |
+| `turnThreadIntoProject`, `thread-handoff-row`, `ThreadInlineFilePreview`, `thread-inspector-preview` | `projects.createFromThread` |
 | Android: `*.android.tsx`, `plugins/withAndroid*.cjs` (7), `app.config.ts` android block (`:287-305`) | none |
 | `app.config.ts`: `widgetsPlugin` (`:129-198,429`), `sharingPlugin` (`:200-222,340`), `expo-notifications` (`:342-346`), `@clerk/expo` (`:350`), `expo-quick-actions` (`:353-365`), `extra.relay`/`extra.clerk` (`:442-453`), `ios.associatedDomains` (`:252-255`) | none. **Keep** `NSAllowsArbitraryLoads` (`:265-267`) and `NSLocalNetworkUsageDescription` (`:268-269`) for plain `http://` tailnet hosts. |
 
@@ -1027,7 +1037,6 @@ Routes to delete from `src/Stack.tsx` (imports at `:2-150`):
 | `src/features/keyboard/CommandPalette.tsx:283` | `server.prepareTriage` |
 | `src/features/settings/SettingsEnvironmentDetailRouteScreen.tsx:64,68-69` | `server.updateServer*`, `server.updateProvider` |
 | `src/state/queries.ts:106,268-288,445` | `pullRequests.*`, `vcs.listRefs`, diffs |
-| `src/features/home/useThreadListActions.ts:89-93,213-220,566-569`, `ThreadDetailScreen.tsx:548-549` | the 9 no-op triage commands in §3.5 |
 | `src/features/threads/thread-work-log.tsx:853` | `prepared-run.retry` |
 | `src/connection/runtime.ts:3,23`; `src/persistence/layer.ts:3,15` | PR diff loader and PR cache (no protocol, but delete with the PR code) |
 | `src/dependency-graph.test.ts:206` | asserts more than 500 files; lower it after the trim |

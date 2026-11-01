@@ -21,14 +21,14 @@ use gpui_kit::test::{
     TestWindowExt as _,
 };
 use gpui_kit::{
-    AnyWindowHandle, App, AppContext as _, Bounds, ElementId, MouseButton, Role, TestAppContext,
-    Window, WindowBounds, WindowOptions, px, size,
+    AnyWindowHandle, App, AppContext as _, Bounds, ElementId, MouseButton, TestAppContext, Window,
+    WindowBounds, WindowOptions, px, size,
 };
 use j3_client::{
     Connection, ConnectionStatus, ThreadState,
     t3::{
         model::ModelSelection,
-        orchestration::{RunStatus, TurnItemKind, UserMessageInputIntent},
+        orchestration::{RunStatus, ThreadShell, TurnItemKind, UserMessageInputIntent},
     },
 };
 use j3_core::{
@@ -62,7 +62,8 @@ const WAIT: Duration = Duration::from_secs(15);
 #[derive(Default)]
 struct Script {
     calls: Mutex<Vec<String>>,
-    events: Mutex<Option<mpsc::UnboundedSender<Event>>>,
+    /// Each started session's event channel, in start order.
+    sessions: Mutex<Vec<mpsc::UnboundedSender<Event>>>,
     ui_responses: Mutex<Vec<ExtensionUiResponse>>,
     /// omp's current goal (`Goal` JSON), driven by `goal` like omp does.
     goal: Mutex<Option<Value>>,
@@ -83,13 +84,16 @@ impl Script {
         self.calls.lock().unwrap().iter().any(|c| c == call)
     }
 
+    /// Sends an omp notification to the latest session.
     fn emit(&self, value: Value) {
+        let last = self.sessions.lock().unwrap().len().checked_sub(1);
+        self.emit_to(last.expect("omp started"), value);
+    }
+
+    /// Sends an omp notification to the `session`th session (0-based).
+    fn emit_to(&self, session: usize, value: Value) {
         let notification = RpcNotification::from_value(value).unwrap();
-        self.events
-            .lock()
-            .unwrap()
-            .as_ref()
-            .expect("omp started")
+        self.sessions.lock().unwrap()[session]
             .send(Event::Notification(notification))
             .unwrap();
     }
@@ -305,7 +309,7 @@ impl SessionFactory for FakeFactory {
         let script = Arc::clone(&self.0);
         Box::pin(async move {
             let (tx, rx) = mpsc::unbounded_channel();
-            *script.events.lock().unwrap() = Some(tx);
+            script.sessions.lock().unwrap().push(tx);
             Ok((Box::new(FakeSession(script)) as Box<dyn AgentSession>, rx))
         })
     }
@@ -398,19 +402,31 @@ struct Harness {
     runtime: Option<tokio::runtime::Runtime>,
 }
 
+/// The UI preferences tests start with: quiet, every T3 shelf open.
+fn test_ui() -> Value {
+    json!({"sounds": false, "expandedShelves": ["working", "snoozed", "settled"]})
+}
+
 impl Harness {
     /// Serves a fresh j3 server and opens the workspace window on it, with
     /// the local connection live.
     async fn start(name: &str, cx: &mut TestAppContext) -> Self {
-        Self::start_with(name, cx, |_| json!([])).await
+        Self::start_with(name, cx, |_| json!([]), test_ui()).await
+    }
+
+    /// Like [`Harness::start`], with these UI preferences.
+    async fn start_ui(name: &str, cx: &mut TestAppContext, ui: Value) -> Self {
+        Self::start_with(name, cx, |_| json!([]), ui).await
     }
 
     /// Like [`Harness::start`], with the remote environments `remotes`
-    /// returns for the local server's port written to the desktop config.
+    /// returns for the local server's port and the UI preferences `ui`
+    /// written to the desktop config.
     async fn start_with(
         name: &str,
         cx: &mut TestAppContext,
         remotes: impl FnOnce(u16) -> Value,
+        ui: Value,
     ) -> Self {
         // The server and connections run on tokio threads; GPUI waits for them.
         cx.executor().allow_parking();
@@ -435,7 +451,7 @@ impl Harness {
         let config_path = config_dir.join("desktop.json");
         std::fs::write(
             &config_path,
-            json!({ "environments": remotes(port) }).to_string(),
+            json!({ "environments": remotes(port), "ui": ui }).to_string(),
         )
         .unwrap();
         let local = Arc::new(LocalServer::from_server(server));
@@ -505,31 +521,63 @@ impl Harness {
             .await;
     }
 
+    /// Waits until the shell's row of the thread satisfies `check`.
+    async fn until_shell(
+        &self,
+        cx: &mut TestAppContext,
+        thread_id: &str,
+        mut check: impl FnMut(&ThreadShell) -> bool + 'static,
+    ) {
+        let connection = self.connection.clone();
+        let thread_id = thread_id.to_owned();
+        self.until(cx, move |_, _| {
+            connection
+                .state()
+                .borrow()
+                .shell
+                .thread(&thread_id)
+                .is_some_and(&mut check)
+        })
+        .await;
+    }
+
+    /// Waits until `desktop.json` satisfies `check`.
+    async fn until_config(&self, cx: &mut TestAppContext, check: impl Fn(&Value) -> bool) {
+        let path = self.config_dir.join("desktop.json");
+        self.until(cx, move |_, _| {
+            std::fs::read(&path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .is_some_and(|config| check(&config))
+        })
+        .await;
+    }
+
     fn update<R>(&self, cx: &mut TestAppContext, f: impl FnOnce(&mut Window, &mut App) -> R) -> R {
         cx.update_window(self.window, |_, window, cx| f(window, cx))
             .expect("the test window is open")
     }
 
-    /// Creates the project "Demo" through the connection and waits for its
-    /// sidebar row.
+    /// Creates the project "Demo" through the connection and waits until
+    /// the app has it.
     async fn project(&self, cx: &mut TestAppContext) -> String {
         let project = self
             .connection
             .create_project("Demo", &self.project_dir.to_string_lossy())
             .await
             .unwrap();
-        self.until(cx, |window, _| has_label(window, "Demo")).await;
+        let connection = self.connection.clone();
+        let id = project.id.clone();
+        self.until(cx, move |_, _| {
+            connection.state().borrow().shell.project(&id).is_some()
+        })
+        .await;
         project.id
     }
 
-    /// Launches a thread through the connection, starts its run and opens
-    /// it from the sidebar; returns its id.
-    async fn open_running_thread(
-        &self,
-        cx: &mut TestAppContext,
-        project_id: &str,
-        text: &str,
-    ) -> String {
+    /// Launches a thread through the connection and starts its run (in the
+    /// newest fake session); returns its id.
+    async fn launch(&self, cx: &mut TestAppContext, project_id: &str, text: &str) -> String {
         let thread_id = self
             .connection
             .launch(project_id, text, Vec::new(), model())
@@ -537,9 +585,38 @@ impl Harness {
             .unwrap();
         self.until_called(cx, &format!("prompt:{text}:0")).await;
         self.script.emit(json!({"type": "agent_start"}));
-        let row = format!("{text}, Running");
-        self.until(cx, |window, _| has_label(window, &row)).await;
-        self.update(cx, |window, cx| click_label(window, &row, cx));
+        self.until_shell(cx, &thread_id, |thread| thread.active_run_id.is_some())
+            .await;
+        thread_id
+    }
+
+    /// Launches a thread and lets its run complete; returns its id.
+    async fn completed(&self, cx: &mut TestAppContext, project_id: &str, text: &str) -> String {
+        let thread_id = self.launch(cx, project_id, text).await;
+        self.script.settle("completed");
+        self.until_shell(cx, &thread_id, |thread| {
+            thread.active_run_id.is_none()
+                && thread
+                    .latest_run_completed_at
+                    .as_ref()
+                    .is_some_and(Option::is_some)
+        })
+        .await;
+        thread_id
+    }
+
+    /// Launches a thread, starts its run and opens it from the sidebar;
+    /// returns its id.
+    async fn open_running_thread(
+        &self,
+        cx: &mut TestAppContext,
+        project_id: &str,
+        text: &str,
+    ) -> String {
+        let thread_id = self.launch(cx, project_id, text).await;
+        let row = format!("{text}, Working");
+        self.until(cx, |window, _| in_sidebar(window, &row)).await;
+        self.update(cx, |window, cx| click_sidebar(window, &row, cx));
         // The thread view's composer offers Stop while the run is active.
         self.until(cx, |window, _| window.try_find("stop-run").is_some())
             .await;
@@ -579,6 +656,36 @@ fn label_of(window: &Window, id: &str) -> Option<String> {
         .and_then(|element| element.label().map(str::to_owned))
 }
 
+/// The element labelled `label` inside the element `scope`, if both exist.
+fn in_scope(window: &mut Window, scope: &str, label: &str) -> Option<ElementSnapshot> {
+    window.try_find(scope.to_owned())?;
+    window
+        .within(scope.to_owned())
+        .find_all_by_label(label)
+        .into_iter()
+        .next()
+}
+
+/// The sidebar row labelled `label`, if shown.
+fn sidebar_row(window: &mut Window, label: &str) -> Option<ElementSnapshot> {
+    in_scope(window, "sidebar", label)
+}
+
+fn in_sidebar(window: &mut Window, label: &str) -> bool {
+    sidebar_row(window, label).is_some()
+}
+
+/// Clicks a sidebar row through native pointer events.
+fn click_sidebar(window: &mut Window, label: &str, cx: &mut App) {
+    let position = sidebar_row(window, label)
+        .unwrap_or_else(|| panic!("sidebar row {label:?}"))
+        .bounds()
+        .center();
+    window.pointer_move(position, None, cx);
+    window.pointer_down(position, MouseButton::Left, cx);
+    window.pointer_up(position, MouseButton::Left, cx);
+}
+
 /// Clicks the center of the element with this accessible label through
 /// native pointer events (for rows whose ids are list indices).
 fn click_label(window: &mut Window, label: &str, cx: &mut App) {
@@ -588,16 +695,12 @@ fn click_label(window: &mut Window, label: &str, cx: &mut App) {
     window.pointer_up(position, MouseButton::Left, cx);
 }
 
-/// The sidebar tree item named `label` (the tree's own entry, which carries
-/// selection; the row inside it repeats or extends the label).
-fn tree_item(window: &Window, label: &str) -> ElementSnapshot {
-    let mut items: Vec<_> = window
-        .find_all_by_role(Role::TreeItem)
-        .into_iter()
-        .filter(|item| item.label() == Some(label))
-        .collect();
-    assert_eq!(items.len(), 1, "one tree item {label:?}");
-    items.remove(0)
+/// The top edge of the sidebar row labelled `label`.
+fn top_of(window: &mut Window, label: &str) -> gpui_kit::Pixels {
+    sidebar_row(window, label)
+        .unwrap_or_else(|| panic!("sidebar row {label:?}"))
+        .bounds()
+        .top()
 }
 
 /// The feed row whose accessible label is `text`.
@@ -609,8 +712,9 @@ fn feed_row(window: &Window, text: &str) -> Option<ElementSnapshot> {
         .find(|row| row.path().contains(&feed))
 }
 
-fn hostname() -> String {
-    gethostname::gethostname().to_string_lossy().into_owned()
+/// A thread row's element id (its sidebar row in T3 mode).
+fn thread_row(thread_id: &str) -> String {
+    format!("thread-local-{thread_id}")
 }
 
 // ---------------------------------------------------------------------------
@@ -618,60 +722,373 @@ fn hostname() -> String {
 // ---------------------------------------------------------------------------
 
 #[gpui_kit::test]
-async fn sidebar_shows_the_environment_its_projects_and_threads(cx: &mut TestAppContext) {
-    let app = Harness::start("sidebar", cx).await;
-
-    // The local environment, empty.
-    app.until(cx, |window, _| has_label(window, "No projects"))
+async fn settings_switch_the_workflow_and_persist(cx: &mut TestAppContext) {
+    let app = Harness::start("settings", cx).await;
+    // T3 is the default.
+    app.until(cx, |window, _| window.try_find("t3-list").is_some())
         .await;
     app.update(cx, |window, _| {
-        assert!(has_label(window, &hostname()));
-        assert!(window.try_find("add-project-local").is_some());
+        assert!(window.try_find("herdr-list").is_none());
+        assert!(window.try_find("project-filter").is_some());
     });
 
-    // A project created through the connection gets a row and a new-thread button.
+    // ⌘, opens Settings over the window; herdr is one click away.
+    app.update(cx, |window, cx| window.press("secondary-,", cx));
+    app.until(cx, |window, _| window.try_find("close-settings").is_some())
+        .await;
+    app.update(cx, |window, cx| {
+        assert!(window.try_find("t3-list").is_none());
+        window.click("workflow-herdr", cx);
+    });
+    app.until_config(cx, |config| config["ui"]["workflow"] == "herdr")
+        .await;
+    // A switch saves too.
+    app.until(cx, |window, _| has_label(window, "Working shelf"))
+        .await;
+    app.update(cx, |window, cx| click_label(window, "Working shelf", cx));
+    app.until_config(cx, |config| config["ui"]["workingShelf"] == false)
+        .await;
+
+    // Escape leaves Settings onto the herdr sidebar.
+    app.update(cx, |window, cx| window.press("escape", cx));
+    app.until(cx, |window, _| {
+        window.try_find("close-settings").is_none()
+            && window.try_find("herdr-spaces").is_some()
+            && window.try_find("t3-list").is_none()
+    })
+    .await;
+
+    // And back to T3 with the Done button.
+    app.update(cx, |window, cx| window.press("secondary-,", cx));
+    app.until(cx, |window, _| window.try_find("workflow-t3").is_some())
+        .await;
+    app.update(cx, |window, cx| window.click("workflow-t3", cx));
+    app.until_config(cx, |config| config["ui"]["workflow"] == "t3")
+        .await;
+    app.update(cx, |window, cx| window.click("close-settings", cx));
+    app.until(cx, |window, _| window.try_find("t3-list").is_some())
+        .await;
+
+    // What was saved is what the next launch loads.
+    let path = app.config_dir.join("desktop.json");
+    let preferences = crate::preferences::Preferences::load(Some(path), "test-host");
+    assert_eq!(preferences.ui().workflow, crate::ui_settings::Workflow::T3);
+    assert!(!preferences.ui().working_shelf);
+    assert!(!preferences.ui().sounds);
+
+    app.stop(cx);
+}
+
+#[gpui_kit::test]
+async fn t3_sections_settle_and_advance_pin_and_reorder(cx: &mut TestAppContext) {
+    let app = Harness::start("t3", cx).await;
     let project_id = app.project(cx).await;
+    app.until(cx, |window, _| has_label(window, "No threads yet"))
+        .await;
+
+    // Three finished threads: unread ("Done") in Active, newest first.
+    let alpha = app.completed(cx, &project_id, "Alpha").await;
+    let beta = app.completed(cx, &project_id, "Beta").await;
+    let gamma = app.completed(cx, &project_id, "Gamma").await;
+    app.until(cx, |window, _| {
+        ["Alpha, Done", "Beta, Done", "Gamma, Done"]
+            .iter()
+            .all(|label| in_scope(window, "t3-active", label).is_some())
+    })
+    .await;
     app.update(cx, |window, _| {
-        assert!(!has_label(window, "No projects"));
-        let project = tree_item(window, "Demo");
-        let env = tree_item(window, &hostname());
-        assert!(project.bounds().top() > env.bounds().top());
-        assert!(
-            window
-                .try_find(format!("new-thread-local-{project_id}"))
-                .is_some()
+        assert!(top_of(window, "Gamma, Done") < top_of(window, "Beta, Done"));
+        assert!(top_of(window, "Beta, Done") < top_of(window, "Alpha, Done"));
+    });
+
+    // Opening a thread reads it.
+    app.update(cx, |window, cx| click_sidebar(window, "Gamma, Done", cx));
+    app.until(cx, |window, _| {
+        in_sidebar(window, "Gamma") && feed_row(window, "Gamma").is_some()
+    })
+    .await;
+
+    // ⌘⇧S settles it and moves on to the next unsettled row.
+    app.update(cx, |window, cx| window.press("secondary-shift-s", cx));
+    app.until(cx, |window, _| {
+        in_scope(window, "t3-settled", "Gamma, Settled").is_some()
+            && feed_row(window, "Beta").is_some()
+            && in_sidebar(window, "Beta")
+    })
+    .await;
+    app.update(cx, |window, _| {
+        // The Settled shelf sits below Active.
+        assert!(window.find("shelf-settled").bounds().top() > top_of(window, "Alpha, Done"));
+        assert_eq!(
+            label_of(window, "shelf-settled").as_deref(),
+            Some("Settled 1")
+        );
+    });
+    let settled = app
+        .connection
+        .state()
+        .borrow()
+        .shell
+        .thread(&gamma)
+        .cloned();
+    assert!(settled.is_some_and(|thread| thread.settled_at.is_some()));
+
+    // ⌘⇧S on a settled thread un-settles it, in place.
+    app.update(cx, |window, cx| click_sidebar(window, "Gamma, Settled", cx));
+    app.until(cx, |window, _| feed_row(window, "Gamma").is_some())
+        .await;
+    app.update(cx, |window, cx| window.press("secondary-shift-s", cx));
+    app.until(cx, |window, _| {
+        in_scope(window, "t3-active", "Gamma").is_some()
+    })
+    .await;
+
+    // Pin two threads from the context menu.
+    for (id, label) in [(&alpha, "Alpha, Done"), (&beta, "Beta")] {
+        app.update(cx, |window, cx| window.right_click(thread_row(id), cx));
+        app.until(cx, |window, _| has_label(window, "Pin thread"))
+            .await;
+        app.update(cx, |window, cx| click_label(window, "Pin thread", cx));
+        app.until(cx, |window, _| {
+            in_scope(window, "t3-pinned", label).is_some()
+        })
+        .await;
+    }
+    // Keyless pins: the newest first.
+    app.update(cx, |window, _| {
+        assert!(top_of(window, "Beta") < top_of(window, "Alpha, Done"));
+        assert!(top_of(window, "Alpha, Done") < top_of(window, "Gamma"));
+    });
+
+    // Dragging Alpha onto Beta puts it first and gives both an order key.
+    app.update(cx, |window, cx| {
+        window.drag_to(thread_row(&alpha), thread_row(&beta), cx)
+    });
+    app.until(cx, |window, _| {
+        top_of(window, "Alpha, Done") < top_of(window, "Beta")
+    })
+    .await;
+    app.until_shell(cx, &beta, |thread| {
+        thread.pin_order_key.as_ref().is_some_and(Option::is_some)
+    })
+    .await;
+
+    // Dropping a pinned row on the Settled shelf settles it.
+    app.update(cx, |window, cx| {
+        window.drag_to(thread_row(&beta), "shelf-settled", cx)
+    });
+    app.until(cx, |window, _| {
+        in_scope(window, "t3-settled", "Beta, Settled").is_some()
+            && label_of(window, "shelf-settled").as_deref() == Some("Settled 1")
+    })
+    .await;
+
+    app.stop(cx);
+}
+
+#[gpui_kit::test]
+async fn t3_snooze_hides_a_thread_until_it_wakes(cx: &mut TestAppContext) {
+    let app = Harness::start("snooze", cx).await;
+    let project_id = app.project(cx).await;
+    let nap = app.completed(cx, &project_id, "Nap").await;
+    app.until(cx, |window, _| {
+        in_scope(window, "t3-active", "Nap, Done").is_some()
+    })
+    .await;
+
+    // Snooze ▸ Custom… for an hour: the row moves to the Snoozed shelf.
+    app.update(cx, |window, cx| window.right_click(thread_row(&nap), cx));
+    app.until(cx, |window, _| has_label(window, "Snooze")).await;
+    app.update(cx, |window, cx| click_label(window, "Snooze", cx));
+    app.until(cx, |window, _| has_label(window, "Custom…"))
+        .await;
+    app.update(cx, |window, cx| click_label(window, "Custom…", cx));
+    app.until(cx, |window, _| window.try_find("dialog-confirm").is_some())
+        .await;
+    app.update(cx, |window, cx| window.click("dialog-confirm", cx));
+    app.until(cx, |window, _| {
+        in_scope(window, "t3-snoozed", "Nap, Snoozed").is_some()
+            && in_scope(window, "t3-active", "Nap, Done").is_none()
+    })
+    .await;
+    app.update(cx, |window, _| {
+        assert_eq!(
+            label_of(window, "shelf-snoozed").as_deref(),
+            Some("Snoozed 1")
         );
     });
 
-    // Its threads appear under it with their activity.
-    app.connection
-        .launch(&project_id, "Say hi", Vec::new(), model())
-        .await
-        .unwrap();
-    app.until_called(cx, "prompt:Say hi:0").await;
-    app.script.emit(json!({"type": "agent_start"}));
-    app.until(cx, |window, _| has_label(window, "Say hi, Running"))
+    // Wake thread brings it back at once.
+    app.update(cx, |window, cx| window.right_click(thread_row(&nap), cx));
+    app.until(cx, |window, _| has_label(window, "Wake thread"))
         .await;
-    app.script.settle("completed");
-    app.until(cx, |window, _| has_label(window, "Say hi, Idle"))
+    app.update(cx, |window, cx| click_label(window, "Wake thread", cx));
+    app.until(cx, |window, _| {
+        in_scope(window, "t3-active", "Nap, Done").is_some()
+    })
+    .await;
+
+    // A short snooze hides the row until its wake time, then the sidebar
+    // brings it back by itself, marked as woken.
+    let wake = time::OffsetDateTime::now_utc() + time::Duration::seconds(3);
+    app.connection.snooze(&nap, wake).await.unwrap();
+    app.until(cx, |window, _| {
+        in_scope(window, "t3-snoozed", "Nap, Snoozed").is_some()
+    })
+    .await;
+    app.until(cx, |window, _| {
+        in_scope(window, "t3-active", "Nap, Woke").is_some()
+            && window.try_find("t3-snoozed").is_none()
+    })
+    .await;
+    assert!(time::OffsetDateTime::now_utc() >= wake);
+
+    app.stop(cx);
+}
+
+#[gpui_kit::test]
+async fn herdr_glyphs_attention_notifications_and_goto(cx: &mut TestAppContext) {
+    let app = Harness::start_ui(
+        "herdr",
+        cx,
+        json!({"workflow": "herdr", "agentOrder": "attention", "sounds": false}),
+    )
+    .await;
+    let project_id = app.project(cx).await;
+    app.until(cx, |window, _| in_sidebar(window, "Demo, unknown"))
         .await;
+
+    // Idle: finished and read (opened).
+    let idle = app.completed(cx, &project_id, "Calm").await;
+    app.until(cx, |window, _| in_sidebar(window, "Calm, done"))
+        .await;
+    app.update(cx, |window, cx| click_sidebar(window, "Calm, done", cx));
+    app.until(cx, |window, _| in_sidebar(window, "Calm, idle"))
+        .await;
+
+    // Done: finished while another thread is open; it says so.
+    let done = app.completed(cx, &project_id, "Finish").await;
+    app.until(cx, |window, _| {
+        in_sidebar(window, "Finish, done") && has_label(window, "Finish finished")
+    })
+    .await;
+
+    // Blocked on a question.
+    let blocked = app.launch(cx, &project_id, "Ask").await;
+    app.script.emit(
+        json!({"type": "extension_ui_request", "id": "ui-1", "method": "select",
+        "title": "Pick one", "options": ["alpha", "beta"]}),
+    );
+    app.until(cx, |window, _| {
+        in_sidebar(window, "Ask, blocked") && has_label(window, "Ask needs attention")
+    })
+    .await;
+
+    // Working.
+    let working = app.launch(cx, &project_id, "Busy").await;
+    app.until(cx, |window, _| in_sidebar(window, "Busy, working"))
+        .await;
+
+    // Dots, and attention order: blocked, done, working, idle.
     app.update(cx, |window, _| {
-        let thread = window.find_by_label("Say hi, Idle");
-        assert!(thread.bounds().top() > tree_item(window, "Demo").bounds().top());
-        assert_eq!(tree_item(window, "Say hi").selected(), Some(false));
+        let glyph = |id: &str| label_of(window, &format!("glyph-local-{id}"));
+        assert_eq!(glyph(&blocked).as_deref(), Some("●"));
+        assert_eq!(glyph(&done).as_deref(), Some("●"));
+        assert_eq!(glyph(&working).as_deref(), Some("●"));
+        assert_eq!(glyph(&idle).as_deref(), Some("○"));
+        let tops: Vec<_> = [
+            "Ask, blocked",
+            "Finish, done",
+            "Busy, working",
+            "Calm, idle",
+        ]
+        .iter()
+        .map(|label| top_of(window, label))
+        .collect();
+        assert!(tops.windows(2).all(|pair| pair[0] < pair[1]), "{tops:?}");
+        // The space rolls up its most urgent agent.
+        assert!(in_sidebar(window, "Demo, blocked"));
     });
 
-    // Clicking the row opens the thread and selects it.
-    app.update(cx, |window, cx| click_label(window, "Say hi, Idle", cx));
+    // Symbols, from Settings.
+    app.update(cx, |window, cx| window.press("secondary-,", cx));
     app.until(cx, |window, _| {
-        tree_item(window, "Say hi").selected() == Some(true)
+        window.try_find("status-indicators-symbols").is_some()
     })
     .await;
-    // The thread view opens and loads the feed.
+    app.update(cx, |window, cx| {
+        window.click("status-indicators-symbols", cx);
+        window.click("close-settings", cx);
+    });
     app.until(cx, |window, _| {
-        window.try_find("set-goal").is_some() && feed_row(window, "Say hi").is_some()
+        label_of(window, &format!("glyph-local-{blocked}")).as_deref() == Some("×")
     })
     .await;
+    app.update(cx, |window, _| {
+        let glyph = |id: &str| label_of(window, &format!("glyph-local-{id}"));
+        assert_eq!(glyph(&done).as_deref(), Some("✓"));
+        assert_eq!(glyph(&working).as_deref(), Some("◐"));
+        assert_eq!(glyph(&idle).as_deref(), Some("○"));
+    });
+
+    // The goto picker: everything, then only what a filter key keeps.
+    app.update(cx, |window, cx| window.press("secondary-g", cx));
+    app.until(cx, |window, _| {
+        in_scope(window, "goto-picker", "Busy, working").is_some()
+    })
+    .await;
+    let picked = |window: &mut Window| {
+        [
+            "Ask, blocked",
+            "Finish, done",
+            "Busy, working",
+            "Calm, idle",
+        ]
+        .iter()
+        .filter(|label| in_scope(window, "goto-picker", label).is_some())
+        .count()
+    };
+    app.update(cx, |window, cx| {
+        assert_eq!(picked(window), 4);
+        window.press("b", cx);
+        assert_eq!(picked(window), 1);
+        assert!(in_scope(window, "goto-picker", "Ask, blocked").is_some());
+        window.press("a", cx);
+        assert_eq!(picked(window), 4);
+        window.press("d", cx);
+        assert_eq!(picked(window), 1);
+        // Enter jumps; opening the done thread reads it.
+        window.press("enter", cx);
+    });
+    app.until(cx, |window, _| {
+        window.try_find("goto-picker").is_none()
+            && feed_row(window, "Finish").is_some()
+            && in_sidebar(window, "Finish, idle")
+    })
+    .await;
+
+    // Search narrows by name.
+    app.update(cx, |window, cx| window.press("secondary-g", cx));
+    app.until(cx, |window, _| window.try_find("goto-picker").is_some())
+        .await;
+    app.update(cx, |window, cx| {
+        window.press("/", cx);
+        window.input("busy", cx);
+    });
+    app.until(cx, |window, _| picked(window) == 1).await;
+    app.update(cx, |window, cx| window.press("enter", cx));
+    app.until(cx, |window, _| feed_row(window, "Busy").is_some())
+        .await;
+
+    // A thread that finishes while open was seen: idle, and no toast.
+    app.script.emit_to(
+        3,
+        json!({"type": "prompt_result", "agentInvoked": true, "status": "completed",
+            "sessionSettled": true}),
+    );
+    app.until(cx, |window, _| in_sidebar(window, "Busy, idle"))
+        .await;
+    app.update(cx, |window, _| assert!(!has_label(window, "Busy finished")));
 
     app.stop(cx);
 }
@@ -697,11 +1114,9 @@ async fn new_thread_launches_from_the_composer_and_streams_the_reply(cx: &mut Te
     })
     .await;
 
-    // The project's new-thread button opens a new thread there, with the
-    // composer focused.
-    app.update(cx, |window, cx| {
-        window.click(format!("new-thread-local-{project_id}"), cx);
-    });
+    // The sidebar's new-thread button opens a new thread in the (only)
+    // project, with the composer focused.
+    app.update(cx, |window, cx| window.click("new-thread", cx));
     app.until(cx, |window, _| {
         window
             .find_all_by_label("Message")
@@ -738,7 +1153,7 @@ async fn new_thread_launches_from_the_composer_and_streams_the_reply(cx: &mut Te
 
     // Streaming text reaches the feed piece by piece.
     app.script.emit(json!({"type": "agent_start"}));
-    app.until(cx, |window, _| has_label(window, "Say hi, Running"))
+    app.until(cx, |window, _| in_sidebar(window, "Say hi, Working"))
         .await;
     app.script
         .text("m1", json!({"type": "text_start", "contentIndex": 0}));
@@ -767,7 +1182,7 @@ async fn new_thread_launches_from_the_composer_and_streams_the_reply(cx: &mut Te
 
     app.script.settle("completed");
     app.until(cx, |window, _| {
-        has_label(window, "Say hi, Idle") && window.try_find("stop-run").is_none()
+        in_sidebar(window, "Say hi") && window.try_find("stop-run").is_none()
     })
     .await;
     // The launch carried the composer's model (the one the fake omp lists).
@@ -799,7 +1214,7 @@ async fn a_pending_question_is_answered_from_its_card(cx: &mut TestAppContext) {
     })
     .await;
     app.update(cx, |window, _| {
-        assert!(has_label(window, "Ask me, Waiting for input"));
+        assert!(in_sidebar(window, "Ask me, Input"));
         assert!(has_label(window, "alpha"));
     });
 
@@ -828,7 +1243,7 @@ async fn a_pending_question_is_answered_from_its_card(cx: &mut TestAppContext) {
     })
     .await;
     app.until(cx, |window, _| {
-        window.try_find("question-card").is_none() && has_label(window, "Ask me, Running")
+        window.try_find("question-card").is_none() && in_sidebar(window, "Ask me, Working")
     })
     .await;
     assert_eq!(
@@ -909,12 +1324,10 @@ async fn stop_interrupts_the_run(cx: &mut TestAppContext) {
     app.until(cx, |window, _| {
         window.try_find("stop-run").is_none()
             && window.find("send-message").label() == Some("Send")
-            && has_label(window, "long task, Idle")
+            && in_sidebar(window, "long task")
     })
     .await;
-    app.update(cx, |window, _| {
-        assert!(has_label(window, "long task, Idle"))
-    });
+    app.update(cx, |window, _| assert!(in_sidebar(window, "long task")));
 
     // A new message starts another run; ⌘. (StopRun) stops it too.
     app.click_composer(cx);
@@ -1052,33 +1465,52 @@ async fn a_remote_that_is_the_local_server_is_listed_once(cx: &mut TestAppContex
     let other = LocalServer::from_server(other_server);
 
     // "twin" reaches the local server under another host name.
-    let app = Harness::start_with("dedupe", cx, |port| {
-        json!([
-            {"label": "twin", "url": format!("http://localhost:{port}")},
-            {"label": "other", "url": format!("http://127.0.0.1:{other_port}")},
-        ])
-    })
+    let app = Harness::start_with(
+        "dedupe",
+        cx,
+        |port| {
+            json!([
+                {"label": "twin", "url": format!("http://localhost:{port}")},
+                {"label": "other", "url": format!("http://127.0.0.1:{other_port}")},
+            ])
+        },
+        json!({"workflow": "herdr", "sounds": false}),
+    )
     .await;
 
     let connections = cx.update(|cx| Workspace::global_connections(cx));
     assert_eq!(connections.len(), 3, "local, twin and other connect");
+    let live = connections.clone();
     app.until(cx, move |_, _| {
-        connections.iter().all(|connection| {
+        live.iter().all(|connection| {
             let state = connection.state();
             let state = state.borrow();
             state.status == ConnectionStatus::Live && state.shell.loaded
         })
     })
     .await;
-    // Both remotes show until their descriptors arrive; then the twin drops out.
+    // A project on each server: the local one is listed once, not again
+    // under the twin; the other server's after it.
+    app.project(cx).await;
+    connections[2]
+        .create_project("Remote", &app.project_dir.to_string_lossy())
+        .await
+        .unwrap();
     app.until(cx, |window, _| {
-        has_label(window, "other") && !has_label(window, "twin")
+        in_sidebar(window, "Demo, unknown") && in_sidebar(window, "Remote, unknown")
     })
     .await;
     app.update(cx, |window, _| {
-        assert!(has_label(window, &hostname()));
-        let local = tree_item(window, &hostname());
-        assert!(tree_item(window, "other").bounds().top() > local.bounds().top());
+        let demo = in_scope(window, "herdr-spaces", "Demo, unknown");
+        assert_eq!(
+            window
+                .within("herdr-spaces")
+                .find_all_by_label("Demo, unknown")
+                .len(),
+            1
+        );
+        let remote = in_scope(window, "herdr-spaces", "Remote, unknown").unwrap();
+        assert!(remote.bounds().top() > demo.unwrap().bounds().top());
     });
 
     // Hidden, not forgotten: the config entry stays.

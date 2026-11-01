@@ -284,7 +284,7 @@ pub struct ThreadVisitCommand {
 }
 
 // ---------------------------------------------------------------------------
-// No-op commands (§3.5)
+// Thread triage (t3's settle workflow)
 // ---------------------------------------------------------------------------
 
 /// `thread.settle` (`OV2:2945-2950`).
@@ -364,10 +364,10 @@ pub struct SubagentStopCommand {
 
 open_union! {
     /// `OrchestrationV2Command` (`OV2:2877-3347`), the `dispatchCommand`
-    /// payload, by `type`. The 17 required and 9 no-op commands j3 accepts,
-    /// `subagent.stop`, and the `j3.*` extension commands
-    /// ([`crate::j3`]) are typed; every other type (the cut ones, future
-    /// ones) decodes to `Unknown` and must be rejected with
+    /// payload, by `type`. The commands j3 serves (ios-surface §3.4, the
+    /// §3.5 triage commands), `subagent.stop`, and the `j3.*` extension
+    /// commands ([`crate::j3`]) are typed; every other type (the cut ones,
+    /// future ones) decodes to `Unknown` and must be rejected with
     /// [`OrchestrationV2DispatchCommandError`].
     pub enum OrchestrationV2Command {
         tag = "type";
@@ -398,6 +398,7 @@ open_union! {
             "thread.unpin" => ThreadUnpin(ThreadCommand),
             "thread.pin.reorder" => ThreadPinReorder(ThreadReorderCommand),
             "thread.active.reorder" => ThreadActiveReorder(ThreadReorderCommand),
+            "thread.mark-unread" => ThreadMarkUnread(ThreadCommand),
             "subagent.stop" => SubagentStop(SubagentStopCommand),
             "j3.goal.create" => GoalCreate(GoalCreateCommand),
             "j3.goal.pause" => GoalPause(GoalCommand),
@@ -418,7 +419,8 @@ impl OrchestrationV2Command {
             Self::ThreadArchive(c)
             | Self::ThreadUnarchive(c)
             | Self::QueueResume(c)
-            | Self::ThreadUnpin(c) => &c.command_id,
+            | Self::ThreadUnpin(c)
+            | Self::ThreadMarkUnread(c) => &c.command_id,
             Self::ThreadDelete(c) => &c.command_id,
             Self::ThreadMetadataUpdate(c) => &c.command_id,
             Self::ThreadRuntimeModeSet(c) => &c.command_id,
@@ -452,7 +454,8 @@ impl OrchestrationV2Command {
             Self::ThreadArchive(c)
             | Self::ThreadUnarchive(c)
             | Self::QueueResume(c)
-            | Self::ThreadUnpin(c) => &c.thread_id,
+            | Self::ThreadUnpin(c)
+            | Self::ThreadMarkUnread(c) => &c.thread_id,
             Self::ThreadDelete(c) => &c.thread_id,
             Self::ThreadMetadataUpdate(c) => &c.thread_id,
             Self::ThreadRuntimeModeSet(c) => &c.thread_id,
@@ -474,22 +477,6 @@ impl OrchestrationV2Command {
             Self::GoalPause(c) | Self::GoalResume(c) | Self::GoalDrop(c) => &c.thread_id,
             Self::Unknown(value) => return value.get("threadId").and_then(Value::as_str),
         })
-    }
-
-    /// True for the §3.5 triage commands that only need to succeed.
-    pub fn is_no_op(&self) -> bool {
-        matches!(
-            self,
-            Self::ThreadSettle(_)
-                | Self::ThreadUnsettle(_)
-                | Self::ThreadSnooze(_)
-                | Self::ThreadUnsnooze(_)
-                | Self::ThreadAutoSettleSet(_)
-                | Self::ThreadPin(_)
-                | Self::ThreadUnpin(_)
-                | Self::ThreadPinReorder(_)
-                | Self::ThreadActiveReorder(_)
-        )
     }
 }
 

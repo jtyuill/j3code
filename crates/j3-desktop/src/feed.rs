@@ -229,14 +229,19 @@ pub fn tool_summary(item: &TurnItem) -> Option<ToolSummary> {
 /// timestamp and `now`; `None` if the timestamp does not parse.
 pub fn relative_age(iso: &str, now: OffsetDateTime) -> Option<String> {
     let at = OffsetDateTime::parse(iso, &Rfc3339).ok()?;
+    Some(age_since(at, now))
+}
+
+/// [`relative_age`] of a parsed time.
+pub fn age_since(at: OffsetDateTime, now: OffsetDateTime) -> String {
     let seconds = (now - at).whole_seconds().max(0);
-    Some(match seconds {
+    match seconds {
         0..60 => "now".to_owned(),
         60..3_600 => format!("{}m", seconds / 60),
         3_600..86_400 => format!("{}h", seconds / 3_600),
         86_400..604_800 => format!("{}d", seconds / 86_400),
         _ => format!("{}w", seconds / 604_800),
-    })
+    }
 }
 
 #[cfg(test)]

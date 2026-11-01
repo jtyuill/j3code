@@ -38,6 +38,7 @@ use crate::omp::omp_rpc::{
 };
 
 mod agents;
+pub mod triage;
 
 /// Option id of the thinking descriptor j3 advertises.
 pub const THINKING_OPTION: &str = "thinking";

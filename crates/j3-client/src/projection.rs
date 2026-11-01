@@ -66,7 +66,18 @@ pub(crate) fn apply_event(projection: &mut ThreadProjection, event: DomainEvent)
         | DomainEventBody::ThreadMetadataUpdated(thread)
         | DomainEventBody::ThreadRuntimeModeUpdated(thread)
         | DomainEventBody::ThreadInteractionModeUpdated(thread)
-        | DomainEventBody::ThreadModelSelectionUpdated(thread) => {
+        | DomainEventBody::ThreadModelSelectionUpdated(thread)
+        | DomainEventBody::ThreadSettled(thread)
+        | DomainEventBody::ThreadUnsettled(thread)
+        | DomainEventBody::ThreadSnoozed(thread)
+        | DomainEventBody::ThreadUnsnoozed(thread)
+        | DomainEventBody::ThreadPinned(thread)
+        | DomainEventBody::ThreadAutoSettleSet(thread)
+        | DomainEventBody::ThreadUnpinned(thread)
+        | DomainEventBody::ThreadPinReordered(thread)
+        | DomainEventBody::ThreadActiveReordered(thread)
+        | DomainEventBody::ThreadVisited(thread)
+        | DomainEventBody::ThreadMarkedUnread(thread) => {
             projection.thread = thread;
         }
         DomainEventBody::RunCreated(run) | DomainEventBody::RunUpdated(run) => {

@@ -1,6 +1,8 @@
 //! `App` end to end over its `RpcHandler`, with a scripted omp session:
 //! launch, dispatch idempotency, queue hold/resume/cancel/edit/promote,
-//! steer, stop, answers, rejections, persistence and recovery on reopen.
+//! steer, stop, answers, rejections, persistence and recovery on reopen,
+//! and t3's thread triage (settle, snooze, pin, reorder, mark-unread,
+//! visit, auto-settle).
 
 use std::{
     path::{Path, PathBuf},
@@ -29,10 +31,12 @@ use j3_protocol::{
             DispatchCommandResult, OrchestrationV2DispatchCommandError, ThreadLaunchResult,
         },
         orchestration::{
-            RunStatus, RuntimeRequestStatus, ShellStreamItem, ThreadProjection, ThreadStreamItem,
-            TurnItemKind, TurnItemStatus, UserMessageInputIntent,
+            AppThread, RunStatus, RuntimeRequestStatus, SettledOverride, ShellStreamItem,
+            ThreadProjection, ThreadShell, ThreadStreamItem, TurnItemKind, TurnItemStatus,
+            UserMessageInputIntent,
         },
         project::Project,
+        unix_ms_from_iso,
     },
 };
 use serde_json::{Value, json};
@@ -409,6 +413,80 @@ fn run_status(projection: &ThreadProjection, run_id: &str) -> RunStatus {
         .status
 }
 
+/// Launches `thread_id` with `text` and lets its run complete; returns the
+/// run's completion time (epoch ms).
+async fn finish(env: &Env, thread_id: &str, text: &str) -> i64 {
+    launch(env, &format!("c-{thread_id}"), thread_id, text).await;
+    let prompt = format!("prompt:{text}:0");
+    wait_calls(&env.script, "prompt", |calls| calls.contains(&prompt)).await;
+    env.script.emit(json!({"type": "agent_start"}));
+    env.script.settle("completed");
+    let done = wait_for(&env.app, thread_id, "completion", |p| {
+        p.runs[0].status == RunStatus::Completed
+    })
+    .await;
+    unix_ms_from_iso(done.runs[0].completed_at.as_deref().unwrap()).unwrap()
+}
+
+async fn thread(app: &Arc<App>, thread_id: &str) -> AppThread {
+    projection(app, thread_id).await.thread
+}
+
+/// The thread's row in a fresh shell snapshot.
+async fn shell_row(app: &Arc<App>, thread_id: &str) -> ThreadShell {
+    let mut shell = stream(app, "orchestration.subscribeShell", json!({})).await;
+    let Some(StreamItem::Value(snapshot)) = shell.next().await else {
+        panic!("shell snapshot")
+    };
+    let ShellStreamItem::Snapshot(snapshot) = serde_json::from_value(snapshot).unwrap() else {
+        panic!("snapshot item")
+    };
+    snapshot
+        .snapshot
+        .threads
+        .into_iter()
+        .find(|shell| shell.id == thread_id)
+        .unwrap()
+}
+
+/// Reads the thread stream up to the next domain event of `event_type`.
+async fn next_event(events: &mut BoxStream<'static, StreamItem>, event_type: &str) -> AppThread {
+    loop {
+        let item = tokio::time::timeout(Duration::from_secs(2), events.next())
+            .await
+            .unwrap_or_else(|_| panic!("no {event_type} event"));
+        let Some(StreamItem::Value(item)) = item else {
+            panic!("thread stream ended")
+        };
+        let ThreadStreamItem::Event(event) = serde_json::from_value(item).unwrap() else {
+            continue;
+        };
+        if event.event.body.tag() == Some(event_type) {
+            return serde_json::from_value(
+                serde_json::to_value(&event.event.body).unwrap()["payload"].take(),
+            )
+            .unwrap();
+        }
+    }
+}
+
+fn triage(kind: &str, command_id: &str, thread_id: &str, extra: Value) -> Value {
+    let mut command = json!({"type": kind, "commandId": command_id, "threadId": thread_id});
+    for (key, value) in extra.as_object().unwrap() {
+        command[key] = value.clone();
+    }
+    command
+}
+
+async fn reject_message(app: &Arc<App>, command: Value) -> String {
+    let error = dispatch(app, command).await.unwrap_err();
+    error["message"].as_str().unwrap().to_owned()
+}
+
+fn set<T: Clone>(field: &Option<Option<T>>) -> Option<T> {
+    field.clone().flatten()
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -778,7 +856,7 @@ async fn engine_app_rejections() {
         "{message}"
     );
 
-    // No-op triage commands succeed.
+    // Pinning and visiting work while a run is active.
     dispatch(
         &env.app,
         json!({"type": "thread.pin", "commandId": "pin", "threadId": "T3"}),
@@ -921,6 +999,590 @@ async fn engine_app_persistence_and_recovery_on_reopen() {
     })
     .await;
     assert_eq!(*env.script.starts.lock().unwrap(), 2);
+    app.shutdown().await;
+    let _ = std::fs::remove_dir_all(&env.data_dir);
+    let _ = std::fs::remove_dir_all(&env.project_dir);
+}
+
+#[tokio::test]
+async fn engine_app_triage_commands() {
+    let env = env("triage").await;
+    let app = &env.app;
+    let far = "2999-01-01T00:00:00.000Z";
+
+    // While the first run is active: settle and mark-unread are refused,
+    // the first message already set the read watermark.
+    let launched = launch(&env, "c-l", "T5", "first").await;
+    assert!(launched.projection.thread.last_visited_at.is_some());
+    wait_calls(&env.script, "prompt", |calls| {
+        calls.iter().any(|c| c == "prompt:first:0")
+    })
+    .await;
+    env.script.emit(json!({"type": "agent_start"}));
+    assert_eq!(
+        reject_message(app, triage("thread.settle", "s0", "T5", json!({}))).await,
+        "This thread is still running. Stop it before settling."
+    );
+    assert_eq!(
+        reject_message(app, triage("thread.mark-unread", "u0", "T5", json!({}))).await,
+        "This thread has no finished run to mark unread."
+    );
+    // A queued message blocks snoozing; a pending question blocks it first.
+    dispatch(
+        app,
+        message(
+            "T5",
+            "q1",
+            "later",
+            json!({"dispatchMode": {"type": "queue_after_active"}}),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        reject_message(
+            app,
+            triage("thread.snooze", "z0", "T5", json!({"snoozedUntil": far}))
+        )
+        .await,
+        "This thread has a queued message and can't be snoozed."
+    );
+    env.script.emit(
+        json!({"type": "extension_ui_request", "id": "ui-1", "method": "confirm",
+        "title": "Proceed?", "message": "ok?"}),
+    );
+    let waiting = wait_for(app, "T5", "question", |p| {
+        p.runtime_requests
+            .iter()
+            .any(|r| r.status == RuntimeRequestStatus::Pending)
+    })
+    .await;
+    assert_eq!(
+        reject_message(
+            app,
+            triage("thread.snooze", "z1", "T5", json!({"snoozedUntil": far}))
+        )
+        .await,
+        "This thread is waiting on an approval or question and can't be snoozed."
+    );
+    assert_eq!(
+        reject_message(app, triage("thread.settle", "s1", "T5", json!({}))).await,
+        "This thread is waiting on an approval or question. Answer it before settling."
+    );
+    let request = waiting.runtime_requests[0].id.clone();
+    dispatch(
+        app,
+        json!({"type": "runtime-request.respond", "commandId": "a1", "threadId": "T5",
+        "requestId": request, "decision": "accept"}),
+    )
+    .await
+    .unwrap();
+    let queued = projection(app, "T5")
+        .await
+        .runs
+        .iter()
+        .find(|r| r.status == RunStatus::Queued)
+        .unwrap()
+        .id
+        .clone();
+    dispatch(
+        app,
+        triage("queued-run.cancel", "x1", "T5", json!({"runId": queued})),
+    )
+    .await
+    .unwrap();
+    env.script.settle("completed");
+    let done = wait_for(app, "T5", "completion", |p| {
+        p.runs[0].status == RunStatus::Completed
+    })
+    .await;
+    let completed = unix_ms_from_iso(done.runs[0].completed_at.as_deref().unwrap()).unwrap();
+
+    let mut events = stream(
+        app,
+        "orchestration.subscribeThread",
+        json!({"threadId": "T5"}),
+    )
+    .await;
+
+    // Settle, then settle again: the second keeps settledAt and updatedAt.
+    dispatch(app, triage("thread.settle", "s2", "T5", json!({})))
+        .await
+        .unwrap();
+    let settled = next_event(&mut events, "thread.settled").await;
+    assert_eq!(settled.settled_override, Some(SettledOverride::Settled));
+    assert!(settled.settled_at.is_some());
+    dispatch(app, triage("thread.settle", "s3", "T5", json!({})))
+        .await
+        .unwrap();
+    let again = next_event(&mut events, "thread.settled").await;
+    assert_eq!(again.settled_at, settled.settled_at);
+    assert_eq!(again.updated_at, settled.updated_at);
+    let shell = shell_row(app, "T5").await;
+    assert_eq!(shell.settled_override, Some(SettledOverride::Settled));
+    assert_eq!(shell.settled_at, settled.settled_at);
+    // Settled threads can't be reordered among active ones.
+    assert_eq!(
+        reject_message(
+            app,
+            triage(
+                "thread.active.reorder",
+                "r0",
+                "T5",
+                json!({"orderKey": "m"})
+            )
+        )
+        .await,
+        "This thread is not active, so it can't be reordered."
+    );
+
+    // Unsettle → active.
+    dispatch(
+        app,
+        triage("thread.unsettle", "un1", "T5", json!({"reason": "user"})),
+    )
+    .await
+    .unwrap();
+    let active = next_event(&mut events, "thread.unsettled").await;
+    assert_eq!(active.settled_override, Some(SettledOverride::Active));
+    assert_eq!(active.settled_at, None);
+    assert!(set(&active.unsettled_at).is_some());
+
+    // Active reorder never moves updatedAt.
+    dispatch(
+        app,
+        triage(
+            "thread.active.reorder",
+            "r1",
+            "T5",
+            json!({"orderKey": "k"}),
+        ),
+    )
+    .await
+    .unwrap();
+    let reordered = next_event(&mut events, "thread.active-reordered").await;
+    assert_eq!(set(&reordered.active_order_key).as_deref(), Some("k"));
+    assert_eq!(reordered.updated_at, active.updated_at);
+    assert_eq!(
+        reject_message(
+            app,
+            triage(
+                "thread.active.reorder",
+                "r2",
+                "T5",
+                json!({"orderKey": "  "})
+            )
+        )
+        .await,
+        "The order key can't be empty."
+    );
+
+    // Pin with a key; reorder; unpin; reorder after unpin is refused.
+    dispatch(
+        app,
+        triage("thread.pin", "p1", "T5", json!({"orderKey": "m"})),
+    )
+    .await
+    .unwrap();
+    let pinned = next_event(&mut events, "thread.pinned").await;
+    assert!(set(&pinned.pinned_at).is_some());
+    assert_eq!(set(&pinned.pin_order_key).as_deref(), Some("m"));
+    assert_eq!(
+        reject_message(
+            app,
+            triage(
+                "thread.active.reorder",
+                "r3",
+                "T5",
+                json!({"orderKey": "j"})
+            )
+        )
+        .await,
+        "This thread is not active, so it can't be reordered."
+    );
+    dispatch(
+        app,
+        triage("thread.pin.reorder", "pr1", "T5", json!({"orderKey": "n"})),
+    )
+    .await
+    .unwrap();
+    let moved = next_event(&mut events, "thread.pin-reordered").await;
+    assert_eq!(set(&moved.pin_order_key).as_deref(), Some("n"));
+    assert_eq!(set(&moved.pinned_at), set(&pinned.pinned_at));
+    let shell = shell_row(app, "T5").await;
+    assert_eq!(set(&shell.pin_order_key).as_deref(), Some("n"));
+    assert_eq!(set(&shell.active_order_key).as_deref(), Some("k"));
+    dispatch(app, triage("thread.unpin", "up1", "T5", json!({})))
+        .await
+        .unwrap();
+    let unpinned = next_event(&mut events, "thread.unpinned").await;
+    assert_eq!(set(&unpinned.pinned_at), None);
+    assert_eq!(set(&unpinned.pin_order_key), None);
+    assert_eq!(
+        reject_message(
+            app,
+            triage("thread.pin.reorder", "pr2", "T5", json!({"orderKey": "o"}))
+        )
+        .await,
+        "This thread is not pinned, so it can't be reordered."
+    );
+
+    // Settling clears the order keys; pinning a settled thread promotes it.
+    dispatch(app, triage("thread.settle", "s4", "T5", json!({})))
+        .await
+        .unwrap();
+    let settled = next_event(&mut events, "thread.settled").await;
+    assert_eq!(set(&settled.active_order_key), None);
+    assert_eq!(set(&settled.unsettled_at), None);
+    dispatch(app, triage("thread.pin", "p2", "T5", json!({})))
+        .await
+        .unwrap();
+    let promoted = next_event(&mut events, "thread.pinned").await;
+    assert_eq!(promoted.settled_override, Some(SettledOverride::Active));
+    assert_eq!(promoted.settled_at, None);
+    assert!(set(&promoted.pinned_at).is_some());
+    dispatch(app, triage("thread.unpin", "up2", "T5", json!({})))
+        .await
+        .unwrap();
+    next_event(&mut events, "thread.unpinned").await;
+
+    // Snooze: the wake time must be ahead.
+    assert_eq!(
+        reject_message(
+            app,
+            triage(
+                "thread.snooze",
+                "z2",
+                "T5",
+                json!({"snoozedUntil": "2000-01-01T00:00:00.000Z"})
+            )
+        )
+        .await,
+        "The snooze time is not in the future."
+    );
+    dispatch(
+        app,
+        triage(
+            "thread.snooze",
+            "z3",
+            "T5",
+            json!({"snoozedUntil": "2999-01-01T00:00:00Z"}),
+        ),
+    )
+    .await
+    .unwrap();
+    let snoozed = next_event(&mut events, "thread.snoozed").await;
+    assert_eq!(set(&snoozed.snoozed_until).as_deref(), Some(far));
+    assert!(set(&snoozed.snoozed_at).is_some());
+    assert_eq!(
+        set(&shell_row(app, "T5").await.snoozed_until).as_deref(),
+        Some(far)
+    );
+    // Pinning a snoozed thread wakes it.
+    dispatch(app, triage("thread.pin", "p3", "T5", json!({})))
+        .await
+        .unwrap();
+    let woke = next_event(&mut events, "thread.pinned").await;
+    assert_eq!(set(&woke.snoozed_until), None);
+    assert_eq!(set(&woke.snoozed_at), None);
+    assert!(set(&woke.last_snooze_wake_at).is_some());
+    dispatch(app, triage("thread.unpin", "up3", "T5", json!({})))
+        .await
+        .unwrap();
+    next_event(&mut events, "thread.unpinned").await;
+    // Unsnooze: wakes and records the wake; a second one changes nothing.
+    dispatch(
+        app,
+        triage("thread.snooze", "z4", "T5", json!({"snoozedUntil": far})),
+    )
+    .await
+    .unwrap();
+    next_event(&mut events, "thread.snoozed").await;
+    dispatch(
+        app,
+        triage("thread.unsnooze", "uz1", "T5", json!({"reason": "user"})),
+    )
+    .await
+    .unwrap();
+    let awake = next_event(&mut events, "thread.unsnoozed").await;
+    assert_eq!(set(&awake.snoozed_until), None);
+    assert!(set(&awake.last_snooze_wake_at) > set(&woke.last_snooze_wake_at));
+    dispatch(
+        app,
+        triage("thread.unsnooze", "uz2", "T5", json!({"reason": "user"})),
+    )
+    .await
+    .unwrap();
+    let still = next_event(&mut events, "thread.unsnoozed").await;
+    assert_eq!(still.last_snooze_wake_at, awake.last_snooze_wake_at);
+    assert_eq!(still.updated_at, awake.updated_at);
+
+    // Auto-settle opt-out keeps its first timestamp.
+    dispatch(
+        app,
+        triage(
+            "thread.auto-settle.set",
+            "as1",
+            "T5",
+            json!({"enabled": false}),
+        ),
+    )
+    .await
+    .unwrap();
+    let off = next_event(&mut events, "thread.auto-settle-set").await;
+    assert!(set(&off.auto_settle_disabled_at).is_some());
+    dispatch(
+        app,
+        triage(
+            "thread.auto-settle.set",
+            "as2",
+            "T5",
+            json!({"enabled": false}),
+        ),
+    )
+    .await
+    .unwrap();
+    let still_off = next_event(&mut events, "thread.auto-settle-set").await;
+    assert_eq!(
+        still_off.auto_settle_disabled_at,
+        off.auto_settle_disabled_at
+    );
+    assert_eq!(still_off.updated_at, off.updated_at);
+    dispatch(
+        app,
+        triage(
+            "thread.auto-settle.set",
+            "as3",
+            "T5",
+            json!({"enabled": true}),
+        ),
+    )
+    .await
+    .unwrap();
+    let on = next_event(&mut events, "thread.auto-settle-set").await;
+    assert_eq!(set(&on.auto_settle_disabled_at), None);
+
+    // Visit only moves forward and never moves updatedAt.
+    let visit = |command_id: &str, at: &str| {
+        triage(
+            "thread.visit",
+            command_id,
+            "T5",
+            json!({"visitedAt": at, "opened": true}),
+        )
+    };
+    dispatch(app, visit("v1", "2999-01-01T00:00:00.000Z"))
+        .await
+        .unwrap();
+    let visited = next_event(&mut events, "thread.visited").await;
+    assert_eq!(visited.last_visited_at.as_deref(), Some(far));
+    assert_eq!(visited.updated_at, on.updated_at);
+    dispatch(app, visit("v2", "2001-01-01T00:00:00.000Z"))
+        .await
+        .unwrap();
+    let not_back = next_event(&mut events, "thread.visited").await;
+    assert_eq!(not_back.last_visited_at.as_deref(), Some(far));
+    assert_eq!(
+        reject_message(app, visit("v3", "yesterday")).await,
+        "The visit time is not a valid timestamp."
+    );
+
+    // Mark unread: just before the latest completion; no updatedAt change.
+    dispatch(app, triage("thread.mark-unread", "mu1", "T5", json!({})))
+        .await
+        .unwrap();
+    let unread = next_event(&mut events, "thread.marked-unread").await;
+    assert_eq!(
+        unread.last_visited_at.as_deref().and_then(unix_ms_from_iso),
+        Some(completed - 1)
+    );
+    assert_eq!(unread.updated_at, on.updated_at);
+    assert_eq!(
+        shell_row(app, "T5").await.last_visited_at,
+        Some(unread.last_visited_at.clone())
+    );
+
+    // A sent message un-settles and wakes the thread.
+    dispatch(app, triage("thread.settle", "s5", "T5", json!({})))
+        .await
+        .unwrap();
+    next_event(&mut events, "thread.settled").await;
+    dispatch(
+        app,
+        triage("thread.snooze", "z5", "T5", json!({"snoozedUntil": far})),
+    )
+    .await
+    .unwrap();
+    next_event(&mut events, "thread.snoozed").await;
+    dispatch(app, message("T5", "m2", "back again", json!({})))
+        .await
+        .unwrap();
+    let woken = next_event(&mut events, "thread.unsnoozed").await;
+    assert_eq!(woken.settled_override, None);
+    assert_eq!(woken.settled_at, None);
+    assert!(set(&woken.unsettled_at).is_some());
+    assert_eq!(set(&woken.snoozed_until), None);
+    let shell = shell_row(app, "T5").await;
+    assert_eq!(shell.settled_override, None);
+    assert_eq!(set(&shell.snoozed_until), None);
+
+    // Archived threads refuse triage; idempotent replays keep their sequence.
+    let first = dispatch(app, triage("thread.archive", "ar", "T5", json!({})))
+        .await
+        .unwrap();
+    assert_eq!(
+        dispatch(app, triage("thread.archive", "ar", "T5", json!({})))
+            .await
+            .unwrap(),
+        first
+    );
+    assert_eq!(
+        reject_message(app, triage("thread.pin", "p4", "T5", json!({}))).await,
+        "This thread is archived."
+    );
+    assert_eq!(
+        reject_message(app, triage("thread.settle", "s6", "T5", json!({}))).await,
+        "This thread is archived."
+    );
+
+    env.app.shutdown().await;
+    let _ = std::fs::remove_dir_all(&env.data_dir);
+    let _ = std::fs::remove_dir_all(&env.project_dir);
+}
+
+#[tokio::test]
+async fn engine_app_auto_settle_sweep_and_persistence() {
+    let env = env("autosettle").await;
+    let app = &env.app;
+    let after = Duration::from_secs(3 * 24 * 60 * 60);
+    let after_ms = after.as_millis() as i64;
+
+    let quiet = finish(&env, "A1", "quiet").await;
+    finish(&env, "A2", "pinned").await;
+    dispatch(
+        app,
+        triage("thread.pin", "p", "A2", json!({"orderKey": "m"})),
+    )
+    .await
+    .unwrap();
+    finish(&env, "A3", "opted out").await;
+    dispatch(
+        app,
+        triage(
+            "thread.auto-settle.set",
+            "o",
+            "A3",
+            json!({"enabled": false}),
+        ),
+    )
+    .await
+    .unwrap();
+    finish(&env, "A4", "snoozed").await;
+    dispatch(
+        app,
+        triage(
+            "thread.snooze",
+            "z",
+            "A4",
+            json!({"snoozedUntil": "2999-01-01T00:00:00.000Z"}),
+        ),
+    )
+    .await
+    .unwrap();
+    let woke = finish(&env, "A5", "woke").await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    dispatch(
+        app,
+        triage(
+            "thread.snooze",
+            "z5",
+            "A5",
+            json!({"snoozedUntil": "2999-01-01T00:00:00.000Z"}),
+        ),
+    )
+    .await
+    .unwrap();
+    dispatch(
+        app,
+        triage("thread.unsnooze", "w5", "A5", json!({"reason": "user"})),
+    )
+    .await
+    .unwrap();
+    let wake =
+        unix_ms_from_iso(&set(&thread(app, "A5").await.last_snooze_wake_at).unwrap()).unwrap();
+    assert!(wake > woke);
+
+    // Nothing is due yet: inactivity must exceed `after`.
+    assert_eq!(app.auto_settle(quiet + after_ms, after).await, 0);
+
+    // Inactive for longer than `after`: A1 settles at its last activity;
+    // pinned, opted-out and snoozed threads stay. A5's wake restarted its
+    // timer.
+    let mut events = stream(
+        app,
+        "orchestration.subscribeThread",
+        json!({"threadId": "A1"}),
+    )
+    .await;
+    let now = woke + after_ms + 1;
+    assert!(wake > woke + 1);
+    assert_eq!(app.auto_settle(now, after).await, 1);
+    let settled = next_event(&mut events, "thread.settled").await;
+    assert_eq!(settled.settled_override, Some(SettledOverride::Settled));
+    assert_eq!(
+        settled.settled_at.as_deref().and_then(unix_ms_from_iso),
+        Some(quiet)
+    );
+    for id in ["A2", "A3", "A4", "A5"] {
+        assert_eq!(thread(app, id).await.settled_override, None, "{id}");
+    }
+    // A second sweep finds nothing new.
+    assert_eq!(app.auto_settle(now, after).await, 0);
+    let now = wake + after_ms + 1;
+    assert_eq!(app.auto_settle(now, after).await, 1);
+    assert_eq!(
+        thread(app, "A5")
+            .await
+            .settled_at
+            .as_deref()
+            .and_then(unix_ms_from_iso),
+        Some(wake)
+    );
+    // A user's unsettle wins over later sweeps.
+    dispatch(
+        app,
+        triage("thread.unsettle", "u", "A1", json!({"reason": "user"})),
+    )
+    .await
+    .unwrap();
+    assert_eq!(app.auto_settle(now + 30 * after_ms, after).await, 0);
+
+    // Every field survives a restart, in the projection and the shell.
+    let before: Vec<(AppThread, ThreadShell)> = {
+        let mut rows = Vec::new();
+        for id in ["A1", "A2", "A3", "A4", "A5"] {
+            rows.push((thread(app, id).await, shell_row(app, id).await));
+        }
+        rows
+    };
+    env.app.shutdown().await;
+    let app = open(&env.data_dir, &env.script).await;
+    for (thread_before, shell_before) in before {
+        let id = thread_before.id.clone();
+        assert_eq!(thread(&app, &id).await, thread_before, "{id}");
+        assert_eq!(shell_row(&app, &id).await, shell_before, "{id}");
+    }
+    let a1 = thread(&app, "A1").await;
+    assert_eq!(a1.settled_override, Some(SettledOverride::Active));
+    let a2 = thread(&app, "A2").await;
+    assert_eq!(set(&a2.pin_order_key).as_deref(), Some("m"));
+    assert!(set(&thread(&app, "A3").await.auto_settle_disabled_at).is_some());
+    assert!(set(&thread(&app, "A4").await.snoozed_until).is_some());
+    assert_eq!(
+        thread(&app, "A5").await.settled_override,
+        Some(SettledOverride::Settled)
+    );
+
     app.shutdown().await;
     let _ = std::fs::remove_dir_all(&env.data_dir);
     let _ = std::fs::remove_dir_all(&env.project_dir);

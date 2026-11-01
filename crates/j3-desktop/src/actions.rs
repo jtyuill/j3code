@@ -14,12 +14,22 @@ use crate::{services::Services, workspace::Workspace};
 
 /// Key context of the workspace root.
 pub const WORKSPACE: &str = "Workspace";
+/// Key context of the thread sidebar.
+pub const SIDEBAR: &str = "Sidebar";
+/// Key context of the settings view.
+pub const SETTINGS: &str = "Settings";
+/// Key context of the goto picker.
+pub const GOTO: &str = "GotoPicker";
 
 actions!(
     j3,
     [
         /// Quit, stopping the local server's omp sessions first.
         Quit,
+        /// Open (or close) Settings.
+        OpenSettings,
+        /// Leave Settings.
+        CloseSettings,
         /// Start a new thread in the selected project.
         NewThread,
         /// Add a project to the selected environment.
@@ -34,18 +44,28 @@ actions!(
         ArchiveThread,
         /// Delete the selected thread.
         DeleteThread,
-        /// Show the selected environment's archived threads.
+        /// Settle the open thread and move on to the next unsettled one (or
+        /// un-settle it if it is settled).
+        SettleThread,
+        /// Show archived threads (in Settings).
         ShowArchived,
+        /// Open the goto picker over every agent.
+        GotoAgent,
         /// Move keyboard focus to the composer.
         FocusComposer,
         /// Move keyboard focus to the sidebar.
         FocusSidebar,
-        /// Select the next thread in the sidebar.
+        /// Open the next thread of the sidebar.
         NextThread,
-        /// Select the previous thread in the sidebar.
+        /// Open the previous thread of the sidebar.
         PreviousThread,
     ]
 );
+
+/// Open the sidebar's Nth thread (1-based), as t3's `thread.jump.N`.
+#[derive(Clone, Debug, PartialEq, Eq, Action)]
+#[action(namespace = j3, no_json)]
+pub struct JumpToThread(pub usize);
 
 /// A binding written with GPUI's `secondary-` modifier: ⌘ on macOS, Ctrl
 /// elsewhere.
@@ -77,19 +97,26 @@ pub fn shortcut(keys: &str, cx: &App) -> String {
 pub fn init(cx: &mut App) {
     // Bindings first: `set_menus` bakes shortcuts in when it is called.
     let ws = Some(WORKSPACE);
-    let bindings = [
+    let mut bindings = vec![
         bind("secondary-q", Quit, None, cx),
+        bind("secondary-,", OpenSettings, ws, cx),
+        bind("escape", CloseSettings, Some(SETTINGS), cx),
         bind("secondary-n", NewThread, ws, cx),
         bind("secondary-o", AddProject, ws, cx),
         bind("secondary-.", StopRun, ws, cx),
         bind("secondary-shift-r", RenameThread, ws, cx),
         bind("secondary-shift-a", ArchiveThread, ws, cx),
         bind("secondary-shift-backspace", DeleteThread, ws, cx),
+        bind("secondary-shift-s", SettleThread, ws, cx),
+        bind("secondary-g", GotoAgent, ws, cx),
         bind("secondary-l", FocusComposer, ws, cx),
         bind("secondary-0", FocusSidebar, ws, cx),
-        bind("secondary-]", NextThread, ws, cx),
-        bind("secondary-[", PreviousThread, ws, cx),
+        bind("secondary-shift-]", NextThread, ws, cx),
+        bind("secondary-shift-[", PreviousThread, ws, cx),
+        bind("down", NextThread, Some(SIDEBAR), cx),
+        bind("up", PreviousThread, Some(SIDEBAR), cx),
     ];
+    bindings.extend((1..=9).map(|n| bind(&format!("secondary-{n}"), JumpToThread(n), ws, cx)));
     cx.bind_keys(bindings);
     cx.on_action(|_: &Quit, cx| quit(cx));
     cx.on_window_closed(|cx, _| {
@@ -99,7 +126,11 @@ pub fn init(cx: &mut App) {
     })
     .detach();
     cx.set_menus([
-        Menu::new("j3").items([MenuItem::action("Quit j3", Quit)]),
+        Menu::new("j3").items([
+            MenuItem::action("Settings…", OpenSettings),
+            MenuItem::separator(),
+            MenuItem::action("Quit j3", Quit),
+        ]),
         Menu::new("File").items([
             MenuItem::action("New Thread", NewThread),
             MenuItem::action("Add Project…", AddProject),
@@ -117,11 +148,13 @@ pub fn init(cx: &mut App) {
             MenuItem::os_action("Select All", SelectAll, OsAction::SelectAll),
         ]),
         Menu::new("Thread").items([
+            MenuItem::action("Settle", SettleThread),
             MenuItem::action("Stop", StopRun),
             MenuItem::action("Rename…", RenameThread),
             MenuItem::action("Archive", ArchiveThread),
             MenuItem::action("Delete…", DeleteThread),
             MenuItem::separator(),
+            MenuItem::action("Go to Agent…", GotoAgent),
             MenuItem::action("Next Thread", NextThread),
             MenuItem::action("Previous Thread", PreviousThread),
         ]),

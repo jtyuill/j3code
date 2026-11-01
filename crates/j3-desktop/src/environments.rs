@@ -1,6 +1,6 @@
-//! Remote environments the desktop connects to, persisted in
-//! `<config dir>/j3/desktop.json`. The local environment (the in-process
-//! server) is implicit and never stored.
+//! `<config dir>/j3/desktop.json`: the remote environments the desktop
+//! connects to and its UI preferences. The local environment (the
+//! in-process server) is implicit and never stored.
 
 use std::{
     fs, io,
@@ -10,6 +10,8 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use j3_core::serve::DEFAULT_PORT;
+
+use crate::ui_settings::UiSettings;
 
 /// One remote j3 server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -22,6 +24,9 @@ pub struct RemoteEnvironment {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DesktopConfig {
     pub environments: Vec<RemoteEnvironment>,
+    /// Absent in files from before the preferences existed.
+    #[serde(default)]
+    pub ui: UiSettings,
 }
 
 /// The always-on agent host every desktop connects to by default.
@@ -41,7 +46,10 @@ impl DesktopConfig {
                 url: format!("http://{DEFAULT_REMOTE}:{DEFAULT_PORT}"),
             }]
         };
-        Self { environments }
+        Self {
+            environments,
+            ui: UiSettings::default(),
+        }
     }
 }
 
@@ -283,9 +291,10 @@ mod tests {
         assert_eq!(created, DesktopConfig::default_for_host("revolver"));
         let on_disk: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(
-            on_disk,
-            serde_json::json!({"environments":[{"label":"shieldy","url":"http://shieldy:3780"}]})
+            on_disk["environments"],
+            serde_json::json!([{"label":"shieldy","url":"http://shieldy:3780"}])
         );
+        assert_eq!(on_disk["ui"]["workflow"], "t3");
 
         let mut changed = created;
         changed.add("revived", "revived").unwrap();
@@ -301,5 +310,12 @@ mod tests {
             Err(ConfigError::Parse { .. })
         ));
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn files_without_ui_preferences_load_with_defaults() {
+        let config: DesktopConfig =
+            serde_json::from_value(serde_json::json!({"environments": []})).unwrap();
+        assert_eq!(config.ui, UiSettings::default());
     }
 }

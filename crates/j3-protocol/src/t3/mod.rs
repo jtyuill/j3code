@@ -33,6 +33,7 @@ pub mod server;
 pub mod thread_search;
 
 use time::format_description::FormatItem;
+use time::format_description::well_known::Rfc3339;
 use time::macros::format_description;
 use time::{OffsetDateTime, PrimitiveDateTime};
 
@@ -62,6 +63,13 @@ pub fn iso_from_unix_ms(ms: i64) -> String {
         },
     );
     format_iso(at)
+}
+
+/// Epoch milliseconds of an ISO-8601 / RFC 3339 timestamp (any offset), or
+/// `None` when it does not parse.
+pub fn unix_ms_from_iso(iso: &str) -> Option<i64> {
+    let at = OffsetDateTime::parse(iso, &Rfc3339).ok()?;
+    i64::try_from(at.unix_timestamp_nanos().div_euclid(1_000_000)).ok()
 }
 
 macros::json_literal! {

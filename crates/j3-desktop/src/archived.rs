@@ -1,7 +1,8 @@
-//! An environment's archived threads, with unarchive and delete.
+//! An environment's archived threads, with unarchive and delete; shown in
+//! Settings under the environment's name.
 
 use gpui_kit::component::{
-    ActiveTheme as _, IconName, Sizable as _, StyledExt as _, WindowExt as _,
+    ActiveTheme as _, IconName, Sizable as _, WindowExt as _,
     button::{Button, ButtonVariant, ButtonVariants as _},
     h_flex,
     spinner::Spinner,
@@ -10,8 +11,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, Context, Entity, EventEmitter, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Window,
-    div, rems,
+    ParentElement as _, Render, SharedString, Styled as _, Window, div, rems,
 };
 use j3_client::t3::methods::ArchivedShellSnapshot;
 use time::OffsetDateTime;
@@ -46,10 +46,6 @@ impl ArchivedView {
         };
         view.reload(cx);
         view
-    }
-
-    pub fn environment(&self) -> &Entity<Environment> {
-        &self.environment
     }
 
     fn reload(&mut self, cx: &mut Context<Self>) {
@@ -131,10 +127,9 @@ impl ArchivedView {
         let theme = cx.theme();
         if snapshot.threads.is_empty() {
             return div()
-                .p_4()
                 .text_sm()
                 .text_color(theme.muted_foreground)
-                .child("No archived threads.")
+                .child("No archived threads")
                 .into_any_element();
         }
         let now = OffsetDateTime::now_utc();
@@ -160,10 +155,7 @@ impl ArchivedView {
                 h_flex()
                     .id(SharedString::from(format!("archived-{}", thread.id)))
                     .gap_2()
-                    .px_3()
-                    .py_1p5()
-                    .border_b_1()
-                    .border_color(theme.border)
+                    .py_1()
                     .child(div().flex_1().min_w_0().truncate().text_sm().child(title))
                     .child(
                         div()
@@ -209,11 +201,9 @@ impl ArchivedView {
 
 impl Render for ArchivedView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let label = self.environment.read(cx).label().clone();
         let body = match &self.listing {
-            Listing::Loading => div().p_4().child(Spinner::new()).into_any_element(),
+            Listing::Loading => Spinner::new().small().into_any_element(),
             Listing::Failed(error) => div()
-                .p_4()
                 .text_sm()
                 .text_color(cx.theme().danger)
                 .child(format!("Couldn’t load archived threads: {error}"))
@@ -225,41 +215,15 @@ impl Render for ArchivedView {
         };
         let theme = cx.theme();
         v_flex()
-            .size_full()
-            .bg(theme.background)
-            .child(
-                h_flex()
-                    .flex_shrink_0()
-                    .h_10()
-                    .px_4()
-                    .gap_2()
-                    .border_b_1()
-                    .border_color(theme.border)
-                    .child(div().font_medium().text_sm().child("Archived threads"))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(label),
-                    ),
-            )
+            .id(SharedString::from(format!(
+                "archived-{}",
+                self.environment.read(cx).key()
+            )))
+            .w_full()
+            .gap_2()
             .when_some(self.error.clone(), |this, error| {
-                this.child(
-                    div()
-                        .px_4()
-                        .py_2()
-                        .text_xs()
-                        .text_color(theme.danger)
-                        .child(error),
-                )
+                this.child(div().text_xs().text_color(theme.danger).child(error))
             })
-            .child(
-                div()
-                    .id("archived-list")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .child(body),
-            )
+            .child(body)
     }
 }

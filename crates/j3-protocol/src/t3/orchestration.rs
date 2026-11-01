@@ -1718,7 +1718,7 @@ pub struct ProjectedTurnItem {
 // ---------------------------------------------------------------------------
 
 open_union! {
-    /// `type` + `payload` of a [`DomainEvent`] (`OV2:1851-1994`). The 21 types
+    /// `type` + `payload` of a [`DomainEvent`] (`OV2:1851-1994`). The 32 types
     /// j3 emits are typed; every other type is `Unknown` holding `type`,
     /// `payload` and any other non-base keys.
     pub enum DomainEventBody {
@@ -1732,6 +1732,17 @@ open_union! {
             "thread.runtime-mode-updated" => ThreadRuntimeModeUpdated(AppThread),
             "thread.interaction-mode-updated" => ThreadInteractionModeUpdated(AppThread),
             "thread.model-selection-updated" => ThreadModelSelectionUpdated(AppThread),
+            "thread.settled" => ThreadSettled(AppThread),
+            "thread.unsettled" => ThreadUnsettled(AppThread),
+            "thread.snoozed" => ThreadSnoozed(AppThread),
+            "thread.unsnoozed" => ThreadUnsnoozed(AppThread),
+            "thread.pinned" => ThreadPinned(AppThread),
+            "thread.auto-settle-set" => ThreadAutoSettleSet(AppThread),
+            "thread.unpinned" => ThreadUnpinned(AppThread),
+            "thread.pin-reordered" => ThreadPinReordered(AppThread),
+            "thread.active-reordered" => ThreadActiveReordered(AppThread),
+            "thread.visited" => ThreadVisited(AppThread),
+            "thread.marked-unread" => ThreadMarkedUnread(AppThread),
             "run.created" => RunCreated(Run),
             "run.updated" => RunUpdated(Run),
             "run-attempt.created" => RunAttemptCreated(RunAttempt),

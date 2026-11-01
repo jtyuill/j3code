@@ -7,10 +7,7 @@ use std::collections::BTreeMap;
 
 use j3_protocol::t3::{
     environment::ExecutionEnvironmentDescriptor,
-    orchestration::{
-        ActivityRunStatus, RuntimeRequestKind, ShellLocation, ShellStreamItem, ShellThreadStatus,
-        ThreadRelationship, ThreadShell,
-    },
+    orchestration::{ShellLocation, ShellStreamItem, ThreadRelationship, ThreadShell},
     project::ProjectShell,
     server::{
         ServerConfig, ServerConfigStreamEvent, ServerProviderSkill, ServerProviderSlashCommand,
@@ -212,50 +209,5 @@ pub(crate) fn apply_config(config: &mut Option<ServerConfig>, event: ServerConfi
         ServerConfigStreamEvent::EnvironmentThemesUpdated(_)
         | ServerConfigStreamEvent::UsageLimitSourcesUpdated(_)
         | ServerConfigStreamEvent::Unknown(_) => {}
-    }
-}
-
-/// A thread row's state for a list badge.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ThreadActivity {
-    Running,
-    WaitingForInput,
-    Error,
-    Idle,
-}
-
-impl ThreadActivity {
-    /// Like t3's list model: a pending `user_input` request waits for input;
-    /// otherwise `activityRunStatus ?? status` decides.
-    pub fn of(thread: &ThreadShell) -> Self {
-        if thread
-            .pending_runtime_request
-            .as_ref()
-            .is_some_and(|request| request.kind == RuntimeRequestKind::UserInput)
-        {
-            return Self::WaitingForInput;
-        }
-        if let Some(Some(
-            ActivityRunStatus::Preparing
-            | ActivityRunStatus::Starting
-            | ActivityRunStatus::Running
-            | ActivityRunStatus::Waiting,
-        )) = thread.activity_run_status
-        {
-            return Self::Running;
-        }
-        match thread.status {
-            ShellThreadStatus::Preparing
-            | ShellThreadStatus::Queued
-            | ShellThreadStatus::Starting
-            | ShellThreadStatus::Running
-            | ShellThreadStatus::Waiting => Self::Running,
-            ShellThreadStatus::Failed => Self::Error,
-            ShellThreadStatus::Idle
-            | ShellThreadStatus::Completed
-            | ShellThreadStatus::Interrupted
-            | ShellThreadStatus::Cancelled
-            | ShellThreadStatus::RolledBack => Self::Idle,
-        }
     }
 }

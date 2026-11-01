@@ -1,7 +1,7 @@
 //! `j3-client` against a real in-process `j3_core` server on an ephemeral port
 //! with a scripted omp session: handshake, projects, launch + streaming,
 //! questions, queue/steer/interrupt, reconnect after a dropped socket, image
-//! upload, workspace commands.
+//! upload, workspace commands, the settle workflow calls.
 
 use std::{
     collections::BTreeMap,
@@ -19,10 +19,11 @@ use j3_client::{
     t3::{
         model::ModelSelection,
         orchestration::{
-            ProviderGoalStatus, RunStatus, SubagentStatus, TurnItemKind, TurnItemStatus,
-            UserMessageInputIntent,
+            ProviderGoalStatus, RunStatus, SettledOverride, SubagentStatus, ThreadShell,
+            TurnItemKind, TurnItemStatus, UserMessageInputIntent,
         },
     },
+    workflow::{self, AgentStatus, T3Section, ThreadStatus},
 };
 use j3_core::{
     app::{App, AppConfig},
@@ -630,9 +631,9 @@ async fn launch_streams_text_and_answers_questions() {
     // The thread shows up in the shell as running.
     let mut shell = connection.state();
     let shell_state = wait_state(&mut shell, "the thread in the shell", |s| {
-        s.shell.thread(&thread_id).is_some_and(|thread| {
-            j3_client::ThreadActivity::of(thread) == j3_client::ThreadActivity::Running
-        })
+        s.shell
+            .thread(&thread_id)
+            .is_some_and(|thread| workflow::thread_status(thread) == ThreadStatus::Working)
     })
     .await;
     assert_eq!(shell_state.shell.threads_of(&project_id).len(), 1);
@@ -694,9 +695,9 @@ async fn launch_streams_text_and_answers_questions() {
     assert_eq!(asked.active_run().unwrap().status, RunStatus::Waiting);
     let mut shell_rx = connection.state();
     wait_state(&mut shell_rx, "waiting for input in the shell", |s| {
-        s.shell.thread(&thread_id).is_some_and(|thread| {
-            j3_client::ThreadActivity::of(thread) == j3_client::ThreadActivity::WaitingForInput
-        })
+        s.shell
+            .thread(&thread_id)
+            .is_some_and(|thread| workflow::thread_status(thread) == ThreadStatus::Input)
     })
     .await;
 
@@ -1159,9 +1160,10 @@ async fn reconnects_after_the_socket_drops() {
     assert!(caught_up.sequence > before);
     let shell = connection.state().borrow().clone();
     assert!(
-        shell.shell.thread(&thread_id).is_some_and(
-            |thread| j3_client::ThreadActivity::of(thread) == j3_client::ThreadActivity::Idle
-        )
+        shell
+            .shell
+            .thread(&thread_id)
+            .is_some_and(|thread| workflow::thread_status(thread) == ThreadStatus::Ready)
     );
 
     // Calls work on the new socket.
@@ -1235,6 +1237,199 @@ async fn uploads_an_image_and_serves_it() {
     let loaded = wait_state(&mut state, "the thread", |s| !s.feed().is_empty()).await;
     assert!(matches!(&loaded.feed()[0].item.kind,
         TurnItemKind::UserMessage(m) if m.attachments == vec![attachment.clone()]));
+
+    server.stop().await;
+}
+
+/// The shell row of `thread_id` once `check` holds.
+async fn wait_row(
+    connection: &Connection,
+    thread_id: &str,
+    what: &str,
+    check: impl Fn(&ThreadShell) -> bool,
+) -> ThreadShell {
+    let mut shell = connection.state();
+    let state = wait_state(&mut shell, what, |s| {
+        s.shell.thread(thread_id).is_some_and(&check)
+    })
+    .await;
+    state.shell.thread(thread_id).unwrap().clone()
+}
+
+fn rejected(error: &Error) -> bool {
+    matches!(error, Error::Rejected { tag, .. } if tag.as_deref() == Some("OrchestrationV2DispatchCommandError"))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn settle_workflow_calls() {
+    let server = TestServer::start("settle").await;
+    let connection = Connection::open(server.url(), tokio::runtime::Handle::current());
+    live(&connection).await;
+    let project_id = project(&connection, &server).await;
+    let (thread_id, mut state, _handle) =
+        launch_running(&connection, &server, &project_id, "Settle me").await;
+    let now = time::OffsetDateTime::now_utc;
+
+    // Working, then Done: the first message stamped a visit before the run
+    // completed, so the completion is unread.
+    let row = wait_row(&connection, &thread_id, "the running row", |row| {
+        workflow::agent_status(row) == AgentStatus::Working
+    })
+    .await;
+    assert_eq!(workflow::thread_status(&row), ThreadStatus::Working);
+    assert!(workflow::working_started_at(&row).is_some());
+    server.script.settle("completed");
+    wait_state(&mut state, "the run completed", |s| {
+        s.active_run().is_none()
+    })
+    .await;
+    let row = wait_row(&connection, &thread_id, "an unread completion", |row| {
+        workflow::agent_status(row) == AgentStatus::Done
+    })
+    .await;
+    assert!(workflow::has_unseen_completion(&row));
+    assert_eq!(workflow::thread_status(&row).label(true), Some("Done"));
+    assert_eq!(
+        workflow::t3_section(&row, now(), true),
+        Some(T3Section::Active)
+    );
+
+    // Visiting reads it; mark-unread brings it back.
+    connection.visit(&thread_id).await.unwrap();
+    wait_row(&connection, &thread_id, "the completion seen", |row| {
+        workflow::agent_status(row) == AgentStatus::Idle
+    })
+    .await;
+    connection.mark_unread(&thread_id).await.unwrap();
+    wait_row(&connection, &thread_id, "unread again", |row| {
+        workflow::has_unseen_completion(row)
+    })
+    .await;
+
+    // Pin at a key, reorder it; Active reorders are refused while pinned.
+    connection.pin(&thread_id, Some("m")).await.unwrap();
+    let row = wait_row(&connection, &thread_id, "the pin", |row| {
+        row.pin_order_key == Some(Some("m".into()))
+    })
+    .await;
+    assert_eq!(
+        workflow::t3_section(&row, now(), true),
+        Some(T3Section::Pinned)
+    );
+    connection.reorder_pinned(&thread_id, "g").await.unwrap();
+    wait_row(&connection, &thread_id, "the pin reorder", |row| {
+        row.pin_order_key == Some(Some("g".into()))
+    })
+    .await;
+    let error = connection
+        .reorder_active(&thread_id, "t")
+        .await
+        .unwrap_err();
+    assert!(rejected(&error), "{error:?}");
+    connection.unpin(&thread_id).await.unwrap();
+    let row = wait_row(&connection, &thread_id, "the unpin", |row| {
+        row.pinned_at.clone().flatten().is_none()
+    })
+    .await;
+    assert_eq!(row.pin_order_key.clone().flatten(), None);
+    connection.reorder_active(&thread_id, "t").await.unwrap();
+    wait_row(&connection, &thread_id, "the active reorder", |row| {
+        row.active_order_key == Some(Some("t".into()))
+    })
+    .await;
+
+    // Settle drops the order key; unsettle reopens it.
+    connection.settle(&thread_id).await.unwrap();
+    let row = wait_row(&connection, &thread_id, "settled", |row| {
+        workflow::t3_section(row, now(), true) == Some(T3Section::Settled)
+    })
+    .await;
+    assert!(row.settled_at.is_some());
+    assert_eq!(row.active_order_key.clone().flatten(), None);
+    assert_eq!(
+        workflow::settled_timestamp(&row),
+        row.settled_at.as_deref().map(|at| {
+            time::OffsetDateTime::parse(at, &time::format_description::well_known::Rfc3339).unwrap()
+        })
+    );
+    connection.unsettle(&thread_id).await.unwrap();
+    let row = wait_row(&connection, &thread_id, "unsettled", |row| {
+        row.settled_override == Some(SettledOverride::Active)
+    })
+    .await;
+    assert!(row.unsettled_at.clone().flatten().is_some());
+    assert_eq!(
+        workflow::t3_section(&row, now(), true),
+        Some(T3Section::Active)
+    );
+
+    // Snooze: the past is refused; a future wake hides it; unsnooze wakes it.
+    assert!(workflow::can_snooze(&row, now()));
+    let error = connection
+        .snooze(&thread_id, now() - time::Duration::minutes(1))
+        .await
+        .unwrap_err();
+    assert!(rejected(&error), "{error:?}");
+    let presets = workflow::resolve_snooze_presets(now(), &workflow::TimeZone::UTC);
+    let wake = presets[0].snoozed_until;
+    connection.snooze(&thread_id, wake).await.unwrap();
+    let row = wait_row(&connection, &thread_id, "snoozed", |row| {
+        workflow::effective_snoozed(row, now())
+    })
+    .await;
+    assert_eq!(
+        workflow::t3_section(&row, now(), true),
+        Some(T3Section::Snoozed)
+    );
+    assert_eq!(
+        workflow::next_snooze_wake_after([&row], now()),
+        Some(
+            wake.replace_nanosecond(wake.millisecond() as u32 * 1_000_000)
+                .unwrap()
+        )
+    );
+    connection.unsnooze(&thread_id).await.unwrap();
+    wait_row(&connection, &thread_id, "awake", |row| {
+        row.snoozed_until.clone().flatten().is_none()
+    })
+    .await;
+
+    // The per-thread auto-settle opt-out.
+    connection.set_auto_settle(&thread_id, false).await.unwrap();
+    wait_row(&connection, &thread_id, "auto-settle off", |row| {
+        row.auto_settle_disabled_at.clone().flatten().is_some()
+    })
+    .await;
+    connection.set_auto_settle(&thread_id, true).await.unwrap();
+    wait_row(&connection, &thread_id, "auto-settle on", |row| {
+        row.auto_settle_disabled_at.clone().flatten().is_none()
+    })
+    .await;
+
+    // A real message reopens a settled thread.
+    connection.settle(&thread_id).await.unwrap();
+    wait_row(&connection, &thread_id, "settled again", |row| {
+        row.settled_override == Some(SettledOverride::Settled)
+    })
+    .await;
+    connection
+        .send(
+            &thread_id,
+            "Back to work",
+            Vec::new(),
+            None,
+            SendMode::Start,
+        )
+        .await
+        .unwrap();
+    let row = wait_row(&connection, &thread_id, "auto-unsettled", |row| {
+        row.settled_override.is_none()
+    })
+    .await;
+    assert_ne!(
+        workflow::t3_section(&row, now(), false),
+        Some(T3Section::Settled)
+    );
 
     server.stop().await;
 }

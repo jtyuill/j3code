@@ -15,6 +15,13 @@ Everything the server sends uses shapes the t3 contracts already define. `packag
 
 Verified with `tests/conformance` (37/37 against a server with these changes). A one-off contracts client then ran one real omp subagent and a real goal create/pause on the same server and decoded `subscribeThread` and `subscribeShell` through the contracts' RPC client: no `unknown-event`; every `subagent.updated` and `subagent` item, the snapshot's `subagents` and `providerThreads[].goal`, and the shell row's `goal` all came through typed.
 
+t3's thread triage (settle, snooze, pin, reorder, mark-unread, visit, auto-settle) is **not** an extension. j3 implements t3's commands, events and fields unchanged (`ios-surface.md` §3.5), so t3 clients need no changes. Server: `crates/j3-core/src/engine/model/triage.rs`. Client: `j3_client::Connection`. Where j3 differs from t3:
+
+- Auto-settle uses t3's defaults only: 3 days without activity, swept at startup and every 5 minutes. There are no pull-request rules, no server settings and no per-project scope, so j3 does not advertise `threadAutoSettlementScope`.
+- `thread.visit` moves the read watermark but does not record `opens` (t3 uses them only to rank search results).
+- Every j3 runtime request blocks, and j3 has no automatic queued messages (notifications, delegated completions). So `thread.settle` refuses any pending request or queued message instead of cancelling the non-blocking ones, and every sent message wakes a snoozed thread.
+- When one commit makes several thread changes (a sent message that un-settles and wakes the thread), it emits one thread event, not one per change. Its payload is the final thread.
+
 ## omp settings
 
 - `goal.enabled` (default `true`): goal mode and the hidden `goal` tool. With it off, `j3.goal.create` fails with omp's message.

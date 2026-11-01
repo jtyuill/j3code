@@ -50,7 +50,10 @@ use crate::{
     catalog::Catalog,
     engine::{
         actor::{self, ActorConfig, Request, ThreadHandle},
-        model::{NewThread, Reject, ThreadModel, UserInput},
+        model::{
+            NewThread, Reject, ThreadModel, UserInput,
+            triage::{self, DAY_MS},
+        },
         projection::Projection,
         session::{OmpFactory, SessionFactory},
         streams::{self, SnapshotFn},
@@ -69,6 +72,11 @@ const COALESCE: Duration = Duration::from_millis(50);
 /// How long the config handshake waits for the model list before sending
 /// a provider that is still loading.
 const CONFIG_WAIT: Duration = Duration::from_secs(8);
+/// Threads inactive this long settle automatically (t3's default
+/// `sidebarAutoSettleAfterDays`, `contracts/src/settings.ts:85`).
+const AUTO_SETTLE_AFTER_MS: i64 = 3 * DAY_MS;
+/// How often the auto-settle sweep runs (also once at startup).
+const AUTO_SETTLE_EVERY: Duration = Duration::from_secs(5 * 60);
 
 pub struct AppConfig {
     /// `j3.sqlite`, `attachments/`, `logs/`.
@@ -175,6 +183,14 @@ fn descriptor(environment_id: &str, label: &str) -> Value {
             "attachmentUploads": true,
             "threadStop": true,
             "providerWorkspaceSnapshotsOnDemand": true,
+            "threadSettlement": true,
+            "threadAutoSettlement": true,
+            "threadSnooze": true,
+            "threadPinning": true,
+            "threadPinReorder": true,
+            "threadActiveReorder": true,
+            "threadAutoSettleOptOut": true,
+            "threadVisitedTracking": true,
         },
     }))
     .expect("descriptor matches ExecutionEnvironmentDescriptor");
@@ -252,8 +268,9 @@ fn stored_project_shells(store: &Store) -> Result<Vec<ProjectShell>, store::Erro
 }
 
 impl App {
-    /// Opens the data directory, recovers interrupted threads and starts
-    /// loading the omp model catalog in the background.
+    /// Opens the data directory, recovers interrupted threads, starts
+    /// loading the omp model catalog in the background and runs the
+    /// auto-settle sweep now and every [`AUTO_SETTLE_EVERY`].
     pub async fn open(config: AppConfig) -> Result<Arc<App>, Error> {
         let factory = Arc::new(OmpFactory(config.omp.clone()));
         let app = Self::open_with(config, factory, IDLE_TIMEOUT).await?;
@@ -261,11 +278,26 @@ impl App {
         tokio::spawn(async move {
             catalog.provider().await;
         });
+        let inner = Arc::downgrade(&app.inner);
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(AUTO_SETTLE_EVERY);
+            every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                every.tick().await;
+                let Some(inner) = inner.upgrade() else {
+                    break;
+                };
+                inner
+                    .auto_settle(triage::now_ms(), AUTO_SETTLE_AFTER_MS)
+                    .await;
+            }
+        });
         Ok(app)
     }
 
     /// [`App::open`] with a custom session factory and idle timeout (tests,
-    /// embedding). Does not preload the catalog.
+    /// embedding). Does not preload the catalog or run the auto-settle sweep
+    /// (see [`App::auto_settle`]).
     pub async fn open_with(
         config: AppConfig,
         factory: Arc<dyn SessionFactory>,
@@ -313,6 +345,14 @@ impl App {
     /// `ExecutionEnvironmentDescriptor` JSON (static for the process).
     pub fn descriptor(&self) -> Value {
         self.inner.descriptor.clone()
+    }
+
+    /// One auto-settle sweep as of `now_ms` (epoch ms): settles every thread
+    /// t3 would settle automatically after `inactive_for` without activity.
+    /// Returns how many it settled.
+    pub async fn auto_settle(&self, now_ms: i64, inactive_for: Duration) -> usize {
+        let after_ms = i64::try_from(inactive_for.as_millis()).unwrap_or(i64::MAX);
+        self.inner.auto_settle(now_ms, after_ms).await
     }
 
     pub fn attachments(&self) -> Arc<AttachmentStore> {
@@ -436,6 +476,55 @@ impl Inner {
                 .remove(thread_id);
         }
         Err(ThreadError::NotFound)
+    }
+
+    /// The auto-settle sweep (t3 `ThreadSettlementService`, without pull
+    /// requests). Stored shells pick the threads that look due; each one's
+    /// actor decides again on its live state (and the snooze wake time the
+    /// shell lacks) and settles it with a `server:auto-settle:<id>:<snapshot>`
+    /// receipt, so user changes after the snapshot win.
+    async fn auto_settle(&self, now_ms: i64, after_ms: i64) -> usize {
+        let rows = match self.hub.read(|store| store.threads()) {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::error!(%error, "reading threads to auto-settle");
+                return 0;
+            }
+        };
+        let mut settled = 0;
+        for row in rows {
+            if row.archived || row.deleted {
+                continue;
+            }
+            let Ok(shell) = serde_json::from_value::<ThreadShell>(row.shell) else {
+                continue;
+            };
+            // The snooze wake time only delays settlement, so a thread that
+            // isn't due without it isn't due at all.
+            if triage::auto_settlement_at(&shell, None, now_ms, after_ms).is_none() {
+                continue;
+            }
+            let snapshot_at = shell.updated_at;
+            let result = self
+                .ask(&row.id, |reply| Request::AutoSettle {
+                    now_ms,
+                    after_ms,
+                    snapshot_at: snapshot_at.clone(),
+                    reply,
+                })
+                .await;
+            match result {
+                Ok(Ok(Some(_))) => settled += 1,
+                Ok(Ok(None)) | Err(ThreadError::NotFound) => {}
+                Ok(Err(Reject(message))) => {
+                    tracing::debug!(thread = %row.id, message, "automatic settlement skipped");
+                }
+                Err(ThreadError::Store(error)) => {
+                    tracing::warn!(%error, thread = %row.id, "loading thread to auto-settle");
+                }
+            }
+        }
+        settled
     }
 
     // -----------------------------------------------------------------------
@@ -769,11 +858,6 @@ impl Inner {
                 &command_type,
                 "This action isn't supported by this server.",
             );
-        }
-        if command.is_no_op() || matches!(command, OrchestrationV2Command::ThreadVisit(_)) {
-            return Response::ok(to_value(&DispatchCommandResult {
-                sequence: self.hub.high_water(),
-            }));
         }
         if let Ok(Some(receipt)) = self.hub.read(|store| store.receipt(&command_id)) {
             let sequence = receipt.get("sequence").and_then(Value::as_u64).unwrap_or(0);

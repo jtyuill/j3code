@@ -1,128 +1,124 @@
-//! The navigation sidebar: environments → projects → threads, as one tree
-//! with keyboard navigation, per-row actions and context menus.
+//! The thread sidebar, in the workflow the preferences choose:
+//!
+//! - **T3** ([`t3`]): t3code's settle workflow. One list across
+//!   environments: Pinned and Active at the top; the Working, Snoozed and
+//!   Settled shelves anchored at the bottom.
+//! - **herdr** ([`herdr`]): herdr's agent workflow. Spaces (projects) with
+//!   their rolled-up attention, then every agent (thread) with its state.
+//!
+//! The sidebar owns presentation and navigation order; thread commands are
+//! requests the workspace carries out.
 
-use std::{
-    collections::{HashMap, HashSet},
-    rc::Rc,
-};
+mod herdr;
+mod t3;
 
-use gpui_kit::component::{
-    ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt as _,
-    button::{Button, ButtonVariants as _},
-    h_flex,
-    list::ListItem,
-    menu::{PopupMenu, PopupMenuItem},
-    spinner::Spinner,
-    tooltip::Tooltip,
-    tree::{Tree, TreeEntry, TreeEvent, TreeItem, TreeState},
-    v_flex,
-};
-use gpui_kit::prelude::FluentBuilder as _;
+use std::{rc::Rc, sync::Arc, time::Duration};
+
+use gpui_kit::component::{ActiveTheme as _, v_flex};
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, EventEmitter, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, ScrollStrategy, SharedString, StatefulInteractiveElement as _,
-    Styled as _, Subscription, WeakEntity, Window, div, rems,
+    App, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement as _,
+    IntoElement, ParentElement as _, Render, SharedString, Styled as _, Subscription, Task,
+    TestSupportExt as _, Window,
 };
-use j3_client::ThreadActivity;
-use time::OffsetDateTime;
+use j3_client::ConnectionState;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::{
+    actions::SIDEBAR,
     environment::{Environment, distinct_environments},
-    feed::relative_age,
+    preferences::Preferences,
+    ui_settings::Workflow,
 };
+
+pub use herdr::{HerdrRows, glyph as herdr_glyph};
+pub use t3::T3Rows;
+
+/// One thread, across environments.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ThreadKey {
+    pub env: SharedString,
+    pub thread_id: String,
+}
+
+impl ThreadKey {
+    pub fn new(env: impl Into<SharedString>, thread_id: impl Into<String>) -> Self {
+        Self {
+            env: env.into(),
+            thread_id: thread_id.into(),
+        }
+    }
+
+    /// A stable element id for this thread's control `part`.
+    pub fn element_id(&self, part: &str) -> SharedString {
+        format!("{part}-{}-{}", self.env, self.thread_id).into()
+    }
+}
+
+/// A project, across environments.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ProjectKey {
+    pub env: SharedString,
+    pub project_id: String,
+}
+
+/// One thread mutation (t3's sidebar commands).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThreadCommand {
+    Settle,
+    Unsettle,
+    Snooze(OffsetDateTime),
+    Wake,
+    Pin(Option<String>),
+    Unpin,
+    ReorderPinned(String),
+    ReorderActive(String),
+    MarkUnread,
+    AutoSettle(bool),
+}
 
 /// A request from the sidebar; the workspace carries it out.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SidebarEvent {
-    OpenThread {
-        env: SharedString,
-        thread_id: String,
-    },
-    NewThread {
-        env: SharedString,
-        project_id: String,
-    },
-    AddProject {
-        env: SharedString,
-    },
-    RenameThread {
-        env: SharedString,
-        thread_id: String,
-    },
-    ArchiveThread {
-        env: SharedString,
-        thread_id: String,
-    },
-    DeleteThread {
-        env: SharedString,
-        thread_id: String,
-    },
-    DeleteProject {
-        env: SharedString,
-        project_id: String,
-    },
-    ShowArchived {
-        env: SharedString,
-    },
-    RemoveEnvironment {
-        env: SharedString,
-    },
-    AddEnvironment,
+    OpenThread(ThreadKey),
+    /// The new-thread composer, preset to a project when one is given.
+    NewThread(Option<ProjectKey>),
+    /// Commands to run in order (a drop can touch several threads).
+    Commands(Vec<(ThreadKey, ThreadCommand)>),
+    /// Ask for a custom wake time, then snooze.
+    CustomSnooze(ThreadKey),
+    RenameThread(ThreadKey),
+    ArchiveThread(ThreadKey),
+    DeleteThread(ThreadKey),
 }
 
-/// What a tree row stands for, with the values its row shows.
-#[derive(Debug, Clone, PartialEq)]
-enum Node {
-    Environment {
-        env: SharedString,
-        local: bool,
-        status: Option<&'static str>,
-        detail: SharedString,
-    },
-    Project {
-        env: SharedString,
-        project_id: String,
-        root: SharedString,
-    },
-    Thread {
-        env: SharedString,
-        thread_id: String,
-        activity: ThreadActivity,
-        age: Option<SharedString>,
-    },
-    Note,
+/// One connected environment's latest state, for building rows.
+pub(crate) struct EnvSnapshot {
+    pub key: SharedString,
+    pub label: SharedString,
+    pub state: Arc<ConnectionState>,
 }
 
-/// Tree item ids; `|` cannot occur in environment keys' meaning here
-/// because ids are only ever parsed through [`Node`].
-pub fn environment_node_id(env: &str) -> SharedString {
-    format!("e|{env}").into()
-}
-
-pub fn project_node_id(env: &str, project_id: &str) -> SharedString {
-    format!("p|{env}|{project_id}").into()
-}
-
-pub fn thread_node_id(env: &str, thread_id: &str) -> SharedString {
-    format!("t|{env}|{thread_id}").into()
-}
-
-/// The environment and project a sidebar selection points into.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SelectionContext {
-    pub env: SharedString,
-    pub project_id: Option<String>,
-    pub thread_id: Option<String>,
+enum Rows {
+    T3(Rc<T3Rows>),
+    Herdr(Rc<HerdrRows>),
 }
 
 pub struct Sidebar {
-    tree: Entity<TreeState>,
     environments: Vec<Entity<Environment>>,
-    nodes: Rc<HashMap<SharedString, Node>>,
-    /// Thread node → its project, for [`Sidebar::selection_context`].
-    thread_projects: HashMap<SharedString, String>,
-    collapsed: HashSet<SharedString>,
-    selected: Option<SharedString>,
+    preferences: Entity<Preferences>,
+    /// The open thread.
+    selected: Option<ThreadKey>,
+    /// T3's project filter (`None`: all projects).
+    project_filter: Option<ProjectKey>,
+    /// Settled rows shown (t3's paged tail).
+    settled_shown: usize,
+    rows: Rows,
+    /// Visible threads in display order, for keyboard navigation.
+    order: Rc<Vec<ThreadKey>>,
+    focus_handle: FocusHandle,
+    /// Re-renders when time-dependent rows change (a snooze wakes, a
+    /// working timer or a relative time ticks).
+    _clock: Task<()>,
     _environment_subscriptions: Vec<Subscription>,
     _subscriptions: Vec<Subscription>,
 }
@@ -130,26 +126,22 @@ pub struct Sidebar {
 impl EventEmitter<SidebarEvent> for Sidebar {}
 
 impl Sidebar {
-    pub fn new(environments: Vec<Entity<Environment>>, cx: &mut Context<Self>) -> Self {
-        let tree = cx.new(|cx| TreeState::new(cx));
-        let subscriptions = vec![
-            cx.subscribe(&tree, |this, _, event: &TreeEvent, _| match event {
-                TreeEvent::Expanded(id) => {
-                    this.collapsed.remove(id);
-                }
-                TreeEvent::Collapsed(id) => {
-                    this.collapsed.insert(id.clone());
-                }
-            }),
-            cx.observe(&tree, |this, tree, cx| this.on_tree_changed(&tree, cx)),
-        ];
+    pub fn new(
+        environments: Vec<Entity<Environment>>,
+        preferences: Entity<Preferences>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let subscriptions = vec![cx.observe(&preferences, |this, _, cx| this.rebuild(cx))];
         let mut sidebar = Self {
-            tree,
             environments: Vec::new(),
-            nodes: Rc::default(),
-            thread_projects: HashMap::new(),
-            collapsed: HashSet::new(),
+            preferences,
             selected: None,
+            project_filter: None,
+            settled_shown: t3::SETTLED_INITIAL_COUNT,
+            rows: Rows::T3(Rc::default()),
+            order: Rc::default(),
+            focus_handle: cx.focus_handle(),
+            _clock: Task::ready(()),
             _environment_subscriptions: Vec::new(),
             _subscriptions: subscriptions,
         };
@@ -170,487 +162,160 @@ impl Sidebar {
         self.rebuild(cx);
     }
 
-    /// Highlights a thread (expanding its ancestors) without emitting.
-    pub fn select_thread(&mut self, env: &str, thread_id: &str, cx: &mut Context<Self>) {
-        let id = thread_node_id(env, thread_id);
-        self.selected = Some(id.clone());
-        self.tree.update(cx, |tree, cx| {
-            tree.reveal_item(&id, ScrollStrategy::Center, cx);
-            let ix = tree.index_of(&id);
-            tree.set_selected_index(ix, cx);
-        });
-    }
-
-    pub fn clear_selection(&mut self, cx: &mut Context<Self>) {
-        self.selected = None;
-        self.tree
-            .update(cx, |tree, cx| tree.set_selected_index(None, cx));
-    }
-
-    /// Where a new thread or project would go given the current selection.
-    pub fn selection_context(&self) -> Option<SelectionContext> {
-        let id = self.selected.as_ref()?;
-        Some(match self.nodes.get(id)? {
-            Node::Environment { env, .. } => SelectionContext {
-                env: env.clone(),
-                project_id: None,
-                thread_id: None,
-            },
-            Node::Project {
-                env, project_id, ..
-            } => SelectionContext {
-                env: env.clone(),
-                project_id: Some(project_id.clone()),
-                thread_id: None,
-            },
-            Node::Thread { env, thread_id, .. } => SelectionContext {
-                env: env.clone(),
-                project_id: self.thread_projects.get(id).cloned(),
-                thread_id: Some(thread_id.clone()),
-            },
-            Node::Note => return None,
-        })
-    }
-
-    /// The thread `delta` rows away from the selection, among visible
-    /// thread rows, wrapping around.
-    pub fn adjacent_thread(&self, delta: isize, cx: &App) -> Option<(SharedString, String)> {
-        let tree = self.tree.read(cx);
-        let threads: Vec<(usize, &Node)> = (0..)
-            .map_while(|ix| tree.entry(ix).map(|entry| (ix, entry)))
-            .filter_map(|(ix, entry)| match self.nodes.get(&entry.item().id) {
-                Some(node @ Node::Thread { .. }) => Some((ix, node)),
-                _ => None,
-            })
-            .collect();
-        if threads.is_empty() {
-            return None;
+    /// Highlights the open thread without emitting.
+    pub fn select_thread(&mut self, key: Option<ThreadKey>, cx: &mut Context<Self>) {
+        if self.selected != key {
+            self.selected = key;
+            self.rebuild(cx);
         }
-        let current = tree.selected_index();
-        let position = current.and_then(|ix| threads.iter().position(|(i, _)| *i == ix));
-        let next = match position {
-            Some(pos) => (pos as isize + delta).rem_euclid(threads.len() as isize) as usize,
-            None if delta >= 0 => 0,
-            None => threads.len() - 1,
-        };
-        match threads[next].1 {
-            Node::Thread { env, thread_id, .. } => Some((env.clone(), thread_id.clone())),
-            _ => None,
-        }
+    }
+
+    /// The project new threads go to from the sidebar's point of view: the
+    /// T3 project filter.
+    pub fn project_scope(&self) -> Option<&ProjectKey> {
+        self.project_filter.as_ref()
+    }
+
+    /// Visible threads in display order.
+    pub fn order(&self) -> Rc<Vec<ThreadKey>> {
+        self.order.clone()
+    }
+
+    /// The thread `delta` rows away from the open one, wrapping around.
+    pub fn adjacent_thread(&self, delta: isize) -> Option<ThreadKey> {
+        adjacent(&self.order, self.selected.as_ref(), delta).cloned()
+    }
+
+    /// The Nth visible thread (1-based).
+    pub fn nth_thread(&self, n: usize) -> Option<ThreadKey> {
+        n.checked_sub(1).and_then(|ix| self.order.get(ix)).cloned()
+    }
+
+    /// Every agent in space order, for the goto picker (in either mode).
+    pub fn goto_rows(&self, cx: &App) -> HerdrRows {
+        let mut ui = self.preferences.read(cx).ui().clone();
+        ui.agent_order = j3_client::workflow::AgentOrder::Spaces;
+        HerdrRows::build(&self.snapshots(cx), &ui)
     }
 
     pub fn focus(&self, window: &mut Window, cx: &mut App) {
-        self.tree.update(cx, |tree, cx| tree.focus(window, cx));
+        self.focus_handle.focus(window, cx);
     }
 
-    fn on_tree_changed(&mut self, tree: &Entity<TreeState>, cx: &mut Context<Self>) {
-        let selected = tree.read(cx).selected_item().map(|item| item.id.clone());
-        if selected == self.selected {
-            return;
-        }
-        self.selected = selected.clone();
-        if let Some(Node::Thread { env, thread_id, .. }) =
-            selected.as_ref().and_then(|id| self.nodes.get(id))
-        {
-            cx.emit(SidebarEvent::OpenThread {
-                env: env.clone(),
-                thread_id: thread_id.clone(),
-            });
-        }
+    /// The distinct environments' latest states.
+    fn snapshots(&self, cx: &App) -> Vec<EnvSnapshot> {
+        distinct_environments(&self.environments, cx)
+            .into_iter()
+            .map(|env| {
+                let env = env.read(cx);
+                EnvSnapshot {
+                    key: env.key().clone(),
+                    label: env.label().clone(),
+                    state: env.state().clone(),
+                }
+            })
+            .collect()
     }
 
     fn rebuild(&mut self, cx: &mut Context<Self>) {
         let now = OffsetDateTime::now_utc();
-        let mut nodes = HashMap::new();
-        let mut thread_projects = HashMap::new();
-        let mut roots = Vec::with_capacity(self.environments.len());
-        for environment in &distinct_environments(&self.environments, cx) {
-            let environment = environment.read(cx);
-            let key = environment.key().clone();
-            let env_id = environment_node_id(&key);
-            let shell = &environment.state().shell;
-            let mut children = Vec::new();
-            if !shell.loaded {
-                let id: SharedString = format!("n|{key}").into();
-                nodes.insert(id.clone(), Node::Note);
-                let text = environment.status_label().unwrap_or("Loading…");
-                children.push(TreeItem::new(id, text));
-            } else if shell.projects.is_empty() {
-                let id: SharedString = format!("n|{key}").into();
-                nodes.insert(id.clone(), Node::Note);
-                children.push(TreeItem::new(id, "No projects"));
-            }
-            for project in &shell.projects {
-                let project_id = project_node_id(&key, &project.id);
-                let threads = shell.threads_of(&project.id);
-                let thread_items: Vec<TreeItem> = threads
-                    .iter()
-                    .map(|thread| {
-                        let id = thread_node_id(&key, &thread.id);
-                        nodes.insert(
-                            id.clone(),
-                            Node::Thread {
-                                env: key.clone(),
-                                thread_id: thread.id.clone(),
-                                activity: ThreadActivity::of(thread),
-                                age: relative_age(&thread.updated_at, now).map(Into::into),
-                            },
-                        );
-                        thread_projects.insert(id.clone(), project.id.clone());
-                        let title = if thread.title.trim().is_empty() {
-                            "Untitled"
-                        } else {
-                            thread.title.as_str()
-                        };
-                        TreeItem::new(id, title.to_owned())
+        let snapshots = self.snapshots(cx);
+        let ui = self.preferences.read(cx).ui().clone();
+        let next_tick = match ui.workflow {
+            Workflow::T3 => {
+                if let Some(filter) = &self.project_filter
+                    && !snapshots.iter().any(|env| {
+                        env.key == filter.env
+                            && (!env.state.shell.loaded
+                                || env.state.shell.project(&filter.project_id).is_some())
                     })
-                    .collect();
-                nodes.insert(
-                    project_id.clone(),
-                    Node::Project {
-                        env: key.clone(),
-                        project_id: project.id.clone(),
-                        root: project.workspace_root.clone().into(),
-                    },
+                {
+                    self.project_filter = None;
+                }
+                let rows = T3Rows::build(
+                    &snapshots,
+                    &ui,
+                    self.project_filter.as_ref(),
+                    self.selected.as_ref(),
+                    self.settled_shown,
+                    now,
                 );
-                let expanded = !self.collapsed.contains(&project_id);
-                children.push(
-                    TreeItem::new(project_id, project.title.clone())
-                        .children(thread_items)
-                        .expanded(expanded),
-                );
+                self.order = Rc::new(rows.order());
+                let tick = rows.next_tick(now);
+                self.rows = Rows::T3(Rc::new(rows));
+                tick
             }
-            nodes.insert(
-                env_id.clone(),
-                Node::Environment {
-                    env: key.clone(),
-                    local: environment.is_local(),
-                    status: environment.status_label(),
-                    detail: environment.status_detail().into(),
-                },
-            );
-            let expanded = !self.collapsed.contains(&env_id);
-            roots.push(
-                TreeItem::new(env_id, environment.label().clone())
-                    .children(children)
-                    .expanded(expanded),
-            );
-        }
-        self.nodes = Rc::new(nodes);
-        self.thread_projects = thread_projects;
-        let selected = self.selected.clone();
-        self.tree.update(cx, |tree, cx| {
-            tree.set_items(roots, cx);
-            if let Some(id) = selected {
-                let ix = tree.index_of(&id);
-                tree.set_selected_index(ix, cx);
+            Workflow::Herdr => {
+                let rows = HerdrRows::build(&snapshots, &ui);
+                self.order = Rc::new(rows.order());
+                self.rows = Rows::Herdr(Rc::new(rows));
+                None
             }
-        });
+        };
+        self._clock = match next_tick {
+            Some(delay) => cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(delay).await;
+                let _ = this.update(cx, |this, cx| this.rebuild(cx));
+            }),
+            None => Task::ready(()),
+        };
         cx.notify();
     }
+}
 
-    fn emit_later(weak: &WeakEntity<Self>, event: SidebarEvent, cx: &mut App) {
-        let _ = weak.update(cx, |_, cx| cx.emit(event));
+/// The key `delta` places after `current` in `order`, wrapping; the first
+/// (or last) one when nothing is current.
+fn adjacent<'a>(
+    order: &'a [ThreadKey],
+    current: Option<&ThreadKey>,
+    delta: isize,
+) -> Option<&'a ThreadKey> {
+    if order.is_empty() {
+        return None;
     }
+    let position = current.and_then(|current| order.iter().position(|key| key == current));
+    let next = match position {
+        Some(pos) => (pos as isize + delta).rem_euclid(order.len() as isize) as usize,
+        None if delta >= 0 => 0,
+        None => order.len() - 1,
+    };
+    order.get(next)
+}
 
-    fn render_row(
-        weak: &WeakEntity<Self>,
-        nodes: &HashMap<SharedString, Node>,
-        ix: usize,
-        entry: &TreeEntry,
-        selected: bool,
-        cx: &mut App,
-    ) -> ListItem {
-        let item = entry.item();
-        let node = nodes.get(&item.id).cloned().unwrap_or(Node::Note);
-        let theme = cx.theme();
-        let muted = theme.muted_foreground;
-        let indent = div().flex_shrink_0().w(rems(0.875 * entry.depth() as f32));
-        let disclosure = div()
-            .flex_shrink_0()
-            .size_4()
-            .when(entry.is_folder(), |this| {
-                this.child(
-                    Icon::new(if entry.is_expanded() {
-                        IconName::ChevronDown
-                    } else {
-                        IconName::ChevronRight
-                    })
-                    .xsmall()
-                    .text_color(muted),
-                )
-            });
-        let label = div()
-            .flex_1()
-            .min_w_0()
-            .truncate()
-            .child(item.label.clone());
-        let row = ListItem::new(ix)
-            .selected(selected)
-            .px_2()
-            .py_0p5()
-            .text_sm()
-            .rounded(theme.radius)
-            .accessibility_label(item.label.clone());
-        match node {
-            Node::Environment {
-                env,
-                local,
-                status,
-                detail,
-            } => {
-                let weak = weak.clone();
-                row.child(
-                    h_flex()
-                        .id(SharedString::from(format!("env-row-{env}")))
-                        .gap_1()
-                        .child(disclosure)
-                        .child(
-                            Icon::new(if local {
-                                IconName::HardDrive
-                            } else {
-                                IconName::Globe
-                            })
-                            .small()
-                            .text_color(muted),
-                        )
-                        .child(label.font_medium())
-                        .when_some(status, |this, status| {
-                            this.child(div().text_xs().text_color(muted).child(status))
-                        })
-                        .tooltip(move |window, cx| Tooltip::new(detail.clone()).build(window, cx)),
-                )
-                .suffix(move |_, _| {
-                    let weak = weak.clone();
-                    let env = env.clone();
-                    Button::new(SharedString::from(format!("add-project-{env}")))
-                        .ghost()
-                        .xsmall()
-                        .icon(IconName::Plus)
-                        .tooltip("Add project…")
-                        .on_click(move |_, _, cx| {
-                            cx.stop_propagation();
-                            Self::emit_later(
-                                &weak,
-                                SidebarEvent::AddProject { env: env.clone() },
-                                cx,
-                            );
-                        })
-                })
-            }
-            Node::Project {
-                env,
-                project_id,
-                root,
-            } => {
-                let weak = weak.clone();
-                row.child(
-                    h_flex()
-                        .id(SharedString::from(format!(
-                            "project-row-{env}-{project_id}"
-                        )))
-                        .gap_1()
-                        .child(indent)
-                        .child(disclosure)
-                        .child(
-                            Icon::new(if entry.is_expanded() {
-                                IconName::FolderOpen
-                            } else {
-                                IconName::Folder
-                            })
-                            .small()
-                            .text_color(muted),
-                        )
-                        .child(label)
-                        .tooltip(move |window, cx| Tooltip::new(root.clone()).build(window, cx)),
-                )
-                .suffix(move |_, _| {
-                    let weak = weak.clone();
-                    let event = SidebarEvent::NewThread {
-                        env: env.clone(),
-                        project_id: project_id.clone(),
-                    };
-                    Button::new(SharedString::from(format!("new-thread-{env}-{project_id}")))
-                        .ghost()
-                        .xsmall()
-                        .icon(IconName::Plus)
-                        .tooltip("New thread")
-                        .on_click(move |_, _, cx| {
-                            cx.stop_propagation();
-                            Self::emit_later(&weak, event.clone(), cx);
-                        })
-                })
-            }
-            Node::Thread { activity, age, .. } => {
-                let indicator = div()
-                    .flex_shrink_0()
-                    .size_4()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .map(|this| match activity {
-                        ThreadActivity::Running => this.child(Spinner::new().xsmall()),
-                        ThreadActivity::WaitingForInput => {
-                            this.child(Icon::new(IconName::Bell).xsmall().text_color(theme.warning))
-                        }
-                        ThreadActivity::Error => this.child(
-                            Icon::new(IconName::CircleAlert)
-                                .xsmall()
-                                .text_color(theme.danger),
-                        ),
-                        ThreadActivity::Idle => this,
-                    });
-                let status = match activity {
-                    ThreadActivity::Running => "Running",
-                    ThreadActivity::WaitingForInput => "Waiting for input",
-                    ThreadActivity::Error => "Error",
-                    ThreadActivity::Idle => "Idle",
-                };
-                row.accessibility_label(format!("{}, {status}", item.label))
-                    .child(
-                        h_flex()
-                            .gap_1()
-                            .child(indent)
-                            .child(indicator)
-                            .child(label)
-                            .when_some(age, |this, age| {
-                                this.child(
-                                    div().flex_shrink_0().text_xs().text_color(muted).child(age),
-                                )
-                            }),
-                    )
-            }
-            Node::Note => row.disabled(true).child(
-                h_flex()
-                    .gap_1()
-                    .child(indent)
-                    .child(div().size_4())
-                    .child(label.text_xs().text_color(muted)),
-            ),
-        }
-    }
+/// Parses an ISO-8601 timestamp from the wire.
+pub(crate) fn parse_time(iso: &str) -> Option<OffsetDateTime> {
+    OffsetDateTime::parse(iso, &Rfc3339).ok()
+}
 
-    fn context_menu(
-        weak: &WeakEntity<Self>,
-        nodes: &HashMap<SharedString, Node>,
-        entry: &TreeEntry,
-        menu: PopupMenu,
-    ) -> PopupMenu {
-        let item = |label: &'static str, event: SidebarEvent| {
-            let weak = weak.clone();
-            PopupMenuItem::new(label).on_click(move |_, _, cx| {
-                Self::emit_later(&weak, event.clone(), cx);
-            })
-        };
-        match nodes.get(&entry.item().id) {
-            Some(Node::Environment { env, local, .. }) => {
-                let menu = menu
-                    .item(item(
-                        "Add Project…",
-                        SidebarEvent::AddProject { env: env.clone() },
-                    ))
-                    .item(item(
-                        "Archived Threads",
-                        SidebarEvent::ShowArchived { env: env.clone() },
-                    ));
-                if *local {
-                    menu
-                } else {
-                    menu.separator().item(item(
-                        "Remove Environment",
-                        SidebarEvent::RemoveEnvironment { env: env.clone() },
-                    ))
-                }
-            }
-            Some(Node::Project {
-                env, project_id, ..
-            }) => menu
-                .item(item(
-                    "New Thread",
-                    SidebarEvent::NewThread {
-                        env: env.clone(),
-                        project_id: project_id.clone(),
-                    },
-                ))
-                .separator()
-                .item(item(
-                    "Remove Project…",
-                    SidebarEvent::DeleteProject {
-                        env: env.clone(),
-                        project_id: project_id.clone(),
-                    },
-                )),
-            Some(Node::Thread { env, thread_id, .. }) => {
-                let thread = |make: fn(SharedString, String) -> SidebarEvent| {
-                    make(env.clone(), thread_id.clone())
-                };
-                menu.item(item(
-                    "Rename…",
-                    thread(|env, thread_id| SidebarEvent::RenameThread { env, thread_id }),
-                ))
-                .item(item(
-                    "Archive",
-                    thread(|env, thread_id| SidebarEvent::ArchiveThread { env, thread_id }),
-                ))
-                .separator()
-                .item(item(
-                    "Delete…",
-                    thread(|env, thread_id| SidebarEvent::DeleteThread { env, thread_id }),
-                ))
-            }
-            Some(Node::Note) | None => menu,
-        }
+/// How long until the next whole minute of `since`'s age, so relative
+/// times like `5m` stay current.
+pub(crate) fn until_next_minute(now: OffsetDateTime) -> Duration {
+    let into_minute = now.second() as u64 * 1_000 + now.millisecond() as u64;
+    Duration::from_millis(60_000 - into_minute)
+}
+
+impl Focusable for Sidebar {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
     }
 }
 
 impl Render for Sidebar {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let weak = cx.weak_entity();
-        let nodes = self.nodes.clone();
-        let menu_weak = weak.clone();
-        let menu_nodes = self.nodes.clone();
-        let add_weak = weak.clone();
+        let body = match &self.rows {
+            Rows::T3(rows) => self.render_t3(rows.clone(), cx),
+            Rows::Herdr(rows) => self.render_herdr(rows.clone(), cx),
+        };
         let theme = cx.theme();
         v_flex()
+            .id("sidebar")
+            .test_support()
+            .key_context(SIDEBAR)
+            .track_focus(&self.focus_handle)
             .size_full()
             .bg(theme.sidebar)
             .text_color(theme.sidebar_foreground)
-            .child(
-                h_flex()
-                    .flex_shrink_0()
-                    .h_9()
-                    .px_3()
-                    .justify_between()
-                    .border_b_1()
-                    .border_color(theme.sidebar_border)
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_medium()
-                            .text_color(theme.muted_foreground)
-                            .child("Environments"),
-                    )
-                    .child(
-                        Button::new("add-environment")
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::Plus)
-                            .tooltip("Add environment…")
-                            .on_click(move |_, _, cx| {
-                                Self::emit_later(&add_weak, SidebarEvent::AddEnvironment, cx);
-                            }),
-                    ),
-            )
-            .child(
-                div().flex_1().min_h_0().px_1().py_1().child(
-                    Tree::new(&self.tree, move |ix, entry, selected, _, cx| {
-                        Self::render_row(&weak, &nodes, ix, entry, selected, cx)
-                    })
-                    .context_menu(move |_, entry, menu, _, _| {
-                        Self::context_menu(&menu_weak, &menu_nodes, entry, menu)
-                    }),
-                ),
-            )
+            .child(body)
     }
 }
 
@@ -659,15 +324,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn node_ids_are_namespaced_per_environment() {
-        assert_eq!(environment_node_id("local"), "e|local");
-        assert_eq!(
-            project_node_id("http://shieldy:3780", "p1"),
-            "p|http://shieldy:3780|p1"
-        );
+    fn adjacent_wraps_and_starts_at_the_ends() {
+        let order: Vec<ThreadKey> = ["a", "b", "c"]
+            .into_iter()
+            .map(|id| ThreadKey::new("local", id))
+            .collect();
+        let key = |id: &str| ThreadKey::new("local", id);
+        assert_eq!(adjacent(&order, Some(&key("a")), 1), Some(&key("b")));
+        assert_eq!(adjacent(&order, Some(&key("c")), 1), Some(&key("a")));
+        assert_eq!(adjacent(&order, Some(&key("a")), -1), Some(&key("c")));
+        assert_eq!(adjacent(&order, None, 1), Some(&key("a")));
+        assert_eq!(adjacent(&order, None, -1), Some(&key("c")));
+        assert_eq!(adjacent(&order, Some(&key("x")), 1), Some(&key("a")));
+        assert_eq!(adjacent(&[], None, 1), None);
+    }
+
+    #[test]
+    fn element_ids_are_namespaced_per_environment() {
         assert_ne!(
-            thread_node_id("local", "t1"),
-            thread_node_id("http://x:1", "t1")
+            ThreadKey::new("local", "t1").element_id("thread"),
+            ThreadKey::new("http://x:1", "t1").element_id("thread")
         );
+    }
+
+    #[test]
+    fn the_clock_ticks_on_the_minute() {
+        let now = OffsetDateTime::parse("2026-11-01T12:00:45.250Z", &Rfc3339).unwrap();
+        assert_eq!(until_next_minute(now), Duration::from_millis(14_750));
     }
 }

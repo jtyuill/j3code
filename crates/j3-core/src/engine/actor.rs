@@ -21,7 +21,7 @@ use tokio::{
 use super::{
     model::{
         Delivery, Effect, Reject, ThreadModel, UserInput, rewrite_skill, split_model,
-        thinking_level,
+        thinking_level, triage::now_ms,
     },
     session::{AgentSession, Events, SessionFactory},
 };
@@ -57,6 +57,8 @@ pub struct ActorConfig {
 
 pub type DispatchReply = oneshot::Sender<Result<u64, Reject>>;
 pub type LaunchReply = oneshot::Sender<Result<(u64, ThreadProjection), Reject>>;
+/// `Ok(None)`: the thread is not due for automatic settlement.
+pub type AutoSettleReply = oneshot::Sender<Result<Option<u64>, Reject>>;
 
 /// Messages to a thread actor.
 pub enum Request {
@@ -77,6 +79,15 @@ pub enum Request {
     },
     /// M18: kill the omp process now.
     ForceStop { reply: oneshot::Sender<u64> },
+    /// t3 `thread.auto-settle` from the sweep: settle when the thread has
+    /// been inactive longer than `after_ms` as of `now_ms` and is unchanged
+    /// since `snapshot_at` (its shell's `updatedAt` the sweep saw).
+    AutoSettle {
+        now_ms: i64,
+        after_ms: i64,
+        snapshot_at: String,
+        reply: AutoSettleReply,
+    },
     /// Close omp and end the actor.
     Shutdown { reply: oneshot::Sender<()> },
 }
@@ -734,6 +745,7 @@ impl Actor {
             } => {
                 if let Some(input) = &input {
                     self.model.start_run(input);
+                    self.model.on_user_message(now_ms());
                 }
                 let thread_id = self.model.thread_id().to_owned();
                 let result = self.commit_now(Some((
@@ -760,8 +772,41 @@ impl Actor {
                 let _ = reply.send(sequence);
                 self.start_next().await;
             }
+            Request::AutoSettle {
+                now_ms,
+                after_ms,
+                snapshot_at,
+                reply,
+            } => {
+                let _ = reply.send(self.auto_settle(now_ms, after_ms, &snapshot_at));
+            }
             Request::Shutdown { reply } => {
                 let _ = reply.send(());
+            }
+        }
+    }
+
+    fn auto_settle(
+        &mut self,
+        now_ms: i64,
+        after_ms: i64,
+        snapshot_at: &str,
+    ) -> Result<Option<u64>, Reject> {
+        let Some(settled_ms) = self.model.auto_settlement_at(now_ms, after_ms) else {
+            return Ok(None);
+        };
+        let command_id = format!(
+            "server:auto-settle:{}:{snapshot_at}",
+            self.model.thread_id()
+        );
+        if let Ok(Some(receipt)) = self.config.hub.read(|store| store.receipt(&command_id)) {
+            return Ok(receipt.get("sequence").and_then(Value::as_u64));
+        }
+        match self.model.auto_settle(now_ms, snapshot_at, settled_ms) {
+            Ok(()) => self.commit_with_receipt(&command_id).map(Some),
+            Err(error) => {
+                self.schedule_commit();
+                Err(error)
             }
         }
     }
@@ -882,16 +927,17 @@ impl Actor {
             C::QueuedRunStart(start) => self.start_queued_now(&start.run_id).await.map(|input| {
                 after = input;
             }),
-            C::ThreadVisit(_)
-            | C::ThreadSettle(_)
-            | C::ThreadUnsettle(_)
-            | C::ThreadSnooze(_)
-            | C::ThreadUnsnooze(_)
-            | C::ThreadAutoSettleSet(_)
-            | C::ThreadPin(_)
-            | C::ThreadUnpin(_)
-            | C::ThreadPinReorder(_)
-            | C::ThreadActiveReorder(_) => Ok(()),
+            C::ThreadVisit(visit) => self.model.visit(&visit.visited_at),
+            C::ThreadSettle(settle) => self.model.settle(now_ms(), settle.settled_at.as_deref()),
+            C::ThreadUnsettle(_) => self.model.unsettle(now_ms()),
+            C::ThreadSnooze(snooze) => self.model.snooze(now_ms(), &snooze.snoozed_until),
+            C::ThreadUnsnooze(_) => self.model.unsnooze(now_ms()),
+            C::ThreadAutoSettleSet(set) => self.model.set_auto_settle(now_ms(), set.enabled),
+            C::ThreadPin(pin) => self.model.pin(now_ms(), pin.order_key.as_deref()),
+            C::ThreadUnpin(_) => self.model.unpin(now_ms()),
+            C::ThreadPinReorder(reorder) => self.model.reorder_pinned(now_ms(), &reorder.order_key),
+            C::ThreadActiveReorder(reorder) => self.model.reorder_active(&reorder.order_key),
+            C::ThreadMarkUnread(_) => self.model.mark_unread(now_ms()),
             C::SubagentStop(stop) => self.stop_subagent(&stop.subagent_id).await,
             C::GoalCreate(create) => {
                 let objective = create.objective.trim();
@@ -1016,26 +1062,26 @@ impl Actor {
         if input.text.trim().is_empty() && input.attachments.is_empty() {
             return Err(reject("The message is empty."));
         }
-        match self
+        let start = match self
             .model
             .resolve_delivery(&message.dispatch_mode, message.delivery_intent)
         {
             Delivery::Start => {
                 self.model.start_run(&input);
-                Ok(Some(input))
+                Some(input)
             }
             Delivery::Queue => {
                 self.model.queue_run(&input);
-                Ok(None)
+                None
             }
             Delivery::Steer { run_id } => {
-                if !self.model.has_running_turn() {
+                if self.model.has_running_turn() {
+                    self.steer_omp(&input).await?;
+                    self.model.steer(&input, &run_id)?;
+                } else {
                     self.model.queue_run(&input);
-                    return Ok(None);
                 }
-                self.steer_omp(&input).await?;
-                self.model.steer(&input, &run_id)?;
-                Ok(None)
+                None
             }
             Delivery::Restart { .. } => {
                 let run_id = self.model.queue_run(&input);
@@ -1049,8 +1095,11 @@ impl Actor {
                 {
                     tracing::warn!(%error, "omp abort");
                 }
-                Ok(None)
+                None
             }
-        }
+        };
+        // t3 `dispatchMessage`: a sent message un-settles and wakes the thread.
+        self.model.on_user_message(now_ms());
+        Ok(start)
     }
 }

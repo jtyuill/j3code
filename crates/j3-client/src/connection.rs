@@ -21,10 +21,11 @@ use j3_protocol::t3::{
     commands::{
         DeliveryIntent, DispatchCommandResult, DispatchMode, MessageDispatchCommand,
         OrchestrationV2Command, PromoteToSteerCommand, QueuedRunCommand, QueuedRunEditCommand,
-        RunInterruptCommand, RuntimeRequestRespondCommand, SubagentStopCommand, ThreadCommand,
-        ThreadDeleteCommand, ThreadLaunchInitialMessage, ThreadLaunchInput, ThreadLaunchResult,
-        ThreadMetadataUpdateCommand, ThreadStopCommand, ThreadVisitCommand,
-        UserInputDismissCommand,
+        RunInterruptCommand, RuntimeRequestRespondCommand, SubagentStopCommand,
+        ThreadAutoSettleSetCommand, ThreadCommand, ThreadDeleteCommand, ThreadLaunchInitialMessage,
+        ThreadLaunchInput, ThreadLaunchResult, ThreadMetadataUpdateCommand, ThreadPinCommand,
+        ThreadReorderCommand, ThreadSettleCommand, ThreadSnoozeCommand, ThreadStopCommand,
+        ThreadUserReasonCommand, ThreadVisitCommand, UserInputDismissCommand, UserReason,
     },
     filesystem::{FilesystemBrowseInput, FilesystemBrowseResult},
     methods::{ArchivedShellSnapshot, EmptyInput},
@@ -496,6 +497,122 @@ impl Connection {
             search_query: None,
         }))
         .await
+    }
+
+    // -----------------------------------------------------------------------
+    // Settle workflow (t3's thread.settle … thread.mark-unread)
+    // -----------------------------------------------------------------------
+
+    /// Settles the thread (`thread.settle`): it moves to the Settled shelf
+    /// and loses its pin, order keys and snooze. The server stamps
+    /// `settledAt`.
+    pub async fn settle(&self, thread_id: &str) -> Result<u64, Error> {
+        self.dispatch(OrchestrationV2Command::ThreadSettle(ThreadSettleCommand {
+            command_id: new_id(),
+            thread_id: thread_id.to_owned(),
+            settled_at: None,
+        }))
+        .await
+    }
+
+    /// Brings a settled thread back to Active (`thread.unsettle`).
+    pub async fn unsettle(&self, thread_id: &str) -> Result<u64, Error> {
+        self.dispatch(OrchestrationV2Command::ThreadUnsettle(
+            ThreadUserReasonCommand {
+                command_id: new_id(),
+                thread_id: thread_id.to_owned(),
+                reason: UserReason::User,
+            },
+        ))
+        .await
+    }
+
+    /// Hides the thread until `until` (`thread.snooze`). The server refuses
+    /// a wake in the past, a pending question and queued runs; see
+    /// [`crate::workflow::can_snooze`].
+    pub async fn snooze(&self, thread_id: &str, until: time::OffsetDateTime) -> Result<u64, Error> {
+        let until_ms =
+            i64::try_from(until.unix_timestamp_nanos().div_euclid(1_000_000)).unwrap_or(i64::MAX);
+        self.dispatch(OrchestrationV2Command::ThreadSnooze(ThreadSnoozeCommand {
+            command_id: new_id(),
+            thread_id: thread_id.to_owned(),
+            snoozed_until: t3::iso_from_unix_ms(until_ms),
+        }))
+        .await
+    }
+
+    /// Wakes a snoozed thread now (`thread.unsnooze`).
+    pub async fn unsnooze(&self, thread_id: &str) -> Result<u64, Error> {
+        self.dispatch(OrchestrationV2Command::ThreadUnsnooze(
+            ThreadUserReasonCommand {
+                command_id: new_id(),
+                thread_id: thread_id.to_owned(),
+                reason: UserReason::User,
+            },
+        ))
+        .await
+    }
+
+    /// Turns automatic settling of an inactive thread on or off
+    /// (`thread.auto-settle.set`).
+    pub async fn set_auto_settle(&self, thread_id: &str, enabled: bool) -> Result<u64, Error> {
+        self.dispatch(OrchestrationV2Command::ThreadAutoSettleSet(
+            ThreadAutoSettleSetCommand {
+                command_id: new_id(),
+                thread_id: thread_id.to_owned(),
+                enabled,
+            },
+        ))
+        .await
+    }
+
+    /// Pins the thread (`thread.pin`), at `order_key` within Pinned
+    /// ([`crate::workflow::plan_drop`]) or, without one, after the keyed
+    /// pins. Pinning a settled or snoozed thread brings it back.
+    pub async fn pin(&self, thread_id: &str, order_key: Option<&str>) -> Result<u64, Error> {
+        self.dispatch(OrchestrationV2Command::ThreadPin(ThreadPinCommand {
+            command_id: new_id(),
+            thread_id: thread_id.to_owned(),
+            order_key: order_key.map(str::to_owned),
+        }))
+        .await
+    }
+
+    pub async fn unpin(&self, thread_id: &str) -> Result<u64, Error> {
+        self.thread_command(thread_id, OrchestrationV2Command::ThreadUnpin)
+            .await
+    }
+
+    /// Moves a pinned thread to `order_key` (`thread.pin.reorder`).
+    pub async fn reorder_pinned(&self, thread_id: &str, order_key: &str) -> Result<u64, Error> {
+        self.dispatch(OrchestrationV2Command::ThreadPinReorder(
+            ThreadReorderCommand {
+                command_id: new_id(),
+                thread_id: thread_id.to_owned(),
+                order_key: order_key.to_owned(),
+            },
+        ))
+        .await
+    }
+
+    /// Moves an Active thread to `order_key` (`thread.active.reorder`); the
+    /// server refuses pinned and settled threads.
+    pub async fn reorder_active(&self, thread_id: &str, order_key: &str) -> Result<u64, Error> {
+        self.dispatch(OrchestrationV2Command::ThreadActiveReorder(
+            ThreadReorderCommand {
+                command_id: new_id(),
+                thread_id: thread_id.to_owned(),
+                order_key: order_key.to_owned(),
+            },
+        ))
+        .await
+    }
+
+    /// Marks the latest completion unread again (`thread.mark-unread`); the
+    /// server refuses a thread with no completed run.
+    pub async fn mark_unread(&self, thread_id: &str) -> Result<u64, Error> {
+        self.thread_command(thread_id, OrchestrationV2Command::ThreadMarkUnread)
+            .await
     }
 
     /// Answers a pending question (`runtime-request.respond`); `answers` maps
