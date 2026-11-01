@@ -136,7 +136,9 @@ pub fn provider_models(
                     model.name.clone()
                 },
                 short_name: None,
-                sub_provider: None,
+                // Clients show it beside the name; the same model is often
+                // offered by several omp providers.
+                sub_provider: Some(model.provider.clone()),
                 aliases: None,
                 badge: None,
                 is_custom: false,
