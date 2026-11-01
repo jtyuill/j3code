@@ -6,11 +6,12 @@
 use j3_core::{
     engine::{
         actor::commit_thread,
-        model::{NewThread, ThreadModel, UserInput},
+        model::{Effect, NewThread, ThreadModel, UserInput},
     },
     hub::{Hub, ThreadEvent},
     omp::omp_rpc::{
-        AnswersUiResponse, AskAnswer, Event, ExtensionUiResponse, RpcNotification, SessionState,
+        AnswersUiResponse, AskAnswer, Event, ExtensionUiResponse, GoalResult, RpcNotification,
+        SessionState, SubagentMessages,
     },
     store::Store,
 };
@@ -18,9 +19,9 @@ use j3_protocol::t3::{
     model::ModelSelection,
     orchestration::{
         Actor, CreationSource, DomainEventBody, MessageRole, PlanArtifactKind, PlanArtifactStatus,
-        PlanStepStatus, ProviderInteractionMode, RunStatus, RuntimeMode, RuntimeRequestStatus,
-        ThreadProjection, ThreadShell, ThreadStreamItem, TurnItemKind, TurnItemStatus,
-        UserMessageInputIntent,
+        PlanStepStatus, ProviderGoalStatus, ProviderInteractionMode, RunStatus, RuntimeMode,
+        RuntimeRequestStatus, SubagentOrigin, SubagentStatus, ThreadProjection, ThreadShell,
+        ThreadStreamItem, TurnItemKind, TurnItemStatus, UserMessageInputIntent,
     },
 };
 use serde_json::{Value, json};
@@ -35,6 +36,8 @@ struct Harness {
     last_shell: Option<Value>,
     last_sequence: u64,
     events: Vec<DomainEventBody>,
+    /// Subagents whose transcript the actor would read next.
+    fetches: Vec<String>,
 }
 
 impl Harness {
@@ -59,6 +62,7 @@ impl Harness {
             last_shell: None,
             last_sequence: 0,
             events: Vec::new(),
+            fetches: Vec::new(),
         };
         harness.commit();
         harness
@@ -119,17 +123,37 @@ impl Harness {
         for line in fixture.lines().filter(|line| !line.trim().is_empty()) {
             let value: Value = serde_json::from_str(line).unwrap();
             if value["type"] == "response" {
-                if value["command"] == "get_state" {
-                    let state: SessionState =
-                        serde_json::from_value(value["data"].clone()).unwrap();
-                    self.model.apply_state(&state);
-                    self.commit();
+                // The actor applies these command results (and `get_state`).
+                match value["command"].as_str() {
+                    Some("get_state") => {
+                        let state: SessionState =
+                            serde_json::from_value(value["data"].clone()).unwrap();
+                        self.model.apply_state(&state);
+                    }
+                    Some("goal") if value["success"] == true => {
+                        let result: GoalResult =
+                            serde_json::from_value(value["data"].clone()).unwrap();
+                        self.model.apply_goal(result.goal.as_ref());
+                    }
+                    Some("get_subagent_messages") if value["success"] == true => {
+                        let transcript: SubagentMessages =
+                            serde_json::from_value(value["data"].clone()).unwrap();
+                        let subagent_id = self.fetches.remove(0);
+                        self.model
+                            .apply_subagent_transcript(&subagent_id, &transcript);
+                    }
+                    _ => {}
                 }
+                self.commit();
                 continue;
             }
             let notification = RpcNotification::from_value(value).unwrap();
             let pending_before = self.pending_requests();
-            self.model.apply(&Event::Notification(notification));
+            for effect in self.model.apply(&Event::Notification(notification)) {
+                if let Effect::FetchSubagentResult { subagent_id } = effect {
+                    self.fetches.push(subagent_id);
+                }
+            }
             self.commit();
             for request_id in self.pending_requests() {
                 if !pending_before.contains(&request_id) {
@@ -477,4 +501,252 @@ fn engine_mapping_trailing_settle_does_not_end_the_next_run() {
     let run = projection.runs.iter().find(|run| run.id == second).unwrap();
     assert_eq!(run.status, RunStatus::Starting);
     assert_eq!(projection.runs[0].status, RunStatus::Completed);
+}
+
+/// The `subagent` row of `subagent_id` and the `task` tool row it hangs off.
+fn subagent_row<'a>(
+    projection: &'a ThreadProjection,
+    subagent_id: &str,
+) -> &'a j3_protocol::t3::orchestration::TurnItem {
+    let row = projection
+        .visible_turn_items
+        .iter()
+        .find(|row| {
+            matches!(&row.item.kind, TurnItemKind::Subagent(body) if body.subagent_id == subagent_id)
+        })
+        .expect("a subagent feed row");
+    &row.item
+}
+
+#[test]
+fn engine_mapping_subagent() {
+    let mut harness = Harness::new();
+    harness.start("Use the task tool to run exactly one subagent that replies PONG.");
+    harness.replay(include_str!("fixtures/omp/subagent.jsonl"), |_, _| {
+        panic!("no questions")
+    });
+    assert!(harness.fetches.is_empty(), "the transcript was read");
+    let projection = harness.projection();
+    assert_completed_run(&projection);
+    assert_eq!(projection.subagents.len(), 1);
+    let subagent = &projection.subagents[0];
+    assert_eq!(subagent.status, SubagentStatus::Completed);
+    assert_eq!(subagent.origin, SubagentOrigin::ProviderNative);
+    assert_eq!(subagent.driver, "pi");
+    assert_eq!(subagent.run_id.as_ref(), Some(&projection.runs[0].id));
+    assert_eq!(
+        Some(&subagent.parent_node_id),
+        projection.runs[0].root_node_id.as_ref()
+    );
+    assert_eq!(subagent.title.as_deref(), Some("task"));
+    assert!(
+        subagent
+            .prompt
+            .starts_with("Reply with exactly the word PONG")
+    );
+    assert_eq!(subagent.model.as_deref(), Some(MODEL));
+    // The final answer comes from the subagent's transcript.
+    assert_eq!(subagent.result.as_deref(), Some("PONG"));
+    assert_eq!(subagent.progress.as_deref(), Some("13.9k tokens"));
+    assert!(subagent.started_at.is_some() && subagent.completed_at.is_some());
+    assert_eq!(
+        subagent
+            .native_task_ref
+            .as_ref()
+            .unwrap()
+            .native_id
+            .as_ref(),
+        Some(&subagent.id)
+    );
+
+    // Its feed row mirrors it, under the `task` tool row that started it.
+    let item = subagent_row(&projection, &subagent.id);
+    assert_eq!(item.status, TurnItemStatus::Completed);
+    assert_eq!(item.run_id, subagent.run_id);
+    let TurnItemKind::Subagent(body) = &item.kind else {
+        unreachable!()
+    };
+    assert_eq!(body.result.as_deref(), Some("PONG"));
+    assert_eq!(body.prompt, subagent.prompt);
+    let parent = projection
+        .turn_items
+        .iter()
+        .find(|candidate| Some(&candidate.id) == item.parent_item_id.as_ref())
+        .expect("the task tool row");
+    assert!(
+        matches!(&parent.kind, TurnItemKind::DynamicTool(tool) if tool.tool_name.as_deref() == Some("task"))
+    );
+    assert!(parent.ordinal < item.ordinal);
+
+    // Live: the entity streamed as `subagent.updated` events.
+    let updates = harness
+        .events
+        .iter()
+        .filter(|body| matches!(body, DomainEventBody::SubagentUpdated(_)))
+        .count();
+    assert!(updates >= 3, "{updates} subagent updates");
+}
+
+#[test]
+fn engine_mapping_subagent_cancelled_then_revived() {
+    let mut harness = Harness::new();
+    harness.start("Use the task tool to run one subagent that sleeps 60 seconds.");
+    let mut statuses = Vec::new();
+    for line in include_str!("fixtures/omp/subagent-cancel.jsonl").lines() {
+        harness.replay(line, |_, _| panic!("no questions"));
+        if let Some(subagent) = harness.model.proj.subagents.first()
+            && statuses.last() != Some(&subagent.status)
+        {
+            statuses.push(subagent.status);
+        }
+    }
+    assert_eq!(
+        statuses,
+        [
+            SubagentStatus::Running,
+            SubagentStatus::Cancelled,
+            SubagentStatus::Running,
+            SubagentStatus::Completed,
+        ]
+    );
+    let projection = harness.projection();
+    assert_completed_run(&projection);
+    assert_eq!(
+        projection.subagents.len(),
+        1,
+        "a revived subagent is the same one"
+    );
+    let subagent = &projection.subagents[0];
+    assert_eq!(subagent.title.as_deref(), Some("Run sleep 60 via bash"));
+    // No transcript read in this recording: the last output lines stand in.
+    assert_eq!(subagent.result.as_deref(), Some("DONE"));
+    assert_eq!(harness.fetches.len(), 1);
+    assert!(
+        subagent
+            .progress
+            .as_deref()
+            .is_some_and(|line| line.starts_with("Waiting for sleep job to finish · 2 tool calls"))
+    );
+    let item = subagent_row(&projection, &subagent.id);
+    assert_eq!(item.status, TurnItemStatus::Completed);
+    assert_eq!(
+        projection
+            .visible_turn_items
+            .iter()
+            .filter(|row| matches!(row.item.kind, TurnItemKind::Subagent(_)))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn engine_mapping_subagents_end_with_the_omp_process() {
+    let mut harness = Harness::new();
+    harness.start("Use the task tool to run one subagent that sleeps 60 seconds.");
+    let fixture = include_str!("fixtures/omp/subagent-cancel.jsonl");
+    let until_running: String = fixture
+        .lines()
+        .take_while(|line| !line.contains("\"cancel_subagent\""))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    harness.replay(&until_running, |_, _| panic!("no questions"));
+    assert_eq!(
+        harness.model.proj.subagents[0].status,
+        SubagentStatus::Running
+    );
+    assert!(harness.model.needs_recovery());
+    // A server restart: nothing survives in omp.
+    harness.model.recover();
+    harness.commit();
+    let projection = harness.projection();
+    assert_eq!(projection.subagents[0].status, SubagentStatus::Interrupted);
+    assert_eq!(
+        subagent_row(&projection, &projection.subagents[0].id).status,
+        TurnItemStatus::Interrupted
+    );
+    assert!(!harness.model.needs_recovery());
+}
+
+#[test]
+fn engine_mapping_goal_lifecycle() {
+    let mut harness = Harness::new();
+    harness.start("Work on the goal now.");
+    harness.replay(include_str!("fixtures/omp/goal.jsonl"), |_, _| {
+        panic!("no questions")
+    });
+    let projection = harness.projection();
+    assert_completed_run(&projection);
+    // create → pause → resume → the agent completes it → a second goal is
+    // created and dropped. omp's `get_state.goal` is null right after the
+    // completion; j3 keeps showing the completed goal until the next one.
+    let mut statuses = Vec::new();
+    let mut completed = None;
+    for body in &harness.events {
+        let DomainEventBody::ProviderThreadUpdated(thread) = body else {
+            continue;
+        };
+        let status = thread.goal.as_ref().map(|goal| goal.status);
+        if status == Some(ProviderGoalStatus::Complete) {
+            completed = thread.goal.clone();
+        }
+        if statuses.last() != Some(&status) {
+            statuses.push(status);
+        }
+    }
+    assert_eq!(
+        statuses,
+        [
+            None,
+            Some(ProviderGoalStatus::Active),
+            Some(ProviderGoalStatus::Paused),
+            Some(ProviderGoalStatus::Active),
+            Some(ProviderGoalStatus::Complete),
+            Some(ProviderGoalStatus::Active),
+            None,
+        ]
+    );
+    let completed = completed.unwrap();
+    assert_eq!(
+        completed.objective,
+        "Create a file named goal.txt containing the word done"
+    );
+    assert_eq!(completed.tokens_used, Some(15950));
+    assert_eq!(completed.token_budget, Some(Some(200_000)));
+    assert_eq!(completed.time_used_seconds, Some(7));
+    assert!(projection.provider_threads[0].goal.is_none());
+    assert!(!harness.model.goal_active());
+    let shell: ThreadShell = serde_json::from_value(harness.last_shell.clone().unwrap()).unwrap();
+    assert_eq!(shell.goal, None);
+}
+
+#[test]
+fn engine_mapping_goal_shows_on_the_shell_and_pauses_with_omp() {
+    let mut harness = Harness::new();
+    let fixture = include_str!("fixtures/omp/goal.jsonl");
+    let created: String = fixture
+        .lines()
+        .take_while(|line| !line.contains("\"status\":\"paused\""))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    harness.replay(&created, |_, _| panic!("no questions"));
+    assert!(harness.model.goal_active());
+    let shell: ThreadShell = serde_json::from_value(harness.last_shell.clone().unwrap()).unwrap();
+    let goal = shell
+        .goal
+        .flatten()
+        .expect("the shell row carries the goal");
+    assert_eq!(goal.status, ProviderGoalStatus::Active);
+    assert_eq!(goal.tokens_used, Some(0));
+    // omp restores an active goal paused when its process starts again.
+    harness.model.session_closed();
+    harness.commit();
+    assert_eq!(
+        harness.projection().provider_threads[0]
+            .goal
+            .as_ref()
+            .map(|goal| goal.status),
+        Some(ProviderGoalStatus::Paused)
+    );
+    // A completed goal is cleared by j3 alone.
+    assert!(!harness.model.clear_completed_goal());
 }

@@ -8,10 +8,10 @@
 
 use j3_protocol::t3::orchestration::{
     ActivityRunStatus, AppThread, ConversationMessage, LatestVisibleMessageSummary, MessageRole,
-    PendingRuntimeRequestSummary, PlanArtifact, ProjectedTurnItem, ProviderSession, ProviderThread,
-    ProviderTurn, Run, RunAttempt, RunStatus, RuntimeRequest, RuntimeRequestStatus,
-    ShellThreadStatus, ThreadProjection, ThreadShell, TurnItem, TurnItemKind, TurnItemVisibility,
-    UserMessageInputIntent,
+    PendingRuntimeRequestSummary, PlanArtifact, ProjectedTurnItem, ProviderGoal, ProviderSession,
+    ProviderThread, ProviderTurn, Run, RunAttempt, RunStatus, RuntimeRequest, RuntimeRequestStatus,
+    ShellThreadStatus, Subagent, ThreadProjection, ThreadShell, TurnItem, TurnItemKind,
+    TurnItemVisibility, UserMessageInputIntent,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -36,6 +36,7 @@ pub enum Kind {
     Message,
     Plan,
     Item,
+    Subagent,
 }
 
 impl Kind {
@@ -51,6 +52,7 @@ impl Kind {
             Self::Message => "message",
             Self::Plan => "plan",
             Self::Item => "turnItem",
+            Self::Subagent => "subagent",
         }
     }
 
@@ -66,6 +68,7 @@ impl Kind {
             "message" => Self::Message,
             "plan" => Self::Plan,
             "turnItem" => Self::Item,
+            "subagent" => Self::Subagent,
             _ => return None,
         })
     }
@@ -83,6 +86,7 @@ impl Kind {
             Self::Message => "message.updated",
             Self::Plan => "plan.updated",
             Self::Item => "turn-item.updated",
+            Self::Subagent => "subagent.updated",
         }
     }
 
@@ -126,6 +130,7 @@ pub struct Projection {
     pub messages: Vec<ConversationMessage>,
     pub plans: Vec<PlanArtifact>,
     pub items: Vec<TurnItem>,
+    pub subagents: Vec<Subagent>,
     pending: Vec<Pending>,
 }
 
@@ -142,6 +147,7 @@ impl Projection {
             messages: Vec::new(),
             plans: Vec::new(),
             items: Vec::new(),
+            subagents: Vec::new(),
             pending: Vec::new(),
         }
     }
@@ -178,6 +184,7 @@ impl Projection {
                 Kind::Message => projection.messages.push(serde_json::from_value(json)?),
                 Kind::Plan => projection.plans.push(serde_json::from_value(json)?),
                 Kind::Item => projection.items.push(serde_json::from_value(json)?),
+                Kind::Subagent => projection.subagents.push(serde_json::from_value(json)?),
             }
         }
         Ok(Some(projection))
@@ -303,6 +310,9 @@ impl Projection {
         for id in self.items.iter().map(|i| i.id.clone()) {
             push(Kind::Item, &id)?;
         }
+        for id in self.subagents.iter().map(|s| s.id.clone()) {
+            push(Kind::Subagent, &id)?;
+        }
         Ok(rows)
     }
 
@@ -365,6 +375,9 @@ impl Projection {
                     )
                 })
                 .transpose()?,
+            Kind::Subagent => find(&self.subagents, id, |s| &s.id)
+                .map(|(i, s)| build(s, i as i64, s.run_id.as_ref(), Some(&s.parent_node_id)))
+                .transpose()?,
         };
         Ok(entity)
     }
@@ -375,6 +388,27 @@ impl Projection {
 
     pub fn run_mut(&mut self, id: &str) -> Option<&mut Run> {
         self.runs.iter_mut().rev().find(|run| run.id == id)
+    }
+
+    pub fn subagent(&self, id: &str) -> Option<&Subagent> {
+        self.subagents
+            .iter()
+            .rev()
+            .find(|subagent| subagent.id == id)
+    }
+
+    pub fn subagent_mut(&mut self, id: &str) -> Option<&mut Subagent> {
+        self.subagents
+            .iter_mut()
+            .rev()
+            .find(|subagent| subagent.id == id)
+    }
+
+    /// The goal of the thread's provider thread (omp goal mode).
+    pub fn goal(&self) -> Option<&ProviderGoal> {
+        self.provider_threads
+            .iter()
+            .find_map(|thread| thread.goal.as_ref())
     }
 
     pub fn item(&self, id: &str) -> Option<&TurnItem> {
@@ -483,6 +517,7 @@ impl Projection {
         runs.sort_by_key(|run| run.ordinal);
         projection.runs = runs;
         projection.attempts = self.attempts.clone();
+        projection.subagents = self.subagents.clone();
         projection.provider_sessions = self.sessions.clone();
         projection.provider_threads = self.provider_threads.clone();
         projection.provider_turns = self.provider_turns.clone();
@@ -635,7 +670,7 @@ impl Projection {
             has_actionable_proposed_plan: false,
             pending_background_tasks: Vec::new(),
             provider_instance_history: vec![thread.provider_instance_id.clone()],
-            goal: None,
+            goal: self.goal().cloned().map(Some),
             item_count: self.items.len() as u64,
             visible_item_count: visible.len() as u64,
             created_at: thread.created_at.clone(),

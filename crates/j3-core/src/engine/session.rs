@@ -11,9 +11,12 @@ use tokio::sync::mpsc;
 use crate::omp::{
     self, OmpLauncher, OmpSession,
     omp_rpc::{
-        AbortCommand, AvailableSlashCommand, Command, Event, ExtensionUiResponse,
-        GetAvailableCommandsCommand, GetStateCommand, ImageContent, PromptAck, PromptCommand,
-        SessionState, SetModelCommand, SetThinkingLevelCommand, SteerCommand, ThinkingLevel,
+        AbortCommand, AvailableSlashCommand, CancelSubagentCommand, Command, Event,
+        ExtensionUiResponse, GetAvailableCommandsCommand, GetStateCommand,
+        GetSubagentMessagesCommand, GoalCommand, GoalOp, GoalResult, ImageContent, PromptAck,
+        PromptCommand, SessionState, SetModelCommand, SetSubagentSubscriptionCommand,
+        SetThinkingLevelCommand, SteerCommand, SubagentMessages, SubagentSubscriptionLevel,
+        ThinkingLevel,
     },
 };
 
@@ -35,6 +38,17 @@ pub trait AgentSession: Send + Sync + 'static {
     fn set_thinking_level(&self, level: ThinkingLevel) -> BoxFuture<'_, Result<()>>;
     fn get_state(&self) -> BoxFuture<'_, Result<SessionState>>;
     fn available_commands(&self) -> BoxFuture<'_, Result<Vec<AvailableSlashCommand>>>;
+    /// omp `goal`: read or change goal mode.
+    fn goal(
+        &self,
+        op: GoalOp,
+        objective: Option<String>,
+        token_budget: Option<i64>,
+    ) -> BoxFuture<'_, Result<GoalResult>>;
+    /// omp `cancel_subagent`; false when it is not a running subagent.
+    fn cancel_subagent(&self, subagent_id: String) -> BoxFuture<'_, Result<bool>>;
+    /// omp `get_subagent_messages` for one subagent's whole transcript.
+    fn subagent_messages(&self, subagent_id: String) -> BoxFuture<'_, Result<SubagentMessages>>;
     fn respond_ui(&self, response: ExtensionUiResponse) -> Result<()>;
     fn close(self: Box<Self>) -> BoxFuture<'static, ()>;
 }
@@ -117,6 +131,31 @@ impl AgentSession for Omp {
         Box::pin(self.0.call(GetAvailableCommandsCommand {}))
     }
 
+    fn goal(
+        &self,
+        op: GoalOp,
+        objective: Option<String>,
+        token_budget: Option<i64>,
+    ) -> BoxFuture<'_, Result<GoalResult>> {
+        Box::pin(self.0.call(GoalCommand {
+            op,
+            objective,
+            token_budget,
+        }))
+    }
+
+    fn cancel_subagent(&self, subagent_id: String) -> BoxFuture<'_, Result<bool>> {
+        Box::pin(self.0.call(CancelSubagentCommand { subagent_id }))
+    }
+
+    fn subagent_messages(&self, subagent_id: String) -> BoxFuture<'_, Result<SubagentMessages>> {
+        Box::pin(self.0.call(GetSubagentMessagesCommand {
+            subagent_id: Some(subagent_id),
+            session_file: None,
+            from_byte: None,
+        }))
+    }
+
     fn respond_ui(&self, response: ExtensionUiResponse) -> Result<()> {
         self.0.respond_ui(response)
     }
@@ -152,6 +191,16 @@ impl SessionFactory for OmpFactory {
                 .await
             {
                 tracing::debug!(%error, "omp set_event_filter delta mode unavailable");
+            }
+            // Lifecycle and progress frames of subagents; their own session
+            // events stay off (the subagent transcript has them).
+            if let Err(error) = session
+                .call(SetSubagentSubscriptionCommand {
+                    level: SubagentSubscriptionLevel::Progress,
+                })
+                .await
+            {
+                tracing::warn!(%error, "omp set_subagent_subscription");
             }
             Ok((Box::new(Omp(session)) as Box<dyn AgentSession>, events))
         })

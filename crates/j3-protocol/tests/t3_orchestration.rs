@@ -253,6 +253,17 @@ fn every_accepted_command_type_is_typed() {
             "queued-message.promote-to-steer",
             json!({"queuedRunId":"a","targetRunId":"b"}),
         ),
+        base(
+            "subagent.stop",
+            json!({"runId":"r","subagentId":"PingTest"}),
+        ),
+        base(
+            "j3.goal.create",
+            json!({"objective":"Ship it","tokenBudget":200000}),
+        ),
+        base("j3.goal.pause", json!({})),
+        base("j3.goal.resume", json!({})),
+        base("j3.goal.drop", json!({})),
     ];
     let mut types = std::collections::BTreeSet::new();
     for case in cases {
@@ -263,8 +274,8 @@ fn every_accepted_command_type_is_typed() {
         );
         types.insert(command.tag().unwrap().to_owned());
     }
-    assert_eq!(types.len(), 26);
-    assert_eq!(OrchestrationV2Command::KNOWN_TAGS.len(), 26);
+    assert_eq!(types.len(), 31);
+    assert_eq!(OrchestrationV2Command::KNOWN_TAGS.len(), 31);
 }
 
 #[test]
@@ -272,7 +283,7 @@ fn cut_commands_decode_to_unknown_and_reencode() {
     for value in [
         json!({"type":"thread.create","commandId":"c","threadId":T,"projectId":P,"title":"x","createdBy":"user","creationSource":"web",
             "modelSelection":{"instanceId":"omp","model":"m"},"runtimeMode":"full-access","interactionMode":"default","branch":null,"worktreePath":null}),
-        json!({"type":"subagent.stop","commandId":"c","threadId":T,"runId":"r","subagentId":"n"}),
+        json!({"type":"thread.fork","commandId":"c","threadId":T}),
         json!({"type":"provider.switch","commandId":"c","threadId":T,"modelSelection":{"instanceId":"x","model":"y"}}),
         json!({"type":"some.future.command","commandId":"c","weird":[1,{"a":null}]}),
     ] {
@@ -580,6 +591,56 @@ fn remaining_turn_item_kinds() {
         let item: TurnItem = round_trip(v);
         assert!(!matches!(item.kind, TurnItemKind::Unknown(_)), "{item:?}");
     }
+}
+
+/// The t3 shapes j3 fills from omp goals and subagents
+/// (`docs/protocol/j3-extensions.md`).
+#[test]
+fn goal_and_subagent_shapes() {
+    let goal = json!({"objective":"Ship it","status":"budget_limited","tokensUsed":15950,"tokenBudget":200000,
+        "timeUsedSeconds":7});
+    let typed: ProviderGoal = round_trip(goal.clone());
+    assert_eq!(typed.status, ProviderGoalStatus::BudgetLimited);
+    let _: ProviderGoal = round_trip(json!({"objective":"x","status":"active","tokenBudget":null}));
+    let mut thread = provider_thread();
+    thread["goal"] = goal.clone();
+    let thread: ProviderThread = round_trip(thread);
+    assert_eq!(thread.goal.unwrap().tokens_used, Some(15950));
+    let mut shell = thread_shell();
+    shell["goal"] = goal;
+    let _: ThreadShell = round_trip(shell);
+
+    let subagent = json!({"id":"PingTest","threadId":T,"runId":"run_1","parentNodeId":"node_r1","origin":"provider_native",
+        "createdBy":"agent","driver":"pi","providerInstanceId":"omp","providerThreadId":null,"childThreadId":null,
+        "nativeTaskRef":{"driver":"pi","nativeId":"PingTest","strength":"strong"},"prompt":"Reply PONG",
+        "title":"Ping","model":"opencode-go/glm-5.3-flash","status":"completed","progress":"1 request",
+        "result":"PONG","startedAt":"2026-11-01T12:00:00.000Z","completedAt":"2026-11-01T12:00:03.000Z",
+        "updatedAt":"2026-11-01T12:00:03.000Z"});
+    let typed: Subagent = round_trip(subagent.clone());
+    assert!(!typed.status.is_active());
+    let item: ThreadStreamItem = round_trip(
+        json!({"kind":"event","sequence":9,"event":{"id":"e","threadId":T,"runId":"run_1",
+        "occurredAt":"2026-11-01T12:00:00.000Z","type":"subagent.updated","payload":subagent.clone()}}),
+    );
+    let ThreadStreamItem::Event(event) = item else {
+        panic!("expected an event");
+    };
+    assert!(matches!(
+        event.event.body,
+        DomainEventBody::SubagentUpdated(_)
+    ));
+    let mut projection = empty_projection();
+    projection["subagents"] = json!([subagent]);
+    let _: ThreadProjection = round_trip(projection);
+
+    let item: TurnItem = round_trip(
+        json!({"id":"ti_4","threadId":T,"runId":"run_1","nodeId":"node_r1","providerThreadId":"pth_T","providerTurnId":"ptu_1",
+        "nativeItemRef":null,"parentItemId":"ti_3","ordinal":4,"status":"running","title":"Ping",
+        "startedAt":"2026-11-01T12:00:00.000Z","completedAt":null,"updatedAt":"2026-11-01T12:00:00.000Z",
+        "type":"subagent","subagentId":"PingTest","origin":"provider_native","driver":"pi","providerInstanceId":"omp",
+        "childThreadId":null,"prompt":"Reply PONG","progress":"Thinking","result":null}),
+    );
+    assert!(matches!(item.kind, TurnItemKind::Subagent(_)));
 }
 
 // ---------------------------------------------------------------------------

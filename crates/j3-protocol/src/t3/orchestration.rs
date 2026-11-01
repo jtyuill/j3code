@@ -3,7 +3,7 @@
 //! `C/providerPolicy.ts`, message context from `C/composerContext.ts`).
 //!
 //! Rust names drop the `OrchestrationV2` prefix. Entities j3 never emits
-//! (subagents, checkpoints, context handoffs/transfers) stay opaque JSON.
+//! (checkpoints, context handoffs/transfers) stay opaque JSON.
 
 use std::collections::BTreeMap;
 
@@ -557,6 +557,82 @@ pub struct ExecutionNode {
     pub completed_at: Option<IsoDateTime>,
 }
 
+/// `origin` of [`Subagent`] and [`SubagentItem`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentOrigin {
+    ProviderNative,
+    AppOwned,
+}
+
+/// `status` of [`Subagent`] (`OV2:896-905`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentStatus {
+    Idle,
+    Pending,
+    Running,
+    Waiting,
+    Completed,
+    Failed,
+    Cancelled,
+    Interrupted,
+}
+
+impl SubagentStatus {
+    /// `isOrchestrationV2WorkActive`: pending, running or waiting.
+    pub fn is_active(self) -> bool {
+        matches!(self, Self::Pending | Self::Running | Self::Waiting)
+    }
+}
+
+/// `OrchestrationV2Subagent` (`OV2:879-918`), one entry of the projection's
+/// `subagents`, replaced by `subagent.updated`. j3 fills it from omp's
+/// `subagent_lifecycle` / `subagent_progress` frames (`docs/protocol/j3-extensions.md`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Subagent {
+    pub id: NodeId,
+    pub thread_id: ThreadId,
+    pub run_id: Option<RunId>,
+    pub parent_node_id: NodeId,
+    pub origin: SubagentOrigin,
+    pub created_by: Actor,
+    pub driver: ProviderDriverKind,
+    pub provider_instance_id: ProviderInstanceId,
+    pub provider_thread_id: Option<ProviderThreadId>,
+    pub child_thread_id: Option<ThreadId>,
+    /// `OrchestrationV2RemoteTaskChild`; opaque.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_child: Option<Value>,
+    pub native_task_ref: Option<ProviderRef>,
+    pub prompt: String,
+    pub title: Option<String>,
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_selection: Option<ModelSelection>,
+    /// `"always" | "settled_only"`; opaque.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_wake: Option<Value>,
+    /// `OrchestrationV2DelegatedCompletionTaskDelivery`; opaque.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_delivery: Option<Value>,
+    pub status: SubagentStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<String>,
+    /// `OrchestrationV2SubagentWorkflow`; opaque.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<Value>,
+    pub result: Option<String>,
+    pub started_at: Option<IsoDateTime>,
+    pub completed_at: Option<IsoDateTime>,
+    pub updated_at: IsoDateTime,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_omitted: Option<True>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_omitted: Option<True>,
+}
+
 // ---------------------------------------------------------------------------
 // Provider entities
 // ---------------------------------------------------------------------------
@@ -892,6 +968,44 @@ pub struct ProviderThreadForkedFrom {
     pub checkpoint_id: Option<CheckpointId>,
 }
 
+/// `OrchestrationV2ProviderGoalStatus` (`OV2:1048-1055`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderGoalStatus {
+    Active,
+    Paused,
+    Blocked,
+    UsageLimited,
+    BudgetLimited,
+    Complete,
+}
+
+/// `OrchestrationV2ProviderGoal` (`OV2:1058-1066`): the provider's goal on a
+/// provider thread (and the thread shell). j3 fills it from omp goal mode
+/// (`docs/protocol/j3-extensions.md`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderGoal {
+    /// Non-blank.
+    pub objective: String,
+    pub status: ProviderGoalStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_used: Option<u64>,
+    /// `Schema.optional(Schema.NullOr(NonNegativeInt))`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "double_option"
+    )]
+    pub token_budget: Option<Option<u64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_used_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checks: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_check: Option<String>,
+}
+
 /// `OrchestrationV2ProviderThread` (`OV2:1069-1103`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -920,9 +1034,9 @@ pub struct ProviderThread {
     /// `OrchestrationV2ProviderThreadNativeMetadata | null`, decoding default `null`; opaque.
     #[serde(default)]
     pub native_metadata: Option<Value>,
-    /// `OrchestrationV2ProviderGoal | null`, decoding default `null`; opaque.
+    /// `OrchestrationV2ProviderGoal | null`, decoding default `null`.
     #[serde(default)]
-    pub goal: Option<Value>,
+    pub goal: Option<ProviderGoal>,
     pub created_at: IsoDateTime,
     pub updated_at: IsoDateTime,
 }
@@ -1489,12 +1603,36 @@ pub struct DynamicToolItem {
     pub output_omitted: Option<bool>,
 }
 
+/// `subagent` turn item (`OV2:1778-1793`): one subagent the agent started,
+/// with its prompt, latest progress and final result. The status lives in the
+/// item base.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentItem {
+    pub subagent_id: NodeId,
+    pub origin: SubagentOrigin,
+    pub driver: ProviderDriverKind,
+    pub provider_instance_id: ProviderInstanceId,
+    pub child_thread_id: Option<ThreadId>,
+    /// `OrchestrationV2RemoteTaskChild`; opaque.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_child: Option<Value>,
+    pub prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<String>,
+    pub result: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_omitted: Option<True>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_omitted: Option<True>,
+}
+
 open_union! {
-    /// The `type`-specific body of a [`TurnItem`] (`OV2:1583-1805`). The 15
+    /// The `type`-specific body of a [`TurnItem`] (`OV2:1583-1805`). The 16
     /// kinds j3 emits are typed; every other kind (`notification`,
     /// `proposed_plan`, `approval_request`, `checkpoint`, `handoff`, `fork`,
-    /// `thread_created`, `secret_request`, `link_request`, `subagent`, future
-    /// kinds) is `Unknown` holding the non-base keys, `type` included.
+    /// `thread_created`, `secret_request`, `link_request`, future kinds) is
+    /// `Unknown` holding the non-base keys, `type` included.
     pub enum TurnItemKind {
         tag = "type";
         newtype {
@@ -1513,6 +1651,7 @@ open_union! {
             "system_notice" => SystemNotice(MessageItem),
             "error" => Error(ErrorItem),
             "compaction" => Compaction(CompactionItem),
+            "subagent" => Subagent(SubagentItem),
         }
         unit {}
     }
@@ -1579,7 +1718,7 @@ pub struct ProjectedTurnItem {
 // ---------------------------------------------------------------------------
 
 open_union! {
-    /// `type` + `payload` of a [`DomainEvent`] (`OV2:1851-1994`). The 20 types
+    /// `type` + `payload` of a [`DomainEvent`] (`OV2:1851-1994`). The 21 types
     /// j3 emits are typed; every other type is `Unknown` holding `type`,
     /// `payload` and any other non-base keys.
     pub enum DomainEventBody {
@@ -1605,6 +1744,7 @@ open_union! {
             "message.updated" => MessageUpdated(ConversationMessage),
             "turn-item.updated" => TurnItemUpdated(TurnItem),
             "plan.updated" => PlanUpdated(PlanArtifact),
+            "subagent.updated" => SubagentUpdated(Subagent),
         }
         unit {}
     }
@@ -1645,8 +1785,7 @@ pub struct ThreadProjection {
     pub runs: Vec<Run>,
     pub attempts: Vec<RunAttempt>,
     pub nodes: Vec<ExecutionNode>,
-    /// `OrchestrationV2Subagent[]`; opaque (j3 sends `[]`).
-    pub subagents: Vec<Value>,
+    pub subagents: Vec<Subagent>,
     pub provider_sessions: Vec<ProviderSession>,
     pub provider_threads: Vec<ProviderThread>,
     pub provider_turns: Vec<ProviderTurn>,
@@ -1878,13 +2017,13 @@ pub struct ThreadShell {
     /// Decoding default `[]`.
     #[serde(default)]
     pub provider_instance_history: Vec<ProviderInstanceId>,
-    /// `OrchestrationV2ProviderGoal | null`; opaque.
+    /// `OrchestrationV2ProviderGoal | null`.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         with = "double_option"
     )]
-    pub goal: Option<Option<Value>>,
+    pub goal: Option<Option<ProviderGoal>>,
     pub item_count: u64,
     pub visible_item_count: u64,
     pub created_at: IsoDateTime,

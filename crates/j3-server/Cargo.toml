@@ -8,7 +8,6 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-axum.workspace = true
 clap.workspace = true
 gethostname.workspace = true
 j3-core.workspace = true

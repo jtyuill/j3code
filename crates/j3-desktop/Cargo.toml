@@ -1,0 +1,29 @@
+[package]
+name = "j3-desktop"
+description = "j3 desktop app (GPUI)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "j3"
+path = "src/main.rs"
+
+[dependencies]
+dirs.workspace = true
+gethostname.workspace = true
+gpui-kit.workspace = true
+j3-client.workspace = true
+j3-core.workspace = true
+j3-protocol.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+

@@ -62,7 +62,8 @@ crates/
   j3-protocol/      client⇄server wire: Effect RPC envelopes (`effect_rpc`) + t3 contract types (`t3`)
   j3-core/          server library: omp driver, engine (thread actors, omp→t3 mapping), SQLite store, hub, HTTP/WS
   j3-server/        headless binary (`j3-server serve [--tailscale]`), port 3780 (t3code keeps 3773)
-  j3-desktop/       GPUI desktop app; embeds j3-core                       [M4]
+  j3-client/        protocol client: connection supervisor, typed calls, shell/thread state reducers (GPUI-agnostic)
+  j3-desktop/       GPUI Kit desktop app (binary `j3`); embeds j3-core as the local environment
 packages/contracts/ t3code's Effect Schema contracts (unchanged copy); used by the conformance client and later the iOS app
 tests/conformance/  Node client that drives a j3 server like t3's client-runtime and decodes everything with the contracts
 apps/mobile/        trimmed Expo fork of t3code/apps/mobile                [M5]
@@ -89,6 +90,7 @@ Protocol check against a running server (uses real omp and spends tokens):
 | M1 | omp driver (`j3-core::omp`) | Integration test starts real omp, prompts, streams events, answers `ask`, resumes by session file, on Mac and shieldy. | done (`crates/j3-core/tests/omp_live.rs`) |
 | M2 | Wire protocol foundations | Effect RPC envelope types round-trip frames captured from Effect's own RPC server; iOS thread-surface spec written. | done (`docs/protocol/`) |
 | M3 | Server | `j3-server serve` on shieldy under systemd; thread create/prompt/stream/reconnect over WS, verified with a scripted client. | done: user unit on shieldy, port 3780; conformance 37/37 on Mac and shieldy |
-| M4 | Desktop v1 | GPUI app on Mac: local + shieldy environments, the v1 scope above. | next |
+| M4a | Desktop v1 core | GPUI app on Mac: local + shieldy environments; projects, threads, streaming chat, composer (images, model/thinking, slash commands/skills), steer/queue/stop, `ask` answers, todos. | in progress |
+| M4b | omp extras | Goals and subagent visibility end to end: server maps omp `goal_updated`/`get_state.goal` and `subagent_*` frames into j3 protocol extensions (safe for iOS: unknown thread events and turn item kinds are skipped), client + desktop render them. | |
 | M5 | iOS | Trimmed Expo app on the iPhone, talking to shieldy. | |
 | M6 | revived | Linux desktop build and NixOS packaging verified on revived. | |

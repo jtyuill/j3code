@@ -13,6 +13,7 @@ use super::orchestration::{
     ProviderInteractionMode, ProviderUserInputAnswers, RuntimeMode, SourcePlanRef,
     ThreadProjection, UserInputAttachments, WorkspaceStrategy,
 };
+use crate::j3::{GoalCommand, GoalCreateCommand};
 
 // ---------------------------------------------------------------------------
 // Required commands (§3.4)
@@ -350,11 +351,24 @@ pub struct ThreadReorderCommand {
     pub order_key: String,
 }
 
+/// `subagent.stop` (`OV2:3194-3200`): stop one running subagent of a run
+/// without stopping the run (omp `cancel_subagent`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentStopCommand {
+    pub command_id: CommandId,
+    pub thread_id: ThreadId,
+    pub run_id: RunId,
+    pub subagent_id: NodeId,
+}
+
 open_union! {
     /// `OrchestrationV2Command` (`OV2:2877-3347`), the `dispatchCommand`
-    /// payload, by `type`. The 17 required and 9 no-op commands j3 accepts
-    /// are typed; every other type (the 29 cut ones, future ones) decodes to
-    /// `Unknown` and must be rejected with [`OrchestrationV2DispatchCommandError`].
+    /// payload, by `type`. The 17 required and 9 no-op commands j3 accepts,
+    /// `subagent.stop`, and the `j3.*` extension commands
+    /// ([`crate::j3`]) are typed; every other type (the cut ones, future
+    /// ones) decodes to `Unknown` and must be rejected with
+    /// [`OrchestrationV2DispatchCommandError`].
     pub enum OrchestrationV2Command {
         tag = "type";
         newtype {
@@ -384,6 +398,11 @@ open_union! {
             "thread.unpin" => ThreadUnpin(ThreadCommand),
             "thread.pin.reorder" => ThreadPinReorder(ThreadReorderCommand),
             "thread.active.reorder" => ThreadActiveReorder(ThreadReorderCommand),
+            "subagent.stop" => SubagentStop(SubagentStopCommand),
+            "j3.goal.create" => GoalCreate(GoalCreateCommand),
+            "j3.goal.pause" => GoalPause(GoalCommand),
+            "j3.goal.resume" => GoalResume(GoalCommand),
+            "j3.goal.drop" => GoalDrop(GoalCommand),
         }
         unit {}
     }
@@ -416,6 +435,9 @@ impl OrchestrationV2Command {
             Self::ThreadAutoSettleSet(c) => &c.command_id,
             Self::ThreadPin(c) => &c.command_id,
             Self::ThreadPinReorder(c) | Self::ThreadActiveReorder(c) => &c.command_id,
+            Self::SubagentStop(c) => &c.command_id,
+            Self::GoalCreate(c) => &c.command_id,
+            Self::GoalPause(c) | Self::GoalResume(c) | Self::GoalDrop(c) => &c.command_id,
             Self::Unknown(value) => return value.get("commandId").and_then(Value::as_str),
         })
     }
@@ -447,6 +469,9 @@ impl OrchestrationV2Command {
             Self::ThreadAutoSettleSet(c) => &c.thread_id,
             Self::ThreadPin(c) => &c.thread_id,
             Self::ThreadPinReorder(c) | Self::ThreadActiveReorder(c) => &c.thread_id,
+            Self::SubagentStop(c) => &c.thread_id,
+            Self::GoalCreate(c) => &c.thread_id,
+            Self::GoalPause(c) | Self::GoalResume(c) | Self::GoalDrop(c) => &c.thread_id,
             Self::Unknown(value) => return value.get("threadId").and_then(Value::as_str),
         })
     }

@@ -37,6 +37,8 @@ use crate::omp::omp_rpc::{
     SessionState, ThinkingLevel, TodoPhase, TodoStatus, ToolCall, ValueUiResponse,
 };
 
+mod agents;
+
 /// Option id of the thinking descriptor j3 advertises.
 pub const THINKING_OPTION: &str = "thinking";
 /// omp's ask tool; its row is represented by the `user_input_request` item.
@@ -53,6 +55,9 @@ pub enum Effect {
     RunSettled,
     /// Expire runtime request `request_id` after `after_ms` unless answered.
     ExpireAfter { request_id: String, after_ms: u64 },
+    /// Read the transcript of finished subagent `subagent_id` and feed it to
+    /// [`ThreadModel::apply_subagent_transcript`].
+    FetchSubagentResult { subagent_id: String },
 }
 
 /// A command the model refuses; the message is shown to the user.
@@ -161,6 +166,9 @@ pub struct ThreadModel {
     /// Runtime request id → pending omp UI request.
     ui: HashMap<String, PendingUi>,
     next_ordinal: u64,
+    /// Last `recentOutput` lines per subagent id: its result when the
+    /// transcript can't be read.
+    subagent_output: HashMap<String, Vec<String>>,
 }
 
 fn now() -> String {
@@ -400,6 +408,7 @@ impl ThreadModel {
             live: None,
             ui: HashMap::new(),
             next_ordinal,
+            subagent_output: HashMap::new(),
         }
     }
 
@@ -1180,6 +1189,7 @@ impl ThreadModel {
         self.hold_queue();
         self.live = None;
         self.ui.clear();
+        self.session_closed();
         self.set_session_status(ProviderSessionStatus::Stopped, None);
     }
 
@@ -1196,6 +1206,7 @@ impl ThreadModel {
                 .sessions
                 .iter()
                 .any(|session| !matches!(session.status, ProviderSessionStatus::Stopped))
+            || self.has_live_agent_state()
     }
 
     // -----------------------------------------------------------------------
@@ -1411,6 +1422,8 @@ impl ThreadModel {
             .items
             .iter()
             .filter(|item| item.run_id.as_deref() == Some(run_id))
+            // Subagents end with their own lifecycle, not with the run.
+            .filter(|item| !matches!(item.kind, TurnItemKind::Subagent(_)))
             .filter(|item| {
                 matches!(
                     item.status,
@@ -1572,6 +1585,12 @@ impl ThreadModel {
                 }
             }
             RpcNotification::RpcAgentEvent(event) => self.apply_agent_event(event, &mut effects),
+            RpcNotification::SubagentLifecycle(lifecycle) => {
+                self.apply_subagent_lifecycle(&lifecycle.payload, &mut effects);
+            }
+            RpcNotification::SubagentProgress(progress) => {
+                self.apply_subagent_progress(&progress.payload);
+            }
             _ => {}
         }
         effects
@@ -1754,6 +1773,7 @@ impl ThreadModel {
                     self.set_thinking_option(level);
                 }
             }
+            RpcAgentEvent::GoalUpdated(update) => self.apply_goal(update.goal.as_ref()),
             _ => {}
         }
     }
@@ -2256,6 +2276,7 @@ impl ThreadModel {
     /// Applies a `get_state` snapshot (todos and the effective model).
     pub fn apply_state(&mut self, state: &SessionState) {
         self.apply_todos(&state.todo_phases);
+        self.apply_goal_state(state.goal.as_ref());
         if let Some(model) = &state.model {
             let slug = format!("{}/{}", model.provider, model.id);
             if self.proj.thread.model_selection.model != slug {

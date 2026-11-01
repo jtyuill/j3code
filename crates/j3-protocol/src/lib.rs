@@ -5,4 +5,5 @@
 
 pub mod effect_rpc;
 
+pub mod j3;
 pub mod t3;

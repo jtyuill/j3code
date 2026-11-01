@@ -4,26 +4,20 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
     process::ExitCode,
-    sync::Arc,
     time::Duration,
 };
 
 use clap::{Parser, Subcommand};
 use j3_core::{
     app::{App, AppConfig},
-    http::{HttpState, router},
     omp::OmpLauncher,
-    rpc::RpcHandler,
+    serve::{DEFAULT_PORT, Server, tailscale_ipv4},
 };
-use tokio::{net::TcpListener, process::Command, signal, task::JoinSet};
+use tokio::signal;
 use tracing::{error, info, warn};
 
-/// Not t3code's 3773, so both servers can run on one host.
-const DEFAULT_PORT: u16 = 3780;
 /// How long `--tailscale` waits for tailscaled to report an address (boot ordering).
 const TAILSCALE_WAIT: Duration = Duration::from_secs(120);
-/// How long in-flight HTTP requests get after a shutdown signal.
-const SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -92,10 +86,12 @@ async fn serve(args: ServeArgs) -> Result<(), String> {
 
     let mut addrs = vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), args.port)];
     if args.tailscale {
-        addrs.push(SocketAddr::new(tailscale_ipv4().await?, args.port));
+        addrs.push(SocketAddr::new(
+            tailscale_ipv4(TAILSCALE_WAIT).await?,
+            args.port,
+        ));
     }
     addrs.extend(args.listen);
-    addrs.dedup();
 
     let app = App::open(AppConfig {
         data_dir: data_dir.clone(),
@@ -105,54 +101,15 @@ async fn serve(args: ServeArgs) -> Result<(), String> {
     .await
     .map_err(|e| format!("opening j3 state in {}: {e}", data_dir.display()))?;
 
-    let rpc: Arc<dyn RpcHandler> = app.clone();
-    let routes = router(HttpState {
-        descriptor: app.descriptor(),
-        rpc,
-        attachments: app.attachments(),
-    });
-
-    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-    let mut servers = JoinSet::new();
-    for addr in addrs {
-        let listener = TcpListener::bind(addr)
-            .await
-            .map_err(|e| format!("binding {addr}: {e}"))?;
-        info!("listening on http://{addr}");
-        let routes = routes.clone();
-        let mut stop = stop_rx.clone();
-        servers.spawn(async move {
-            axum::serve(listener, routes)
-                .with_graceful_shutdown(async move {
-                    let _ = stop.wait_for(|stop| *stop).await;
-                })
-                .await
-                .map_err(|e| format!("server on {addr}: {e}"))
-        });
-    }
-
-    let mut result = Ok(());
-    tokio::select! {
-        () = shutdown_signal() => info!("shutdown requested"),
-        Some(joined) = servers.join_next() => {
-            result = joined.map_err(|e| e.to_string()).and_then(|served| served);
-            if result.is_ok() {
-                result = Err("a listener stopped unexpectedly".into());
-            }
+    let mut server = Server::bind(app, &addrs).await.map_err(|e| e.to_string())?;
+    let result = tokio::select! {
+        () = shutdown_signal() => {
+            info!("shutdown requested");
+            Ok(())
         }
-    }
-    let _ = stop_tx.send(true);
-    // Open WebSockets never finish on their own; give requests a moment, then cut them.
-    if tokio::time::timeout(SHUTDOWN_DRAIN, async {
-        while servers.join_next().await.is_some() {}
-    })
-    .await
-    .is_err()
-    {
-        servers.abort_all();
-    }
-    info!("shutting down omp sessions");
-    app.shutdown().await;
+        reason = server.failed() => Err(reason),
+    };
+    server.shutdown().await;
     result
 }
 
@@ -162,31 +119,6 @@ fn default_data_dir() -> Result<PathBuf, String> {
     }
     let home = std::env::var_os("HOME").ok_or("HOME is not set; pass --data-dir")?;
     Ok(PathBuf::from(home).join(".local/share/j3"))
-}
-
-/// Polls `tailscale ip -4` until tailscaled reports an address.
-async fn tailscale_ipv4() -> Result<IpAddr, String> {
-    let deadline = tokio::time::Instant::now() + TAILSCALE_WAIT;
-    loop {
-        let reason = match Command::new("tailscale").args(["ip", "-4"]).output().await {
-            Ok(out) if out.status.success() => {
-                let text = String::from_utf8_lossy(&out.stdout);
-                match text.lines().next().map(str::trim).map(str::parse::<IpAddr>) {
-                    Some(Ok(ip)) => return Ok(ip),
-                    _ => format!("unexpected `tailscale ip -4` output: {text:?}"),
-                }
-            }
-            Ok(out) => String::from_utf8_lossy(&out.stderr).trim().to_owned(),
-            Err(e) => format!("running tailscale: {e}"),
-        };
-        if tokio::time::Instant::now() >= deadline {
-            return Err(format!(
-                "no Tailscale address after {TAILSCALE_WAIT:?}: {reason}"
-            ));
-        }
-        warn!("waiting for Tailscale: {reason}");
-        tokio::time::sleep(Duration::from_secs(2)).await;
-    }
 }
 
 async fn shutdown_signal() {

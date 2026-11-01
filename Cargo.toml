@@ -1,6 +1,12 @@
 [workspace]
 resolver = "3"
-members = ["crates/j3-protocol", "crates/j3-core", "crates/j3-server"]
+members = [
+    "crates/j3-protocol",
+    "crates/j3-core",
+    "crates/j3-server",
+    "crates/j3-client",
+    "crates/j3-desktop",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -10,19 +16,24 @@ license = "GPL-3.0-or-later"
 repository = "https://github.com/jtyuill/j3code"
 
 [workspace.dependencies]
+j3-client = { path = "crates/j3-client" }
 j3-core = { path = "crates/j3-core" }
 j3-protocol = { path = "crates/j3-protocol" }
 omp-rpc = { git = "https://github.com/can1357/oh-my-pi", rev = "c810721b42fa4ff06e93aff775e8ccf653a0041f" }
 axum = { version = "0.8", features = ["ws"] }
 base64 = "0.23"
 clap = { version = "4", features = ["derive"] }
+dirs = "7"
 futures-util = "0.3"
 gethostname = "1"
+gpui-kit = "=0.8.1"
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
 rusqlite = { version = "0.41", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "fs", "io-util", "signal", "process"] }
+tokio-tungstenite = "0.29"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

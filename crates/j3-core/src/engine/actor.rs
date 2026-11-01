@@ -28,9 +28,12 @@ use super::{
 use crate::{
     attachments::AttachmentStore,
     hub::{Commit, Hub, ReceiptFn, ShellChange, ThreadWrite},
-    omp::omp_rpc::{
-        AvailableSlashCommand, Event, ImageContent, LitImage, RpcNotification, SlashCommandSource,
-        ThinkingLevel,
+    omp::{
+        self,
+        omp_rpc::{
+            self, AvailableSlashCommand, Event, GoalOp, ImageContent, LitImage, RpcNotification,
+            SlashCommandSource, ThinkingLevel,
+        },
     },
     store::ThreadRow,
 };
@@ -155,6 +158,16 @@ fn reject(message: &str) -> Reject {
     Reject(message.to_owned())
 }
 
+/// omp's own refusal text (e.g. "Goal mode is disabled"), else `fallback`.
+fn omp_refusal(error: &omp::Error, fallback: &str) -> Reject {
+    match error {
+        omp::Error::Rpc(omp_rpc::Error::Command { error, .. }) if !error.trim().is_empty() => {
+            Reject(error.trim().to_owned())
+        }
+        _ => reject(fallback),
+    }
+}
+
 impl Actor {
     fn cwd(&self) -> String {
         self.model
@@ -222,12 +235,14 @@ impl Actor {
         }
     }
 
-    /// When the actor may wind down: nothing running, queued or pending.
+    /// When the actor may wind down: nothing running, queued or pending, and
+    /// no active goal (omp pauses a goal it restores on restart).
     fn idle_deadline(&self) -> Option<Instant> {
         let busy = !self.model.is_settled()
             || self.model.next_startable().is_some()
             || !self.expiries.is_empty()
-            || self.flush_at.is_some();
+            || self.flush_at.is_some()
+            || (self.session.is_some() && self.model.goal_active());
         (!busy).then(|| self.idle_since + self.config.idle_timeout)
     }
 
@@ -368,6 +383,7 @@ impl Actor {
                             .as_ref()
                             .map(|model| format!("{}/{}", model.provider, model.id));
                         self.current_thinking = state.thinking_level;
+                        self.model.apply_goal_state(state.goal.as_ref());
                     }
                     Err(error) => tracing::warn!(%error, "omp get_state after start"),
                 }
@@ -414,6 +430,7 @@ impl Actor {
         if let Some(session) = self.session.take() {
             session.close().await;
             if !self.deleted {
+                self.model.session_closed();
                 self.model
                     .set_session_status(ProviderSessionStatus::Stopped, None);
             }
@@ -437,6 +454,7 @@ impl Actor {
         if self.model.live_run_id().is_some() {
             self.model.abandon_run(false);
         }
+        self.model.session_closed();
         self.model
             .set_session_status(ProviderSessionStatus::Stopped, None);
         let _ = self.commit_now(None);
@@ -483,6 +501,19 @@ impl Actor {
                     // Commit the settled run before starting the next one.
                     let _ = self.commit_now(None);
                     self.start_next().await;
+                }
+                Effect::FetchSubagentResult { subagent_id } => {
+                    let transcript = match &self.session {
+                        Some(session) => session.subagent_messages(subagent_id.clone()).await,
+                        None => continue,
+                    };
+                    match transcript {
+                        Ok(transcript) => {
+                            self.model
+                                .apply_subagent_transcript(&subagent_id, &transcript);
+                        }
+                        Err(error) => tracing::debug!(%error, "omp get_subagent_messages"),
+                    }
                 }
             }
         }
@@ -626,6 +657,58 @@ impl Actor {
                 tracing::warn!(%error, "omp steer");
                 reject("The agent did not accept the message.")
             })
+    }
+
+    /// omp `goal` with `op`, starting omp if needed; the result is applied
+    /// right away (the matching `goal_updated` frame follows).
+    async fn goal_command(
+        &mut self,
+        op: GoalOp,
+        objective: Option<String>,
+        token_budget: Option<u64>,
+    ) -> Result<(), Reject> {
+        let token_budget = token_budget
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|_| reject("The token budget is too large."))?;
+        self.ensure_session().await.map_err(Reject)?;
+        let Some(session) = &self.session else {
+            return Err(reject("The agent is not running."));
+        };
+        match session.goal(op, objective, token_budget).await {
+            Ok(result) => {
+                self.model.apply_goal(result.goal.as_ref());
+                Ok(())
+            }
+            Err(error) => {
+                tracing::warn!(%error, op = op.as_str(), "omp goal");
+                Err(omp_refusal(&error, "The goal could not be changed."))
+            }
+        }
+    }
+
+    /// omp `cancel_subagent` for a subagent of this thread.
+    async fn stop_subagent(&self, subagent_id: &str) -> Result<(), Reject> {
+        let not_running = || reject("That subagent is no longer running.");
+        if !self
+            .model
+            .proj
+            .subagent(subagent_id)
+            .is_some_and(|subagent| subagent.status.is_active())
+        {
+            return Err(not_running());
+        }
+        let Some(session) = &self.session else {
+            return Err(not_running());
+        };
+        match session.cancel_subagent(subagent_id.to_owned()).await {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(not_running()),
+            Err(error) => {
+                tracing::warn!(%error, "omp cancel_subagent");
+                Err(omp_refusal(&error, "The subagent could not be stopped."))
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -809,6 +892,30 @@ impl Actor {
             | C::ThreadUnpin(_)
             | C::ThreadPinReorder(_)
             | C::ThreadActiveReorder(_) => Ok(()),
+            C::SubagentStop(stop) => self.stop_subagent(&stop.subagent_id).await,
+            C::GoalCreate(create) => {
+                let objective = create.objective.trim();
+                if objective.is_empty() {
+                    Err(reject("Describe the goal first."))
+                } else {
+                    self.goal_command(
+                        GoalOp::Create,
+                        Some(objective.to_owned()),
+                        create.token_budget,
+                    )
+                    .await
+                }
+            }
+            C::GoalPause(_) => self.goal_command(GoalOp::Pause, None, None).await,
+            C::GoalResume(_) => self.goal_command(GoalOp::Resume, None, None).await,
+            C::GoalDrop(_) => {
+                // A completed goal is gone from omp already; only j3 shows it.
+                if self.model.clear_completed_goal() {
+                    Ok(())
+                } else {
+                    self.goal_command(GoalOp::Drop, None, None).await
+                }
+            }
             C::Unknown(_) => Err(reject("This action isn't supported by this server.")),
         };
         match result {

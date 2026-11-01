@@ -15,8 +15,8 @@ use j3_core::{
     omp::{
         OmpLauncher,
         omp_rpc::{
-            AvailableSlashCommand, Event, ExtensionUiResponse, ImageContent, PromptAck,
-            RpcNotification, SessionState, ThinkingLevel,
+            AvailableSlashCommand, Event, ExtensionUiResponse, GoalOp, GoalResult, ImageContent,
+            PromptAck, RpcNotification, SessionState, SubagentMessages, ThinkingLevel,
         },
     },
     rpc::{Response, RpcHandler, StreamItem},
@@ -165,6 +165,44 @@ impl AgentSession for FakeSession {
                 {"name": "compact", "source": "builtin"}
             ]))
             .unwrap())
+        })
+    }
+
+    fn goal(
+        &self,
+        op: GoalOp,
+        objective: Option<String>,
+        _: Option<i64>,
+    ) -> BoxFuture<'_, j3_core::engine::session::Result<GoalResult>> {
+        self.0.record(format!(
+            "goal:{}:{}",
+            op.as_str(),
+            objective.unwrap_or_default()
+        ));
+        Box::pin(async {
+            Ok(serde_json::from_value(json!({"goal": null, "state": null})).unwrap())
+        })
+    }
+
+    fn cancel_subagent(
+        &self,
+        subagent_id: String,
+    ) -> BoxFuture<'_, j3_core::engine::session::Result<bool>> {
+        self.0.record(format!("cancel_subagent:{subagent_id}"));
+        Box::pin(async { Ok(false) })
+    }
+
+    fn subagent_messages(
+        &self,
+        subagent_id: String,
+    ) -> BoxFuture<'_, j3_core::engine::session::Result<SubagentMessages>> {
+        self.0.record(format!("subagent_messages:{subagent_id}"));
+        Box::pin(async {
+            Ok(
+                serde_json::from_value(json!({"sessionFile": "/tmp/sub.jsonl", "fromByte": 0,
+                "nextByte": 0, "reset": false, "entries": [], "messages": []}))
+                .unwrap(),
+            )
         })
     }
 

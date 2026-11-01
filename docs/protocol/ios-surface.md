@@ -273,7 +273,7 @@ Tier **R** = required. Tier **S** = cheap stub that must succeed or fail cleanly
 | G1 | `orchestration.subscribeCommandOutput` | stream | G | `C/rpc.ts:1845-1852` | only with `capabilities.commandOutputStreaming` (`M/features/threads/thread-command-output.tsx:15-31`) |
 | G2 | `orchestration.getOlderSettledThreads` | unary | G | `C/rpc.ts:1780-1787` | only with `ServerConfig.shellOlderSettled && shellThreadFamilies` (`CR/state/shell.ts:366-371`) |
 | G3 | `orchestration.getThreadFamily` | unary | G | `C/rpc.ts:1765-1769` | only with `shellThreadFamilies` (`CR/state/threadFamilies.ts:107-110`) |
-| G4 | `orchestration.stopWorkflow` | unary | G | `C/rpc.ts` (OV2 schema `:4167`) | subagent stop button (`M/features/threads/SubagentStopButton.tsx:23-25`); j3 never emits subagents |
+| G4 | `orchestration.stopWorkflow` | unary | G | `C/rpc.ts` (OV2 schema `:4167`) | subagent stop button (`M/features/threads/SubagentStopButton.tsx:23-25`); mobile offers it only for workflows and Claude/app-owned subagents, never for j3's `pi` subagents |
 | G5 | `projects.ensureScratch` | unary | G | `C/rpc.ts:1332-1336` | "scratch" new task; shown only when the server sets `scratchWorkspaceRoot` [INFERENCE] |
 | G6 | `projects.createNew` | unary | G | `C/rpc.ts:1338-1342` | "new empty project"; needs `newProjectsRoot` (`M/features/projects/AddProjectScreen.tsx:1032-1035`) |
 | G7 | `projects.writeFile` | unary | G | `C/rpc.ts` (`WsProjectsWriteFileRpc`) | "save plan" on `ProposedPlanCard`; j3 never emits `proposed_plan` |
@@ -606,7 +606,7 @@ Callers: `M/features/home/useThreadListActions.ts:89-93,213-220,566-569`; `M/fea
 | `provider-session.detach` | No mobile caller. |
 | `prepared-run.release`, `.progress`, `.fail`, `.retry` | Worktree preparation. |
 | `notification.delivery.accept` | Notifications. |
-| `subagent.stop` | j3 emits no subagents. |
+| `subagent.stop` | Accepted since M4b (omp `cancel_subagent`); see `j3-extensions.md`. Mobile never sends it for j3's subagents. |
 | `queued-run.reorder` | No client caller. |
 | `checkpoint.rollback` | Checkpoints. |
 | `thread.fork`, `thread.merge_back` | Fork and side chats. |
@@ -684,7 +684,7 @@ The client applies events with `applyOrchestrationV2ProjectionEvent` (`CR/state/
 - `visibleTurnItems`
 - plus `updatedAt` (DateTimeUtc)
 
-j3 sends `[]` for `nodes`, `subagents`, `checkpointScopes`, `checkpoints`, `contextHandoffs` and `contextTransfers`. Mobile resolves attempts through `attemptByRootNodeId.get(item.nodeId)` (`M/lib/threadActivity.ts:1992-2007`), so set each item's `nodeId` to its attempt's `rootNodeId`.
+j3 sends `[]` for `nodes`, `checkpointScopes`, `checkpoints`, `contextHandoffs` and `contextTransfers`. `subagents` holds omp's subagents and `providerThreads[].goal` omp's goal (`j3-extensions.md`). Mobile resolves attempts through `attemptByRootNodeId.get(item.nodeId)` (`M/lib/threadActivity.ts:1992-2007`), so set each item's `nodeId` to its attempt's `rootNodeId`.
 
 **`visibleTurnItems`** (`OV2:1831-1837`) is the feed. Mobile builds its rows only from this list (`M/lib/threadActivity.ts:1977-2168`). **The server must fill it in snapshots**; the client maintains it only incrementally, from events (`CR/state/orchestrationV2Projection.ts:372-407`).
 - Each row: `{position: NonNegativeInt (0..n-1), visibility:"local", sourceThreadId: thread.id, sourceItemId: item.id, item}`.
@@ -836,7 +836,7 @@ Forward-compatibility:
 - Unknown item types inside `turnItems` / `visibleTurnItems` are dropped (`OV2:1810-1829`).
 - **A known type with a bad payload is a hard failure** (`OV2:1837`).
 
-The 20 event types j3 emits (`OV2:1851-1994`):
+The 21 event types j3 emits (`OV2:1851-1994`):
 
 | `type` | payload | used for |
 |---|---|---|
@@ -851,6 +851,7 @@ The 20 event types j3 emits (`OV2:1851-1994`):
 | `message.updated` | ConversationMessage | queued text, reconciliation |
 | `turn-item.updated` | TurnItem | the feed |
 | `plan.updated` | PlanArtifact | todos |
+| `subagent.updated` | Subagent | omp subagents (`j3-extensions.md`) |
 
 **TurnItem base fields** (`OV2:1483-1510`):
 - `id`, `threadId`
@@ -862,7 +863,7 @@ The 20 event types j3 emits (`OV2:1851-1994`):
 - `updatedAt`
 - optional: `deferredWork` (omit), `toolNonExecutionKind`, `toolSurface`, `toolIcon`, `toolSource`
 
-The 15 kinds j3 emits (union `OV2:1583-1805`). Rendering goes through `buildThreadFeed` (`M/lib/threadActivity.ts:1977-2246`) and `renderFeedEntry` (`M/features/threads/ThreadFeed.tsx:1653-2328`):
+The 16 kinds j3 emits (union `OV2:1583-1805`). Rendering goes through `buildThreadFeed` (`M/lib/threadActivity.ts:1977-2246`) and `renderFeedEntry` (`M/features/threads/ThreadFeed.tsx:1653-2328`):
 
 | kind | def | extra fields (★ = required) | mobile rendering |
 |---|---|---|---|
@@ -881,8 +882,9 @@ The 15 kinds j3 emits (union `OV2:1583-1805`). Rendering goes through `buildThre
 | `error` | `OV2:1715-1720` | ★`failure: {class: usage_limit\|provider_error\|transport_error\|permission_error\|validation_error\|unknown, message (non-blank ≤4096), code: string\|null, retryable: bool\|null, resetAt?}`, `retry?: {attempt, maxAttempts\|null, retryDelayMs\|null}` (`OV2:1442-1471`) | error row |
 | `system_notice` | `OV2:1710-1714` | ★`message` | prominent row |
 | `compaction` | `OV2:1721-1728` | ★`driver` (NullOr), `summary?`, `beforeTokenCount?`, `afterTokenCount?` | divider (`M/features/threads/ThreadFeed.tsx:1837-1864`) |
+| `subagent` | `OV2:1778-1793` | ★`subagentId`, ★`origin`, ★`driver`, ★`providerInstanceId`, ★`childThreadId` (NullOr), ★`prompt`, `progress?`, ★`result` (NullOr) | subagent row/group (`M/features/threads/SubagentRow.tsx`); omp subagents, see `j3-extensions.md` |
 
-j3 never emits: `proposed_plan`, `approval_request` (omp runs yolo), `notification`, `checkpoint`, `handoff`, `fork`, `thread_created`, `secret_request`, `link_request`, `subagent`.
+j3 never emits: `proposed_plan`, `approval_request` (omp runs yolo), `notification`, `checkpoint`, `handoff`, `fork`, `thread_created`, `secret_request`, `link_request`.
 
 ### 4.5 Queue, steer and stop in the projection
 

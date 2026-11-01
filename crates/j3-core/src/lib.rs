@@ -8,4 +8,5 @@ pub mod http;
 pub mod hub;
 pub mod omp;
 pub mod rpc;
+pub mod serve;
 pub mod store;
