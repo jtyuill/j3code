@@ -10,10 +10,10 @@ A scripted client that drives a j3 server the way t3code's `client-runtime` and 
 Node 26 runs the TypeScript sources directly through native type stripping, so there is no build step.
 
 ```sh
+pnpm install    # from the repository root; installs the whole workspace
 cd tests/conformance
-npm ci          # postinstall symlinks packages/contracts/node_modules -> ./node_modules
-npm run conformance -- --url http://127.0.0.1:3780 [--model <provider/id>] [--project <dir>]
-npm run typecheck
+pnpm conformance --url http://127.0.0.1:3780 [--model <provider/id>] [--project <dir>]
+pnpm typecheck
 ```
 
 | Option | Default | Meaning |
@@ -83,4 +83,4 @@ The queue, interrupt and idempotency steps each wait for the thread to be idle f
 - `src/watcher.ts`: waiting on stream-derived state with timeouts
 - `src/report.ts`: step runner and error formatting
 
-`packages/contracts` has no `node_modules` of its own: `npm ci` here symlinks it to this directory's `node_modules`, so contracts and harness share one copy of `effect`.
+`packages/contracts` is a pnpm workspace package; the workspace catalog pins one `effect` version, so contracts and harness share one copy.

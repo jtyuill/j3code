@@ -1,0 +1,11 @@
+{
+  "platforms": [
+    "apple"
+  ],
+  "apple": {
+    "modules": [
+      "T3HighlightsModule"
+    ],
+    "podspecPath": "T3HighlightsNative.podspec"
+  }
+}

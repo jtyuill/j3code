@@ -90,7 +90,7 @@ Protocol check against a running server (uses real omp and spends tokens):
 | M1 | omp driver (`j3-core::omp`) | Integration test starts real omp, prompts, streams events, answers `ask`, resumes by session file, on Mac and shieldy. | done (`crates/j3-core/tests/omp_live.rs`) |
 | M2 | Wire protocol foundations | Effect RPC envelope types round-trip frames captured from Effect's own RPC server; iOS thread-surface spec written. | done (`docs/protocol/`) |
 | M3 | Server | `j3-server serve` on shieldy under systemd; thread create/prompt/stream/reconnect over WS, verified with a scripted client. | done: user unit on shieldy, port 3780; conformance 37/37 on Mac and shieldy |
-| M4a | Desktop v1 core | GPUI app on Mac: local + shieldy environments; projects, threads, streaming chat, composer (images, model/thinking, slash commands/skills), steer/queue/stop, `ask` answers, todos. | in progress |
-| M4b | omp extras | Goals and subagent visibility end to end: server maps omp `goal_updated`/`get_state.goal` and `subagent_*` frames into j3 protocol extensions (safe for iOS: unknown thread events and turn item kinds are skipped), client + desktop render them. | |
-| M5 | iOS | Trimmed Expo app on the iPhone, talking to shieldy. | |
-| M6 | revived | Linux desktop build and NixOS packaging verified on revived. | |
+| M4a | Desktop v1 core | GPUI app on Mac: local + shieldy environments; projects, threads, streaming chat, composer (images, model/thinking, slash commands/skills), steer/queue/stop, `ask` answers, todos. | built; 26 tests incl. 7 headless UI tests against a real server. Outstanding: interactive smoke on the Mac (screen was locked) |
+| M4b | omp extras | Goals and subagent visibility end to end, safe for the iOS client. | done: goals on t3's provider-thread `goal`, subagents as t3 `subagent` entities/items, `j3.goal.*` commands (`docs/protocol/j3-extensions.md`) |
+| M5 | iOS | Trimmed Expo app on the iPhone, talking to shieldy. | in progress |
+| M6 | revived | Linux desktop build and NixOS packaging verified on revived. | `.#j3-desktop` builds and renders on shieldy (Xvfb + lavapipe); real GPU/Wayland check waits for revived |

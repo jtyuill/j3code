@@ -2,7 +2,7 @@
  * j3 conformance client: drives a server the way t3's client-runtime / mobile app does and lets
  * the contracts' schemas (packages/contracts) judge every response and stream item.
  *
- *   npm run conformance -- --url http://127.0.0.1:3780 [--model <provider/id>] [--project <dir>]
+ *   pnpm conformance --url http://127.0.0.1:3780 [--model <provider/id>] [--project <dir>]
  */
 import { randomUUID } from "node:crypto";
 import { dirname, resolve } from "node:path";
@@ -36,7 +36,7 @@ import { Session, mobileSocketUrl } from "./session.ts";
 import { ACTIVE_RUN_STATUSES, ShellView, ThreadView } from "./views.ts";
 import type { Waiter } from "./watcher.ts";
 
-const HELP = `Usage: npm run conformance -- --url <http-base-url> [options]
+const HELP = `Usage: pnpm conformance --url <http-base-url> [options]
 
 Options:
   --url <url>          Server HTTP base URL (default http://127.0.0.1:3780)
