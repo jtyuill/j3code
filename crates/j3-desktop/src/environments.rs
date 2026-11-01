@@ -24,15 +24,24 @@ pub struct DesktopConfig {
     pub environments: Vec<RemoteEnvironment>,
 }
 
-impl Default for DesktopConfig {
-    /// shieldy, the always-on agent host.
-    fn default() -> Self {
-        Self {
-            environments: vec![RemoteEnvironment {
-                label: "shieldy".to_owned(),
-                url: format!("http://shieldy:{DEFAULT_PORT}"),
-            }],
-        }
+/// The always-on agent host every desktop connects to by default.
+const DEFAULT_REMOTE: &str = "shieldy";
+
+impl DesktopConfig {
+    /// The config a fresh `desktop.json` gets on `hostname`: shieldy as a
+    /// remote, except on shieldy itself (its local environment already is
+    /// that server).
+    pub fn default_for_host(hostname: &str) -> Self {
+        let short = hostname.split('.').next().unwrap_or_default();
+        let environments = if short.eq_ignore_ascii_case(DEFAULT_REMOTE) {
+            Vec::new()
+        } else {
+            vec![RemoteEnvironment {
+                label: DEFAULT_REMOTE.to_owned(),
+                url: format!("http://{DEFAULT_REMOTE}:{DEFAULT_PORT}"),
+            }]
+        };
+        Self { environments }
     }
 }
 
@@ -77,15 +86,16 @@ pub fn config_path() -> Result<PathBuf, ConfigError> {
 }
 
 impl DesktopConfig {
-    /// Reads `path`, creating it with [`DesktopConfig::default`] when missing.
-    pub fn load_or_create(path: &Path) -> Result<Self, ConfigError> {
+    /// Reads `path`, creating it with [`DesktopConfig::default_for_host`]
+    /// when missing.
+    pub fn load_or_create(path: &Path, hostname: &str) -> Result<Self, ConfigError> {
         match fs::read(path) {
             Ok(bytes) => serde_json::from_slice(&bytes).map_err(|source| ConfigError::Parse {
                 path: path.to_owned(),
                 source,
             }),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                let config = Self::default();
+                let config = Self::default_for_host(hostname);
                 config.save(path)?;
                 Ok(config)
             }
@@ -185,7 +195,10 @@ mod tests {
     #[test]
     fn normalizes_hosts_and_urls() {
         assert_eq!(normalize_url("shieldy").unwrap(), "http://shieldy:3780");
-        assert_eq!(normalize_url(" shieldy:4000 ").unwrap(), "http://shieldy:4000");
+        assert_eq!(
+            normalize_url(" shieldy:4000 ").unwrap(),
+            "http://shieldy:4000"
+        );
         assert_eq!(
             normalize_url("http://100.64.0.7:3780/").unwrap(),
             "http://100.64.0.7:3780"
@@ -210,7 +223,7 @@ mod tests {
 
     #[test]
     fn add_rejects_blank_and_duplicate_environments() {
-        let mut config = DesktopConfig::default();
+        let mut config = DesktopConfig::default_for_host("revolver.local");
         assert_eq!(config.add(" ", "x"), Err(AddError::EmptyLabel));
         assert_eq!(
             config.add("SHIELDY", "other"),
@@ -231,7 +244,33 @@ mod tests {
         assert_eq!(config.environments.len(), 2);
         assert!(config.remove("http://revived:3780"));
         assert!(!config.remove("http://revived:3780"));
-        assert_eq!(config, DesktopConfig::default());
+        assert_eq!(config, DesktopConfig::default_for_host("revolver.local"));
+    }
+
+    #[test]
+    fn shieldy_does_not_get_itself_as_a_remote() {
+        assert_eq!(
+            DesktopConfig::default_for_host("revolver")
+                .environments
+                .len(),
+            1
+        );
+        assert!(
+            DesktopConfig::default_for_host("shieldy")
+                .environments
+                .is_empty()
+        );
+        assert!(
+            DesktopConfig::default_for_host("Shieldy.tail1234.ts.net")
+                .environments
+                .is_empty()
+        );
+        assert_eq!(
+            DesktopConfig::default_for_host("shieldy2")
+                .environments
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -240,8 +279,8 @@ mod tests {
         let path = dir.join("nested").join("desktop.json");
         let _ = fs::remove_dir_all(&dir);
 
-        let created = DesktopConfig::load_or_create(&path).unwrap();
-        assert_eq!(created, DesktopConfig::default());
+        let created = DesktopConfig::load_or_create(&path, "revolver").unwrap();
+        assert_eq!(created, DesktopConfig::default_for_host("revolver"));
         let on_disk: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(
             on_disk,
@@ -251,11 +290,14 @@ mod tests {
         let mut changed = created;
         changed.add("revived", "revived").unwrap();
         changed.save(&path).unwrap();
-        assert_eq!(DesktopConfig::load_or_create(&path).unwrap(), changed);
+        assert_eq!(
+            DesktopConfig::load_or_create(&path, "revolver").unwrap(),
+            changed
+        );
 
         fs::write(&path, b"{not json").unwrap();
         assert!(matches!(
-            DesktopConfig::load_or_create(&path),
+            DesktopConfig::load_or_create(&path, "revolver"),
             Err(ConfigError::Parse { .. })
         ));
         fs::remove_dir_all(&dir).unwrap();

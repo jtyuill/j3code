@@ -9,8 +9,8 @@ use std::{
 
 use gpui_kit::component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt as _,
-    h_flex,
     button::{Button, ButtonVariants as _},
+    h_flex,
     spinner::Spinner,
     text::{TextView, TextViewState},
     v_flex,
@@ -73,11 +73,12 @@ pub fn render_item(item: &TurnItem, row: &RowContext, _: &mut Window, cx: &mut A
                         .stream_fade(message.streaming),
                 )
                 .into_any_element(),
-            None => div().text_sm().child(message.text.clone()).into_any_element(),
+            None => div()
+                .text_sm()
+                .child(message.text.clone())
+                .into_any_element(),
         },
-        TurnItemKind::Reasoning(reasoning) => {
-            reasoning_row(&id, reasoning.streaming, row, cx)
-        }
+        TurnItemKind::Reasoning(reasoning) => reasoning_row(&id, reasoning.streaming, row, cx),
         TurnItemKind::UserInputRequest(request) => question_row(item.status, request, cx),
         TurnItemKind::TodoList(todo) => {
             let done = todo
@@ -134,9 +135,7 @@ pub fn render_item(item: &TurnItem, row: &RowContext, _: &mut Window, cx: &mut A
         TurnItemKind::Subagent(subagent) => subagent_row(item, subagent, row, cx),
         // Stop requests, unknown kinds and kinds added later render nothing
         // (`feed::is_hidden` also drops them before rendering).
-        _ => {
-            div().into_any_element()
-        }
+        _ => div().into_any_element(),
     };
     // Messages are named by their text so the row is identifiable to
     // accessibility clients (and UI tests) like the text on screen.
@@ -171,7 +170,12 @@ fn subagent_status_label(status: SubagentStatus) -> &'static str {
 
 /// A subagent the agent started: title, model, status, live progress, and
 /// (expanded) its assignment and final answer; Stop while it runs.
-fn subagent_row(item: &TurnItem, subagent: &SubagentItem, row: &RowContext, cx: &App) -> AnyElement {
+fn subagent_row(
+    item: &TurnItem,
+    subagent: &SubagentItem,
+    row: &RowContext,
+    cx: &App,
+) -> AnyElement {
     let id = item.id.clone();
     let entity = row.state.subagent(&subagent.subagent_id);
     let status = entity.map(|s| s.status);
@@ -204,12 +208,17 @@ fn subagent_row(item: &TurnItem, subagent: &SubagentItem, row: &RowContext, cx: 
                 .on_click(move |_, window, cx| {
                     cx.stop_propagation();
                     let (run_id, subagent_id) = (run_id.clone(), subagent_id.clone());
-                    let _ = view.update(cx, |view, cx| view.stop_subagent(run_id, subagent_id, window, cx));
+                    let _ = view.update(cx, |view, cx| {
+                        view.stop_subagent(run_id, subagent_id, window, cx)
+                    });
                 })
         });
     let mono = theme.mono_font_family.clone();
     let summary = result.as_deref().map(crate::feed::one_line);
-    let mut label = format!("{title}, {}", status.map_or("Unknown", subagent_status_label));
+    let mut label = format!(
+        "{title}, {}",
+        status.map_or("Unknown", subagent_status_label)
+    );
     if let Some(progress) = progress.as_deref().filter(|_| active || summary.is_none()) {
         label.push_str(&format!(", {progress}"));
     }
@@ -217,7 +226,10 @@ fn subagent_row(item: &TurnItem, subagent: &SubagentItem, row: &RowContext, cx: 
         label.push_str(&format!(", {summary}"));
     }
     v_flex()
-        .id(SharedString::from(format!("subagent-{}", subagent.subagent_id)))
+        .id(SharedString::from(format!(
+            "subagent-{}",
+            subagent.subagent_id
+        )))
         .test_support()
         .aria_label(label)
         .gap_1()
@@ -232,8 +244,19 @@ fn subagent_row(item: &TurnItem, subagent: &SubagentItem, row: &RowContext, cx: 
                 .gap_2()
                 .text_sm()
                 .on_click(toggle(&row.view, id.clone()))
-                .child(Icon::new(IconName::Bot).small().text_color(theme.muted_foreground))
-                .child(div().flex_1().min_w_0().truncate().font_medium().child(title))
+                .child(
+                    Icon::new(IconName::Bot)
+                        .small()
+                        .text_color(theme.muted_foreground),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .font_medium()
+                        .child(title),
+                )
                 .when_some(model, |this, model| {
                     this.child(
                         div()
@@ -250,23 +273,30 @@ fn subagent_row(item: &TurnItem, subagent: &SubagentItem, row: &RowContext, cx: 
                         div()
                             .flex_shrink_0()
                             .text_xs()
-                            .text_color(if failed { theme.danger } else { theme.muted_foreground })
+                            .text_color(if failed {
+                                theme.danger
+                            } else {
+                                theme.muted_foreground
+                            })
                             .child(subagent_status_label(status)),
                     )
                 })
                 .children(stop)
                 .child(disclosure(expanded, cx)),
         )
-        .when_some(progress.filter(|_| active || summary.is_none()), |this, progress| {
-            this.child(
-                div()
-                    .pl_6()
-                    .text_xs()
-                    .truncate()
-                    .text_color(theme.muted_foreground)
-                    .child(progress),
-            )
-        })
+        .when_some(
+            progress.filter(|_| active || summary.is_none()),
+            |this, progress| {
+                this.child(
+                    div()
+                        .pl_6()
+                        .text_xs()
+                        .truncate()
+                        .text_color(theme.muted_foreground)
+                        .child(progress),
+                )
+            },
+        )
         .when(expanded, |this| {
             this.child(
                 v_flex()
@@ -276,8 +306,13 @@ fn subagent_row(item: &TurnItem, subagent: &SubagentItem, row: &RowContext, cx: 
                     .child(div().text_color(theme.muted_foreground).child("Assignment"))
                     .child(div().whitespace_normal().child(subagent.prompt.clone()))
                     .when_some(result, |this, result| {
-                        this.child(div().pt_1().text_color(theme.muted_foreground).child("Result"))
-                            .child(div().whitespace_normal().child(result))
+                        this.child(
+                            div()
+                                .pt_1()
+                                .text_color(theme.muted_foreground)
+                                .child("Result"),
+                        )
+                        .child(div().whitespace_normal().child(result))
                     }),
             )
         })
@@ -328,7 +363,12 @@ fn user_message(
                 .text_color(theme.secondary_foreground)
                 .text_sm()
                 .when_some(badge, |this, badge| {
-                    this.child(div().text_xs().text_color(theme.muted_foreground).child(badge))
+                    this.child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(badge),
+                    )
                 })
                 .when(!images.is_empty(), |this| {
                     this.child(h_flex().flex_wrap().gap_2().children(images))
@@ -340,7 +380,12 @@ fn user_message(
         .into_any_element()
 }
 
-fn attachment_thumbnail(id: &str, attachment: &ChatAttachment, load: ImageLoad, cx: &App) -> AnyElement {
+fn attachment_thumbnail(
+    id: &str,
+    attachment: &ChatAttachment,
+    load: ImageLoad,
+    cx: &App,
+) -> AnyElement {
     let theme = cx.theme();
     let name = match attachment {
         ChatAttachment::Image(image) => image.name.clone(),
@@ -375,7 +420,10 @@ fn attachment_thumbnail(id: &str, attachment: &ChatAttachment, load: ImageLoad, 
     }
 }
 
-fn toggle(view: &WeakEntity<ThreadView>, id: String) -> impl Fn(&gpui_kit::ClickEvent, &mut Window, &mut App) + 'static {
+fn toggle(
+    view: &WeakEntity<ThreadView>,
+    id: String,
+) -> impl Fn(&gpui_kit::ClickEvent, &mut Window, &mut App) + 'static {
     let view = view.clone();
     move |_, _, cx| {
         let _ = view.update(cx, |view, cx| view.toggle_expanded(&id, cx));
@@ -477,15 +525,11 @@ fn tool_row(item: &TurnItem, row: &RowContext, cx: &App) -> AnyElement {
                     this.hover(|this| this.bg(theme.muted.opacity(0.5)))
                         .on_click(toggle(&row.view, id.clone()))
                 })
-                .child(
-                    Icon::new(icon)
-                        .small()
-                        .text_color(if summary.failed {
-                            theme.danger
-                        } else {
-                            theme.muted_foreground
-                        }),
-                )
+                .child(Icon::new(icon).small().text_color(if summary.failed {
+                    theme.danger
+                } else {
+                    theme.muted_foreground
+                }))
                 .child(
                     div()
                         .flex_shrink_0()
@@ -517,11 +561,7 @@ fn tool_row(item: &TurnItem, row: &RowContext, cx: &App) -> AnyElement {
 fn answer_text(value: &Value) -> String {
     match value {
         Value::String(s) => s.clone(),
-        Value::Array(items) => items
-            .iter()
-            .map(answer_text)
-            .collect::<Vec<_>>()
-            .join(", "),
+        Value::Array(items) => items.iter().map(answer_text).collect::<Vec<_>>().join(", "),
         Value::Null => String::new(),
         other => other.to_string(),
     }
@@ -558,7 +598,11 @@ fn question_row(status: TurnItemStatus, request: &UserInputRequestItem, cx: &App
                 .child(match answer {
                     Some(answer) if !answer.is_empty() => h_flex()
                         .gap_1()
-                        .child(Icon::new(IconName::Check).xsmall().text_color(theme.success))
+                        .child(
+                            Icon::new(IconName::Check)
+                                .xsmall()
+                                .text_color(theme.success),
+                        )
                         .child(div().font_medium().child(answer))
                         .into_any_element(),
                     _ if waiting => div()
@@ -581,7 +625,11 @@ fn notice_row(icon: IconName, color: gpui_kit::Hsla, message: String, cx: &App) 
         .gap_2()
         .items_start()
         .text_sm()
-        .child(div().pt_0p5().child(Icon::new(icon).small().text_color(color)))
+        .child(
+            div()
+                .pt_0p5()
+                .child(Icon::new(icon).small().text_color(color)),
+        )
         .child(
             div()
                 .flex_1()

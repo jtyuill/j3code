@@ -3,8 +3,10 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use gpui_kit::{Context, Image, ImageFormat, SharedString, Task};
-use j3_client::{Connection, ConnectionState, ConnectionStatus, t3::chat_attachment::ChatAttachment};
+use gpui_kit::{App, Context, Entity, Image, ImageFormat, SharedString, Task};
+use j3_client::{
+    Connection, ConnectionState, ConnectionStatus, t3::chat_attachment::ChatAttachment,
+};
 
 use crate::{local_server::LocalServerStatus, services::Services};
 
@@ -36,6 +38,16 @@ pub struct Environment {
 
 /// Key of the local environment.
 pub const LOCAL_KEY: &str = "local";
+
+impl Environment {
+    /// The server's stable `environmentId`, once its descriptor is known.
+    pub fn environment_id(&self) -> Option<&str> {
+        self.state
+            .descriptor
+            .as_ref()
+            .map(|descriptor| descriptor.environment_id.as_str())
+    }
+}
 
 impl Environment {
     pub fn new(
@@ -174,6 +186,36 @@ impl Environment {
     }
 }
 
+/// Indices of the entries to show, given each one's server environment id
+/// (`None` until its descriptor arrives): an entry whose id an earlier entry
+/// already has is the same server reached twice and is left out. The local
+/// environment is listed first, so it wins.
+pub fn distinct(ids: &[Option<&str>]) -> Vec<usize> {
+    let mut seen = std::collections::HashSet::new();
+    ids.iter()
+        .enumerate()
+        .filter(|(_, id)| id.is_none_or(|id| seen.insert(id)))
+        .map(|(ix, _)| ix)
+        .collect()
+}
+
+/// `environments` without the ones that reach a server already listed
+/// (e.g. the default `shieldy` remote on shieldy itself). Their config
+/// entries stay; they reappear if the ids ever differ.
+pub fn distinct_environments(
+    environments: &[Entity<Environment>],
+    cx: &App,
+) -> Vec<Entity<Environment>> {
+    let ids: Vec<Option<&str>> = environments
+        .iter()
+        .map(|env| env.read(cx).environment_id())
+        .collect();
+    distinct(&ids)
+        .into_iter()
+        .map(|ix| environments[ix].clone())
+        .collect()
+}
+
 async fn fetch(url: &str) -> Option<Vec<u8>> {
     let response = reqwest::get(url).await.ok()?.error_for_status().ok()?;
     response.bytes().await.ok().map(|bytes| bytes.to_vec())
@@ -190,4 +232,18 @@ pub fn image_format(mime_type: &str) -> Option<ImageFormat> {
         "image/tiff" => ImageFormat::Tiff,
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_same_server_is_listed_once() {
+        // local, shieldy (same server as local), revived, unknown, unknown
+        let ids = [Some("env-a"), Some("env-a"), Some("env-b"), None, None];
+        assert_eq!(distinct(&ids), [0, 2, 3, 4]);
+        assert_eq!(distinct(&[Some("x"), Some("y")]), [0, 1]);
+        assert_eq!(distinct(&[]), Vec::<usize>::new());
+    }
 }

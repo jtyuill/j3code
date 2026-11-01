@@ -8,13 +8,13 @@ use std::{
 };
 
 use gpui_kit::component::{
-    ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt as _,
+    ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt as _, WindowExt as _,
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState},
     menu::DropdownMenu as _,
-    notification::{Notification, NotificationType},
     message_scroller::{MessageScroller, MessageScrollerState},
+    notification::{Notification, NotificationType},
     questionnaire::{
         Questionnaire, QuestionnaireActions, QuestionnaireChoice, QuestionnaireChoiceDefinition,
         QuestionnaireChoices, QuestionnaireDescription, QuestionnaireError, QuestionnaireEvent,
@@ -24,7 +24,6 @@ use gpui_kit::component::{
         QuestionnaireTitle,
     },
     spinner::Spinner,
-    WindowExt as _,
     text::TextViewState,
     v_flex,
 };
@@ -173,7 +172,8 @@ impl ThreadView {
     }
 
     pub fn focus_composer(&self, window: &mut Window, cx: &mut App) {
-        self.composer.update(cx, |composer, cx| composer.focus(window, cx));
+        self.composer
+            .update(cx, |composer, cx| composer.focus(window, cx));
     }
 
     pub fn toggle_expanded(&mut self, id: &str, cx: &mut Context<Self>) {
@@ -183,13 +183,10 @@ impl ThreadView {
         }
         self.expanded = Rc::new(expanded);
         let feed = self.state.feed();
-        if let Some(row) = self
-            .visible
-            .iter()
-            .position(|&ix| feed[ix].item.id == id)
-        {
-            self.scroller
-                .update(cx, |scroller, cx| scroller.remeasure_items(row..row + 1, cx));
+        if let Some(row) = self.visible.iter().position(|&ix| feed[ix].item.id == id) {
+            self.scroller.update(cx, |scroller, cx| {
+                scroller.remeasure_items(row..row + 1, cx)
+            });
         }
         cx.notify();
     }
@@ -205,7 +202,9 @@ impl ThreadView {
         }
         let connection = self.connection(cx);
         let thread_id = self.thread_id().to_owned();
-        self.run_action(window, cx, async move { connection.stop(&thread_id).await.map(drop) });
+        self.run_action(window, cx, async move {
+            connection.stop(&thread_id).await.map(drop)
+        });
     }
 
     /// Runs a thread command; a failure (often omp's reason, such as a
@@ -231,7 +230,13 @@ impl ThreadView {
         .detach();
     }
 
-    pub fn stop_subagent(&mut self, run_id: String, subagent_id: String, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn stop_subagent(
+        &mut self,
+        run_id: String,
+        subagent_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let connection = self.connection(cx);
         let thread_id = self.thread_id().to_owned();
         self.run_action(window, cx, async move {
@@ -257,12 +262,18 @@ impl ThreadView {
 
     /// Asks for an objective and optional token budget, then creates the goal.
     pub fn open_goal_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let objective = cx.new(|cx| InputState::new(window, cx).placeholder("What should omp keep working towards?"));
+        let objective = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("What should omp keep working towards?")
+        });
         let budget = cx.new(|cx| InputState::new(window, cx).placeholder("No limit"));
         let view = cx.weak_entity();
         let (dialog_objective, dialog_budget) = (objective.clone(), budget.clone());
         window.open_dialog(cx, move |dialog, _, _| {
-            let (objective, budget, view) = (dialog_objective.clone(), dialog_budget.clone(), view.clone());
+            let (objective, budget, view) = (
+                dialog_objective.clone(),
+                dialog_budget.clone(),
+                view.clone(),
+            );
             dialog
                 .title("Set goal")
                 .child(
@@ -319,7 +330,11 @@ impl ThreadView {
         let old_feed = self.state.feed();
         let old_ids = self.visible.iter().map(|&ix| old_feed[ix].item.id.as_str());
         let new_ids = visible.iter().map(|&ix| feed[ix].item.id.as_str());
-        let common = old_ids.clone().zip(new_ids.clone()).take_while(|(a, b)| a == b).count();
+        let common = old_ids
+            .clone()
+            .zip(new_ids.clone())
+            .take_while(|(a, b)| a == b)
+            .count();
         let (old_len, new_len) = (self.visible.len(), visible.len());
         let changed: Vec<usize> = (0..common)
             .filter(|&row| old_feed[self.visible[row]].item != feed[visible[row]].item)
@@ -357,7 +372,8 @@ impl ThreadView {
                 Some(_) => {}
                 None => {
                     let entity = cx.new(|cx| TextViewState::markdown(text, cx));
-                    self.markdown.insert(item.id.clone(), (entity, text.clone()));
+                    self.markdown
+                        .insert(item.id.clone(), (entity, text.clone()));
                 }
             }
         }
@@ -400,8 +416,9 @@ impl ThreadView {
             },
             None => RunState::Idle,
         };
-        self.composer
-            .update(cx, |composer, cx| composer.set_run_state(run_state, window, cx));
+        self.composer.update(cx, |composer, cx| {
+            composer.set_run_state(run_state, window, cx)
+        });
 
         self.visible = Rc::new(visible);
         self.state = state;
@@ -424,18 +441,26 @@ impl ThreadView {
                 .map(|option| option.value.clone().unwrap_or_else(|| option.label.clone()))
                 .collect();
             let custom = question.allow_custom_answer == Some(true) || question.options.is_empty();
-            let mut item = QuestionnaireItemDefinition::new(question.id.clone(), question.question.clone())
-                .with_description(question.header.clone())
-                .with_multiple(question.multi_select == Some(true))
-                .with_required(question.required != Some(false))
-                .with_choices(question.options.iter().zip(&choice_values).map(|(option, value)| {
-                    let choice = QuestionnaireChoiceDefinition::new(value.clone(), option.label.clone());
-                    if option.description.trim().is_empty() || option.description == option.label {
-                        choice
-                    } else {
-                        choice.with_description(option.description.clone())
-                    }
-                }));
+            let mut item =
+                QuestionnaireItemDefinition::new(question.id.clone(), question.question.clone())
+                    .with_description(question.header.clone())
+                    .with_multiple(question.multi_select == Some(true))
+                    .with_required(question.required != Some(false))
+                    .with_choices(question.options.iter().zip(&choice_values).map(
+                        |(option, value)| {
+                            let choice = QuestionnaireChoiceDefinition::new(
+                                value.clone(),
+                                option.label.clone(),
+                            );
+                            if option.description.trim().is_empty()
+                                || option.description == option.label
+                            {
+                                choice
+                            } else {
+                                choice.with_description(option.description.clone())
+                            }
+                        },
+                    ));
             if custom {
                 let initial = question.initial_answer.clone();
                 let input = cx.new(|cx| {
@@ -458,11 +483,15 @@ impl ThreadView {
                 QuestionnaireState::new(items, cx)
                     .expect("schema_problem rules out every schema error j3 can produce")
             });
-            let subscription = cx.subscribe_in(&state, window, |this, _, event: &QuestionnaireEvent, window, cx| {
-                if let QuestionnaireEvent::Submit(submission) = event {
-                    this.answer_question(submission, window, cx);
-                }
-            });
+            let subscription = cx.subscribe_in(
+                &state,
+                window,
+                |this, _, event: &QuestionnaireEvent, window, cx| {
+                    if let QuestionnaireEvent::Submit(submission) = event {
+                        this.answer_question(submission, window, cx);
+                    }
+                },
+            );
             (Some(state), Some(subscription))
         };
         let schema_error = schema_error.map(SharedString::from);
@@ -551,19 +580,31 @@ impl ThreadView {
                 .await
                 .map(drop)
                 .map_err(|e| e.to_string());
-            let _ = composer.update_in(cx, |composer, window, cx| composer.finish(result, window, cx));
+            let _ = composer.update_in(cx, |composer, window, cx| {
+                composer.finish(result, window, cx)
+            });
         })
         .detach();
     }
 
-    fn start_editing(&mut self, run_id: String, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+    fn start_editing(
+        &mut self,
+        run_id: String,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let input = cx.new(|cx| InputState::new(window, cx).default_value(text.to_owned()));
-        let subscription = cx.subscribe_in(&input, window, |this, input, event: &InputEvent, window, cx| {
-            if let InputEvent::PressEnter { .. } = event {
-                let text = input.read(cx).value().to_string();
-                this.save_edit(text, window, cx);
-            }
-        });
+        let subscription = cx.subscribe_in(
+            &input,
+            window,
+            |this, input, event: &InputEvent, window, cx| {
+                if let InputEvent::PressEnter { .. } = event {
+                    let text = input.read(cx).value().to_string();
+                    this.save_edit(text, window, cx);
+                }
+            },
+        );
         input.update(cx, |input, cx| input.focus(window, cx));
         self.editing = Some(QueueEdit {
             run_id,
@@ -612,7 +653,14 @@ impl ThreadView {
             .gap_2()
             .border_b_1()
             .border_color(theme.border)
-            .child(div().min_w_0().truncate().font_medium().text_sm().child(title))
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .font_medium()
+                    .text_sm()
+                    .child(title),
+            )
             .child(
                 div()
                     .flex_shrink_0()
@@ -628,7 +676,9 @@ impl ThreadView {
                         .xsmall()
                         .icon(IconName::Star)
                         .label("Set goal…")
-                        .on_click(cx.listener(|this, _, window, cx| this.open_goal_dialog(window, cx))),
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.open_goal_dialog(window, cx)),
+                        ),
                 )
             })
             .child(
@@ -690,15 +740,12 @@ impl ThreadView {
         });
         MessageScroller::new("feed", self.scroller.clone(), move |ix, window, cx| {
             let item = &state.feed()[visible[ix]].item;
-            h_flex()
-                .w_full()
-                .justify_center()
-                .child(
-                    div()
-                        .w_full()
-                        .max_w(rems(CONTENT_MAX_WIDTH))
-                        .child(render_item(item, &row, window, cx)),
-                )
+            h_flex().w_full().justify_center().child(
+                div()
+                    .w_full()
+                    .max_w(rems(CONTENT_MAX_WIDTH))
+                    .child(render_item(item, &row, window, cx)),
+            )
         })
         .size_full()
         .into_any_element()
@@ -807,32 +854,47 @@ impl ThreadView {
                             this.save_edit(text, window, cx);
                         }
                     })))
-                    .child(action("Cancel", "cancel-edit").on_click(cx.listener(|this, _, _, cx| {
-                        this.editing = None;
-                        cx.notify();
-                    })))
+                    .child(action("Cancel", "cancel-edit").on_click(cx.listener(
+                        |this, _, _, cx| {
+                            this.editing = None;
+                            cx.notify();
+                        },
+                    )))
                     .into_any_element(),
                 None => h_flex()
                     .flex_1()
                     .min_w_0()
                     .gap_1()
-                    .child(div().flex_1().min_w_0().truncate().text_sm().child(text.clone()))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_sm()
+                            .child(text.clone()),
+                    )
                     .when_some(active_run.clone().filter(|_| can_steer), |this, target| {
                         let connection = self.connection(cx);
                         let thread_id = thread_id.clone();
                         let run_id = run_id.clone();
-                        this.child(action("Steer", "steer").tooltip("Send into the running turn").on_click(
-                            cx.listener(move |this, _, window, cx| {
-                                let (connection, thread_id, run_id, target) =
-                                    (connection.clone(), thread_id.clone(), run_id.clone(), target.clone());
-                                this.run_action(window, cx, async move {
-                                    connection
-                                        .promote_to_steer(&thread_id, &run_id, &target)
-                                        .await
-                                        .map(drop)
-                                });
-                            }),
-                        ))
+                        this.child(
+                            action("Steer", "steer")
+                                .tooltip("Send into the running turn")
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    let (connection, thread_id, run_id, target) = (
+                                        connection.clone(),
+                                        thread_id.clone(),
+                                        run_id.clone(),
+                                        target.clone(),
+                                    );
+                                    this.run_action(window, cx, async move {
+                                        connection
+                                            .promote_to_steer(&thread_id, &run_id, &target)
+                                            .await
+                                            .map(drop)
+                                    });
+                                })),
+                        )
                     })
                     .child({
                         let connection = self.connection(cx);
@@ -868,7 +930,10 @@ impl ThreadView {
                                 let (connection, thread_id, run_id) =
                                     (connection.clone(), thread_id.clone(), run_id.clone());
                                 this.run_action(window, cx, async move {
-                                    connection.cancel_queued(&thread_id, &run_id).await.map(drop)
+                                    connection
+                                        .cancel_queued(&thread_id, &run_id)
+                                        .await
+                                        .map(drop)
                                 });
                             }))
                     })
@@ -879,7 +944,11 @@ impl ThreadView {
                 .test_support()
                 .aria_label(text)
                 .gap_2()
-                .child(Icon::new(IconName::Inbox).xsmall().text_color(theme.muted_foreground))
+                .child(
+                    Icon::new(IconName::Inbox)
+                        .xsmall()
+                        .text_color(theme.muted_foreground),
+                )
                 .child(body)
         });
         let rows: Vec<_> = rows.collect();
@@ -936,7 +1005,9 @@ impl ThreadView {
                         .xsmall()
                         .ghost()
                         .label("Dismiss")
-                        .on_click(cx.listener(|this, _, window, cx| this.dismiss_question(window, cx))),
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.dismiss_question(window, cx)),
+                        ),
                 )
             });
         let body = match (&card.state, &card.schema_error) {
@@ -948,7 +1019,11 @@ impl ThreadView {
                 for (id, values, custom) in &card.values {
                     let mut choices = QuestionnaireChoices::new(state, id.clone());
                     for value in values {
-                        choices = choices.child(QuestionnaireChoice::new(state, id.clone(), value.clone()));
+                        choices = choices.child(QuestionnaireChoice::new(
+                            state,
+                            id.clone(),
+                            value.clone(),
+                        ));
                     }
                     if *custom {
                         choices = choices.child(QuestionnaireInput::new(state, id.clone()));
@@ -1034,11 +1109,9 @@ impl ThreadView {
         };
         let usage = goal_usage(goal);
         let command = |id: &'static str, label: &'static str, command: GoalCommand| {
-            Button::new(id)
-                .xsmall()
-                .ghost()
-                .label(label)
-                .on_click(cx.listener(move |this, _, window, cx| this.goal_command(command, window, cx)))
+            Button::new(id).xsmall().ghost().label(label).on_click(
+                cx.listener(move |this, _, window, cx| this.goal_command(command, window, cx)),
+            )
         };
         Some(
             h_flex()
@@ -1053,21 +1126,46 @@ impl ThreadView {
                 .border_color(theme.border)
                 .text_sm()
                 .child(Icon::new(IconName::Star).xsmall().text_color(color))
-                .child(div().flex_1().min_w_0().truncate().child(goal.objective.clone()))
-                .child(div().flex_shrink_0().text_xs().text_color(color).child(goal_status_label(status)))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .child(goal.objective.clone()),
+                )
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_xs()
+                        .text_color(color)
+                        .child(goal_status_label(status)),
+                )
                 .when(!usage.is_empty(), |this| {
-                    this.child(div().flex_shrink_0().text_xs().text_color(theme.muted_foreground).child(usage))
+                    this.child(
+                        div()
+                            .flex_shrink_0()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(usage),
+                    )
                 })
                 .when(status == ProviderGoalStatus::Active, |this| {
                     this.child(command("goal-pause", "Pause", GoalCommand::Pause))
                 })
                 .when(
-                    matches!(status, ProviderGoalStatus::Paused | ProviderGoalStatus::BudgetLimited),
+                    matches!(
+                        status,
+                        ProviderGoalStatus::Paused | ProviderGoalStatus::BudgetLimited
+                    ),
                     |this| this.child(command("goal-resume", "Resume", GoalCommand::Resume)),
                 )
                 .child(command(
                     "goal-drop",
-                    if status == ProviderGoalStatus::Complete { "Clear" } else { "Drop" },
+                    if status == ProviderGoalStatus::Complete {
+                        "Clear"
+                    } else {
+                        "Drop"
+                    },
                     GoalCommand::Drop,
                 ))
                 .into_any_element(),
@@ -1077,7 +1175,10 @@ impl ThreadView {
 
 /// The token budget typed in the goal dialog: empty means none.
 fn parse_budget(text: &str) -> Result<Option<u64>, std::num::ParseIntError> {
-    let digits: String = text.chars().filter(|c| !matches!(c, ',' | '_' | ' ')).collect();
+    let digits: String = text
+        .chars()
+        .filter(|c| !matches!(c, ',' | '_' | ' '))
+        .collect();
     if digits.is_empty() {
         Ok(None)
     } else {
@@ -1226,7 +1327,11 @@ mod tests {
 
     #[test]
     fn answers_follow_question_shape() {
-        let questions = [question("color", false), question("tools", true), question("skip", false)];
+        let questions = [
+            question("color", false),
+            question("tools", true),
+            question("skip", false),
+        ];
         let answers = build_answers(&questions, |id| match id {
             "color" => Some((vec!["red".into()], None)),
             "tools" => Some((vec!["a".into(), "b".into()], Some("c".into()))),
@@ -1243,7 +1348,9 @@ mod tests {
                 ),
             ])
         );
-        let typed = build_answers(&questions[..1], |_| Some((vec!["red".into()], Some("teal".into()))));
+        let typed = build_answers(&questions[..1], |_| {
+            Some((vec!["red".into()], Some("teal".into())))
+        });
         assert_eq!(typed["color"], Answer::One("teal".into()));
     }
 }

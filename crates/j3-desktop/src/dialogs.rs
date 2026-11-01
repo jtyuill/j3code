@@ -2,7 +2,7 @@
 //! adding a remote environment, and renaming a thread.
 
 use gpui_kit::component::{
-    ActiveTheme as _, StyledExt as _, Icon, IconName, Sizable as _,
+    ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt as _,
     button::{Button, ButtonVariants as _},
     dialog::{DialogAction, DialogClose, DialogFooter},
     h_flex,
@@ -68,7 +68,11 @@ pub struct ProjectPicker {
 impl EventEmitter<ProjectCreated> for ProjectPicker {}
 
 impl ProjectPicker {
-    pub fn new(environment: Entity<Environment>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        environment: Entity<Environment>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let path = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("~/Developer/project")
@@ -109,7 +113,8 @@ impl ProjectPicker {
     fn on_path_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.title_edited {
             let title = title_from_path(&self.path.read(cx).value());
-            self.title.update(cx, |input, cx| input.set_value(title, window, cx));
+            self.title
+                .update(cx, |input, cx| input.set_value(title, window, cx));
         }
         self.browse(cx);
     }
@@ -231,7 +236,11 @@ impl Render for ProjectPicker {
                         .rounded(theme.radius)
                         .text_sm()
                         .hover(|this| this.bg(theme.accent))
-                        .child(Icon::new(IconName::Folder).xsmall().text_color(theme.muted_foreground))
+                        .child(
+                            Icon::new(IconName::Folder)
+                                .xsmall()
+                                .text_color(theme.muted_foreground),
+                        )
                         .child(entry.name.clone())
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.open_entry(&full_path, window, cx);
@@ -291,7 +300,9 @@ impl EnvironmentForm {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         Self {
             label: cx.new(|cx| InputState::new(window, cx).placeholder("revived")),
-            url: cx.new(|cx| InputState::new(window, cx).placeholder("revived or http://revived:3780")),
+            url: cx.new(|cx| {
+                InputState::new(window, cx).placeholder("revived or http://revived:3780")
+            }),
             error: None,
         }
     }

@@ -133,11 +133,9 @@ pub fn tool_summary(item: &TurnItem) -> Option<ToolSummary> {
         TurnItemKind::FileChange(change) => {
             let counts = match (change.additions, change.deletions) {
                 (None, None) => String::new(),
-                (additions, deletions) => format!(
-                    "  +{} −{}",
-                    additions.unwrap_or(0),
-                    deletions.unwrap_or(0)
-                ),
+                (additions, deletions) => {
+                    format!("  +{} −{}", additions.unwrap_or(0), deletions.unwrap_or(0))
+                }
             };
             ToolSummary {
                 icon: ToolIcon::File,
@@ -358,7 +356,13 @@ mod tests {
         assert_eq!(pairs.title, "grep");
         assert_eq!(pairs.subtitle, "a: 1, b: two");
 
-        assert!(tool_summary(&item("completed", json!({"type":"reasoning","text":"x","streaming":false}))).is_none());
+        assert!(
+            tool_summary(&item(
+                "completed",
+                json!({"type":"reasoning","text":"x","streaming":false})
+            ))
+            .is_none()
+        );
     }
 
     #[test]

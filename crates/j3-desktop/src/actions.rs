@@ -1,8 +1,14 @@
 //! Commands, key bindings and the menu bar. Each command is one action; the
 //! workspace owns their handlers so menus, keys and buttons agree.
 
+use std::rc::Rc;
+
 use gpui_kit::component::input::{Copy, Cut, Paste, Redo, SelectAll, Undo};
-use gpui_kit::{App, KeyBinding, Menu, MenuItem, OsAction, actions};
+use gpui_kit::component::kbd::Kbd;
+use gpui_kit::{
+    Action, App, KeyBinding, KeyBindingContextPredicate, Keystroke, Menu, MenuItem,
+    OperatingSystem, OsAction, actions,
+};
 
 use crate::{services::Services, workspace::Workspace};
 
@@ -41,21 +47,50 @@ actions!(
     ]
 );
 
+/// A binding written with GPUI's `secondary-` modifier: ⌘ on macOS, Ctrl
+/// elsewhere.
+fn bind(keys: &str, action: impl Action, context: Option<&str>, cx: &App) -> KeyBinding {
+    let predicate = context.map(|context| {
+        Rc::new(KeyBindingContextPredicate::parse(context).expect("static key context"))
+    });
+    KeyBinding::load(keys, Box::new(action), predicate, false, None, cx)
+        .expect("static key bindings parse")
+}
+
+/// How `keys` (GPUI keystroke syntax, `secondary-` allowed) reads on `os`,
+/// e.g. `secondary-n` is `⌘N` on macOS and `Ctrl+N` on Linux.
+pub fn format_shortcut(keys: &str, os: OperatingSystem) -> String {
+    keys.split_whitespace()
+        .map(|stroke| match Keystroke::parse_with_os(stroke, os) {
+            Ok(keystroke) => Kbd::format(&keystroke),
+            Err(_) => stroke.to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// [`format_shortcut`] for the running platform.
+pub fn shortcut(keys: &str, cx: &App) -> String {
+    format_shortcut(keys, cx.platform_info().os)
+}
+
 pub fn init(cx: &mut App) {
     // Bindings first: `set_menus` bakes shortcuts in when it is called.
-    cx.bind_keys([
-        KeyBinding::new("cmd-q", Quit, None),
-        KeyBinding::new("cmd-n", NewThread, Some(WORKSPACE)),
-        KeyBinding::new("cmd-o", AddProject, Some(WORKSPACE)),
-        KeyBinding::new("cmd-.", StopRun, Some(WORKSPACE)),
-        KeyBinding::new("cmd-shift-r", RenameThread, Some(WORKSPACE)),
-        KeyBinding::new("cmd-shift-a", ArchiveThread, Some(WORKSPACE)),
-        KeyBinding::new("cmd-shift-backspace", DeleteThread, Some(WORKSPACE)),
-        KeyBinding::new("cmd-l", FocusComposer, Some(WORKSPACE)),
-        KeyBinding::new("cmd-0", FocusSidebar, Some(WORKSPACE)),
-        KeyBinding::new("cmd-]", NextThread, Some(WORKSPACE)),
-        KeyBinding::new("cmd-[", PreviousThread, Some(WORKSPACE)),
-    ]);
+    let ws = Some(WORKSPACE);
+    let bindings = [
+        bind("secondary-q", Quit, None, cx),
+        bind("secondary-n", NewThread, ws, cx),
+        bind("secondary-o", AddProject, ws, cx),
+        bind("secondary-.", StopRun, ws, cx),
+        bind("secondary-shift-r", RenameThread, ws, cx),
+        bind("secondary-shift-a", ArchiveThread, ws, cx),
+        bind("secondary-shift-backspace", DeleteThread, ws, cx),
+        bind("secondary-l", FocusComposer, ws, cx),
+        bind("secondary-0", FocusSidebar, ws, cx),
+        bind("secondary-]", NextThread, ws, cx),
+        bind("secondary-[", PreviousThread, ws, cx),
+    ];
+    cx.bind_keys(bindings);
     cx.on_action(|_: &Quit, cx| quit(cx));
     cx.on_window_closed(|cx, _| {
         if cx.windows().is_empty() {
@@ -101,4 +136,33 @@ pub fn init(cx: &mut App) {
 pub fn quit(cx: &mut App) {
     let connections = Workspace::global_connections(cx);
     Services::quit(connections, cx);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secondary_shortcuts_follow_the_platform() {
+        // `Kbd::format` renders with this build's conventions; `secondary-`
+        // resolves to ⌘ for macOS and Ctrl for Linux.
+        if cfg!(target_os = "macos") {
+            assert_eq!(format_shortcut("secondary-n", OperatingSystem::Mac), "⌘N");
+            assert_eq!(format_shortcut("secondary-n", OperatingSystem::Linux), "⌃N");
+            assert_eq!(format_shortcut("shift-enter", OperatingSystem::Mac), "⇧⏎");
+        } else {
+            assert_eq!(
+                format_shortcut("secondary-n", OperatingSystem::Linux),
+                "Ctrl+N"
+            );
+            assert_eq!(
+                format_shortcut("shift-enter", OperatingSystem::Linux),
+                "Shift+Enter"
+            );
+        }
+        assert_eq!(
+            format_shortcut("not-a-valid--key", OperatingSystem::Mac),
+            "not-a-valid--key"
+        );
+    }
 }

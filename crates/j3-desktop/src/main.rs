@@ -19,15 +19,17 @@ mod new_thread;
 mod services;
 mod sidebar;
 mod thread_view;
-mod workspace;
 #[cfg(test)]
 mod ui_tests;
+mod workspace;
 
 use std::sync::Arc;
 
 use gpui_kit::assets::Assets;
 use gpui_kit::component::Theme;
-use gpui_kit::{App, AppContext as _, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size};
+use gpui_kit::{
+    App, AppContext as _, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size,
+};
 use tracing_subscriber::EnvFilter;
 
 use crate::{local_server::LocalServer, services::Services, workspace::Workspace};
@@ -78,7 +80,8 @@ fn main() {
 async fn termination_signal() -> tokio::sync::oneshot::Receiver<()> {
     use tokio::signal::unix::{SignalKind, signal};
     let (tx, rx) = tokio::sync::oneshot::channel();
-    let listeners = signal(SignalKind::terminate()).and_then(|term| Ok((term, signal(SignalKind::interrupt())?)));
+    let listeners = signal(SignalKind::terminate())
+        .and_then(|term| Ok((term, signal(SignalKind::interrupt())?)));
     match listeners {
         Ok((mut term, mut int)) => {
             tokio::spawn(async move {
@@ -114,6 +117,7 @@ fn open_main_window(cx: &mut App) {
     });
     if let Err(e) = opened {
         tracing::error!("opening the window failed: {e:#}");
-        cx.quit();
+        let connections = Workspace::global_connections(cx);
+        Services::exit(connections, 1, cx);
     }
 }

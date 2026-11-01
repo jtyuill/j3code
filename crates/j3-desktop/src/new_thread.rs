@@ -2,8 +2,7 @@
 //! and launch.
 
 use gpui_kit::component::{
-    ActiveTheme as _, StyledExt as _, IndexPath, Sizable as _,
-    h_flex,
+    ActiveTheme as _, IndexPath, Sizable as _, StyledExt as _, h_flex,
     select::{Select, SelectEvent, SelectItem, SelectState},
     v_flex,
 };
@@ -14,11 +13,14 @@ use gpui_kit::{
 
 use crate::{
     composer::{Composer, ComposerEvent, Submission},
-    environment::Environment,
+    environment::{Environment, distinct_environments},
 };
 
 pub enum NewThreadEvent {
-    Launched { env: SharedString, thread_id: String },
+    Launched {
+        env: SharedString,
+        thread_id: String,
+    },
 }
 
 #[derive(Clone)]
@@ -91,6 +93,7 @@ impl NewThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let environments = distinct_environments(&environments, cx);
         let items: Vec<EnvironmentItem> = environments
             .iter()
             .map(|env| {
@@ -106,7 +109,8 @@ impl NewThreadView {
             .position(|env| env == &environment)
             .map(IndexPath::new);
         let environment_select = cx.new(|cx| SelectState::new(items, selected, window, cx));
-        let project_select = cx.new(|cx| SelectState::new(Vec::new(), None, window, cx).searchable(true));
+        let project_select =
+            cx.new(|cx| SelectState::new(Vec::new(), None, window, cx).searchable(true));
         let subscriptions = vec![
             cx.subscribe_in(
                 &environment_select,
@@ -115,7 +119,12 @@ impl NewThreadView {
                     let SelectEvent::Confirm(Some(key)) = event else {
                         return;
                     };
-                    if let Some(env) = this.environments.iter().find(|e| e.read(cx).key() == key).cloned() {
+                    if let Some(env) = this
+                        .environments
+                        .iter()
+                        .find(|e| e.read(cx).key() == key)
+                        .cloned()
+                    {
                         this.set_environment(env, None, window, cx);
                     }
                 },
@@ -131,9 +140,10 @@ impl NewThreadView {
                 },
             ),
         ];
-        let environment_subscription = cx.observe_in(&environment, window, |this, _, window, cx| {
-            this.sync_projects(window, cx)
-        });
+        let environment_subscription =
+            cx.observe_in(&environment, window, |this, _, window, cx| {
+                this.sync_projects(window, cx)
+            });
         let mut view = Self {
             environments,
             environment,
@@ -164,9 +174,10 @@ impl NewThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self._environment_subscription = cx.observe_in(&environment, window, |this, _, window, cx| {
-            this.sync_projects(window, cx)
-        });
+        self._environment_subscription =
+            cx.observe_in(&environment, window, |this, _, window, cx| {
+                this.sync_projects(window, cx)
+            });
         self.environment = environment;
         self.project_id = project_id;
         self.projects.clear();
@@ -193,7 +204,11 @@ impl NewThreadView {
                 .zip(&self.projects)
                 .all(|(a, b)| a.id == b.id && a.title == b.title);
         if !same {
-            if self.project_id.as_ref().is_none_or(|id| !projects.iter().any(|p| &p.id == id)) {
+            if self
+                .project_id
+                .as_ref()
+                .is_none_or(|id| !projects.iter().any(|p| &p.id == id))
+            {
                 self.project_id = projects.first().map(|p| p.id.clone());
             }
             self.projects = projects.clone();
@@ -232,7 +247,8 @@ impl NewThreadView {
         }
         let environment = self.environment.clone();
         let composer = cx.new(|cx| Composer::new(environment, cwd, preferred, window, cx));
-        self._composer_subscription = Some(cx.subscribe_in(&composer, window, Self::on_composer_event));
+        self._composer_subscription =
+            Some(cx.subscribe_in(&composer, window, Self::on_composer_event));
         composer.update(cx, |composer, cx| composer.focus(window, cx));
         self.composer = Some(composer);
         cx.notify();
@@ -267,13 +283,21 @@ impl NewThreadView {
         let connection = env.connection().clone();
         cx.spawn_in(window, async move |this, cx| {
             let result = connection
-                .launch(&project_id, &submission.text, submission.attachments, submission.model)
+                .launch(
+                    &project_id,
+                    &submission.text,
+                    submission.attachments,
+                    submission.model,
+                )
                 .await;
             let _ = this.update_in(cx, |_, window, cx| {
                 let outcome = result.as_ref().map(drop).map_err(ToString::to_string);
                 composer.update(cx, |composer, cx| composer.finish(outcome, window, cx));
                 if let Ok(thread_id) = result {
-                    cx.emit(NewThreadEvent::Launched { env: key, thread_id });
+                    cx.emit(NewThreadEvent::Launched {
+                        env: key,
+                        thread_id,
+                    });
                 }
             });
         })
@@ -307,47 +331,58 @@ impl Render for NewThreadView {
                     .child(div().font_medium().text_sm().child("New thread")),
             )
             .child(
-                div().flex_1().min_h_0().flex().items_end().justify_center().px_4().pb_3().child(
-                    v_flex()
-                        .w_full()
-                        .max_w(rems(52.))
-                        .gap_2()
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child("Environment")
-                                .child(
-                                    Select::new(&self.environment_select)
-                                        .xsmall()
-                                        .accessibility_label("Environment")
-                                        .w(rems(12.)),
-                                )
-                                .child("Project")
-                                .child(
-                                    Select::new(&self.project_select)
-                                        .xsmall()
-                                        .placeholder("No projects")
-                                        .search_placeholder("Search projects")
-                                        .accessibility_label("Project")
-                                        .disabled(!has_projects)
-                                        .w(rems(16.)),
-                                ),
-                        )
-                        .child(match &self.composer {
-                            Some(composer) => composer.clone().into_any_element(),
-                            None => div()
-                                .p_4()
-                                .rounded(theme.radius_lg)
-                                .border_1()
-                                .border_color(theme.border)
-                                .text_sm()
-                                .text_color(theme.muted_foreground)
-                                .child("Add a project to this environment to start a thread (⌘O).")
-                                .into_any_element(),
-                        }),
-                ),
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .items_end()
+                    .justify_center()
+                    .px_4()
+                    .pb_3()
+                    .child(
+                        v_flex()
+                            .w_full()
+                            .max_w(rems(52.))
+                            .gap_2()
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child("Environment")
+                                    .child(
+                                        Select::new(&self.environment_select)
+                                            .xsmall()
+                                            .accessibility_label("Environment")
+                                            .w(rems(12.)),
+                                    )
+                                    .child("Project")
+                                    .child(
+                                        Select::new(&self.project_select)
+                                            .xsmall()
+                                            .placeholder("No projects")
+                                            .search_placeholder("Search projects")
+                                            .accessibility_label("Project")
+                                            .disabled(!has_projects)
+                                            .w(rems(16.)),
+                                    ),
+                            )
+                            .child(match &self.composer {
+                                Some(composer) => composer.clone().into_any_element(),
+                                None => div()
+                                    .p_4()
+                                    .rounded(theme.radius_lg)
+                                    .border_1()
+                                    .border_color(theme.border)
+                                    .text_sm()
+                                    .text_color(theme.muted_foreground)
+                                    .child(format!(
+                                        "Add a project to this environment to start a thread ({}).",
+                                        crate::actions::shortcut("secondary-o", cx)
+                                    ))
+                                    .into_any_element(),
+                            }),
+                    ),
             )
     }
 }

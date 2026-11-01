@@ -79,14 +79,12 @@ impl SelectItem for ModelItem {
     }
 
     fn render(&self, _: &mut Window, cx: &mut App) -> impl IntoElement {
-        v_flex()
-            .child(self.0.name.clone())
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(self.0.slug().to_owned()),
-            )
+        v_flex().child(self.0.name.clone()).child(
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(self.0.slug().to_owned()),
+        )
     }
 
     fn value(&self) -> &Self::Value {
@@ -160,15 +158,19 @@ impl Composer {
         let levels = cx.new(|cx| SelectState::new(Vec::new(), None, window, cx));
         let subscriptions = vec![
             cx.subscribe_in(&input, window, Self::on_input_event),
-            cx.subscribe_in(&model, window, |this, _, event: &SelectEvent<Vec<ModelItem>>, window, cx| {
-                let SelectEvent::Confirm(Some(key)) = event else {
-                    return;
-                };
-                if let Some(choice) = this.choices.iter().find(|c| &c.key == key).cloned() {
-                    this.preferred = Some(models::model_selection(&choice, None));
-                    this.sync_levels(&choice, window, cx);
-                }
-            }),
+            cx.subscribe_in(
+                &model,
+                window,
+                |this, _, event: &SelectEvent<Vec<ModelItem>>, window, cx| {
+                    let SelectEvent::Confirm(Some(key)) = event else {
+                        return;
+                    };
+                    if let Some(choice) = this.choices.iter().find(|c| &c.key == key).cloned() {
+                        this.preferred = Some(models::model_selection(&choice, None));
+                        this.sync_levels(&choice, window, cx);
+                    }
+                },
+            ),
             cx.observe_in(&environment, window, |this, _, window, cx| {
                 this.sync_config(window, cx)
             }),
@@ -209,7 +211,12 @@ impl Composer {
         &self.cwd
     }
 
-    pub fn set_run_state(&mut self, run_state: RunState, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn set_run_state(
+        &mut self,
+        run_state: RunState,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.run_state == run_state {
             return;
         }
@@ -219,21 +226,28 @@ impl Composer {
             RunState::Running { can_steer: true } => "Steer the run…",
             RunState::Running { can_steer: false } => "Queue a message…",
         };
-        self.input
-            .update(cx, |input, cx| input.set_placeholder(placeholder, window, cx));
+        self.input.update(cx, |input, cx| {
+            input.set_placeholder(placeholder, window, cx)
+        });
         cx.notify();
     }
 
     /// The owner finished sending the last submission: clear on success,
     /// keep the draft and show `error` on failure.
-    pub fn finish(&mut self, result: Result<(), String>, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn finish(
+        &mut self,
+        result: Result<(), String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.busy = false;
         match result {
             Ok(()) => {
                 self.error = None;
                 self.images.clear();
                 self.completions.clear();
-                self.input.update(cx, |input, cx| input.set_value("", window, cx));
+                self.input
+                    .update(cx, |input, cx| input.set_value("", window, cx));
             }
             Err(error) => self.error = Some(error.into()),
         }
@@ -316,9 +330,7 @@ impl Composer {
         let level = self.levels.read(cx).selected_value().cloned();
         Some(models::model_selection(
             choice,
-            self.level_descriptor
-                .as_deref()
-                .zip(level.as_deref()),
+            self.level_descriptor.as_deref().zip(level.as_deref()),
         ))
     }
 
@@ -355,7 +367,11 @@ impl Composer {
             let items: Vec<ModelItem> = self.choices.iter().cloned().map(ModelItem).collect();
             self.model.update(cx, |select, cx| {
                 select.set_items(items, window, cx);
-                select.set_selected_index(initial.map(gpui_kit::component::IndexPath::new), window, cx);
+                select.set_selected_index(
+                    initial.map(gpui_kit::component::IndexPath::new),
+                    window,
+                    cx,
+                );
             });
             if let Some(choice) = initial.map(|ix| self.choices[ix].clone()) {
                 self.sync_levels(&choice, window, cx);
@@ -371,18 +387,13 @@ impl Composer {
             .as_ref()
             .and_then(|config| models::thinking_descriptor(config, choice))
             .cloned();
-        let preferred_level = self
-            .levels
-            .read(cx)
-            .selected_value()
-            .cloned()
-            .or_else(|| {
-                let descriptor = descriptor.as_ref()?;
-                self.preferred
-                    .as_ref()
-                    .and_then(|p| models::selection_level(p, &descriptor.id))
-                    .map(str::to_owned)
-            });
+        let preferred_level = self.levels.read(cx).selected_value().cloned().or_else(|| {
+            let descriptor = descriptor.as_ref()?;
+            self.preferred
+                .as_ref()
+                .and_then(|p| models::selection_level(p, &descriptor.id))
+                .map(str::to_owned)
+        });
         self.level_descriptor = descriptor.as_ref().map(|d| d.id.clone());
         let items: Vec<LevelItem> = descriptor
             .iter()
@@ -421,7 +432,13 @@ impl Composer {
         cx.notify();
     }
 
-    fn add_image(&mut self, format: ImageFormat, bytes: Vec<u8>, name: Option<String>, cx: &mut Context<Self>) {
+    fn add_image(
+        &mut self,
+        format: ImageFormat,
+        bytes: Vec<u8>,
+        name: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         let mime = match format {
             ImageFormat::Png => "image/png",
             ImageFormat::Jpeg => "image/jpeg",
@@ -469,7 +486,9 @@ impl Composer {
         let mut images = Vec::new();
         for entry in item.entries() {
             match entry {
-                ClipboardEntry::Image(image) => images.push((image.format, image.bytes.clone(), None)),
+                ClipboardEntry::Image(image) => {
+                    images.push((image.format, image.bytes.clone(), None))
+                }
                 ClipboardEntry::ExternalPaths(paths) => {
                     for path in paths.paths() {
                         if let Some(format) = format_for_path(path)
@@ -512,7 +531,10 @@ impl Composer {
             .map(|(ix, completion)| {
                 let selected = ix == self.completion_ix;
                 h_flex()
-                    .id(SharedString::from(format!("completion-{}", completion.label)))
+                    .id(SharedString::from(format!(
+                        "completion-{}",
+                        completion.label
+                    )))
                     .gap_2()
                     .px_2()
                     .py_1()
@@ -521,8 +543,14 @@ impl Composer {
                     .when(selected, |this| {
                         this.bg(theme.accent).text_color(theme.accent_foreground)
                     })
-                    .when(!selected, |this| this.hover(|this| this.bg(theme.accent.opacity(0.5))))
-                    .child(div().font_family(theme.mono_font_family.clone()).child(completion.label.clone()))
+                    .when(!selected, |this| {
+                        this.hover(|this| this.bg(theme.accent.opacity(0.5)))
+                    })
+                    .child(
+                        div()
+                            .font_family(theme.mono_font_family.clone())
+                            .child(completion.label.clone()),
+                    )
                     .when_some(completion.hint.clone(), |this, hint| {
                         this.child(div().text_color(theme.muted_foreground).child(hint))
                     })
@@ -538,7 +566,12 @@ impl Composer {
                         )
                     })
                     .when(completion.kind == CompletionKind::Skill, |this| {
-                        this.child(div().text_xs().text_color(theme.muted_foreground).child("skill"))
+                        this.child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child("skill"),
+                        )
                     })
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.completion_ix = ix;
@@ -577,7 +610,9 @@ impl Composer {
                 .children(self.images.iter().map(|image| {
                     let id = image.id;
                     let (status, failed) = match &image.upload {
-                        Upload::Uploading => (Some(Spinner::new().xsmall().into_any_element()), None),
+                        Upload::Uploading => {
+                            (Some(Spinner::new().xsmall().into_any_element()), None)
+                        }
                         Upload::Done(_) => (None, None),
                         Upload::Failed(error) => (None, Some(error.clone())),
                     };
@@ -587,7 +622,11 @@ impl Composer {
                         .p_1()
                         .rounded(theme.radius)
                         .border_1()
-                        .border_color(if failed.is_some() { theme.danger } else { theme.border })
+                        .border_color(if failed.is_some() {
+                            theme.danger
+                        } else {
+                            theme.border
+                        })
                         .child(
                             img(ImageSource::Image(image.image.clone()))
                                 .size_10()
@@ -599,7 +638,13 @@ impl Composer {
                                 .max_w(rems(9.))
                                 .child(div().text_xs().truncate().child(image.name.clone()))
                                 .when_some(failed.clone(), |this, error| {
-                                    this.child(div().text_xs().text_color(theme.danger).truncate().child(error))
+                                    this.child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(theme.danger)
+                                            .truncate()
+                                            .child(error),
+                                    )
                                 }),
                         )
                         .children(status)
@@ -616,7 +661,8 @@ impl Composer {
                         )
                         .when_some(failed, |this, error| {
                             this.tooltip(move |window, cx| {
-                                gpui_kit::component::tooltip::Tooltip::new(error.clone()).build(window, cx)
+                                gpui_kit::component::tooltip::Tooltip::new(error.clone())
+                                    .build(window, cx)
                             })
                         })
                 }))
@@ -649,16 +695,21 @@ impl Render for Composer {
         let has_levels = self.level_descriptor.is_some();
         let completions = self.render_completions(cx);
         let images = self.render_images(cx);
-        let theme = cx.theme();
+        let key = |keys: &str| crate::actions::shortcut(keys, cx);
+        let (enter, queue_key, newline) =
+            (key("enter"), key("secondary-enter"), key("shift-enter"));
+        let stop_tooltip = format!("Stop the run ({})", key("secondary-."));
+        let queue_tooltip = format!("Queue after the current run ({queue_key})");
         let hint = if running {
             if can_steer {
-                "⏎ steer · ⌘⏎ queue"
+                format!("{enter} steer · {queue_key} queue")
             } else {
-                "⏎ queue"
+                format!("{enter} queue")
             }
         } else {
-            "⏎ send · ⇧⏎ newline"
+            format!("{enter} send · {newline} newline")
         };
+        let theme = cx.theme();
         let completions_open = !self.completions.is_empty();
         v_flex()
             .id("composer")
@@ -739,7 +790,12 @@ impl Render for Composer {
                         )
                     })
                     .child(div().flex_1())
-                    .child(div().text_xs().text_color(theme.muted_foreground).child(hint))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(hint),
+                    )
                     .when(running, |this| {
                         this.child(
                             Button::new("stop-run")
@@ -747,7 +803,7 @@ impl Render for Composer {
                                 .outline()
                                 .icon(IconName::Square)
                                 .label("Stop")
-                                .tooltip("Stop the run (⌘.)")
+                                .tooltip(stop_tooltip)
                                 .on_click(cx.listener(|_, _, _, cx| cx.emit(ComposerEvent::Stop))),
                         )
                     })
@@ -757,9 +813,13 @@ impl Render for Composer {
                                 .xsmall()
                                 .outline()
                                 .label("Queue")
-                                .tooltip("Queue after the current run (⌘⏎)")
+                                .tooltip(queue_tooltip)
                                 .disabled(self.busy)
-                                .on_click(cx.listener(|this, _, window, cx| this.submit(true, window, cx))),
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| {
+                                        this.submit(true, window, cx)
+                                    }),
+                                ),
                         )
                     })
                     .child(
@@ -767,9 +827,17 @@ impl Render for Composer {
                             .xsmall()
                             .primary()
                             .icon(IconName::ArrowUp)
-                            .label(if can_steer { "Steer" } else if running { "Queue" } else { "Send" })
+                            .label(if can_steer {
+                                "Steer"
+                            } else if running {
+                                "Queue"
+                            } else {
+                                "Send"
+                            })
                             .loading(self.busy)
-                            .on_click(cx.listener(|this, _, window, cx| this.submit(false, window, cx))),
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.submit(false, window, cx)),
+                            ),
                     ),
             )
     }

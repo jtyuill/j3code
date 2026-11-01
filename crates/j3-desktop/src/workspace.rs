@@ -68,7 +68,7 @@ impl Workspace {
         let local = cx.new(|cx| {
             Environment::new(
                 LOCAL_KEY,
-                hostname,
+                hostname.clone(),
                 &local_url,
                 EnvironmentKind::Local(local_status),
                 cx,
@@ -77,18 +77,31 @@ impl Workspace {
         let mut environments = vec![local];
 
         let (config, config_error) = match &config_path {
-            Some(path) => match DesktopConfig::load_or_create(path) {
+            Some(path) => match DesktopConfig::load_or_create(path, &hostname) {
                 Ok(config) => (config, None),
-                Err(e) => (DesktopConfig { environments: Vec::new() }, Some(e.to_string())),
+                Err(e) => (
+                    DesktopConfig {
+                        environments: Vec::new(),
+                    },
+                    Some(e.to_string()),
+                ),
             },
             None => (
-                DesktopConfig { environments: Vec::new() },
+                DesktopConfig {
+                    environments: Vec::new(),
+                },
                 Some("No config directory; remote environments can’t be saved.".to_owned()),
             ),
         };
         for remote in &config.environments {
             environments.push(cx.new(|cx| {
-                Environment::new(remote.url.clone(), remote.label.clone(), &remote.url, EnvironmentKind::Remote, cx)
+                Environment::new(
+                    remote.url.clone(),
+                    remote.label.clone(),
+                    &remote.url,
+                    EnvironmentKind::Remote,
+                    cx,
+                )
             }));
         }
 
@@ -179,7 +192,13 @@ impl Workspace {
         cx.notify();
     }
 
-    fn open_thread(&mut self, env_key: &str, thread_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_thread(
+        &mut self,
+        env_key: &str,
+        thread_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(view) = self.current_thread()
             && view.read(cx).thread_id() == thread_id
             && view.read(cx).environment().read(cx).key() == env_key
@@ -190,8 +209,9 @@ impl Workspace {
             return;
         };
         let view = cx.new(|cx| ThreadView::new(env, thread_id, window, cx));
-        self.sidebar
-            .update(cx, |sidebar, cx| sidebar.select_thread(env_key, thread_id, cx));
+        self.sidebar.update(cx, |sidebar, cx| {
+            sidebar.select_thread(env_key, thread_id, cx)
+        });
         self.set_main(Main::Thread(view), None, cx);
     }
 
@@ -204,24 +224,38 @@ impl Workspace {
     ) {
         let environments = self.environments.clone();
         let view = cx.new(|cx| NewThreadView::new(environments, env, project_id, window, cx));
-        let subscription = cx.subscribe_in(&view, window, |this, _, event: &NewThreadEvent, window, cx| {
-            let NewThreadEvent::Launched { env, thread_id } = event;
-            this.open_thread(env, thread_id, window, cx);
-            if let Some(view) = this.current_thread().cloned() {
-                view.update(cx, |view, cx| view.focus_composer(window, cx));
-            }
-        });
+        let subscription = cx.subscribe_in(
+            &view,
+            window,
+            |this, _, event: &NewThreadEvent, window, cx| {
+                let NewThreadEvent::Launched { env, thread_id } = event;
+                this.open_thread(env, thread_id, window, cx);
+                if let Some(view) = this.current_thread().cloned() {
+                    view.update(cx, |view, cx| view.focus_composer(window, cx));
+                }
+            },
+        );
         view.update(cx, |view, cx| view.focus_composer(window, cx));
         self.set_main(Main::NewThread(view), Some(subscription), cx);
     }
 
-    fn show_archived(&mut self, env: Entity<Environment>, window: &mut Window, cx: &mut Context<Self>) {
+    fn show_archived(
+        &mut self,
+        env: Entity<Environment>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let key = env.read(cx).key().clone();
         let view = cx.new(|cx| ArchivedView::new(env, cx));
-        let subscription = cx.subscribe_in(&view, window, move |this, _, event: &Unarchived, window, cx| {
-            this.open_thread(&key, &event.thread_id, window, cx);
-        });
-        self.sidebar.update(cx, |sidebar, cx| sidebar.clear_selection(cx));
+        let subscription = cx.subscribe_in(
+            &view,
+            window,
+            move |this, _, event: &Unarchived, window, cx| {
+                this.open_thread(&key, &event.thread_id, window, cx);
+            },
+        );
+        self.sidebar
+            .update(cx, |sidebar, cx| sidebar.clear_selection(cx));
         self.set_main(Main::Archived(view), Some(subscription), cx);
     }
 
@@ -234,8 +268,13 @@ impl Workspace {
     ) {
         let env = |key: &SharedString, this: &Self, cx: &App| this.environment(key, cx);
         match event {
-            SidebarEvent::OpenThread { env, thread_id } => self.open_thread(env, thread_id, window, cx),
-            SidebarEvent::NewThread { env: key, project_id } => {
+            SidebarEvent::OpenThread { env, thread_id } => {
+                self.open_thread(env, thread_id, window, cx)
+            }
+            SidebarEvent::NewThread {
+                env: key,
+                project_id,
+            } => {
                 if let Some(env) = env(key, self, cx) {
                     self.new_thread(env, Some(project_id.clone()), window, cx);
                 }
@@ -245,22 +284,34 @@ impl Workspace {
                     self.add_project(env, window, cx);
                 }
             }
-            SidebarEvent::RenameThread { env: key, thread_id } => {
+            SidebarEvent::RenameThread {
+                env: key,
+                thread_id,
+            } => {
                 if let Some(env) = env(key, self, cx) {
                     self.rename_thread(env, thread_id.clone(), window, cx);
                 }
             }
-            SidebarEvent::ArchiveThread { env: key, thread_id } => {
+            SidebarEvent::ArchiveThread {
+                env: key,
+                thread_id,
+            } => {
                 if let Some(env) = env(key, self, cx) {
                     self.archive_thread(env, thread_id.clone(), window, cx);
                 }
             }
-            SidebarEvent::DeleteThread { env: key, thread_id } => {
+            SidebarEvent::DeleteThread {
+                env: key,
+                thread_id,
+            } => {
                 if let Some(env) = env(key, self, cx) {
                     self.delete_thread(env, thread_id.clone(), window, cx);
                 }
             }
-            SidebarEvent::DeleteProject { env: key, project_id } => {
+            SidebarEvent::DeleteProject {
+                env: key,
+                project_id,
+            } => {
                 if let Some(env) = env(key, self, cx) {
                     self.delete_project(env, project_id.clone(), window, cx);
                 }
@@ -270,7 +321,9 @@ impl Workspace {
                     self.show_archived(env, window, cx);
                 }
             }
-            SidebarEvent::RemoveEnvironment { env: key } => self.remove_environment(key.clone(), window, cx),
+            SidebarEvent::RemoveEnvironment { env: key } => {
+                self.remove_environment(key.clone(), window, cx)
+            }
             SidebarEvent::AddEnvironment => self.add_environment(window, cx),
         }
     }
@@ -313,11 +366,16 @@ impl Workspace {
             .unwrap_or_else(|| "this thread".to_owned())
     }
 
-    fn rename_thread(&mut self, env: Entity<Environment>, thread_id: String, window: &mut Window, cx: &mut Context<Self>) {
+    fn rename_thread(
+        &mut self,
+        env: Entity<Environment>,
+        thread_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let title = Self::thread_title(&env, &thread_id, cx);
-        let input = cx.new(|cx| {
-            gpui_kit::component::input::InputState::new(window, cx).default_value(title)
-        });
+        let input = cx
+            .new(|cx| gpui_kit::component::input::InputState::new(window, cx).default_value(title));
         let workspace = cx.weak_entity();
         let dialog_input = input.clone();
         window.open_dialog(cx, move |dialog, _, _| {
@@ -355,18 +413,31 @@ impl Workspace {
     }
 
     /// After a thread leaves the list, show the next one (or nothing).
-    fn leave_thread(&mut self, env: &Entity<Environment>, thread_id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let open = self
-            .current_thread()
-            .is_some_and(|view| view.read(cx).thread_id() == thread_id && view.read(cx).environment() == env);
+    fn leave_thread(
+        &mut self,
+        env: &Entity<Environment>,
+        thread_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let open = self.current_thread().is_some_and(|view| {
+            view.read(cx).thread_id() == thread_id && view.read(cx).environment() == env
+        });
         if open {
-            self.sidebar.update(cx, |sidebar, cx| sidebar.clear_selection(cx));
+            self.sidebar
+                .update(cx, |sidebar, cx| sidebar.clear_selection(cx));
             self.set_main(Main::Empty, None, cx);
             self.focus_handle.focus(window, cx);
         }
     }
 
-    fn archive_thread(&mut self, env: Entity<Environment>, thread_id: String, window: &mut Window, cx: &mut Context<Self>) {
+    fn archive_thread(
+        &mut self,
+        env: Entity<Environment>,
+        thread_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let connection = env.read(cx).connection().clone();
         let id = thread_id.clone();
         self.run_command(
@@ -378,7 +449,13 @@ impl Workspace {
         );
     }
 
-    fn delete_thread(&mut self, env: Entity<Environment>, thread_id: String, window: &mut Window, cx: &mut Context<Self>) {
+    fn delete_thread(
+        &mut self,
+        env: Entity<Environment>,
+        thread_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let title = Self::thread_title(&env, &thread_id, cx);
         let workspace = cx.weak_entity();
         window.open_alert_dialog(cx, move |alert, _, _| {
@@ -387,7 +464,9 @@ impl Workspace {
             let thread_id = thread_id.clone();
             alert
                 .title(format!("Delete “{title}”?"))
-                .description("The conversation is removed from j3. omp’s session file stays on disk.")
+                .description(
+                    "The conversation is removed from j3. omp’s session file stays on disk.",
+                )
                 .confirm()
                 .ok_text("Delete")
                 .ok_variant(ButtonVariant::Danger)
@@ -402,7 +481,9 @@ impl Workspace {
                             cx,
                             "delete the thread",
                             async move { connection.delete_thread(&id).await },
-                            move |this, _, window, cx| this.leave_thread(&env, &thread_id, window, cx),
+                            move |this, _, window, cx| {
+                                this.leave_thread(&env, &thread_id, window, cx)
+                            },
                         );
                     });
                     true
@@ -410,7 +491,13 @@ impl Workspace {
         });
     }
 
-    fn delete_project(&mut self, env: Entity<Environment>, project_id: String, window: &mut Window, cx: &mut Context<Self>) {
+    fn delete_project(
+        &mut self,
+        env: Entity<Environment>,
+        project_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let state = env.read(cx).state().clone();
         let Some(project) = state.shell.project(&project_id) else {
             return;
@@ -453,16 +540,25 @@ impl Workspace {
         });
     }
 
-    fn add_project(&mut self, env: Entity<Environment>, window: &mut Window, cx: &mut Context<Self>) {
+    fn add_project(
+        &mut self,
+        env: Entity<Environment>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let label = env.read(cx).label().clone();
         let key = env.read(cx).key().clone();
         let picker = cx.new(|cx| ProjectPicker::new(env, window, cx));
-        let subscription = cx.subscribe_in(&picker, window, move |this, _, event: &ProjectCreated, window, cx| {
-            window.close_dialog(cx);
-            if let Some(env) = this.environment(&key, cx) {
-                this.new_thread(env, Some(event.project_id.clone()), window, cx);
-            }
-        });
+        let subscription = cx.subscribe_in(
+            &picker,
+            window,
+            move |this, _, event: &ProjectCreated, window, cx| {
+                window.close_dialog(cx);
+                if let Some(env) = this.environment(&key, cx) {
+                    this.new_thread(env, Some(event.project_id.clone()), window, cx);
+                }
+            },
+        );
         // The subscription lives as long as the picker's dialog is open.
         let dialog_picker = picker.clone();
         let width = window.rem_size() * 34.;
@@ -510,7 +606,12 @@ impl Workspace {
         form.update(cx, |form, cx| form.focus(window, cx));
     }
 
-    fn insert_environment(&mut self, label: &str, url: &str, cx: &mut Context<Self>) -> Result<(), String> {
+    fn insert_environment(
+        &mut self,
+        label: &str,
+        url: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
         let mut config = self.config.clone();
         let remote = config.add(label, url).map_err(|e| e.to_string())?;
         if let Some(path) = &self.config_path {
@@ -518,7 +619,13 @@ impl Workspace {
         }
         self.config = config;
         let env = cx.new(|cx| {
-            Environment::new(remote.url.clone(), remote.label.clone(), &remote.url, EnvironmentKind::Remote, cx)
+            Environment::new(
+                remote.url.clone(),
+                remote.label.clone(),
+                &remote.url,
+                EnvironmentKind::Remote,
+                cx,
+            )
         });
         self.environments.push(env);
         let environments = self.environments.clone();
@@ -527,7 +634,12 @@ impl Workspace {
         Ok(())
     }
 
-    fn remove_environment(&mut self, key: SharedString, window: &mut Window, cx: &mut Context<Self>) {
+    fn remove_environment(
+        &mut self,
+        key: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(env) = self.environment(&key, cx) else {
             return;
         };
@@ -554,14 +666,25 @@ impl Workspace {
         });
     }
 
-    fn drop_environment(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) -> Result<(), String> {
+    fn drop_environment(
+        &mut self,
+        key: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
         let mut config = self.config.clone();
         config.remove(key);
         if let Some(path) = &self.config_path {
-            config.save(path).map_err(|e| format!("Couldn’t save the environments: {e}"))?;
+            config
+                .save(path)
+                .map_err(|e| format!("Couldn’t save the environments: {e}"))?;
         }
         self.config = config;
-        let Some(ix) = self.environments.iter().position(|env| env.read(cx).key() == key) else {
+        let Some(ix) = self
+            .environments
+            .iter()
+            .position(|env| env.read(cx).key() == key)
+        else {
             return Ok(());
         };
         let env = self.environments.remove(ix);
@@ -576,7 +699,8 @@ impl Workspace {
             self.focus_handle.focus(window, cx);
         }
         let connection = env.read(cx).connection().clone();
-        cx.spawn(async move |_, _| connection.close().await).detach();
+        cx.spawn(async move |_, _| connection.close().await)
+            .detach();
         let environments = self.environments.clone();
         self.sidebar
             .update(cx, |sidebar, cx| sidebar.set_environments(environments, cx));
@@ -595,18 +719,17 @@ impl Workspace {
             Main::NewThread(view) => view.clone().into_any_element(),
             Main::Archived(view) => view.clone().into_any_element(),
             Main::Empty => {
+                let key = |keys: &str| crate::actions::shortcut(keys, cx);
+                let hints = [
+                    (key("secondary-n"), "New thread"),
+                    (key("secondary-o"), "Add project"),
+                    (
+                        format!("{}  {}", key("secondary-["), key("secondary-]")),
+                        "Previous / next thread",
+                    ),
+                    (key("secondary-0"), "Focus the sidebar"),
+                ];
                 let theme = cx.theme();
-                let hint = |keys: &'static str, what: &'static str| {
-                    gpui_kit::component::h_flex()
-                        .gap_3()
-                        .child(
-                            div()
-                                .w_16()
-                                .text_right()
-                                .child(keys),
-                        )
-                        .child(what)
-                };
                 v_flex()
                     .size_full()
                     .items_center()
@@ -615,11 +738,18 @@ impl Workspace {
                     .bg(theme.background)
                     .text_sm()
                     .text_color(theme.muted_foreground)
-                    .child(div().text_color(theme.foreground).font_medium().child("No thread open"))
-                    .child(hint("⌘N", "New thread"))
-                    .child(hint("⌘O", "Add project"))
-                    .child(hint("⌘[  ⌘]", "Previous / next thread"))
-                    .child(hint("⌘0", "Focus the sidebar"))
+                    .child(
+                        div()
+                            .text_color(theme.foreground)
+                            .font_medium()
+                            .child("No thread open"),
+                    )
+                    .children(hints.into_iter().map(|(keys, what)| {
+                        gpui_kit::component::h_flex()
+                            .gap_3()
+                            .child(div().w_24().text_right().child(keys))
+                            .child(div().w_40().child(what))
+                    }))
                     .when_some(self.config_error.clone(), |this, error| {
                         this.child(div().text_xs().text_color(theme.danger).child(error))
                     })
@@ -654,7 +784,11 @@ impl Render for Workspace {
                 let (env, _) = this.target_context(cx);
                 this.add_project(env, window, cx);
             }))
-            .on_action(cx.listener(|this, _: &AddEnvironment, window, cx| this.add_environment(window, cx)))
+            .on_action(
+                cx.listener(|this, _: &AddEnvironment, window, cx| {
+                    this.add_environment(window, cx)
+                }),
+            )
             .on_action(cx.listener(|this, _: &StopRun, window, cx| {
                 if let Some(view) = this.current_thread().cloned() {
                     view.update(cx, |view, cx| view.stop(window, cx));
@@ -679,15 +813,25 @@ impl Render for Workspace {
                 let (env, _) = this.target_context(cx);
                 this.show_archived(env, window, cx);
             }))
-            .on_action(cx.listener(|this, _: &FocusComposer, window, cx| match &this.main {
-                Main::Thread(view) => view.clone().update(cx, |view, cx| view.focus_composer(window, cx)),
-                Main::NewThread(view) => view.clone().update(cx, |view, cx| view.focus_composer(window, cx)),
-                _ => {}
+            .on_action(cx.listener(|this, _: &FocusComposer, window, cx| {
+                match &this.main {
+                    Main::Thread(view) => view
+                        .clone()
+                        .update(cx, |view, cx| view.focus_composer(window, cx)),
+                    Main::NewThread(view) => view
+                        .clone()
+                        .update(cx, |view, cx| view.focus_composer(window, cx)),
+                    _ => {}
+                }
             }))
             .on_action(cx.listener(|this, _: &FocusSidebar, window, cx| {
-                this.sidebar.clone().update(cx, |sidebar, cx| sidebar.focus(window, cx));
+                this.sidebar
+                    .clone()
+                    .update(cx, |sidebar, cx| sidebar.focus(window, cx));
             }))
-            .on_action(cx.listener(|this, _: &NextThread, window, cx| this.select_adjacent(1, window, cx)))
+            .on_action(
+                cx.listener(|this, _: &NextThread, window, cx| this.select_adjacent(1, window, cx)),
+            )
             .on_action(cx.listener(|this, _: &PreviousThread, window, cx| {
                 this.select_adjacent(-1, window, cx)
             }))

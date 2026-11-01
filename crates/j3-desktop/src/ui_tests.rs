@@ -17,7 +17,8 @@ use std::{
 
 use futures_util::future::BoxFuture;
 use gpui_kit::test::{
-    ElementSnapshot, TestAppContextExt as _, TestEventExt as _, TestQueryExt as _, TestWindowExt as _,
+    ElementSnapshot, TestAppContextExt as _, TestEventExt as _, TestQueryExt as _,
+    TestWindowExt as _,
 };
 use gpui_kit::{
     AnyWindowHandle, App, AppContext as _, Bounds, ElementId, MouseButton, Role, TestAppContext,
@@ -47,9 +48,7 @@ use j3_core::{
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
-use crate::{
-    actions, local_server::LocalServer, services::Services, workspace::Workspace,
-};
+use crate::{actions, local_server::LocalServer, services::Services, workspace::Workspace};
 
 /// The model the fake omp lists (and the tests launch with).
 const MODEL: &str = "opencode-go/glm-5.3-flash";
@@ -355,6 +354,35 @@ fn model() -> ModelSelection {
     .unwrap()
 }
 
+/// Serves a j3 server over `data_dir` on a free port, sessions faked by
+/// `script`; returns it with its port.
+fn serve(
+    runtime: &tokio::runtime::Runtime,
+    data_dir: &Path,
+    omp_path: &Path,
+    script: Arc<Script>,
+) -> (Server, u16) {
+    runtime.block_on(async {
+        let app = CoreApp::open_with(
+            AppConfig {
+                data_dir: data_dir.to_owned(),
+                label: "test-host".into(),
+                omp: OmpLauncher::new(omp_path),
+            },
+            Arc::new(FakeFactory(script)),
+            Duration::from_secs(600),
+        )
+        .await
+        .unwrap();
+        // `Server::bind` reports the requested address, so pick a free port first.
+        let addr: SocketAddr = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        (Server::bind(app, &[addr]).await.unwrap(), addr.port())
+    })
+}
+
 // ---------------------------------------------------------------------------
 // The app under test
 // ---------------------------------------------------------------------------
@@ -374,6 +402,16 @@ impl Harness {
     /// Serves a fresh j3 server and opens the workspace window on it, with
     /// the local connection live.
     async fn start(name: &str, cx: &mut TestAppContext) -> Self {
+        Self::start_with(name, cx, |_| json!([])).await
+    }
+
+    /// Like [`Harness::start`], with the remote environments `remotes`
+    /// returns for the local server's port written to the desktop config.
+    async fn start_with(
+        name: &str,
+        cx: &mut TestAppContext,
+        remotes: impl FnOnce(u16) -> Value,
+    ) -> Self {
         // The server and connections run on tokio threads; GPUI waits for them.
         cx.executor().allow_parking();
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -392,30 +430,14 @@ impl Harness {
             use std::os::unix::fs::PermissionsExt as _;
             std::fs::set_permissions(&omp_path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let config_path = config_dir.join("desktop.json");
-        std::fs::write(&config_path, r#"{"environments":[]}"#).unwrap();
-
         let script = Arc::new(Script::default());
-        let factory = Arc::new(FakeFactory(Arc::clone(&script)));
-        let server = runtime.block_on(async {
-            let app = CoreApp::open_with(
-                AppConfig {
-                    data_dir: data_dir.clone(),
-                    label: "test-host".into(),
-                    omp: OmpLauncher::new(&omp_path),
-                },
-                factory,
-                Duration::from_secs(600),
-            )
-            .await
-            .unwrap();
-            // `Server::bind` reports the requested address, so pick a free port first.
-            let addr: SocketAddr = std::net::TcpListener::bind("127.0.0.1:0")
-                .unwrap()
-                .local_addr()
-                .unwrap();
-            Server::bind(app, &[addr]).await.unwrap()
-        });
+        let (server, port) = serve(&runtime, &data_dir, &omp_path, Arc::clone(&script));
+        let config_path = config_dir.join("desktop.json");
+        std::fs::write(
+            &config_path,
+            json!({ "environments": remotes(port) }).to_string(),
+        )
+        .unwrap();
         let local = Arc::new(LocalServer::from_server(server));
         let services = Services::new(runtime.handle().clone(), local, Some(config_path));
 
@@ -456,7 +478,11 @@ impl Harness {
     }
 
     /// Waits for `condition` over the rendered window and the app.
-    async fn until(&self, cx: &mut TestAppContext, condition: impl FnMut(&mut Window, &mut App) -> bool) {
+    async fn until(
+        &self,
+        cx: &mut TestAppContext,
+        condition: impl FnMut(&mut Window, &mut App) -> bool,
+    ) {
         cx.wait_for(self.window, WAIT, condition).await;
     }
 
@@ -475,7 +501,8 @@ impl Harness {
         mut check: impl FnMut(&ThreadState) -> bool + 'static,
     ) {
         let handle = self.connection.thread(thread_id);
-        self.until(cx, move |_, _| check(&handle.state().borrow())).await;
+        self.until(cx, move |_, _| check(&handle.state().borrow()))
+            .await;
     }
 
     fn update<R>(&self, cx: &mut TestAppContext, f: impl FnOnce(&mut Window, &mut App) -> R) -> R {
@@ -497,7 +524,12 @@ impl Harness {
 
     /// Launches a thread through the connection, starts its run and opens
     /// it from the sidebar; returns its id.
-    async fn open_running_thread(&self, cx: &mut TestAppContext, project_id: &str, text: &str) -> String {
+    async fn open_running_thread(
+        &self,
+        cx: &mut TestAppContext,
+        project_id: &str,
+        text: &str,
+    ) -> String {
         let thread_id = self
             .connection
             .launch(project_id, text, Vec::new(), model())
@@ -509,8 +541,10 @@ impl Harness {
         self.until(cx, |window, _| has_label(window, &row)).await;
         self.update(cx, |window, cx| click_label(window, &row, cx));
         // The thread view's composer offers Stop while the run is active.
-        self.until(cx, |window, _| window.try_find("stop-run").is_some()).await;
-        self.until_thread(cx, &thread_id, |state| state.can_steer()).await;
+        self.until(cx, |window, _| window.try_find("stop-run").is_some())
+            .await;
+        self.until_thread(cx, &thread_id, |state| state.can_steer())
+            .await;
         thread_id
     }
 
@@ -588,7 +622,8 @@ async fn sidebar_shows_the_environment_its_projects_and_threads(cx: &mut TestApp
     let app = Harness::start("sidebar", cx).await;
 
     // The local environment, empty.
-    app.until(cx, |window, _| has_label(window, "No projects")).await;
+    app.until(cx, |window, _| has_label(window, "No projects"))
+        .await;
     app.update(cx, |window, _| {
         assert!(has_label(window, &hostname()));
         assert!(window.try_find("add-project-local").is_some());
@@ -601,20 +636,25 @@ async fn sidebar_shows_the_environment_its_projects_and_threads(cx: &mut TestApp
         let project = tree_item(window, "Demo");
         let env = tree_item(window, &hostname());
         assert!(project.bounds().top() > env.bounds().top());
-        assert!(window.try_find(format!("new-thread-local-{project_id}")).is_some());
+        assert!(
+            window
+                .try_find(format!("new-thread-local-{project_id}"))
+                .is_some()
+        );
     });
 
     // Its threads appear under it with their activity.
-    app
-        .connection
+    app.connection
         .launch(&project_id, "Say hi", Vec::new(), model())
         .await
         .unwrap();
     app.until_called(cx, "prompt:Say hi:0").await;
     app.script.emit(json!({"type": "agent_start"}));
-    app.until(cx, |window, _| has_label(window, "Say hi, Running")).await;
+    app.until(cx, |window, _| has_label(window, "Say hi, Running"))
+        .await;
     app.script.settle("completed");
-    app.until(cx, |window, _| has_label(window, "Say hi, Idle")).await;
+    app.until(cx, |window, _| has_label(window, "Say hi, Idle"))
+        .await;
     app.update(cx, |window, _| {
         let thread = window.find_by_label("Say hi, Idle");
         assert!(thread.bounds().top() > tree_item(window, "Demo").bounds().top());
@@ -643,9 +683,17 @@ async fn new_thread_launches_from_the_composer_and_streams_the_reply(cx: &mut Te
     // The composer needs the model catalog the fake omp serves.
     let connection = app.connection.clone();
     app.until(cx, move |_, _| {
-        connection.state().borrow().config.as_ref().is_some_and(|config| {
-            config.providers.iter().any(|provider| !provider.models.is_empty())
-        })
+        connection
+            .state()
+            .borrow()
+            .config
+            .as_ref()
+            .is_some_and(|config| {
+                config
+                    .providers
+                    .iter()
+                    .any(|provider| !provider.models.is_empty())
+            })
     })
     .await;
 
@@ -690,14 +738,16 @@ async fn new_thread_launches_from_the_composer_and_streams_the_reply(cx: &mut Te
 
     // Streaming text reaches the feed piece by piece.
     app.script.emit(json!({"type": "agent_start"}));
-    app.until(cx, |window, _| has_label(window, "Say hi, Running")).await;
+    app.until(cx, |window, _| has_label(window, "Say hi, Running"))
+        .await;
     app.script
         .text("m1", json!({"type": "text_start", "contentIndex": 0}));
     app.script.text(
         "m1",
         json!({"type": "text_delta", "contentIndex": 0, "delta": "Hel"}),
     );
-    app.until(cx, |window, _| feed_row(window, "Hel").is_some()).await;
+    app.until(cx, |window, _| feed_row(window, "Hel").is_some())
+        .await;
     app.script.text(
         "m1",
         json!({"type": "text_delta", "contentIndex": 0, "delta": "lo!"}),
@@ -736,7 +786,9 @@ async fn a_pending_question_is_answered_from_its_card(cx: &mut TestAppContext) {
     let app = Harness::start("question", cx).await;
     let project_id = app.project(cx).await;
     let thread_id = app.open_running_thread(cx, &project_id, "Ask me").await;
-    app.update(cx, |window, _| assert!(window.try_find("question-card").is_none()));
+    app.update(cx, |window, _| {
+        assert!(window.try_find("question-card").is_none())
+    });
 
     app.script.emit(
         json!({"type": "extension_ui_request", "id": "ui-1", "method": "select",
@@ -759,8 +811,10 @@ async fn a_pending_question_is_answered_from_its_card(cx: &mut TestAppContext) {
     // Choosing the answer of the last (only) question confirms the
     // questionnaire once the selection has shown, which submits it.
     let script = Arc::clone(&app.script);
-    app.until(cx, move |_, _| !script.ui_responses.lock().unwrap().is_empty())
-        .await;
+    app.until(cx, move |_, _| {
+        !script.ui_responses.lock().unwrap().is_empty()
+    })
+    .await;
     let responses = app.script.ui_responses.lock().unwrap().clone();
     assert_eq!(
         serde_json::to_value(&responses[0]).unwrap(),
@@ -777,7 +831,11 @@ async fn a_pending_question_is_answered_from_its_card(cx: &mut TestAppContext) {
         window.try_find("question-card").is_none() && has_label(window, "Ask me, Running")
     })
     .await;
-    assert_eq!(app.script.ui_responses.lock().unwrap().len(), 1, "answered once");
+    assert_eq!(
+        app.script.ui_responses.lock().unwrap().len(),
+        1,
+        "answered once"
+    );
 
     app.stop(cx);
 }
@@ -796,7 +854,8 @@ async fn enter_steers_and_secondary_enter_queues_while_running(cx: &mut TestAppC
         window.press("enter", cx);
     });
     app.until_called(cx, "steer:steer this").await;
-    app.until(cx, |window, _| feed_row(window, "steer this").is_some()).await;
+    app.until(cx, |window, _| feed_row(window, "steer this").is_some())
+        .await;
     app.until_thread(cx, &thread_id, |state| {
         state.feed().iter().any(|row| matches!(&row.item.kind,
             TurnItemKind::UserMessage(m) if m.input_intent == UserMessageInputIntent::Steer && m.text == "steer this"))
@@ -822,8 +881,10 @@ async fn enter_steers_and_secondary_enter_queues_while_running(cx: &mut TestAppC
         queued.run.id.clone()
     };
     let row = format!("queued-{queued}");
-    app.until(cx, |window, _| label_of(window, &row).as_deref() == Some("queue me"))
-        .await;
+    app.until(cx, |window, _| {
+        label_of(window, &row).as_deref() == Some("queue me")
+    })
+    .await;
     app.update(cx, |window, _| {
         assert!(window.try_find(format!("send-now-{queued}")).is_some());
         assert!(window.try_find(format!("steer-{queued}")).is_some());
@@ -851,7 +912,9 @@ async fn stop_interrupts_the_run(cx: &mut TestAppContext) {
             && has_label(window, "long task, Idle")
     })
     .await;
-    app.update(cx, |window, _| assert!(has_label(window, "long task, Idle")));
+    app.update(cx, |window, _| {
+        assert!(has_label(window, "long task, Idle"))
+    });
 
     // A new message starts another run; ⌘. (StopRun) stops it too.
     app.click_composer(cx);
@@ -861,19 +924,28 @@ async fn stop_interrupts_the_run(cx: &mut TestAppContext) {
     });
     app.until_called(cx, "prompt:again:0").await;
     app.script.emit(json!({"type": "agent_start"}));
-    app.until(cx, |window, _| window.try_find("stop-run").is_some()).await;
+    app.until(cx, |window, _| window.try_find("stop-run").is_some())
+        .await;
     app.update(cx, |window, cx| window.press("cmd-.", cx));
-    app.until(cx, |window, _| window.try_find("stop-run").is_none()).await;
+    app.until(cx, |window, _| window.try_find("stop-run").is_none())
+        .await;
     assert_eq!(
-        app.script.calls().iter().filter(|call| *call == "abort").count(),
+        app.script
+            .calls()
+            .iter()
+            .filter(|call| *call == "abort")
+            .count(),
         2
     );
     app.until_thread(cx, &thread_id, |state| {
         state.active_run().is_none()
-            && state
-                .projection
-                .as_ref()
-                .is_some_and(|p| p.runs.iter().filter(|run| run.status == RunStatus::Interrupted).count() == 2)
+            && state.projection.as_ref().is_some_and(|p| {
+                p.runs
+                    .iter()
+                    .filter(|run| run.status == RunStatus::Interrupted)
+                    .count()
+                    == 2
+            })
     })
     .await;
 
@@ -954,7 +1026,8 @@ async fn goal_chip_controls_and_subagent_progress(cx: &mut TestAppContext) {
     script.subagent_progress("Pinger", "completed", &["PONG"], 2400);
     script.subagent_lifecycle("Pinger", "completed");
     app.until(cx, |window, _| {
-        label_of(window, "subagent-Pinger").as_deref() == Some("Answer PONG, Done, PONG, from the transcript")
+        label_of(window, "subagent-Pinger").as_deref()
+            == Some("Answer PONG, Done, PONG, from the transcript")
     })
     .await;
     app.update(cx, |window, _| {
@@ -962,4 +1035,67 @@ async fn goal_chip_controls_and_subagent_progress(cx: &mut TestAppContext) {
     });
 
     app.stop(cx);
+}
+
+#[gpui_kit::test]
+async fn a_remote_that_is_the_local_server_is_listed_once(cx: &mut TestAppContext) {
+    // A second, separate server for an "other" remote.
+    let other_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let other_dir = temp_dir("dedupe-other");
+    let other_omp = other_dir.join("fake-omp");
+    std::fs::write(&other_omp, fake_omp_script()).unwrap();
+    let (other_server, other_port) = serve(&other_runtime, &other_dir, &other_omp, Arc::default());
+    let other = LocalServer::from_server(other_server);
+
+    // "twin" reaches the local server under another host name.
+    let app = Harness::start_with("dedupe", cx, |port| {
+        json!([
+            {"label": "twin", "url": format!("http://localhost:{port}")},
+            {"label": "other", "url": format!("http://127.0.0.1:{other_port}")},
+        ])
+    })
+    .await;
+
+    let connections = cx.update(|cx| Workspace::global_connections(cx));
+    assert_eq!(connections.len(), 3, "local, twin and other connect");
+    app.until(cx, move |_, _| {
+        connections.iter().all(|connection| {
+            let state = connection.state();
+            let state = state.borrow();
+            state.status == ConnectionStatus::Live && state.shell.loaded
+        })
+    })
+    .await;
+    // Both remotes show until their descriptors arrive; then the twin drops out.
+    app.until(cx, |window, _| {
+        has_label(window, "other") && !has_label(window, "twin")
+    })
+    .await;
+    app.update(cx, |window, _| {
+        assert!(has_label(window, &hostname()));
+        let local = tree_item(window, &hostname());
+        assert!(tree_item(window, "other").bounds().top() > local.bounds().top());
+    });
+
+    // Hidden, not forgotten: the config entry stays.
+    let config: Value = serde_json::from_str(
+        &std::fs::read_to_string(app.config_dir.join("desktop.json")).unwrap(),
+    )
+    .unwrap();
+    let labels: Vec<&str> = config["environments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|env| env["label"].as_str())
+        .collect();
+    assert_eq!(labels, ["twin", "other"]);
+
+    app.stop(cx);
+    other_runtime.block_on(other.shutdown());
+    other_runtime.shutdown_background();
+    let _ = std::fs::remove_dir_all(other_dir);
 }

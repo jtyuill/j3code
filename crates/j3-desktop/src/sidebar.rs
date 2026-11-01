@@ -7,7 +7,7 @@ use std::{
 };
 
 use gpui_kit::component::{
-    ActiveTheme as _, StyledExt as _, Icon, IconName, Sizable as _,
+    ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt as _,
     button::{Button, ButtonVariants as _},
     h_flex,
     list::ListItem,
@@ -19,27 +19,54 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, EventEmitter,
-    InteractiveElement as _, IntoElement, ParentElement as _, Render, ScrollStrategy, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Subscription, WeakEntity, Window, div, rems,
+    App, AppContext as _, Context, Entity, EventEmitter, InteractiveElement as _, IntoElement,
+    ParentElement as _, Render, ScrollStrategy, SharedString, StatefulInteractiveElement as _,
+    Styled as _, Subscription, WeakEntity, Window, div, rems,
 };
 use j3_client::ThreadActivity;
 use time::OffsetDateTime;
 
-use crate::{environment::Environment, feed::relative_age};
+use crate::{
+    environment::{Environment, distinct_environments},
+    feed::relative_age,
+};
 
 /// A request from the sidebar; the workspace carries it out.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SidebarEvent {
-    OpenThread { env: SharedString, thread_id: String },
-    NewThread { env: SharedString, project_id: String },
-    AddProject { env: SharedString },
-    RenameThread { env: SharedString, thread_id: String },
-    ArchiveThread { env: SharedString, thread_id: String },
-    DeleteThread { env: SharedString, thread_id: String },
-    DeleteProject { env: SharedString, project_id: String },
-    ShowArchived { env: SharedString },
-    RemoveEnvironment { env: SharedString },
+    OpenThread {
+        env: SharedString,
+        thread_id: String,
+    },
+    NewThread {
+        env: SharedString,
+        project_id: String,
+    },
+    AddProject {
+        env: SharedString,
+    },
+    RenameThread {
+        env: SharedString,
+        thread_id: String,
+    },
+    ArchiveThread {
+        env: SharedString,
+        thread_id: String,
+    },
+    DeleteThread {
+        env: SharedString,
+        thread_id: String,
+    },
+    DeleteProject {
+        env: SharedString,
+        project_id: String,
+    },
+    ShowArchived {
+        env: SharedString,
+    },
+    RemoveEnvironment {
+        env: SharedString,
+    },
     AddEnvironment,
 }
 
@@ -130,7 +157,11 @@ impl Sidebar {
         sidebar
     }
 
-    pub fn set_environments(&mut self, environments: Vec<Entity<Environment>>, cx: &mut Context<Self>) {
+    pub fn set_environments(
+        &mut self,
+        environments: Vec<Entity<Environment>>,
+        cx: &mut Context<Self>,
+    ) {
         self._environment_subscriptions = environments
             .iter()
             .map(|env| cx.observe(env, |this, _, cx| this.rebuild(cx)))
@@ -233,7 +264,7 @@ impl Sidebar {
         let mut nodes = HashMap::new();
         let mut thread_projects = HashMap::new();
         let mut roots = Vec::with_capacity(self.environments.len());
-        for environment in &self.environments {
+        for environment in &distinct_environments(&self.environments, cx) {
             let environment = environment.read(cx);
             let key = environment.key().clone();
             let env_id = environment_node_id(&key);
@@ -334,20 +365,21 @@ impl Sidebar {
         let node = nodes.get(&item.id).cloned().unwrap_or(Node::Note);
         let theme = cx.theme();
         let muted = theme.muted_foreground;
-        let indent = div()
+        let indent = div().flex_shrink_0().w(rems(0.875 * entry.depth() as f32));
+        let disclosure = div()
             .flex_shrink_0()
-            .w(rems(0.875 * entry.depth() as f32));
-        let disclosure = div().flex_shrink_0().size_4().when(entry.is_folder(), |this| {
-            this.child(
-                Icon::new(if entry.is_expanded() {
-                    IconName::ChevronDown
-                } else {
-                    IconName::ChevronRight
-                })
-                .xsmall()
-                .text_color(muted),
-            )
-        });
+            .size_4()
+            .when(entry.is_folder(), |this| {
+                this.child(
+                    Icon::new(if entry.is_expanded() {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    })
+                    .xsmall()
+                    .text_color(muted),
+                )
+            });
         let label = div()
             .flex_1()
             .min_w_0()
@@ -398,7 +430,11 @@ impl Sidebar {
                         .tooltip("Add project…")
                         .on_click(move |_, _, cx| {
                             cx.stop_propagation();
-                            Self::emit_later(&weak, SidebarEvent::AddProject { env: env.clone() }, cx);
+                            Self::emit_later(
+                                &weak,
+                                SidebarEvent::AddProject { env: env.clone() },
+                                cx,
+                            );
                         })
                 })
             }
@@ -410,7 +446,9 @@ impl Sidebar {
                 let weak = weak.clone();
                 row.child(
                     h_flex()
-                        .id(SharedString::from(format!("project-row-{env}-{project_id}")))
+                        .id(SharedString::from(format!(
+                            "project-row-{env}-{project_id}"
+                        )))
                         .gap_1()
                         .child(indent)
                         .child(disclosure)
@@ -452,11 +490,9 @@ impl Sidebar {
                     .justify_center()
                     .map(|this| match activity {
                         ThreadActivity::Running => this.child(Spinner::new().xsmall()),
-                        ThreadActivity::WaitingForInput => this.child(
-                            Icon::new(IconName::Bell)
-                                .xsmall()
-                                .text_color(theme.warning),
-                        ),
+                        ThreadActivity::WaitingForInput => {
+                            this.child(Icon::new(IconName::Bell).xsmall().text_color(theme.warning))
+                        }
                         ThreadActivity::Error => this.child(
                             Icon::new(IconName::CircleAlert)
                                 .xsmall()
@@ -478,7 +514,9 @@ impl Sidebar {
                             .child(indicator)
                             .child(label)
                             .when_some(age, |this, age| {
-                                this.child(div().flex_shrink_0().text_xs().text_color(muted).child(age))
+                                this.child(
+                                    div().flex_shrink_0().text_xs().text_color(muted).child(age),
+                                )
                             }),
                     )
             }
@@ -507,7 +545,10 @@ impl Sidebar {
         match nodes.get(&entry.item().id) {
             Some(Node::Environment { env, local, .. }) => {
                 let menu = menu
-                    .item(item("Add Project…", SidebarEvent::AddProject { env: env.clone() }))
+                    .item(item(
+                        "Add Project…",
+                        SidebarEvent::AddProject { env: env.clone() },
+                    ))
                     .item(item(
                         "Archived Threads",
                         SidebarEvent::ShowArchived { env: env.clone() },
@@ -624,6 +665,9 @@ mod tests {
             project_node_id("http://shieldy:3780", "p1"),
             "p|http://shieldy:3780|p1"
         );
-        assert_ne!(thread_node_id("local", "t1"), thread_node_id("http://x:1", "t1"));
+        assert_ne!(
+            thread_node_id("local", "t1"),
+            thread_node_id("http://x:1", "t1")
+        );
     }
 }

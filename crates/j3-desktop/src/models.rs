@@ -55,7 +55,10 @@ pub fn model_choices(config: &ServerConfig) -> Vec<ModelChoice> {
 
 /// The choice to preselect: `preferred` if the server still offers it,
 /// else the server's default model, else the first one.
-pub fn initial_choice(choices: &[ModelChoice], preferred: Option<&ModelSelection>) -> Option<usize> {
+pub fn initial_choice(
+    choices: &[ModelChoice],
+    preferred: Option<&ModelSelection>,
+) -> Option<usize> {
     preferred
         .and_then(|selection| {
             choices.iter().position(|choice| {
@@ -66,7 +69,10 @@ pub fn initial_choice(choices: &[ModelChoice], preferred: Option<&ModelSelection
         .or(if choices.is_empty() { None } else { Some(0) })
 }
 
-fn find_model<'a>(config: &'a ServerConfig, choice: &ModelChoice) -> Option<&'a ServerProviderModel> {
+fn find_model<'a>(
+    config: &'a ServerConfig,
+    choice: &ModelChoice,
+) -> Option<&'a ServerProviderModel> {
     config
         .providers
         .iter()
@@ -87,10 +93,12 @@ pub fn thinking_descriptor<'a>(
         .as_ref()?
         .option_descriptors
         .as_deref()?;
-    let selects = descriptors.iter().filter_map(|descriptor| match descriptor {
-        ProviderOptionDescriptor::Select(select) => Some(select),
-        ProviderOptionDescriptor::Boolean(_) => None,
-    });
+    let selects = descriptors
+        .iter()
+        .filter_map(|descriptor| match descriptor {
+            ProviderOptionDescriptor::Select(select) => Some(select),
+            ProviderOptionDescriptor::Boolean(_) => None,
+        });
     selects
         .clone()
         .find(|select| select.id == THINKING)
@@ -198,8 +206,14 @@ mod tests {
         let descriptor = thinking_descriptor(&config, &choices[1]).unwrap();
         assert_eq!(descriptor.id, "thinking");
         assert_eq!(initial_level(descriptor, None).as_deref(), Some("medium"));
-        assert_eq!(initial_level(descriptor, Some("high")).as_deref(), Some("high"));
-        assert_eq!(initial_level(descriptor, Some("bogus")).as_deref(), Some("medium"));
+        assert_eq!(
+            initial_level(descriptor, Some("high")).as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            initial_level(descriptor, Some("bogus")).as_deref(),
+            Some("medium")
+        );
 
         let selection = model_selection(&choices[1], Some(("thinking", "high")));
         assert_eq!(

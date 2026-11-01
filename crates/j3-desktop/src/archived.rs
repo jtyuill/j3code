@@ -1,7 +1,7 @@
 //! An environment's archived threads, with unarchive and delete.
 
 use gpui_kit::component::{
-    ActiveTheme as _, StyledExt as _, IconName, Sizable as _, WindowExt as _,
+    ActiveTheme as _, IconName, Sizable as _, StyledExt as _, WindowExt as _,
     button::{Button, ButtonVariant, ButtonVariants as _},
     h_flex,
     spinner::Spinner,
@@ -85,14 +85,22 @@ impl ArchivedView {
         .detach();
     }
 
-    fn confirm_delete(&mut self, thread_id: String, title: SharedString, window: &mut Window, cx: &mut Context<Self>) {
+    fn confirm_delete(
+        &mut self,
+        thread_id: String,
+        title: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let view = cx.weak_entity();
         window.open_alert_dialog(cx, move |alert, _, _| {
             let view = view.clone();
             let thread_id = thread_id.clone();
             alert
                 .title(format!("Delete “{title}”?"))
-                .description("The conversation is removed from j3. omp’s session file stays on disk.")
+                .description(
+                    "The conversation is removed from j3. omp’s session file stays on disk.",
+                )
                 .confirm()
                 .ok_text("Delete")
                 .ok_variant(ButtonVariant::Danger)
@@ -157,7 +165,12 @@ impl ArchivedView {
                     .border_b_1()
                     .border_color(theme.border)
                     .child(div().flex_1().min_w_0().truncate().text_sm().child(title))
-                    .child(div().text_xs().text_color(theme.muted_foreground).child(project))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(project),
+                    )
                     .child(
                         div()
                             .w(rems(2.5))
@@ -171,7 +184,9 @@ impl ArchivedView {
                             .outline()
                             .icon(IconName::Undo2)
                             .label("Unarchive")
-                            .on_click(cx.listener(move |this, _, _, cx| this.unarchive(id.clone(), cx))),
+                            .on_click(
+                                cx.listener(move |this, _, _, cx| this.unarchive(id.clone(), cx)),
+                            ),
                     )
                     .child(
                         Button::new(SharedString::from(format!("delete-{delete_id}")))
@@ -179,7 +194,12 @@ impl ArchivedView {
                             .ghost()
                             .label("Delete…")
                             .on_click(cx.listener(move |this, _, window, cx| {
-                                this.confirm_delete(delete_id.clone(), delete_title.clone(), window, cx)
+                                this.confirm_delete(
+                                    delete_id.clone(),
+                                    delete_title.clone(),
+                                    window,
+                                    cx,
+                                )
                             })),
                     )
             }))
@@ -216,11 +236,30 @@ impl Render for ArchivedView {
                     .border_b_1()
                     .border_color(theme.border)
                     .child(div().font_medium().text_sm().child("Archived threads"))
-                    .child(div().text_xs().text_color(theme.muted_foreground).child(label)),
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(label),
+                    ),
             )
             .when_some(self.error.clone(), |this, error| {
-                this.child(div().px_4().py_2().text_xs().text_color(theme.danger).child(error))
+                this.child(
+                    div()
+                        .px_4()
+                        .py_2()
+                        .text_xs()
+                        .text_color(theme.danger)
+                        .child(error),
+                )
             })
-            .child(div().id("archived-list").flex_1().min_h_0().overflow_y_scroll().child(body))
+            .child(
+                div()
+                    .id("archived-list")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(body),
+            )
     }
 }

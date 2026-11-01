@@ -71,7 +71,11 @@ impl Catalog {
 
     /// Adds the commands and skills fetched for this workspace by
     /// `refresh_workspace`, keeping names already present.
-    pub fn merge(&mut self, commands: &[ServerProviderSlashCommand], skills: &[ServerProviderSkill]) {
+    pub fn merge(
+        &mut self,
+        commands: &[ServerProviderSlashCommand],
+        skills: &[ServerProviderSkill],
+    ) {
         self.has_workspace = true;
         for command in commands {
             if !self.commands.iter().any(|c| c.name == command.name) {

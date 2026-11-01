@@ -68,15 +68,11 @@ impl Services {
         async move { rx.await.ok() }
     }
 
-    /// Closes `connections`, stops the local server (bounded by
-    /// [`SHUTDOWN_WAIT`]) and quits. Repeated calls while quitting do nothing.
-    pub fn quit(connections: Vec<Connection>, cx: &mut App) {
-        let services = Self::global(cx);
-        if services.quitting.replace(true) {
-            return;
-        }
-        let local = Arc::clone(&services.local);
-        let done = services.run(async move {
+    /// Closes `connections` and stops the local server, bounded by
+    /// [`SHUTDOWN_WAIT`].
+    fn shutdown(&self, connections: Vec<Connection>) -> impl Future<Output = ()> + use<> {
+        let local = Arc::clone(&self.local);
+        let done = self.run(async move {
             let stop = async move {
                 for connection in &connections {
                     connection.close().await;
@@ -87,10 +83,33 @@ impl Services {
                 tracing::warn!("shutdown timed out after {SHUTDOWN_WAIT:?}");
             }
         });
+        async move {
+            done.await;
+        }
+    }
+
+    /// Shuts down (see [`Services::shutdown`]) and quits. Repeated calls
+    /// while quitting do nothing.
+    pub fn quit(connections: Vec<Connection>, cx: &mut App) {
+        let services = Self::global(cx);
+        if services.quitting.replace(true) {
+            return;
+        }
+        let done = services.shutdown(connections);
         cx.spawn(async move |cx| {
             done.await;
             cx.update(|cx| cx.quit());
         })
         .detach();
+    }
+
+    /// Shuts down and exits the process with `code` right away, without
+    /// relying on the platform event loop (used when no window could be
+    /// opened, where some platforms never return from `run`).
+    pub fn exit(connections: Vec<Connection>, code: i32, cx: &mut App) -> ! {
+        let services = Self::global(cx);
+        services.quitting.set(true);
+        services.runtime.block_on(services.shutdown(connections));
+        std::process::exit(code);
     }
 }

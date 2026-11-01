@@ -60,7 +60,10 @@ impl LocalServer {
     /// reported through [`LocalServer::status`].
     pub async fn start() -> Self {
         let (status, server) = match Self::try_start().await {
-            Ok(server) => (LocalServerStatus::Serving(server.addrs().to_vec()), Some(server)),
+            Ok(server) => (
+                LocalServerStatus::Serving(server.addrs().to_vec()),
+                Some(server),
+            ),
             Err(status) => (status, None),
         };
         match &status {
@@ -95,9 +98,8 @@ impl LocalServer {
             .map(|dir| dir.join("j3"))
             .ok_or_else(|| LocalServerStatus::Failed("no data directory".to_owned()))?;
         let logs = data_dir.join("logs");
-        std::fs::create_dir_all(&logs).map_err(|e| {
-            LocalServerStatus::Failed(format!("creating {}: {e}", logs.display()))
-        })?;
+        std::fs::create_dir_all(&logs)
+            .map_err(|e| LocalServerStatus::Failed(format!("creating {}: {e}", logs.display())))?;
         let label = gethostname::gethostname().to_string_lossy().into_owned();
         let app = App::open(AppConfig {
             data_dir: data_dir.clone(),
@@ -107,7 +109,10 @@ impl LocalServer {
         .await
         .map_err(|e| LocalServerStatus::Failed(format!("{}: {e}", data_dir.display())))?;
 
-        let mut addrs = vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), DEFAULT_PORT)];
+        let mut addrs = vec![SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            DEFAULT_PORT,
+        )];
         match tailscale_ipv4(Duration::ZERO).await {
             Ok(ip) => addrs.push(SocketAddr::new(ip, DEFAULT_PORT)),
             Err(e) => info!("not serving on Tailscale: {e}"),
