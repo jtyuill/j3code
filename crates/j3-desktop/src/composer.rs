@@ -7,7 +7,7 @@ use std::{path::Path, sync::Arc, time::Instant};
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::{
     ActiveTheme as _, Icon, IconName, IndexPath, Sizable as _,
-    button::{Button, ButtonVariants as _},
+    button::{Button, ButtonCustomVariant, ButtonVariants as _},
     combobox::{Combobox, ComboboxEvent, ComboboxState},
     h_flex,
     input::{Enter, Escape, IndentInline, InputEvent, MoveDown, MoveUp, Textarea, TextareaState},
@@ -1003,6 +1003,23 @@ fn render_levels(
         .into_any_element()
 }
 
+/// The send button's colours: a quiet grey disc that lights up with the
+/// accent once there is something to send, and a red tint for Stop. (The
+/// theme's primary button is a white disc on the dark theme.)
+fn send_style(action: SendAction, ready: bool, cx: &App) -> ButtonCustomVariant {
+    let theme = cx.theme();
+    let (color, foreground) = match action {
+        SendAction::Stop => (theme.danger.opacity(0.18), theme.danger),
+        _ if ready => (theme.info.opacity(0.22), theme.info),
+        _ => (theme.secondary, theme.muted_foreground),
+    };
+    ButtonCustomVariant::new(cx)
+        .color(color)
+        .foreground(foreground)
+        .hover(color.opacity(1.).blend(theme.foreground.opacity(0.08)))
+        .active(color.opacity(1.).blend(theme.foreground.opacity(0.14)))
+}
+
 fn format_for_path(path: &Path) -> Option<ImageFormat> {
     match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
         "png" => Some(ImageFormat::Png),
@@ -1126,10 +1143,12 @@ impl Render for Composer {
                     .child(model_picker)
                     .child(usage_button)
                     .child(div().flex_1())
-                    .child(
+                    .child({
+                        let ready = action == SendAction::Stop || self.has_draft(cx);
                         Button::new("send-message")
                             .xsmall()
-                            .primary()
+                            .rounded(px(999.))
+                            .custom(send_style(action, ready, cx))
                             .icon(action.icon())
                             .accessibility_label(action.name())
                             .tooltip(tooltip)
@@ -1137,8 +1156,8 @@ impl Render for Composer {
                             .on_click(cx.listener(move |this, _, window, cx| match action {
                                 SendAction::Stop => cx.emit(ComposerEvent::Stop),
                                 SendAction::Send | SendAction::Queue => this.submit(window, cx),
-                            })),
-                    ),
+                            }))
+                    }),
             )
     }
 }
