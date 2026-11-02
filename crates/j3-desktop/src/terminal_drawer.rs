@@ -322,9 +322,13 @@ impl Render for TerminalDrawer {
             .bg(cx.theme().background)
             .child(tabs)
             .child(
+                // A little air between the grid and the drawer's edges; the
+                // terminal sizes its grid to what is left.
                 div()
                     .flex_1()
                     .min_h_0()
+                    .pl_2()
+                    .pt_1()
                     .children(self.terminals.get(self.active).cloned()),
             )
             .children(status)
