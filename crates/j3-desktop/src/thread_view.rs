@@ -1,5 +1,5 @@
 //! One open thread: header, streaming feed, todo card, queued messages, the
-//! pending question, the working indicator and the composer.
+//! pending question, the goal and the composer.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -1133,31 +1133,6 @@ impl ThreadView {
         )
     }
 
-    fn render_activity(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let run = self.state.active_run()?;
-        let theme = cx.theme();
-        let waiting = self.question.is_some();
-        let label = if waiting {
-            "Waiting for your answer"
-        } else {
-            match run.status {
-                j3_client::t3::orchestration::RunStatus::Preparing
-                | j3_client::t3::orchestration::RunStatus::Starting => "Starting…",
-                _ => "Working…",
-            }
-        };
-        Some(
-            h_flex()
-                .gap_2()
-                .px_1()
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .when(!waiting, |this| this.child(Spinner::new().xsmall()))
-                .child(label)
-                .into_any_element(),
-        )
-    }
-
     fn render_goal(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let goal = self.state.goal()?;
         let theme = cx.theme();
@@ -1359,7 +1334,6 @@ impl Render for ThreadView {
         let todo = self.render_todo(cx);
         let queue = self.render_queue(cx);
         let question = self.render_question(cx);
-        let activity = self.render_activity(cx);
         let goal = self.render_goal(cx);
         let theme = cx.theme();
         let measure = self.preferences.read(cx).ui().measure();
@@ -1384,7 +1358,6 @@ impl Render for ThreadView {
                             .children(todo)
                             .children(queue)
                             .children(question)
-                            .children(activity)
                             .children(goal)
                             .child(self.composer.clone()),
                     ),
