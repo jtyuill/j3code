@@ -19,12 +19,13 @@ use gpui_kit::component::{
     input::{Copy, Paste},
 };
 use gpui_kit::{
-    App, Bounds, ClipboardItem, Context, FocusHandle, Focusable, Font, FontStyle, FontWeight, Hsla,
-    InteractiveElement as _, IntoElement, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent,
-    MouseMoveEvent, ParentElement as _, Pixels, Render, Rgba, Role, ScrollEvent, ShapedLine,
-    SharedString, StatefulInteractiveElement as _, StrikethroughStyle, Styled as _, Task,
-    TestSupportExt as _, TextAlign, TextRun, UnderlineStyle, Window, canvas, div, fill, font,
-    outline, point, px, size,
+    App, Bounds, ClipboardItem, Context, ElementInputHandler, EntityInputHandler, FocusHandle,
+    Focusable, Font, FontStyle, FontWeight, Hsla, InteractiveElement as _, IntoElement,
+    KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement as _,
+    Pixels, Render, Rgba, Role, ScrollEvent, ShapedLine, SharedString,
+    StatefulInteractiveElement as _, StrikethroughStyle, Styled as _, Task, TestSupportExt as _,
+    TextAlign, TextRun, UTF16Selection, UnderlineStyle, Window, canvas, div, fill, font, outline,
+    point, px, rems, size,
 };
 use j3_client::{
     Connection, Error,
@@ -128,6 +129,10 @@ pub struct TerminalView {
     /// Input typed while connecting, sent once the snapshot arrives.
     pending: String,
     selecting: bool,
+    /// IME composition not yet committed, shown at the cursor.
+    marked: Option<String>,
+    /// The cursor cell of the last layout, where the IME window goes.
+    cursor_bounds: Option<Bounds<Pixels>>,
     /// Wheel movement not yet worth a whole line.
     scroll_rest: Pixels,
     attach: Option<Task<()>>,
@@ -206,6 +211,8 @@ impl TerminalView {
             input,
             pending: String::new(),
             selecting: false,
+            marked: None,
+            cursor_bounds: None,
             scroll_rest: px(0.),
             attach: None,
             resize: None,
@@ -437,11 +444,17 @@ impl TerminalView {
     // Input
     // -----------------------------------------------------------------------
 
+    /// Non-text keys; typed text comes through [`EntityInputHandler`].
     fn on_key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         let Some(text) = key_input(&event.keystroke, *self.term.mode()) else {
             return;
         };
         cx.stop_propagation();
+        self.type_input(text, cx);
+    }
+
+    /// Input from the user: back to the live screen, selection cleared.
+    fn type_input(&mut self, text: String, cx: &mut Context<Self>) {
         self.term.scroll_display(Scroll::Bottom);
         self.term.selection = None;
         self.send(text);
@@ -462,10 +475,8 @@ impl TerminalView {
         let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
             return;
         };
-        self.term.scroll_display(Scroll::Bottom);
-        self.term.selection = None;
-        self.send(paste_input(&text, *self.term.mode()));
-        cx.notify();
+        let input = paste_input(&text, *self.term.mode());
+        self.type_input(input, cx);
     }
 
     /// The grid cell under a window position, and which half of it.
@@ -603,11 +614,9 @@ impl TerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> TerminalLayout {
-        let (font_family, mono_size) = {
-            let theme = cx.theme();
-            (theme.mono_font_family.clone(), theme.mono_font_size)
-        };
-        let font_size = mono_size * (f32::from(window.rem_size()) / 16.);
+        // The theme's mono font at `text_sm`, like the feed's code.
+        let font_family = cx.theme().mono_font_family.clone();
+        let font_size = rems(0.875).to_pixels(window.rem_size());
         let base_font = font(font_family);
         let text_system = window.text_system().clone();
         let font_id = text_system.resolve_font(&base_font);
@@ -650,6 +659,7 @@ impl TerminalView {
             backgrounds: Vec::new(),
             runs: Vec::new(),
             cursor: None,
+            marked: None,
         };
         let mut batch: Option<Batch> = None;
         let cell_origin = |line: usize, column: usize| {
@@ -769,6 +779,35 @@ impl TerminalView {
                 &cell_origin,
             ));
         }
+        self.cursor_bounds = cursor_cell.map(|at| {
+            Bounds::new(
+                cell_origin(at.line, at.column.0),
+                size(cell_width, line_height),
+            )
+        });
+        // IME composition shows at the cursor, underlined, until committed.
+        if let (Some(text), Some(at)) = (self.marked.as_ref(), self.cursor_bounds) {
+            let run = TextRun {
+                len: text.len(),
+                font: base_font.clone(),
+                color: theme.foreground,
+                background_color: None,
+                underline: Some(UnderlineStyle {
+                    thickness: px(1.),
+                    color: Some(theme.foreground),
+                    wavy: false,
+                }),
+                strikethrough: None,
+            };
+            let line = text_system.shape_line(
+                SharedString::from(text.clone()),
+                font_size,
+                &[run],
+                Some(cell_width),
+            );
+            let bounds = Bounds::new(at.origin, size(line.width(), line_height));
+            layout.marked = Some((bounds, default_bg, line));
+        }
         layout
     }
 }
@@ -844,6 +883,8 @@ struct TerminalLayout {
     runs: Vec<(gpui_kit::Point<Pixels>, ShapedLine)>,
     /// Bounds, colour, focused, shape.
     cursor: Option<(Bounds<Pixels>, Hsla, bool, CursorShape)>,
+    /// IME composition: its background, colour and text.
+    marked: Option<(Bounds<Pixels>, Hsla, ShapedLine)>,
 }
 
 impl TerminalLayout {
@@ -870,6 +911,17 @@ impl TerminalLayout {
                 _ => outline(bounds, color, gpui_kit::BorderStyle::Solid),
             };
             window.paint_quad(quad);
+        }
+        if let Some((bounds, background, line)) = self.marked {
+            window.paint_quad(fill(bounds, background));
+            let _ = line.paint(
+                bounds.origin,
+                self.line_height,
+                TextAlign::Left,
+                None,
+                window,
+                cx,
+            );
         }
     }
 }
@@ -995,9 +1047,11 @@ fn control_byte(key: &str) -> Option<u8> {
     })
 }
 
-/// What a keystroke sends to the shell (xterm sequences), or `None` when
-/// it is not terminal input (⌘ shortcuts, bare modifiers). Alt/Option is
-/// Meta: it prefixes ESC. Cursor keys follow application cursor mode.
+/// What a non-text keystroke sends to the shell (xterm sequences): editing
+/// and cursor keys, F-keys, Ctrl and Alt (as Meta: ESC prefix)
+/// combinations. Cursor keys follow application cursor mode. `None` for
+/// ⌘ shortcuts, bare modifiers and plain typed text, which arrives through
+/// the input handler (IME, dead keys, the emoji picker).
 pub fn key_input(keystroke: &Keystroke, mode: TermMode) -> Option<String> {
     let modifiers = &keystroke.modifiers;
     if modifiers.platform {
@@ -1059,23 +1113,22 @@ pub fn key_input(keystroke: &Keystroke, mode: TermMode) -> Option<String> {
         "backspace" if control => meta(alt, "\x08"),
         "backspace" => meta(alt, "\x7f"),
         "space" if control => meta(alt, "\0"),
-        "space" => meta(alt, " "),
+        "space" if alt => meta(true, " "),
         _ => {
             if control && let Some(byte) = control_byte(key) {
                 return Some(meta(alt, &char::from(byte).to_string()));
             }
-            let typed = keystroke.key_char.as_deref();
-            if alt && key.chars().count() == 1 {
-                // Option composes characters on macOS (⌥s is ß); as Meta
-                // it sends ESC and the key itself.
-                let text = match typed {
-                    Some(typed) if typed.is_ascii() => typed.to_owned(),
-                    _ if shift => key.to_uppercase(),
-                    _ => key.to_owned(),
-                };
-                return Some(meta(true, &text));
+            if !alt || key.chars().count() != 1 {
+                return None;
             }
-            typed?.to_owned()
+            // Option composes characters on macOS (⌥s is ß); as Meta it
+            // sends ESC and the key itself.
+            let text = match keystroke.key_char.as_deref() {
+                Some(typed) if typed.is_ascii() => typed.to_owned(),
+                _ if shift => key.to_uppercase(),
+                _ => key.to_owned(),
+            };
+            meta(true, &text)
         }
     })
 }
@@ -1086,9 +1139,99 @@ impl Focusable for TerminalView {
     }
 }
 
+/// Typed text, IME composition and dead keys. The terminal has no editable
+/// text of its own: committed text goes to the shell, and the composition
+/// is shown at the cursor until then.
+impl EntityInputHandler for TerminalView {
+    fn text_for_range(
+        &mut self,
+        _: std::ops::Range<usize>,
+        _: &mut Option<std::ops::Range<usize>>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<String> {
+        None
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _: bool,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        let end = self
+            .marked
+            .as_ref()
+            .map_or(0, |text| text.encode_utf16().count());
+        Some(UTF16Selection {
+            range: end..end,
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(
+        &self,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<std::ops::Range<usize>> {
+        self.marked
+            .as_ref()
+            .map(|text| 0..text.encode_utf16().count())
+    }
+
+    fn unmark_text(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        if self.marked.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        _: Option<std::ops::Range<usize>>,
+        text: &str,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.marked = None;
+        self.type_input(text.to_owned(), cx);
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _: Option<std::ops::Range<usize>>,
+        text: &str,
+        _: Option<std::ops::Range<usize>>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.marked = (!text.is_empty()).then(|| text.to_owned());
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _: std::ops::Range<usize>,
+        _: Bounds<Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        self.cursor_bounds
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _: gpui_kit::Point<Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
+    }
+}
+
 impl Render for TerminalView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity();
+        let focus = self.focus.clone();
         div()
             .id(SharedString::from(format!("terminal-{}", self.terminal_id)))
             .test_support()
@@ -1110,10 +1253,16 @@ impl Render for TerminalView {
             .on_scroll(cx.listener(Self::on_wheel))
             .child(
                 canvas(
-                    move |bounds, window, cx| {
-                        view.update(cx, |this, cx| this.layout(bounds, window, cx))
+                    {
+                        let view = view.clone();
+                        move |bounds, window, cx| {
+                            view.update(cx, |this, cx| this.layout(bounds, window, cx))
+                        }
                     },
-                    |_, layout, window, cx| layout.paint(window, cx),
+                    move |bounds, layout, window, cx| {
+                        window.handle_input(&focus, ElementInputHandler::new(bounds, view), cx);
+                        layout.paint(window, cx)
+                    },
                 )
                 .size_full(),
             )
@@ -1145,16 +1294,17 @@ mod tests {
     }
 
     #[test]
-    fn printable_keys_send_their_text() {
-        assert_eq!(keys("a").as_deref(), Some("a"));
-        assert_eq!(keys("shift-a").as_deref(), Some("A"));
-        assert_eq!(keys("space").as_deref(), Some(" "));
+    fn typed_text_is_left_to_the_input_handler() {
+        assert_eq!(keys("a"), None);
+        assert_eq!(keys("shift-a"), None);
+        assert_eq!(keys("space"), None);
+        assert_eq!(keys("1"), None);
         let mut composed = Keystroke::parse("é").unwrap();
         composed.key_char = Some("é".into());
-        assert_eq!(
-            key_input(&composed, TermMode::default()).as_deref(),
-            Some("é")
-        );
+        assert_eq!(key_input(&composed, TermMode::default()), None);
+        // Space with a modifier is still a key.
+        assert_eq!(keys("ctrl-space").as_deref(), Some("\0"));
+        assert_eq!(keys("alt-space").as_deref(), Some("\x1b "));
     }
 
     #[test]
