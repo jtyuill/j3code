@@ -3,13 +3,15 @@
 //! composer's environment and the chosen model's provider.
 //!
 //! [`UsageStore`] is app-wide: the last snapshot of each environment is
-//! cached in `usage.json` next to `desktop.json` and shown as it is. Only
-//! opening a usage button asks its environment again; until an answer
+//! cached in `usage.json` next to `desktop.json` and shown as it is. While a
+//! composer shows an environment's usage button, that environment is asked
+//! again once a minute, and opening the button asks at once; until an answer
 //! arrives (and when one fails) the cached snapshot stays on screen.
 
 use std::{
     collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use gpui_kit::component::{
@@ -20,7 +22,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, Entity, Global, InteractiveElement as _,
     IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
-    Styled as _, Subscription, Task, TestSupportExt as _, Window, div, px,
+    Styled as _, Subscription, Task, TestSupportExt as _, WeakEntity, Window, div, px,
 };
 use j3_protocol::j3::{UsageLimit, UsageReport, UsageSnapshot};
 use time::OffsetDateTime;
@@ -28,6 +30,8 @@ use time::OffsetDateTime;
 use crate::{environment::Environment, feed::age_since, logos, services::Services};
 
 const CACHE_FILE: &str = "usage.json";
+/// How often the shown environments' usage is asked for again.
+const POLL_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Every environment's last usage snapshot, shared by the usage buttons.
 pub struct UsageStore {
@@ -39,6 +43,10 @@ pub struct UsageStore {
     errors: HashMap<SharedString, SharedString>,
     /// `None` without a config directory: nothing is persisted.
     path: Option<PathBuf>,
+    /// Live usage buttons and their environments; polled while any lives.
+    watched: Vec<(WeakEntity<UsagePanel>, WeakEntity<Environment>)>,
+    /// The polling loop, while anything is watched.
+    poll: Option<Task<()>>,
 }
 
 struct GlobalUsageStore(Entity<UsageStore>);
@@ -60,6 +68,8 @@ impl UsageStore {
             pending: HashMap::new(),
             errors: HashMap::new(),
             path,
+            watched: Vec::new(),
+            poll: None,
         });
         cx.set_global(GlobalUsageStore(store.clone()));
         store
@@ -103,6 +113,65 @@ impl UsageStore {
         cx.notify();
     }
 
+    /// Keeps `env`'s snapshot fresh while `panel` lives: refreshed now if
+    /// stale, then every [`POLL_INTERVAL`].
+    pub fn watch(
+        &mut self,
+        panel: WeakEntity<UsagePanel>,
+        env: &Entity<Environment>,
+        cx: &mut Context<Self>,
+    ) {
+        self.watched.push((panel, env.downgrade()));
+        if self.is_stale(env.read(cx).key(), OffsetDateTime::now_utc()) {
+            self.refresh(env, cx);
+        }
+        if self.poll.is_none() {
+            self.poll = Some(cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(POLL_INTERVAL).await;
+                    let polling = this.update(cx, |this, cx| this.poll_watched(cx));
+                    if !polling.unwrap_or(false) {
+                        break;
+                    }
+                }
+            }));
+        }
+    }
+
+    /// One poll: drops the closed panels and refreshes the environments
+    /// still shown whose snapshot is stale. `false` stops polling (nothing
+    /// is watched any more).
+    fn poll_watched(&mut self, cx: &mut Context<Self>) -> bool {
+        self.watched
+            .retain(|(panel, env)| panel.upgrade().is_some() && env.upgrade().is_some());
+        if self.watched.is_empty() {
+            self.poll = None;
+            return false;
+        }
+        let now = OffsetDateTime::now_utc();
+        let envs: Vec<Entity<Environment>> = self
+            .watched
+            .iter()
+            .filter_map(|(_, env)| env.upgrade())
+            .collect();
+        for env in envs {
+            // `refresh` skips an environment already asked this tick.
+            if self.is_stale(env.read(cx).key(), now) {
+                self.refresh(&env, cx);
+            }
+        }
+        true
+    }
+
+    /// Whether `env`'s snapshot is missing or due for a poll. A little
+    /// slack keeps a snapshot fetched just before a tick from skipping it.
+    fn is_stale(&self, env: &str, now: OffsetDateTime) -> bool {
+        self.cache
+            .get(env)
+            .and_then(|snapshot| unix_ms(snapshot.generated_at))
+            .is_none_or(|at| now - at >= POLL_INTERVAL - Duration::from_secs(5))
+    }
+
     fn save(&self) {
         let Some(path) = &self.path else {
             return;
@@ -137,6 +206,8 @@ pub struct UsagePanel {
 impl UsagePanel {
     pub fn new(environment: Entity<Environment>, cx: &mut Context<Self>) -> Self {
         let store = UsageStore::global(cx);
+        let panel = cx.weak_entity();
+        store.update(cx, |store, cx| store.watch(panel, &environment, cx));
         Self {
             _store: cx.observe(&store, |_, _, cx| cx.notify()),
             store,

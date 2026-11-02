@@ -791,8 +791,13 @@ async fn usage_shows_the_model_provider_refreshes_on_press_and_keeps_the_cache_o
     app.update(cx, |window, cx| window.click("new-thread", cx));
     app.until(cx, |window, _| window.try_find("usage").is_some())
         .await;
-    // Nothing is fetched until the button is pressed.
-    assert!(!cache.exists());
+    // Showing the gauge fetches at once (nothing is cached yet); the
+    // gauge then shows the model provider's peak.
+    let fetched = cache.clone();
+    app.until(cx, move |window, _| {
+        fetched.exists() && has_label(window, "78%")
+    })
+    .await;
 
     app.update(cx, |window, cx| window.click("usage", cx));
     // Only the model's provider (opencode-go, report 1) is listed.

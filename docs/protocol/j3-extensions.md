@@ -128,4 +128,4 @@ The desktop's agents hub uses it. Double-tap ← (40–500 ms apart) in an empty
   "amount":{"usedFraction":0.78,"used":78,"limit":100,"unit":"percent"}}]}]}
 ```
 
-The desktop's sidebar footer has a **Usage** button. Nothing is fetched until it is pressed. Each press opens a popover and asks every environment for a new snapshot. The last snapshot per environment is cached in `usage.json` next to `desktop.json` and stays on screen while a request is in flight and when one fails.
+The desktop's composer has a usage gauge beside the model picker: the highest used fraction of the chosen model's provider on the composer's environment, with a popover listing its limits. While a composer is open, its environment is asked for a new snapshot once a minute (a snapshot less than a minute old is not asked for again), and opening the popover asks at once. The last snapshot per environment is cached in `usage.json` next to `desktop.json` and stays on screen while a request is in flight and when one fails.
