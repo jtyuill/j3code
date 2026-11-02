@@ -1,6 +1,7 @@
 //! Projects (`C/project.ts`, `C/orchestrationProject.ts`): `projects.mutate`
 //! (ios-surface M12), `projects.readFile` (M19), `projects.searchEntries`
-//! (M20) and the shell snapshot's project rows.
+//! (M20), `projects.listEntries` (the desktop's file pane) and the shell
+//! snapshot's project rows.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -9,6 +10,11 @@ use super::double_option;
 use super::environment::{RepositoryIdentity, ThreadEnvMode};
 use super::ids::{CommandId, IsoDateTime, ProjectId};
 use super::model::ModelSelection;
+
+/// `projects.listEntries` (`C/rpc.ts:408`).
+pub const PROJECTS_LIST_ENTRIES: &str = "projects.listEntries";
+/// `projects.readFile` (`C/rpc.ts:410`).
+pub const PROJECTS_READ_FILE: &str = "projects.readFile";
 
 /// `ProjectScriptIcon` (`C/project.ts:24-31`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -391,6 +397,50 @@ pub struct ProjectSearchEntriesError {
     pub cause: Option<Value>,
 }
 
+/// `ProjectListEntriesInput` (`C/project.ts:293-296`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectListEntriesInput {
+    pub cwd: String,
+    /// The directory to list, relative to `cwd`; absent or empty for `cwd`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directory_path: Option<String>,
+}
+
+/// `ProjectListEntriesResult` (`C/project.ts:299-302`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectListEntriesResult {
+    pub entries: Vec<ProjectEntry>,
+    pub truncated: bool,
+}
+
+json_literal! {
+    /// `_tag` of [`ProjectListEntriesError`].
+    pub struct ProjectListEntriesErrorTag = str("ProjectListEntriesError");
+}
+
+/// `ProjectListEntriesError` (`C/project.ts:411-431`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectListEntriesError {
+    #[serde(rename = "_tag")]
+    pub tag: ProjectListEntriesErrorTag,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<ProjectEntriesFailure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normalized_cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<Value>,
+}
+
 /// `ProjectReadFileInput` (`C/project.ts:433-439`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -499,6 +549,21 @@ impl ProjectSearchEntriesError {
             cwd: None,
             query_length: None,
             limit: None,
+            failure: None,
+            normalized_cwd: None,
+            timeout: None,
+            detail: None,
+            message: message.into(),
+            cause: None,
+        }
+    }
+}
+
+impl ProjectListEntriesError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            tag: ProjectListEntriesErrorTag,
+            cwd: None,
             failure: None,
             normalized_cwd: None,
             timeout: None,

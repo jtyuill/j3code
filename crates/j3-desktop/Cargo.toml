@@ -15,7 +15,18 @@ path = "src/main.rs"
 alacritty_terminal = { version = "0.26", default-features = false }
 dirs.workspace = true
 gethostname.workspace = true
-gpui-kit.workspace = true
+# Syntax highlighting for the file pane's preview (JSON comes with
+# `tree-sitter`); markdown code blocks in the feed use it too.
+gpui-kit = { workspace = true, features = [
+    "tree-sitter-bash",
+    "tree-sitter-javascript",
+    "tree-sitter-markdown",
+    "tree-sitter-python",
+    "tree-sitter-rust",
+    "tree-sitter-toml",
+    "tree-sitter-tsx",
+    "tree-sitter-typescript",
+] }
 j3-client.workspace = true
 j3-core.workspace = true
 j3-protocol.workspace = true

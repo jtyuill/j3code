@@ -17,6 +17,7 @@ mod environment;
 mod environments;
 mod feed;
 mod feed_view;
+mod file_pane;
 mod git_control;
 mod goto;
 mod local_server;

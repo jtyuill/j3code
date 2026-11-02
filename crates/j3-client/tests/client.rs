@@ -593,6 +593,24 @@ async fn handshake_projects_and_browse() {
         "{browse:?}"
     );
 
+    // The project's files, one level at a time.
+    let cwd = server.project_dir();
+    std::fs::create_dir_all(server.project_dir.join("src")).unwrap();
+    std::fs::write(server.project_dir.join("src/main.rs"), "fn main() {}\n").unwrap();
+    std::fs::write(server.project_dir.join("logo.png"), b"\x89PNG\0").unwrap();
+    let root = connection.list_entries(&cwd, "").await.unwrap();
+    let paths: Vec<_> = root.entries.iter().map(|e| e.path.as_str()).collect();
+    assert_eq!(paths, ["src", "logo.png"]);
+    let src = connection.list_entries(&cwd, "src").await.unwrap();
+    assert_eq!(src.entries[0].path, "src/main.rs");
+    let file = connection.read_file(&cwd, "src/main.rs").await.unwrap();
+    assert_eq!(file.contents, "fn main() {}\n");
+    let binary = connection.read_file(&cwd, "logo.png").await.unwrap_err();
+    let j3_client::Error::Rejected { error, .. } = &binary else {
+        panic!("expected a typed failure, got {binary:?}")
+    };
+    assert_eq!(error["failure"], "binary_file");
+
     // Typed failures carry the server's message.
     let error = connection
         .archive("missing-thread")

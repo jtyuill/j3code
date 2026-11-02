@@ -39,7 +39,10 @@ use j3_protocol::t3::{
         Actor as Creator, CreationSource, ShellSnapshot, ThreadProjection, ThreadShell,
         WorkspaceStrategy,
     },
-    project::{Project, ProjectMutation, ProjectMutationError, ProjectShell},
+    project::{
+        PROJECTS_LIST_ENTRIES, PROJECTS_READ_FILE, Project, ProjectListEntriesInput,
+        ProjectMutation, ProjectMutationError, ProjectReadFileInput, ProjectShell,
+    },
     server::{
         ServerConfig, ServerProvider, ServerRefreshProvidersInput, ServerSettingsError,
         ServerSettingsOperation,
@@ -67,7 +70,7 @@ use crate::{
         session::{OmpFactory, SessionFactory},
         streams::{self, SnapshotFn},
     },
-    git, http,
+    files, git, http,
     hub::{Commit, Hub, ShellChange},
     omp::OmpLauncher,
     rpc::{Response, RpcHandler, StreamItem},
@@ -261,6 +264,20 @@ fn terminal_response<T: Serialize>(result: Result<T, TerminalError>) -> Response
     match result {
         Ok(value) => Response::ok(to_value(&value)),
         Err(error) => Response::fail(to_value(&error)),
+    }
+}
+
+/// Runs blocking filesystem `work` off the runtime: its value, or its typed
+/// error.
+async fn blocking<T, E>(work: impl FnOnce() -> Result<T, E> + Send + 'static) -> Response
+where
+    T: Serialize + Send + 'static,
+    E: Serialize + Send + 'static,
+{
+    match tokio::task::spawn_blocking(work).await {
+        Ok(Ok(value)) => Response::ok(to_value(&value)),
+        Ok(Err(error)) => Response::fail(to_value(&error)),
+        Err(error) => Response::die(error.to_string()),
     }
 }
 
@@ -637,17 +654,14 @@ impl Inner {
                 Ok(input) => self.browse(input),
                 Err(response) => response,
             },
-            "projects.readFile" => {
-                let relative_path = payload
-                    .get("relativePath")
-                    .and_then(Value::as_str)
-                    .unwrap_or("t3.json")
-                    .to_owned();
-                Response::ok(json!({
-                    "relativePath": relative_path, "contents": "", "byteLength": 0,
-                    "truncated": false, "exists": false,
-                }))
-            }
+            PROJECTS_READ_FILE => match decode::<ProjectReadFileInput>(tag, payload) {
+                Ok(input) => blocking(move || files::read_file(&input)).await,
+                Err(response) => response,
+            },
+            PROJECTS_LIST_ENTRIES => match decode::<ProjectListEntriesInput>(tag, payload) {
+                Ok(input) => blocking(move || files::list_entries(&input)).await,
+                Err(response) => response,
+            },
             "projects.searchEntries" => Response::ok(json!({"entries": [], "truncated": false})),
             "filesystem.getMetadata" => match decode::<FilesystemGetMetadataInput>(tag, payload) {
                 Ok(input) => Response::ok(json!({"entries": vec![Value::Null; input.paths.len()]})),

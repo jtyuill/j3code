@@ -8,7 +8,8 @@ use std::{
 };
 
 use gpui_kit::component::{
-    ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt as _, WindowExt as _,
+    ActiveTheme as _, Icon, IconName, Selectable as _, Sizable as _, StyledExt as _,
+    WindowExt as _,
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState},
@@ -23,7 +24,7 @@ use gpui_kit::component::{
         QuestionnaireProgress, QuestionnaireState, QuestionnaireSubmission, QuestionnaireSubmit,
         QuestionnaireTitle,
     },
-    resizable::{resizable_panel, v_resizable},
+    resizable::{h_resizable, resizable_panel, v_resizable},
     spinner::Spinner,
     text::TextViewState,
     v_flex,
@@ -49,6 +50,7 @@ use crate::{
     environment::Environment,
     feed::is_hidden,
     feed_view::{RowContext, render_item},
+    file_pane::{CloseFiles, FilePane},
     git_control::GitControl,
     preferences::Preferences,
     terminal_drawer::{self, HideDrawer, TerminalDrawer},
@@ -100,6 +102,9 @@ pub struct ThreadView {
     hub: Option<(Entity<AgentHub>, Subscription)>,
     /// The thread's terminal drawer, once opened (it outlives this view).
     terminal: Option<(Entity<TerminalDrawer>, Subscription)>,
+    /// The file pane, created on first open; kept while hidden.
+    files: Option<(Entity<FilePane>, Subscription)>,
+    files_open: bool,
     _watch: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
@@ -188,6 +193,8 @@ impl ThreadView {
             todo_open: true,
             hub: None,
             terminal,
+            files: None,
+            files_open: false,
             _watch: watch,
             _subscriptions: subscriptions,
         };
@@ -254,6 +261,66 @@ impl ThreadView {
                 )
                 .into_any_element(),
             _ => chat,
+        }
+    }
+
+    /// Shows the file pane and focuses it, or hides it and returns to the
+    /// composer.
+    pub fn toggle_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.files_open {
+            self.files_open = false;
+            self.focus_composer(window, cx);
+            cx.notify();
+            return;
+        }
+        let pane = match &self.files {
+            Some((pane, _)) => pane.clone(),
+            None => {
+                let (cwd, project) = {
+                    let env = self.environment.read(cx);
+                    let shell = &env.state().shell;
+                    shell
+                        .thread(self.thread_id())
+                        .and_then(|thread| shell.project(&thread.project_id))
+                        .map(|project| (project.workspace_root.clone(), project.title.clone()))
+                        .unwrap_or_default()
+                };
+                let environment = self.environment.clone();
+                let pane = cx.new(|cx| FilePane::new(environment, cwd, project.into(), cx));
+                let subscription =
+                    cx.subscribe_in(&pane, window, |this, _, _: &CloseFiles, window, cx| {
+                        this.files_open = false;
+                        this.focus_composer(window, cx);
+                        cx.notify();
+                    });
+                self.files = Some((pane.clone(), subscription));
+                pane
+            }
+        };
+        self.files_open = true;
+        pane.update(cx, |pane, cx| pane.focus(window, cx));
+        cx.notify();
+    }
+
+    /// `chat` with the file pane to its right while the pane is open.
+    fn with_files(&self, chat: AnyElement, window: &Window) -> AnyElement {
+        let body = div().flex_1().min_h_0().w_full();
+        match self.files.as_ref().filter(|_| self.files_open) {
+            None => body.child(chat).into_any_element(),
+            Some((pane, _)) => {
+                let rem = window.rem_size();
+                body.child(
+                    h_resizable("thread-files-split")
+                        .child(resizable_panel().child(chat))
+                        .child(
+                            resizable_panel()
+                                .size(rem * 22.5)
+                                .size_range(rem * 15.0..rem * 60.)
+                                .child(pane.clone()),
+                        ),
+                )
+                .into_any_element()
+            }
         }
     }
 
@@ -758,6 +825,10 @@ impl ThreadView {
             .into();
         let theme = cx.theme();
         let has_goal = self.state.goal().is_some();
+        let terminal_open = self
+            .terminal
+            .as_ref()
+            .is_some_and(|(drawer, _)| drawer.read(cx).is_open());
         let view = cx.weak_entity();
         h_flex()
             .flex_shrink_0()
@@ -783,12 +854,22 @@ impl ThreadView {
             )
             .child(div().flex_1())
             .child(
+                Button::new("toggle-files")
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::Folder)
+                    .selected(self.files_open)
+                    .tooltip(format!("Files ({})", shortcut("secondary-shift-e", cx)))
+                    .on_click(cx.listener(|this, _, window, cx| this.toggle_files(window, cx))),
+            )
+            .child(
                 Button::new("toggle-terminal")
                     .ghost()
                     .xsmall()
                     .icon(IconName::SquareTerminal)
+                    .selected(terminal_open)
                     .tooltip(format!(
-                        "Toggle terminal ({})",
+                        "Terminal ({})",
                         shortcut(terminal_drawer::TOGGLE_KEYS, cx)
                     ))
                     .on_click(cx.listener(|this, _, window, cx| this.toggle_terminal(window, cx))),
@@ -1401,14 +1482,15 @@ impl Focusable for ThreadView {
 }
 
 impl Render for ThreadView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let header = self.render_header(cx);
         if let Some((hub, _)) = &self.hub {
+            let hub = div().size_full().child(hub.clone()).into_any_element();
             return v_flex()
                 .size_full()
                 .bg(cx.theme().background)
                 .child(header)
-                .child(div().flex_1().min_h_0().child(hub.clone()));
+                .child(self.with_files(hub, window));
         }
         let feed = self.render_feed(cx);
         let todo = self.render_todo(cx);
@@ -1440,12 +1522,13 @@ impl Render for ThreadView {
                     ),
             )
             .into_any_element();
+        // The terminal drawer sits under the chat; the file pane spans both.
         let body = self.render_terminal_drawer(chat, cx);
         v_flex()
             .size_full()
             .bg(cx.theme().background)
             .child(header)
-            .child(body)
+            .child(self.with_files(body, window))
     }
 }
 

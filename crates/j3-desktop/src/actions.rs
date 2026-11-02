@@ -57,6 +57,8 @@ actions!(
         FocusComposer,
         /// Move keyboard focus to the sidebar.
         FocusSidebar,
+        /// Show or hide the open thread's file pane.
+        ToggleFiles,
         /// Open the next thread of the sidebar.
         NextThread,
         /// Open the previous thread of the sidebar.
@@ -121,6 +123,7 @@ pub fn init(cx: &mut App) {
         bind("secondary-g", GotoAgent, ws, cx),
         bind("secondary-l", FocusComposer, ws, cx),
         bind("secondary-0", FocusSidebar, ws, cx),
+        bind("secondary-shift-e", ToggleFiles, ws, cx),
         bind("secondary-shift-]", NextThread, ws, cx),
         bind("secondary-shift-[", PreviousThread, ws, cx),
         bind("down", NextThread, Some(SIDEBAR), cx),
@@ -178,6 +181,8 @@ pub fn init(cx: &mut App) {
             MenuItem::action("Focus Composer", FocusComposer),
             MenuItem::action("Focus Sidebar", FocusSidebar),
             MenuItem::action("Toggle Terminal", ToggleTerminal),
+            MenuItem::separator(),
+            MenuItem::action("Files", ToggleFiles),
             MenuItem::separator(),
             MenuItem::action("Zoom In", ZoomIn),
             MenuItem::action("Zoom Out", ZoomOut),

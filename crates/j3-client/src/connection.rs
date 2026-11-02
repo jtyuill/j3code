@@ -41,7 +41,11 @@ use j3_protocol::t3::{
     orchestration::{
         Actor, CreationSource, ProviderInteractionMode, RuntimeMode, WorkspaceStrategy,
     },
-    project::{Project, ProjectCreateMutation, ProjectDeleteMutation, ProjectMutation},
+    project::{
+        PROJECTS_LIST_ENTRIES, PROJECTS_READ_FILE, Project, ProjectCreateMutation,
+        ProjectDeleteMutation, ProjectListEntriesInput, ProjectListEntriesResult, ProjectMutation,
+        ProjectReadFileInput, ProjectReadFileResult,
+    },
     server::{ServerProviderUpdatedPayload, ServerRefreshProvidersInput},
     terminal::{
         TERMINAL_ATTACH, TERMINAL_CLOSE, TERMINAL_RESIZE, TERMINAL_WRITE, TerminalAttachInput,
@@ -478,6 +482,39 @@ impl Connection {
             &FilesystemBrowseInput {
                 partial_path: partial_path.to_owned(),
                 cwd: None,
+            },
+        )
+        .await
+    }
+
+    /// One directory level of a project on the server
+    /// (`projects.listEntries`): `dir` is relative to `cwd`, empty for `cwd`
+    /// itself. Directories come first; git-ignored entries are flagged.
+    pub async fn list_entries(
+        &self,
+        cwd: &str,
+        dir: &str,
+    ) -> Result<ProjectListEntriesResult, Error> {
+        self.call(
+            PROJECTS_LIST_ENTRIES,
+            &ProjectListEntriesInput {
+                cwd: cwd.to_owned(),
+                directory_path: (!dir.is_empty()).then(|| dir.to_owned()),
+            },
+        )
+        .await
+    }
+
+    /// The text of a file on the server (`projects.readFile`): `path` is
+    /// relative to `cwd` or absolute. At most 1 MiB comes back
+    /// (`truncated`); binary files fail with failure `binary_file`.
+    pub async fn read_file(&self, cwd: &str, path: &str) -> Result<ProjectReadFileResult, Error> {
+        self.call(
+            PROJECTS_READ_FILE,
+            &ProjectReadFileInput {
+                cwd: cwd.to_owned(),
+                relative_path: path.to_owned(),
+                allow_missing: None,
             },
         )
         .await

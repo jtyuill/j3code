@@ -129,3 +129,23 @@ The desktop's agents hub uses it. Double-tap ← (40–500 ms apart) in an empty
 ```
 
 The desktop's composer has a usage gauge beside the model picker: the highest used fraction of the chosen model's provider on the composer's environment, with a popover listing its limits. While a composer is open, its environment is asked for a new snapshot once a minute (a snapshot less than a minute old is not asked for again), and opening the popover asks at once. The last snapshot per environment is cached in `usage.json` next to `desktop.json` and stays on screen while a request is in flight and when one fails.
+
+## Project files
+
+The desktop's file pane browses a thread's project where the thread runs, so a shieldy thread shows shieldy's files. It uses two t3 methods, unchanged on the wire: `projects.listEntries` (which mobile never calls) and `projects.readFile` (M19 in `ios-surface.md`, which also covers its answers and failures). Wire types: `j3_protocol::t3::project::{ProjectListEntriesInput, ProjectListEntriesResult, ProjectListEntriesError}`. Server: `crates/j3-core/src/files.rs`. Client API: `j3_client::Connection::{list_entries, read_file}`.
+
+`projects.listEntries` (payload `{cwd, directoryPath?}`) lists one directory level, unlike t3's server, which answers with its whole search index. `directoryPath` is relative to `cwd`; absent or empty lists `cwd` itself.
+
+- Each entry's `path` is relative to `cwd` with `/` separators (`src/main.rs`), so it can be passed back as `directoryPath` or `relativePath`.
+- Directories come first, then names in case-insensitive order. `.git` is left out. Symlinks list as what they point at.
+- When `cwd` is in a git work tree, one `git check-ignore --stdin -z` per listing marks ignored entries `ignored: true`. Inside an ignored directory every entry is ignored. Without git, nothing is marked.
+- At most 2000 entries; past that `truncated` is `true`.
+- A `directoryPath` that is absolute, climbs out of `cwd` or resolves outside it through a symlink fails, as does a missing or unreadable directory: `{"_tag":"ProjectListEntriesError","cwd":…,"failure":"directory_list_failed","message":…}`. A missing `cwd` is `workspace_root_not_found`; a file is `workspace_root_not_directory`.
+
+```json
+{"entries":[{"path":"crates/j3-core/src","kind":"directory"},
+ {"path":"crates/j3-core/target","kind":"directory","ignored":true},
+ {"path":"crates/j3-core/Cargo.toml","kind":"file"}],"truncated":false}
+```
+
+The pane opens from the thread header's folder button or ⌘⇧E (Ctrl+Shift+E on Linux) and sits to the right of the conversation, resizable. Directories load as they are expanded. With the tree focused, ↑/↓ move, → expands a directory (or enters it), ← collapses it (or goes to the parent) and Enter opens a file. A file opens in a read-only, syntax-highlighted preview under the tree, with its path, a Copy path button and notices for truncated and binary files. Closing the pane returns focus to the composer; reopening it keeps its expanded directories and open file. The pane belongs to the thread view, so another thread opens without it.

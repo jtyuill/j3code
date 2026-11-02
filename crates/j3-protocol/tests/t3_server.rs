@@ -304,6 +304,43 @@ fn m19_read_file() {
 }
 
 #[test]
+fn m19_read_file_text_and_errors() {
+    round_trip::<ProjectReadFileResult>(
+        json!({"relativePath":"src/main.rs","contents":"fn main() {}\n","byteLength":13,"truncated":false}),
+    );
+    let error: ProjectReadFileError = round_trip(json!({
+        "_tag":"ProjectReadFileError","cwd":"/w","relativePath":"logo.png","failure":"binary_file",
+        "resolvedPath":"/w/logo.png","message":"Workspace file 'logo.png' in '/w' is binary and cannot be previewed as text."}));
+    assert_eq!(error.failure, Some(ProjectFileFailure::BinaryFile));
+    round_trip::<ProjectReadFileError>(json!({
+        "_tag":"ProjectReadFileError","cwd":"/w","relativePath":"gone.txt","failure":"operation_failed",
+        "operation":"realpath-target","operationPath":"/w/gone.txt","message":"No such file or directory"}));
+}
+
+#[test]
+fn list_entries() {
+    assert_eq!(PROJECTS_LIST_ENTRIES, "projects.listEntries");
+    assert_eq!(PROJECTS_READ_FILE, "projects.readFile");
+    round_trip::<ProjectListEntriesInput>(json!({"cwd":"/home/jacob/Developer/j3code"}));
+    let input: ProjectListEntriesInput =
+        round_trip(json!({"cwd":"/home/jacob/Developer/j3code","directoryPath":"crates/j3-core"}));
+    assert_eq!(input.directory_path.as_deref(), Some("crates/j3-core"));
+    let result: ProjectListEntriesResult = round_trip(json!({"entries":[
+        {"path":"crates/j3-core/src","kind":"directory"},
+        {"path":"crates/j3-core/target","kind":"directory","ignored":true},
+        {"path":"crates/j3-core/Cargo.toml","kind":"file"}],"truncated":false}));
+    assert_eq!(result.entries[1].ignored, Some(true));
+    assert_eq!(result.entries[2].kind, ProjectEntryKind::File);
+    let error: ProjectListEntriesError = round_trip(json!({
+        "_tag":"ProjectListEntriesError","cwd":"/w","failure":"directory_list_failed",
+        "detail":"../etc is outside the workspace","message":"Failed to list workspace entries in '/w'."}));
+    assert_eq!(
+        error.failure,
+        Some(ProjectEntriesFailure::DirectoryListFailed)
+    );
+}
+
+#[test]
 fn m20_search_entries() {
     round_trip::<ProjectSearchEntriesInput>(
         json!({"cwd":"/home/jacob/Developer/j3code","query":"main","limit":50,"kind":"file"}),

@@ -1831,6 +1831,79 @@ async fn the_header_commits_uncommitted_changes(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+async fn the_file_pane_browses_and_previews_the_project(cx: &mut TestAppContext) {
+    let app = Harness::start("files", cx).await;
+    let dir = &app.project_dir;
+    git(dir, &["init", "-q"]);
+    std::fs::write(dir.join(".gitignore"), "target/\n").unwrap();
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::create_dir_all(dir.join("target")).unwrap();
+    std::fs::write(
+        dir.join("src/main.rs"),
+        "fn main() {\n    println!(\"hi\");\n}\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("logo.png"), b"\x89PNG\r\n\x1a\n\0\0").unwrap();
+    let project_id = app.project(cx).await;
+    app.open_running_thread(cx, &project_id, "browse files")
+        .await;
+
+    // The header button opens the pane on the project root, focused, with
+    // directories first.
+    app.update(cx, |window, cx| window.click("toggle-files", cx));
+    app.until(cx, |window, _| {
+        has_label(window, "target") && has_label(window, "logo.png")
+    })
+    .await;
+    app.update(cx, |window, _| {
+        assert_eq!(window.find("file-tree").focused(), Some(true));
+        let top = |label: &str| window.find_by_label(label).bounds().top();
+        assert!(top("src") < top("target"));
+        assert!(top("target") < top(".gitignore"));
+        assert!(top(".gitignore") < top("logo.png"));
+    });
+
+    // A click expands a directory; its entries load beneath it.
+    app.update(cx, |window, cx| click_label(window, "src", cx));
+    app.until(cx, |window, _| has_label(window, "src/main.rs"))
+        .await;
+
+    // ↓ moves to the file and Enter previews it, line numbers and all.
+    app.update(cx, |window, cx| {
+        window.press("down", cx);
+        window.press("enter", cx);
+    });
+    app.until(cx, |window, _| {
+        window
+            .try_find_by_label("Contents of src/main.rs")
+            .is_some_and(|editor| {
+                editor
+                    .value()
+                    .is_some_and(|text| text.contains("println!(\"hi\")"))
+            })
+    })
+    .await;
+
+    // A binary file gets a notice instead of a preview.
+    app.update(cx, |window, cx| click_label(window, "logo.png", cx));
+    app.until(cx, |window, _| {
+        has_label(window, "Binary file; there is no preview.")
+    })
+    .await;
+
+    // The shortcut's action closes the pane and returns to the composer.
+    app.update(cx, |window, cx| {
+        window.dispatch_action(Box::new(actions::ToggleFiles), cx)
+    });
+    app.until(cx, |window, _| window.try_find("file-pane").is_none())
+        .await;
+    app.update(cx, |window, _| {
+        assert_eq!(window.find_by_label("Message").focused(), Some(true));
+    });
+    app.stop(cx);
+}
+
+#[gpui_kit::test]
 async fn the_feed_keeps_following_the_reply_after_a_wheel_scroll_at_the_bottom(
     cx: &mut TestAppContext,
 ) {
