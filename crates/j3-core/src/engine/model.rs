@@ -14,7 +14,7 @@ use j3_protocol::t3::{
     orchestration::{
         Actor, AppThread, AppThreadLineage, AssistantMessageItem, CommandExecutionItem,
         CompactionItem, ConversationMessage, CreationSource, DynamicToolItem, ErrorItem,
-        FileChangeItem, FileSearchItem, MessageContext, MessageItem, MessageRole,
+        FileChangeItem, FileSearchItem, FileSearchResult, MessageContext, MessageItem, MessageRole,
         NativeRefStrength, PlanArtifact, PlanArtifactKind, PlanArtifactStatus, PlanStep,
         PlanStepStatus, ProviderCapabilities, ProviderFailure, ProviderFailureClass,
         ProviderInteractionMode, ProviderRef, ProviderRetry, ProviderSession,
@@ -24,7 +24,7 @@ use j3_protocol::t3::{
         RuntimeMode, RuntimeRequest, RuntimeRequestKind, RuntimeRequestStatus, TodoListItem,
         TurnItem, TurnItemKind, TurnItemStatus, UserInputAnswerPayload, UserInputQuestion,
         UserInputQuestionOption, UserInputRequestItem, UserMessageInputIntent, UserMessageItem,
-        WebSearchItem,
+        WebSearchItem, WebSearchResult,
     },
 };
 use serde_json::{Map, Value};
@@ -216,6 +216,31 @@ fn arg_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
         .filter(|value| !value.trim().is_empty())
 }
 
+/// Whether a tool's `path` names a file rather than an internal URL
+/// (`agent://`, `xd://`, `proc://`, …) or a web page.
+fn is_file_path(path: &str) -> bool {
+    !path.contains("://")
+}
+
+/// The file a hashline `edit` input names first, from its `[PATH#TAG]`
+/// header.
+fn hashline_path(input: &str) -> Option<&str> {
+    input.lines().find_map(|line| {
+        let inner = line.trim().strip_prefix('[')?.strip_suffix(']')?;
+        let (path, tag) = inner.rsplit_once('#')?;
+        let path = path.trim();
+        (tag.len() == 4 && tag.chars().all(|c| c.is_ascii_hexdigit()) && !path.is_empty())
+            .then_some(path)
+    })
+}
+
+/// The file an `edit` or `write` call changes, if it changes one.
+fn changed_file<'a>(name: &str, args: &'a Value) -> Option<&'a str> {
+    let path = arg_str(args, "path")
+        .or_else(|| (name == "edit").then(|| arg_str(args, "input").and_then(hashline_path))?)?;
+    is_file_path(path).then(|| path.trim())
+}
+
 /// TurnItem kind for an omp tool call (ios-surface §5 "Tool calls").
 fn tool_kind(name: &str, args: &Value) -> TurnItemKind {
     match name {
@@ -227,9 +252,9 @@ fn tool_kind(name: &str, args: &Value) -> TurnItemKind {
             exit_code: None,
             monitor: None,
         }),
-        "edit" | "write" if arg_str(args, "path").is_some() => {
+        "edit" | "write" if changed_file(name, args).is_some() => {
             TurnItemKind::FileChange(FileChangeItem {
-                file_name: arg_str(args, "path").unwrap_or_default().trim().to_owned(),
+                file_name: changed_file(name, args).unwrap_or_default().to_owned(),
                 additions: None,
                 deletions: None,
                 diff_str: None,
@@ -241,8 +266,11 @@ fn tool_kind(name: &str, args: &Value) -> TurnItemKind {
                 changes: None,
             })
         }
+        // `glob` and `find` take their pattern as `path`.
         "grep" | "find" | "glob" => TurnItemKind::FileSearch(FileSearchItem {
-            pattern: arg_str(args, "pattern").map(str::to_owned),
+            pattern: arg_str(args, "pattern")
+                .or_else(|| arg_str(args, "path"))
+                .map(str::to_owned),
             results: None,
         }),
         "web_search" => TurnItemKind::WebSearch(WebSearchItem {
@@ -2428,12 +2456,120 @@ fn set_tool_output(item: &mut TurnItem, text: String, details: Option<&Value>) {
                 .and_then(|details| details.get("diff"))
                 .and_then(Value::as_str)
             {
+                let (additions, deletions) = diff_counts(diff);
+                change.additions = Some(additions);
+                change.deletions = Some(deletions);
                 change.diff_str = Some(diff.to_owned());
+            }
+        }
+        TurnItemKind::FileSearch(search) => {
+            let mut results = grep_matches(&text);
+            if results.is_empty()
+                && let Some(files) = details
+                    .and_then(|details| details.get("files"))
+                    .and_then(Value::as_array)
+            {
+                results = files
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .take(MAX_SEARCH_RESULTS)
+                    .map(|file| FileSearchResult {
+                        file_name: file.to_owned(),
+                        line: None,
+                        column: None,
+                        preview: None,
+                    })
+                    .collect();
+            }
+            search.results = Some(results);
+        }
+        TurnItemKind::WebSearch(search) => {
+            if let Some(sources) = details
+                .and_then(|details| details.pointer("/response/sources"))
+                .and_then(Value::as_array)
+            {
+                let field = |source: &Value, key: &str| {
+                    source
+                        .get(key)
+                        .and_then(Value::as_str)
+                        .map(|text| truncate(text.trim(), 300))
+                };
+                search.results = Some(
+                    sources
+                        .iter()
+                        .map(|source| WebSearchResult {
+                            title: field(source, "title"),
+                            url: field(source, "url"),
+                            snippet: field(source, "snippet"),
+                        })
+                        .collect(),
+                );
             }
         }
         TurnItemKind::DynamicTool(tool) => tool.output = Some(Some(Value::String(text))),
         _ => {}
     }
+}
+
+/// Most search results kept on a `file_search` item.
+const MAX_SEARCH_RESULTS: usize = 200;
+
+/// Added and removed lines of an omp edit diff (`+12|text`, `-12|text`,
+/// context ` 12|text`).
+fn diff_counts(diff: &str) -> (u64, u64) {
+    diff.lines().fold((0, 0), |(added, removed), line| {
+        if line.starts_with('+') && !line.starts_with("+++") {
+            (added + 1, removed)
+        } else if line.starts_with('-') && !line.starts_with("---") {
+            (added, removed + 1)
+        } else {
+            (added, removed)
+        }
+    })
+}
+
+/// The matching lines of omp's `grep` output: `# dir/` and `## file#TAG`
+/// headers (`# file#TAG` alone when one file matched), then numbered lines
+/// where `*` marks a match (`*15:text`) and a space a context line
+/// (` 14:text`).
+fn grep_matches(text: &str) -> Vec<FileSearchResult> {
+    let mut dir = "";
+    let mut file = None::<String>;
+    let mut results = Vec::new();
+    for line in text.lines() {
+        if let Some(name) = line.strip_prefix("## ") {
+            let name = name.rsplit_once('#').map_or(name, |(name, _)| name);
+            file = Some(format!("{dir}{}", name.trim()));
+        } else if let Some(path) = line.strip_prefix("# ") {
+            // `# dir/` heads a directory's files; a lone file is headed
+            // `# file#TAG` itself.
+            match path.trim().rsplit_once('#') {
+                Some((name, _)) => {
+                    dir = "";
+                    file = Some(name.to_owned());
+                }
+                None => {
+                    dir = path.trim();
+                    file = None;
+                }
+            }
+        } else if let Some(rest) = line.strip_prefix('*')
+            && let Some((number, preview)) = rest.split_once(':')
+            && let Ok(number) = number.trim().parse::<u64>()
+            && let Some(file) = &file
+        {
+            results.push(FileSearchResult {
+                file_name: file.clone(),
+                line: Some(number),
+                column: None,
+                preview: Some(truncate(preview.trim(), 300)),
+            });
+            if results.len() == MAX_SEARCH_RESULTS {
+                break;
+            }
+        }
+    }
+    results
 }
 
 /// `ProviderFailure` from omp's `PromptError`.
@@ -2585,5 +2721,108 @@ mod tests {
         );
         assert_eq!(split_model("a/b/c"), Some(("a", "b/c")));
         assert_eq!(split_model("nope"), None);
+    }
+
+    #[test]
+    fn hashline_edits_and_writes_map_to_file_changes() {
+        let edit = tool_kind(
+            "edit",
+            &serde_json::json!({"input": "[src/a.rs#1A2B]\nPUT 3:\n+x\n[src/b.rs#FFFF]\nCUT 1"}),
+        );
+        let TurnItemKind::FileChange(change) = edit else {
+            panic!("hashline edit is a file change: {edit:?}");
+        };
+        assert_eq!(change.file_name, "src/a.rs");
+        // Writes to internal URLs (peer messages, tool devices) are not files.
+        for path in ["agent://Reviewer", "xd://lsp"] {
+            let write = tool_kind("write", &serde_json::json!({"path": path, "content": "hi"}));
+            assert!(matches!(write, TurnItemKind::DynamicTool(_)), "{path}");
+        }
+        let glob = tool_kind("glob", &serde_json::json!({"path": "src/**/*.rs"}));
+        let TurnItemKind::FileSearch(search) = glob else {
+            panic!("glob is a file search");
+        };
+        assert_eq!(search.pattern.as_deref(), Some("src/**/*.rs"));
+    }
+
+    #[test]
+    fn tool_results_fill_diffs_matches_and_sources() {
+        let mut item: TurnItem = serde_json::from_value(serde_json::json!({
+            "id":"ti","threadId":"T","runId":null,"nodeId":null,"providerThreadId":null,
+            "providerTurnId":null,"nativeItemRef":null,"parentItemId":null,"ordinal":1,
+            "status":"running","title":null,"startedAt":null,"completedAt":null,
+            "updatedAt":"2026-11-02T00:00:00.000Z","type":"system_notice","message":""
+        }))
+        .unwrap();
+        item.kind = tool_kind(
+            "edit",
+            &serde_json::json!({"input": "[a.rs#0000]\nPUT 1:\n+x"}),
+        );
+        let diff = " 1|a\n-2|b\n+2|c\n+3|d";
+        set_tool_output(
+            &mut item,
+            "ok".into(),
+            Some(&serde_json::json!({"diff": diff})),
+        );
+        let TurnItemKind::FileChange(change) = &item.kind else {
+            panic!();
+        };
+        assert_eq!((change.additions, change.deletions), (Some(2), Some(1)));
+        assert_eq!(change.diff_str.as_deref(), Some(diff));
+
+        item.kind = tool_kind("grep", &serde_json::json!({"pattern": "fn main"}));
+        let grep =
+            "# src/\n## main.rs#AB12\n 1:// x\n*2:fn main() {\n## lib.rs#CD34\n*9:  fn main_like()";
+        set_tool_output(&mut item, grep.into(), None);
+        let TurnItemKind::FileSearch(search) = &item.kind else {
+            panic!();
+        };
+        let found: Vec<(&str, Option<u64>, Option<&str>)> = search
+            .results
+            .iter()
+            .flatten()
+            .map(|r| (r.file_name.as_str(), r.line, r.preview.as_deref()))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                ("src/main.rs", Some(2), Some("fn main() {")),
+                ("src/lib.rs", Some(9), Some("fn main_like()"))
+            ]
+        );
+
+        set_tool_output(
+            &mut item,
+            "# main.rs#6FB6\n*1:fn main() {\n 2:  x".into(),
+            None,
+        );
+        let TurnItemKind::FileSearch(search) = &item.kind else {
+            panic!();
+        };
+        assert_eq!(search.results.as_ref().unwrap()[0].file_name, "main.rs");
+
+        item.kind = tool_kind("glob", &serde_json::json!({"path": "*.toml"}));
+        set_tool_output(
+            &mut item,
+            "# ./\nCargo.toml".into(),
+            Some(&serde_json::json!({"files": ["Cargo.toml"]})),
+        );
+        let TurnItemKind::FileSearch(search) = &item.kind else {
+            panic!();
+        };
+        assert_eq!(search.results.as_ref().unwrap()[0].file_name, "Cargo.toml");
+
+        item.kind = tool_kind("web_search", &serde_json::json!({"query": "gpui"}));
+        set_tool_output(
+            &mut item,
+            "[1] Zed".into(),
+            Some(&serde_json::json!({"response": {"sources": [
+                {"title": "Zed", "url": "https://zed.dev", "snippet": "editor"}]}})),
+        );
+        let TurnItemKind::WebSearch(search) = &item.kind else {
+            panic!();
+        };
+        let source = &search.results.as_ref().unwrap()[0];
+        assert_eq!(source.url.as_deref(), Some("https://zed.dev"));
     }
 }
