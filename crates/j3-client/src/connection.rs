@@ -43,6 +43,10 @@ use j3_protocol::t3::{
     },
     project::{Project, ProjectCreateMutation, ProjectDeleteMutation, ProjectMutation},
     server::{ServerProviderUpdatedPayload, ServerRefreshProvidersInput},
+    terminal::{
+        TERMINAL_ATTACH, TERMINAL_CLOSE, TERMINAL_RESIZE, TERMINAL_WRITE, TerminalAttachInput,
+        TerminalAttachStreamEvent, TerminalCloseInput, TerminalResizeInput, TerminalWriteInput,
+    },
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -140,6 +144,49 @@ async fn drive_git_action(
             "{GIT_RUN_STACKED_ACTION}: the stream ended without a result"
         )),
     })
+}
+
+/// An attached terminal (see [`Connection::attach_terminal`]). Dropping it
+/// detaches; the shell keeps running on the server.
+pub struct TerminalSession {
+    events: mpsc::UnboundedReceiver<Result<TerminalAttachStreamEvent, Error>>,
+    task: tokio::task::AbortHandle,
+}
+
+impl TerminalSession {
+    /// The next event, from any executor: a `snapshot` first, then live
+    /// events. `None` once the stream ended (after `closed`); an error is
+    /// always last.
+    pub async fn next(&mut self) -> Option<Result<TerminalAttachStreamEvent, Error>> {
+        self.events.recv().await
+    }
+}
+
+impl Drop for TerminalSession {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Forwards one `terminal.attach` stream to `events` until it ends or the
+/// receiver is gone. Aborting the task drops the stream, which interrupts it.
+async fn drive_terminal(
+    shared: &Shared,
+    payload: Value,
+    events: &mpsc::UnboundedSender<Result<TerminalAttachStreamEvent, Error>>,
+) -> Result<(), Error> {
+    let session = shared.ready_session().await?;
+    let mut stream = session.stream(TERMINAL_ATTACH, payload)?;
+    while let Some(values) = stream.next().await {
+        for value in values? {
+            let event = serde_json::from_value(value)
+                .map_err(|e| Error::Decode(format!("{TERMINAL_ATTACH}: {e}")))?;
+            if events.send(Ok(event)).is_err() {
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
 }
 
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(120);
@@ -1103,6 +1150,99 @@ impl Connection {
             task: task.abort_handle(),
             finished: false,
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Terminals
+    // -----------------------------------------------------------------------
+
+    /// Attaches to a thread's terminal (`terminal.attach`) on the
+    /// connection's runtime, starting its shell in the thread's project
+    /// folder when it has none. `size` is `(cols, rows)`; `restart` starts
+    /// a new shell when the last one exited.
+    pub fn attach_terminal(
+        &self,
+        thread_id: &str,
+        terminal_id: &str,
+        size: Option<(u16, u16)>,
+        restart: bool,
+    ) -> TerminalSession {
+        let shared = Arc::clone(&self.inner.shared);
+        let payload = encode(&TerminalAttachInput {
+            thread_id: thread_id.to_owned(),
+            terminal_id: terminal_id.to_owned(),
+            cwd: None,
+            worktree_path: None,
+            cols: size.map(|(cols, _)| cols),
+            rows: size.map(|(_, rows)| rows),
+            env: None,
+            restart_if_not_running: restart.then_some(true),
+        });
+        let (tx, events) = mpsc::unbounded_channel();
+        let task = self.inner.shared.runtime.spawn(async move {
+            if let Err(error) = drive_terminal(&shared, payload, &tx).await {
+                let _ = tx.send(Err(error));
+            }
+        });
+        TerminalSession {
+            events,
+            task: task.abort_handle(),
+        }
+    }
+
+    /// Sends input to a terminal's shell (`terminal.write`).
+    pub async fn write_terminal(
+        &self,
+        thread_id: &str,
+        terminal_id: &str,
+        data: String,
+    ) -> Result<(), Error> {
+        self.call::<Value>(
+            TERMINAL_WRITE,
+            &TerminalWriteInput {
+                thread_id: thread_id.to_owned(),
+                terminal_id: terminal_id.to_owned(),
+                data,
+            },
+        )
+        .await
+        .map(drop)
+    }
+
+    /// Resizes a terminal (`terminal.resize`).
+    pub async fn resize_terminal(
+        &self,
+        thread_id: &str,
+        terminal_id: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(), Error> {
+        self.call::<Value>(
+            TERMINAL_RESIZE,
+            &TerminalResizeInput {
+                thread_id: thread_id.to_owned(),
+                terminal_id: terminal_id.to_owned(),
+                cols,
+                rows,
+            },
+        )
+        .await
+        .map(drop)
+    }
+
+    /// Ends a terminal's shell (`terminal.close`); its attached streams end
+    /// with `closed`.
+    pub async fn close_terminal(&self, thread_id: &str, terminal_id: &str) -> Result<(), Error> {
+        self.call::<Value>(
+            TERMINAL_CLOSE,
+            &TerminalCloseInput {
+                thread_id: thread_id.to_owned(),
+                terminal_id: Some(terminal_id.to_owned()),
+                delete_history: None,
+            },
+        )
+        .await
+        .map(drop)
     }
 }
 

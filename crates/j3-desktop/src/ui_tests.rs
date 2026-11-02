@@ -1473,6 +1473,95 @@ async fn stop_interrupts_the_run(cx: &mut TestAppContext) {
     app.stop(cx);
 }
 
+/// The visible text of terminal `id` (its accessibility value).
+fn terminal_text(window: &Window, id: &str) -> String {
+    window
+        .try_find(format!("terminal-{id}"))
+        .and_then(|terminal| terminal.value().map(str::to_owned))
+        .unwrap_or_default()
+}
+
+#[gpui_kit::test]
+async fn the_terminal_drawer_runs_a_shell_on_the_server(cx: &mut TestAppContext) {
+    let app = Harness::start("terminal", cx).await;
+    let project_id = app.project(cx).await;
+    app.open_running_thread(cx, &project_id, "shell").await;
+
+    // ctrl-` opens the drawer with the focus in its first terminal, whose
+    // shell runs on the server and answers typed input.
+    app.update(cx, |window, cx| window.press("ctrl-`", cx));
+    app.until(cx, |window, _| {
+        window
+            .try_find("terminal-term-1")
+            .is_some_and(|terminal| terminal.focused() == Some(true))
+    })
+    .await;
+    app.update(cx, |window, cx| {
+        window.input("echo hi-$((40+2))", cx);
+        window.press("enter", cx);
+    });
+    app.until(cx, |window, _| {
+        terminal_text(window, "term-1").contains("hi-42")
+    })
+    .await;
+
+    // The header button hides it and the composer gets the focus back.
+    app.update(cx, |window, cx| window.click("toggle-terminal", cx));
+    app.until(cx, |window, _| window.try_find("terminal-drawer").is_none())
+        .await;
+    app.update(cx, |window, _| {
+        assert_eq!(window.find_by_label("Message").focused(), Some(true));
+    });
+
+    // Reopened, the same shell is there with its output.
+    app.update(cx, |window, cx| window.press("ctrl-`", cx));
+    app.until(cx, |window, _| {
+        terminal_text(window, "term-1").contains("hi-42")
+    })
+    .await;
+
+    // `+` opens a second terminal; its × ends it.
+    app.update(cx, |window, cx| window.click("terminal-new", cx));
+    app.until(cx, |window, _| {
+        window
+            .try_find("terminal-term-2")
+            .is_some_and(|terminal| terminal.focused() == Some(true))
+    })
+    .await;
+    app.update(cx, |window, cx| window.click("terminal-close-term-2", cx));
+    app.until(cx, |window, _| {
+        window.try_find("terminal-tab-term-2").is_none()
+            && window.try_find("terminal-term-1").is_some()
+    })
+    .await;
+
+    // An exited shell shows why, and Restart starts a new one.
+    app.update(cx, |window, cx| {
+        window.click("terminal-term-1", cx);
+        window.input("exit 7", cx);
+        window.press("enter", cx);
+    });
+    app.until(cx, |window, _| {
+        window
+            .try_find("terminal-status")
+            .is_some_and(|status| status.label() == Some("Shell exited with code 7"))
+    })
+    .await;
+    app.update(cx, |window, cx| window.click("terminal-restart", cx));
+    app.until(cx, |window, _| window.try_find("terminal-status").is_none())
+        .await;
+    app.update(cx, |window, cx| {
+        window.input("echo back-$((1+1))", cx);
+        window.press("enter", cx);
+    });
+    app.until(cx, |window, _| {
+        terminal_text(window, "term-1").contains("back-2")
+    })
+    .await;
+
+    app.stop(cx);
+}
+
 #[gpui_kit::test]
 async fn goal_chip_controls_and_subagent_progress(cx: &mut TestAppContext) {
     let app = Harness::start("extras", cx).await;

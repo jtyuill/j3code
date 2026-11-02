@@ -44,6 +44,11 @@ use j3_protocol::t3::{
         ServerConfig, ServerProvider, ServerRefreshProvidersInput, ServerSettingsError,
         ServerSettingsOperation,
     },
+    terminal::{
+        TERMINAL_ATTACH, TERMINAL_CLOSE, TERMINAL_OPEN, TERMINAL_RESIZE, TERMINAL_WRITE,
+        TerminalAttachInput, TerminalCloseInput, TerminalError, TerminalOpenInput,
+        TerminalResizeInput, TerminalWriteInput,
+    },
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -67,6 +72,7 @@ use crate::{
     omp::OmpLauncher,
     rpc::{Response, RpcHandler, StreamItem},
     store::{self, Store, random_hex},
+    terminal::Terminals,
     transcript,
 };
 
@@ -121,6 +127,8 @@ struct Inner {
     descriptor: Value,
     home: String,
     data_dir: PathBuf,
+    /// Every thread's terminal sessions.
+    terminals: Terminals,
 }
 
 fn create_dir(path: &Path) -> Result<(), Error> {
@@ -248,6 +256,14 @@ fn git_response<T: Serialize>(result: git::GitResult<T>) -> Response {
     }
 }
 
+/// A unary terminal method's answer: the value, or its `TerminalError`.
+fn terminal_response<T: Serialize>(result: Result<T, TerminalError>) -> Response {
+    match result {
+        Ok(value) => Response::ok(to_value(&value)),
+        Err(error) => Response::fail(to_value(&error)),
+    }
+}
+
 /// The thread projection as stored.
 fn stored_projection(
     store: &Store,
@@ -354,6 +370,7 @@ impl App {
             home,
             data_dir: config.data_dir,
             omp: config.omp,
+            terminals: Terminals::new(),
         });
         inner.recover()?;
         Ok(Arc::new(App { inner }))
@@ -376,8 +393,9 @@ impl App {
         Arc::clone(&self.inner.attachments)
     }
 
-    /// Stops every thread actor and its omp process.
+    /// Stops every terminal, then every thread actor and its omp process.
     pub async fn shutdown(&self) {
+        self.inner.terminals.shutdown();
         let handles: Vec<ThreadHandle> = self
             .inner
             .actors
@@ -654,7 +672,66 @@ impl Inner {
                     Err(response) => response,
                 }
             }
+            TERMINAL_ATTACH => match decode::<TerminalAttachInput>(tag, payload) {
+                Ok(input) => self.attach_terminal(&input),
+                Err(response) => response,
+            },
+            TERMINAL_OPEN => match decode::<TerminalOpenInput>(tag, payload) {
+                Ok(input) => terminal_response(
+                    self.thread_root(&input.thread_id, &input.terminal_id)
+                        .and_then(|_| self.terminals.open(&input)),
+                ),
+                Err(response) => response,
+            },
+            TERMINAL_WRITE => match decode::<TerminalWriteInput>(tag, payload) {
+                Ok(input) => terminal_response(self.terminals.write(input).await),
+                Err(response) => response,
+            },
+            TERMINAL_RESIZE => match decode::<TerminalResizeInput>(tag, payload) {
+                Ok(input) => terminal_response(self.terminals.resize(&input)),
+                Err(response) => response,
+            },
+            TERMINAL_CLOSE => match decode::<TerminalCloseInput>(tag, payload) {
+                Ok(input) => {
+                    self.terminals.close(&input);
+                    Response::ok(Value::Null)
+                }
+                Err(response) => response,
+            },
             other => Response::die(format!("{other} is not supported by this server")),
+        }
+    }
+
+    /// The workspace root of a live thread's project, where its terminals
+    /// start; an unknown thread is a `TerminalSessionLookupError`.
+    fn thread_root(&self, thread_id: &str, terminal_id: &str) -> Result<String, TerminalError> {
+        let project_id = self
+            .hub
+            .read(|store| store.thread(thread_id))
+            .ok()
+            .flatten()
+            .filter(|row| !row.deleted)
+            .map(|row| row.project_id);
+        project_id
+            .and_then(|id| self.hub.read(|store| store.project(&id)).ok().flatten())
+            .and_then(|json| serde_json::from_value::<Project>(json).ok())
+            .map(|project| project.workspace_root)
+            .ok_or_else(|| TerminalError::session_lookup(thread_id, terminal_id))
+    }
+
+    /// `terminal.attach` for a live thread; a missing session starts in
+    /// the thread's project folder unless the client names a `cwd`.
+    fn attach_terminal(&self, input: &TerminalAttachInput) -> Response {
+        let events = self
+            .thread_root(&input.thread_id, &input.terminal_id)
+            .and_then(|root| self.terminals.attach(input, &root));
+        match events {
+            Ok(events) => Response::Stream(
+                events
+                    .map(|event| StreamItem::Value(to_value(&event)))
+                    .boxed(),
+            ),
+            Err(error) => Response::fail(to_value(&error)),
         }
     }
 
@@ -951,6 +1028,7 @@ impl Inner {
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner)
                         .remove(&thread_id);
+                    self.terminals.close_thread(&thread_id);
                 }
                 Response::ok(to_value(&DispatchCommandResult { sequence }))
             }
@@ -1204,6 +1282,7 @@ impl Inner {
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner)
                         .remove(&thread_id);
+                    self.terminals.close_thread(&thread_id);
                 }
                 let mut project = project;
                 project["deletedAt"] = json!(now);

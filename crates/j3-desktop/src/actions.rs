@@ -6,11 +6,11 @@ use std::rc::Rc;
 use gpui_kit::component::input::{Copy, Cut, Paste, Redo, SelectAll, Undo};
 use gpui_kit::component::kbd::Kbd;
 use gpui_kit::{
-    Action, App, KeyBinding, KeyBindingContextPredicate, Keystroke, Menu, MenuItem,
+    Action, App, KeyBinding, KeyBindingContextPredicate, Keystroke, Menu, MenuItem, NoAction,
     OperatingSystem, OsAction, actions,
 };
 
-use crate::{services::Services, workspace::Workspace};
+use crate::{services::Services, terminal_drawer, workspace::Workspace};
 
 /// Key context of the workspace root.
 pub const WORKSPACE: &str = "Workspace";
@@ -20,6 +20,8 @@ pub const SIDEBAR: &str = "Sidebar";
 pub const SETTINGS: &str = "Settings";
 /// Key context of the goto picker.
 pub const GOTO: &str = "GotoPicker";
+/// Key context of a focused terminal.
+pub const TERMINAL: &str = "Terminal";
 
 actions!(
     j3,
@@ -65,6 +67,8 @@ actions!(
         ZoomOut,
         /// Back to 100%.
         ResetZoom,
+        /// Open (or hide) the open thread's terminal drawer.
+        ToggleTerminal,
     ]
 );
 
@@ -125,8 +129,10 @@ pub fn init(cx: &mut App) {
         bind("secondary-=", ZoomIn, ws, cx),
         bind("secondary-+", ZoomIn, ws, cx),
         bind("secondary--", ZoomOut, ws, cx),
+        bind(terminal_drawer::TOGGLE_KEYS, ToggleTerminal, ws, cx),
     ];
     bindings.extend((1..=9).map(|n| bind(&format!("secondary-{n}"), JumpToThread(n), ws, cx)));
+    bindings.extend(terminal_bindings(cx));
     cx.bind_keys(bindings);
     cx.on_action(|_: &Quit, cx| quit(cx));
     cx.on_window_closed(|cx, _| {
@@ -171,12 +177,36 @@ pub fn init(cx: &mut App) {
         Menu::new("View").items([
             MenuItem::action("Focus Composer", FocusComposer),
             MenuItem::action("Focus Sidebar", FocusSidebar),
+            MenuItem::action("Toggle Terminal", ToggleTerminal),
             MenuItem::separator(),
             MenuItem::action("Zoom In", ZoomIn),
             MenuItem::action("Zoom Out", ZoomOut),
             MenuItem::action("Actual Size", ResetZoom),
         ]),
     ]);
+}
+
+/// A focused terminal takes the keys a shell needs: Tab and Shift-Tab
+/// (otherwise focus traversal) and, where `secondary-` is Ctrl, every
+/// Ctrl-letter (otherwise app shortcuts). Copy and paste are ⌘C/⌘V on
+/// macOS and Ctrl-Shift-C/V elsewhere, since Ctrl-C interrupts.
+fn terminal_bindings(cx: &App) -> Vec<KeyBinding> {
+    let terminal = Some(TERMINAL);
+    let mac = cx.platform_info().os == OperatingSystem::Mac;
+    let mut bindings = vec![
+        bind("tab", NoAction, terminal, cx),
+        bind("shift-tab", NoAction, terminal, cx),
+    ];
+    if mac {
+        bindings.push(bind("cmd-c", Copy, terminal, cx));
+        bindings.push(bind("cmd-v", Paste, terminal, cx));
+    } else {
+        bindings.push(bind("ctrl-shift-c", Copy, terminal, cx));
+        bindings.push(bind("ctrl-shift-v", Paste, terminal, cx));
+        bindings
+            .extend(('a'..='z').map(|key| bind(&format!("ctrl-{key}"), NoAction, terminal, cx)));
+    }
+    bindings
 }
 
 /// Closes connections, stops the local server (bounded) and quits.

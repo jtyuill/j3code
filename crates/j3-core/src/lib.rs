@@ -11,5 +11,6 @@ pub mod omp;
 pub mod rpc;
 pub mod serve;
 pub mod store;
+pub mod terminal;
 pub mod title;
 pub mod transcript;

@@ -31,6 +31,7 @@ pub mod model;
 pub mod orchestration;
 pub mod project;
 pub mod server;
+pub mod terminal;
 pub mod thread_search;
 
 use time::format_description::FormatItem;

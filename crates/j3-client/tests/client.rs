@@ -24,6 +24,7 @@ use j3_client::{
             ProviderGoalStatus, RunStatus, SettledOverride, SubagentStatus, ThreadShell,
             TurnItemKind, TurnItemStatus, UserMessageInputIntent,
         },
+        terminal::{TerminalAttachStreamEvent, TerminalSessionStatus},
     },
     workflow::{self, AgentStatus, T3Section, ThreadStatus},
 };
@@ -1321,6 +1322,76 @@ async fn git_status_and_streamed_actions() {
         }
         other => panic!("expected a rejection, got {other:?}"),
     }
+
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn terminal_attach_write_resize_and_close() {
+    let server = TestServer::start("terminal").await;
+    let connection = Connection::open(server.url(), tokio::runtime::Handle::current());
+    live(&connection).await;
+    let project_id = project(&connection, &server).await;
+    let (thread_id, _state, _handle) =
+        launch_running(&connection, &server, &project_id, "shell").await;
+
+    let mut terminal = connection.attach_terminal(&thread_id, "term-1", Some((90, 20)), false);
+    let snapshot = match terminal.next().await.expect("a snapshot").unwrap() {
+        TerminalAttachStreamEvent::Snapshot(snapshot) => snapshot.snapshot,
+        other => panic!("expected a snapshot, got {other:?}"),
+    };
+    assert_eq!(snapshot.status, TerminalSessionStatus::Running);
+    assert_eq!(snapshot.cwd, server.project_dir());
+    connection
+        .write_terminal(&thread_id, "term-1", "echo hi-$((40+2))\n".into())
+        .await
+        .unwrap();
+    connection
+        .resize_terminal(&thread_id, "term-1", 100, 30)
+        .await
+        .unwrap();
+    let mut output = String::new();
+    tokio::time::timeout(WAIT, async {
+        while !output.contains("hi-42") {
+            if let TerminalAttachStreamEvent::Output(chunk) =
+                terminal.next().await.expect("output").unwrap()
+            {
+                output.push_str(&chunk.data);
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("no output; got {output:?}"));
+
+    // Errors carry the server's sentence.
+    match connection
+        .resize_terminal(&thread_id, "term-9", 80, 24)
+        .await
+    {
+        Err(Error::Rejected { tag, message, .. }) => {
+            assert_eq!(tag.as_deref(), Some("TerminalSessionLookupError"));
+            assert!(
+                message.starts_with("Unknown terminal thread: "),
+                "{message}"
+            );
+        }
+        other => panic!("expected a rejection, got {other:?}"),
+    }
+
+    connection
+        .close_terminal(&thread_id, "term-1")
+        .await
+        .unwrap();
+    let ended = tokio::time::timeout(WAIT, async {
+        let mut closed = false;
+        while let Some(event) = terminal.next().await {
+            closed |= matches!(event.unwrap(), TerminalAttachStreamEvent::Closed(_));
+        }
+        closed
+    })
+    .await
+    .unwrap();
+    assert!(ended, "the stream ends with closed");
 
     server.stop().await;
 }

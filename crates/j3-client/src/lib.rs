@@ -16,7 +16,9 @@ mod supervisor;
 mod thread;
 pub mod workflow;
 
-pub use connection::{Answer, Connection, GitAction, GitActionUpdate, SendMode, ThreadHandle};
+pub use connection::{
+    Answer, Connection, GitAction, GitActionUpdate, SendMode, TerminalSession, ThreadHandle,
+};
 pub use error::Error;
 /// The wire types (`j3_protocol::t3`).
 pub use j3_protocol::t3;

@@ -12,6 +12,7 @@ name = "j3"
 path = "src/main.rs"
 
 [dependencies]
+alacritty_terminal = { version = "0.26", default-features = false }
 dirs.workspace = true
 gethostname.workspace = true
 gpui-kit.workspace = true

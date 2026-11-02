@@ -23,6 +23,7 @@ use gpui_kit::component::{
         QuestionnaireProgress, QuestionnaireState, QuestionnaireSubmission, QuestionnaireSubmit,
         QuestionnaireTitle,
     },
+    resizable::{resizable_panel, v_resizable},
     spinner::Spinner,
     text::TextViewState,
     v_flex,
@@ -32,7 +33,7 @@ use gpui_kit::{
     AnyElement, App, AppContext as _, Context, Entity, FocusHandle, Focusable,
     InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
     StatefulInteractiveElement as _, Styled as _, Subscription, Task, TestSupportExt as _, Window,
-    div, rems,
+    div, px, rems,
 };
 use j3_client::{
     Answer, SendMode, ThreadHandle, ThreadState, ThreadSync,
@@ -42,7 +43,7 @@ use j3_client::{
 };
 
 use crate::{
-    actions::{ArchiveThread, DeleteThread, RenameThread},
+    actions::{ArchiveThread, DeleteThread, RenameThread, shortcut},
     agent_hub::{AgentHub, CloseHub},
     composer::{Composer, ComposerEvent, RunState, Submission},
     environment::Environment,
@@ -50,6 +51,7 @@ use crate::{
     feed_view::{RowContext, render_item},
     git_control::GitControl,
     preferences::Preferences,
+    terminal_drawer::{self, HideDrawer, TerminalDrawer},
     titlebar,
 };
 
@@ -96,6 +98,8 @@ pub struct ThreadView {
     todo_open: bool,
     /// The agents hub, shown instead of the feed and composer.
     hub: Option<(Entity<AgentHub>, Subscription)>,
+    /// The thread's terminal drawer, once opened (it outlives this view).
+    terminal: Option<(Entity<TerminalDrawer>, Subscription)>,
     _watch: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
@@ -152,6 +156,12 @@ impl ThreadView {
             cx.observe(&environment, |_, _, cx| cx.notify()),
             cx.observe(&preferences, |_, _, cx| cx.notify()),
         ];
+        let terminal = terminal_drawer::existing(&environment, thread_id, cx).map(|drawer| {
+            (
+                drawer.clone(),
+                cx.subscribe_in(&drawer, window, Self::on_drawer_hidden),
+            )
+        });
         let connection = environment.read(cx).connection().clone();
         let visited = thread_id.to_owned();
         cx.spawn(async move |_, _| {
@@ -177,6 +187,7 @@ impl ThreadView {
             editing: None,
             todo_open: true,
             hub: None,
+            terminal,
             _watch: watch,
             _subscriptions: subscriptions,
         };
@@ -195,6 +206,55 @@ impl ThreadView {
     pub fn focus_composer(&self, window: &mut Window, cx: &mut App) {
         self.composer
             .update(cx, |composer, cx| composer.focus(window, cx));
+    }
+
+    /// Opens the thread's terminal drawer with focus in its terminal, or
+    /// hides it and returns focus to the composer.
+    pub fn toggle_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let drawer = match &self.terminal {
+            Some((drawer, _)) => drawer.clone(),
+            None => {
+                let drawer = terminal_drawer::for_thread(&self.environment, self.thread_id(), cx);
+                let subscription = cx.subscribe_in(&drawer, window, Self::on_drawer_hidden);
+                self.terminal = Some((drawer.clone(), subscription));
+                drawer
+            }
+        };
+        if drawer.update(cx, |drawer, cx| drawer.toggle(cx)) {
+            let focus = drawer.read(cx).focus_handle(cx);
+            focus.focus(window, cx);
+        } else {
+            self.focus_composer(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn on_drawer_hidden(
+        &mut self,
+        _: &Entity<TerminalDrawer>,
+        _: &HideDrawer,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.focus_composer(window, cx);
+        cx.notify();
+    }
+
+    /// The chat column with the open terminal drawer below it, resizable.
+    fn render_terminal_drawer(&self, chat: AnyElement, cx: &App) -> AnyElement {
+        match &self.terminal {
+            Some((drawer, _)) if drawer.read(cx).is_open() => v_resizable("terminal-split")
+                .with_state(drawer.read(cx).split())
+                .child(resizable_panel().child(chat))
+                .child(
+                    resizable_panel()
+                        .size(px(280.))
+                        .size_range(px(120.)..px(2000.))
+                        .child(drawer.clone()),
+                )
+                .into_any_element(),
+            _ => chat,
+        }
     }
 
     pub fn toggle_expanded(&mut self, id: &str, cx: &mut Context<Self>) {
@@ -722,6 +782,17 @@ impl ThreadView {
                     .child(location),
             )
             .child(div().flex_1())
+            .child(
+                Button::new("toggle-terminal")
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::SquareTerminal)
+                    .tooltip(format!(
+                        "Toggle terminal ({})",
+                        shortcut(terminal_drawer::TOGGLE_KEYS, cx)
+                    ))
+                    .on_click(cx.listener(|this, _, window, cx| this.toggle_terminal(window, cx))),
+            )
             .child(self.git.clone())
             .child(
                 Button::new("thread-actions")
@@ -1344,12 +1415,9 @@ impl Render for ThreadView {
         let queue = self.render_queue(cx);
         let question = self.render_question(cx);
         let goal = self.render_goal(cx);
-        let theme = cx.theme();
         let measure = self.preferences.read(cx).ui().measure();
-        v_flex()
+        let chat = v_flex()
             .size_full()
-            .bg(theme.background)
-            .child(header)
             .child(div().flex_1().min_h_0().pt_3().child(feed))
             .child(
                 // Extra air between the last message and the composer.
@@ -1371,6 +1439,13 @@ impl Render for ThreadView {
                             .child(self.composer.clone()),
                     ),
             )
+            .into_any_element();
+        let body = self.render_terminal_drawer(chat, cx);
+        v_flex()
+            .size_full()
+            .bg(cx.theme().background)
+            .child(header)
+            .child(body)
     }
 }
 

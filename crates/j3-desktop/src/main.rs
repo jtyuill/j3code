@@ -27,6 +27,8 @@ mod preferences;
 mod services;
 mod settings_view;
 mod sidebar;
+mod terminal_drawer;
+mod terminal_view;
 mod thread_view;
 mod titlebar;
 mod ui_settings;

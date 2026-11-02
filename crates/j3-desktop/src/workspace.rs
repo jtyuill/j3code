@@ -31,7 +31,7 @@ use crate::{
     actions::{
         AddEnvironment, AddProject, ArchiveThread, DeleteThread, FocusComposer, FocusSidebar,
         GotoAgent, JumpToThread, NewThread, NextThread, OpenSettings, PreviousThread, RenameThread,
-        ResetZoom, SettleThread, ShowArchived, StopRun, WORKSPACE, ZoomIn, ZoomOut,
+        ResetZoom, SettleThread, ShowArchived, StopRun, ToggleTerminal, WORKSPACE, ZoomIn, ZoomOut,
     },
     attention::{Alert, AttentionMonitor},
     dialogs::{EnvironmentForm, ProjectCreated, ProjectPicker, SnoozeForm, footer},
@@ -1218,6 +1218,11 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &StopRun, window, cx| {
                 if let Some(view) = this.current_thread().cloned() {
                     view.update(cx, |view, cx| view.stop(window, cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ToggleTerminal, window, cx| {
+                if let Some(view) = this.current_thread().cloned() {
+                    view.update(cx, |view, cx| view.toggle_terminal(window, cx));
                 }
             }))
             .on_action(cx.listener(|this, _: &RenameThread, window, cx| {
