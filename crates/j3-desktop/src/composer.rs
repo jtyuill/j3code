@@ -20,7 +20,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     Anchor, AnyElement, App, AppContext as _, ClipboardEntry, ClipboardItem, Context, Entity,
     EventEmitter, FocusHandle, Focusable, Image, ImageFormat, ImageSource, InteractiveElement as _,
-    IntoElement, KeyDownEvent, ObjectFit, ParentElement as _, Render, SharedString,
+    IntoElement, KeyDownEvent, MouseButton, ObjectFit, ParentElement as _, Render, SharedString,
     StatefulInteractiveElement as _, Styled as _, StyledImage as _, Subscription, Task,
     TestSupportExt as _, WeakEntity, Window, div, img, px, rems,
 };
@@ -32,6 +32,7 @@ use crate::{
     environment::Environment,
     logos,
     models::{self, ModelChoice},
+    preferences::Preferences,
     usage::{self, UsagePanel, UsageStore},
 };
 
@@ -107,65 +108,133 @@ struct PendingImage {
 }
 
 #[derive(Clone)]
-struct ModelItem(ModelChoice);
+struct ModelItem {
+    choice: ModelChoice,
+    favorite: bool,
+    /// Where the row's star saves the favourite.
+    preferences: WeakEntity<Preferences>,
+}
 
-impl SearchableListItem for ModelItem {
-    type Value = (String, String);
-
-    fn title(&self) -> SharedString {
-        self.0.name.clone().into()
-    }
-
-    fn render(&self, _: &mut Window, cx: &mut App) -> impl IntoElement {
-        let id = self
-            .0
-            .slug()
-            .split_once('/')
-            .map_or(self.0.slug(), |(_, id)| id);
+impl ModelItem {
+    /// The whole row: name and id, then the star and the chosen check, so
+    /// the stars line up at the right edge.
+    fn row(&self, checked: bool, cx: &App) -> gpui_kit::Div {
+        let slug = self.choice.slug();
+        let id = slug.split_once('/').map_or(slug, |(_, id)| id);
+        let theme = cx.theme();
+        let (icon, color) = if self.favorite {
+            (Lucide::StarFill, theme.warning)
+        } else {
+            (Lucide::Star, theme.muted_foreground.opacity(0.6))
+        };
+        let preferences = self.preferences.clone();
+        let model = slug.to_owned();
         h_flex()
+            .w_full()
             .gap_2()
             .min_w_0()
-            .child(div().flex_none().child(self.0.name.clone()))
-            .when(id != self.0.name, |this| {
+            .child(div().flex_none().child(self.choice.name.clone()))
+            .when(id != self.choice.name, |this| {
                 this.child(
                     div()
                         .min_w_0()
                         .truncate()
                         .text_xs()
-                        .text_color(cx.theme().muted_foreground)
+                        .text_color(theme.muted_foreground)
                         .child(id.to_owned()),
                 )
             })
-    }
-
-    fn value(&self) -> &Self::Value {
-        &self.0.key
-    }
-
-    fn matches(&self, query: &str) -> bool {
-        self.0.name.to_lowercase().contains(query) || self.0.slug().to_lowercase().contains(query)
+            .child(div().flex_1())
+            .child(
+                // The row confirms on click; the star's own mouse-down stops
+                // that, so starring does not pick the model.
+                div()
+                    .flex_none()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("favorite-{slug}")))
+                            .test_support()
+                            .aria_label(if self.favorite {
+                                "Unstar model"
+                            } else {
+                                "Star model"
+                            })
+                            .p_0p5()
+                            .rounded(theme.radius)
+                            .hover(|this| this.bg(theme.muted))
+                            .child(Icon::new(icon).xsmall().text_color(color))
+                            .on_click(move |_, _, cx| {
+                                cx.stop_propagation();
+                                let _ = preferences.update(cx, |preferences, cx| {
+                                    preferences.update_ui(|ui| ui.toggle_favorite(&model), cx)
+                                });
+                            }),
+                    ),
+            )
+            .child(div().flex_none().w(px(14.)).when(checked, |this| {
+                this.child(Icon::new(IconName::Check).xsmall())
+            }))
     }
 }
 
-/// The model list, one section per provider, headed by its logo and name.
+impl SearchableListItem for ModelItem {
+    type Value = (String, String);
+
+    fn title(&self) -> SharedString {
+        self.choice.name.clone().into()
+    }
+
+    fn render(&self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+        self.row(false, cx)
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.choice.key
+    }
+
+    fn matches(&self, query: &str) -> bool {
+        self.choice.name.to_lowercase().contains(query)
+            || self.choice.slug().to_lowercase().contains(query)
+    }
+}
+
+/// The model list: the starred models first, then one section per
+/// provider, headed by its logo and name.
 struct ModelGroups {
-    /// `(provider, models)`.
-    groups: Vec<(String, Vec<ModelItem>)>,
+    /// `(provider, models)`; `None` is the favourites section.
+    groups: Vec<(Option<String>, Vec<ModelItem>)>,
     /// The shown sections after the last search: `(group, shown rows)`.
     shown: Vec<(usize, Vec<usize>)>,
 }
 
 impl ModelGroups {
-    fn new(choices: &[ModelChoice]) -> Self {
-        let groups: Vec<(String, Vec<ModelItem>)> = models::by_provider(choices)
+    fn new(
+        choices: &[ModelChoice],
+        favorites: &[String],
+        preferences: &WeakEntity<Preferences>,
+    ) -> Self {
+        let item = |choice: &ModelChoice| ModelItem {
+            choice: choice.clone(),
+            favorite: favorites.iter().any(|f| f == choice.slug()),
+            preferences: preferences.clone(),
+        };
+        let starred: Vec<ModelItem> = favorites
+            .iter()
+            .filter_map(|slug| choices.iter().find(|c| c.slug() == slug))
+            .map(item)
+            .collect();
+        let groups: Vec<(Option<String>, Vec<ModelItem>)> = (!starred.is_empty())
+            .then_some((None, starred))
             .into_iter()
-            .map(|(provider, rows)| {
-                let items = rows
+            .chain(
+                models::by_provider(choices)
                     .into_iter()
-                    .map(|ix| ModelItem(choices[ix].clone()))
-                    .collect();
-                (provider.to_owned(), items)
-            })
+                    .map(|(provider, rows)| {
+                        let items = rows.into_iter().map(|ix| item(&choices[ix])).collect();
+                        (Some(provider.to_owned()), items)
+                    }),
+            )
             .collect();
         let shown = groups
             .iter()
@@ -215,11 +284,13 @@ impl SearchableListDelegate for ModelGroups {
             .iter()
             .enumerate()
             .filter_map(|(ix, (provider, items))| {
-                let rows: Vec<usize> = if provider.contains(&query)
-                    || logos::provider_name(provider)
-                        .to_lowercase()
-                        .contains(&query)
-                {
+                let names_provider = provider.as_deref().is_some_and(|provider| {
+                    provider.contains(&query)
+                        || logos::provider_name(provider)
+                            .to_lowercase()
+                            .contains(&query)
+                });
+                let rows: Vec<usize> = if names_provider {
                     (0..items.len()).collect()
                 } else {
                     (0..items.len())
@@ -232,6 +303,19 @@ impl SearchableListDelegate for ModelGroups {
         Task::ready(())
     }
 
+    /// Rows render themselves at full width, with their own check, so the
+    /// stars line up (the default wrapper sizes a row to its text).
+    fn render_item(
+        &self,
+        _: IndexPath,
+        item: &ModelItem,
+        checked: bool,
+        _: &mut Window,
+        cx: &mut App,
+    ) -> Option<AnyElement> {
+        Some(item.row(checked, cx).into_any_element())
+    }
+
     fn render_section_header(
         &self,
         section: usize,
@@ -239,19 +323,27 @@ impl SearchableListDelegate for ModelGroups {
         cx: &mut App,
     ) -> Option<AnyElement> {
         let (group, _) = self.shown.get(section)?;
-        let provider = &self.groups[*group].0;
-        Some(
-            h_flex()
-                .gap_1p5()
-                .px_2()
-                .pt_1p5()
-                .pb_0p5()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
+        let header = h_flex()
+            .gap_1p5()
+            .px_2()
+            .pt_1p5()
+            .pb_0p5()
+            .text_xs()
+            .text_color(cx.theme().muted_foreground);
+        Some(match &self.groups[*group].0 {
+            Some(provider) => header
                 .child(logos::provider_logo(provider, px(14.), cx))
                 .child(logos::provider_name(provider).to_owned())
                 .into_any_element(),
-        )
+            None => header
+                .child(
+                    Icon::new(Lucide::StarFill)
+                        .xsmall()
+                        .text_color(cx.theme().warning),
+                )
+                .child("Favorites")
+                .into_any_element(),
+        })
     }
 }
 
@@ -268,6 +360,9 @@ pub struct Composer {
     images: Vec<PendingImage>,
     next_image: u64,
     choices: Vec<ModelChoice>,
+    /// Starred model slugs the picker was last built with.
+    favorites: Vec<String>,
+    preferences: Entity<Preferences>,
     /// The model picker; the chosen thinking level is in its footer.
     model: Entity<ComboboxState<ModelGroups>>,
     level_descriptor: Option<String>,
@@ -293,8 +388,10 @@ impl EventEmitter<ComposerEvent> for Composer {}
 
 impl Composer {
     /// `preferred` preselects a model (the thread's, or a project default).
+    /// `preferences` holds the starred models.
     pub fn new(
         environment: Entity<Environment>,
+        preferences: Entity<Preferences>,
         cwd: String,
         preferred: Option<ModelSelection>,
         window: &mut Window,
@@ -307,7 +404,8 @@ impl Composer {
                 .placeholder("Message omp…")
         });
         let model = cx.new(|cx| {
-            ComboboxState::new(ModelGroups::new(&[]), Vec::new(), window, cx).searchable(true)
+            let items = ModelGroups::new(&[], &[], &preferences.downgrade());
+            ComboboxState::new(items, Vec::new(), window, cx).searchable(true)
         });
         let usage = cx.new(|cx| UsagePanel::new(environment.clone(), cx));
         let usage_store = UsageStore::global(cx);
@@ -332,6 +430,9 @@ impl Composer {
             cx.observe_in(&environment, window, |this, _, window, cx| {
                 this.sync_config(window, cx)
             }),
+            cx.observe_in(&preferences, window, |this, _, window, cx| {
+                this.sync_favorites(window, cx)
+            }),
             // The button shows the cached peak.
             cx.observe(&usage_store, |_, _, cx| cx.notify()),
         ];
@@ -342,6 +443,8 @@ impl Composer {
             images: Vec::new(),
             next_image: 0,
             choices: Vec::new(),
+            favorites: preferences.read(cx).ui().favorite_models.clone(),
+            preferences,
             model,
             level_descriptor: None,
             levels: Vec::new(),
@@ -564,7 +667,7 @@ impl Composer {
             let initial = models::initial_choice(&choices, current.as_ref());
             self.choices = choices;
             let key = initial.map(|ix| self.choices[ix].key.clone());
-            let items = ModelGroups::new(&self.choices);
+            let items = self.model_groups();
             self.model.update(cx, |model, cx| {
                 model.set_items(items, window, cx);
                 model.set_selected_values(key.as_slice(), window, cx);
@@ -573,6 +676,31 @@ impl Composer {
                 self.sync_levels(&choice, cx);
             }
         }
+        cx.notify();
+    }
+
+    fn model_groups(&self) -> ModelGroups {
+        ModelGroups::new(
+            &self.choices,
+            &self.favorites,
+            &self.preferences.downgrade(),
+        )
+    }
+
+    /// Rebuilds the model list when the starred models change, keeping the
+    /// chosen model.
+    fn sync_favorites(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let favorites = &self.preferences.read(cx).ui().favorite_models;
+        if *favorites == self.favorites {
+            return;
+        }
+        self.favorites = favorites.clone();
+        let items = self.model_groups();
+        let key = self.choice(cx).map(|choice| choice.key.clone());
+        self.model.update(cx, |model, cx| {
+            model.set_items(items, window, cx);
+            model.set_selected_values(key.as_slice(), window, cx);
+        });
         cx.notify();
     }
 

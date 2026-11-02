@@ -67,6 +67,10 @@ pub struct UiSettings {
     pub mono_font: Option<String>,
     /// Scale of the whole interface; 1 is 100%.
     pub zoom: f32,
+    /// Starred models (slugs such as `anthropic/claude-opus-5-5`), pinned
+    /// to the top of the model picker in starring order.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub favorite_models: Vec<String>,
 }
 
 impl Default for UiSettings {
@@ -82,6 +86,7 @@ impl Default for UiSettings {
             text_measure: DEFAULT_TEXT_MEASURE,
             ui_font: None,
             mono_font: None,
+            favorite_models: Vec::new(),
             zoom: 1.,
         }
     }
@@ -128,6 +133,19 @@ impl UiSettings {
                 .find(|&level| level < zoom - 1e-3)
         };
         next.unwrap_or(zoom)
+    }
+
+    pub fn is_favorite(&self, model: &str) -> bool {
+        self.favorite_models.iter().any(|m| m == model)
+    }
+
+    /// Stars `model` (added last) or unstars it.
+    pub fn toggle_favorite(&mut self, model: &str) {
+        if self.is_favorite(model) {
+            self.favorite_models.retain(|m| m != model);
+        } else {
+            self.favorite_models.push(model.to_owned());
+        }
     }
 }
 
@@ -196,21 +214,26 @@ mod tests {
             text_measure: 42.,
             ui_font: Some("Inter".into()),
             mono_font: None,
+            favorite_models: Vec::new(),
             zoom: 1.25,
         };
         ui.set_expanded(Shelf::Settled, true);
         ui.set_expanded(Shelf::Working, true);
         ui.set_expanded(Shelf::Working, false);
+        ui.toggle_favorite("a/one");
+        ui.toggle_favorite("b/two");
+        ui.toggle_favorite("b/two");
         let value = serde_json::to_value(&ui).unwrap();
         assert_eq!(
             value,
             json!({"workflow": "herdr", "workingShelf": false, "statusIndicators": "symbols",
                 "agentOrder": "attention", "toasts": false, "sounds": true,
                 "expandedShelves": ["settled"], "textMeasure": 42.0, "uiFont": "Inter",
-                "zoom": 1.25})
+                "favoriteModels": ["a/one"], "zoom": 1.25})
         );
         assert_eq!(serde_json::from_value::<UiSettings>(value).unwrap(), ui);
         assert!(ui.is_expanded(Shelf::Settled));
         assert!(!ui.is_expanded(Shelf::Working));
+        assert!(ui.is_favorite("a/one") && !ui.is_favorite("b/two"));
     }
 }

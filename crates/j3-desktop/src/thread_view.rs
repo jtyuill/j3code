@@ -135,7 +135,16 @@ impl ThreadView {
                 }
             }
         });
-        let composer = cx.new(|cx| Composer::new(environment.clone(), cwd, preferred, window, cx));
+        let composer = cx.new(|cx| {
+            Composer::new(
+                environment.clone(),
+                preferences.clone(),
+                cwd,
+                preferred,
+                window,
+                cx,
+            )
+        });
         let git = cx.new(|cx| GitControl::new(environment.clone(), thread_id, cx));
         let scroller = cx.new(|cx| MessageScrollerState::new(0, cx));
         let subscriptions = vec![

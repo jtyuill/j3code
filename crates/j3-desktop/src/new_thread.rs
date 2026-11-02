@@ -253,7 +253,9 @@ impl NewThreadView {
             return;
         }
         let environment = self.environment.clone();
-        let composer = cx.new(|cx| Composer::new(environment, cwd, preferred, window, cx));
+        let preferences = self.preferences.clone();
+        let composer =
+            cx.new(|cx| Composer::new(environment, preferences, cwd, preferred, window, cx));
         self._composer_subscription =
             Some(cx.subscribe_in(&composer, window, Self::on_composer_event));
         composer.update(cx, |composer, cx| composer.focus(window, cx));
