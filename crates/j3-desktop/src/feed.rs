@@ -1,8 +1,12 @@
 //! Presentation snapshots of turn items for the thread feed: which items
-//! show, and the one-line summary and expandable detail of tool rows.
+//! show, and how a tool call reads, modelled on omp's own TUI renderers: an
+//! icon, a title (`Bash`, `Read`, `Edit`, …), what it acted on, dim meta
+//! (`+3 −1`, `12 matches · 3 files`, `2.1s`) and a body (the command and its
+//! output, the diff, the matches) of which a few lines show until expanded.
 
 use j3_protocol::t3::orchestration::{
-    TurnItem, TurnItemKind, TurnItemStatus, UserMessageInputIntent,
+    CommandExecutionItem, DynamicToolItem, FileChangeItem, FileSearchItem, TurnItem, TurnItemKind,
+    TurnItemStatus, UserMessageInputIntent, WebSearchItem,
 };
 use serde_json::Value;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -24,27 +28,113 @@ pub fn is_hidden(item: &TurnItem) -> bool {
     }
 }
 
+/// What a tool did, which picks its icon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolIcon {
     Terminal,
-    File,
-    Search,
+    Read,
+    Edit,
+    Write,
+    Delete,
+    Grep,
+    Glob,
     Web,
+    Eval,
+    Task,
+    Todo,
+    Wait,
+    Message,
+    Device,
+    Process,
+    Lsp,
+    Ast,
+    Debug,
+    Browser,
+    Github,
+    Memory,
     Tool,
 }
 
-/// The collapsed row and expanded body of a tool item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolStatus {
+    Running,
+    Done,
+    Failed,
+}
+
+/// How a meta part is coloured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tone {
+    Muted,
+    Added,
+    Removed,
+    Failed,
+}
+
+/// The expandable body under a tool's header.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ToolSummary {
+pub enum ToolBody {
+    /// `$ command`, then its output (bash).
+    Command { command: String, output: String },
+    /// A diff: omp's `+12|text` / `-12|text` / ` 12|text` lines, or unified.
+    Diff(String),
+    /// File text, numbered from `first_line`.
+    Code { text: String, first_line: usize },
+    /// Result lines drawn as a tree (search hits, files, sources).
+    List(Vec<String>),
+    /// Labelled monospace sections, such as a script and its output.
+    Sections(Vec<(Option<String>, String)>),
+}
+
+impl ToolBody {
+    /// The body's line count, as the expander counts it.
+    pub fn lines(&self) -> usize {
+        match self {
+            Self::Command { output, .. } => output.lines().count(),
+            Self::Diff(text) | Self::Code { text, .. } => text.lines().count(),
+            Self::List(lines) => lines.len(),
+            Self::Sections(sections) => sections.iter().map(|(_, text)| text.lines().count()).sum(),
+        }
+    }
+}
+
+/// omp's numbered file text (`12:line` rows, one contiguous range) as code
+/// starting at its first number; `None` for anything else.
+fn numbered(text: &str) -> Option<ToolBody> {
+    let mut first_line = None;
+    let mut lines = Vec::new();
+    for (ix, row) in text.lines().enumerate() {
+        let (number, line) = row.split_once(':')?;
+        let number: usize = number.trim().parse().ok()?;
+        let first = *first_line.get_or_insert(number);
+        if number != first + ix {
+            return None;
+        }
+        lines.push(line);
+    }
+    Some(ToolBody::Code {
+        text: lines.join("\n"),
+        first_line: first_line?,
+    })
+}
+
+/// One tool row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolView {
     pub icon: ToolIcon,
-    /// What ran, e.g. `bash` or the tool name.
+    /// omp's name for the tool, e.g. `Bash`, `Read`, `Edit`.
     pub title: String,
-    /// One line describing the call.
-    pub subtitle: String,
-    /// Monospace body shown when expanded.
-    pub detail: Option<String>,
-    pub failed: bool,
-    pub running: bool,
+    /// What it acted on, one line: the command, path, pattern or query.
+    pub description: String,
+    /// The agent's intent for the call (`Reading the plan`), when given.
+    pub intent: Option<String>,
+    /// The description is prose (an intent), not code: no monospace.
+    pub prose: bool,
+    pub meta: Vec<(String, Tone)>,
+    pub body: Option<ToolBody>,
+    /// Body lines shown while collapsed; 0 shows only the header.
+    pub preview: usize,
+    pub status: ToolStatus,
 }
 
 /// First line of `text`, cut to [`SUMMARY_CHARS`] characters.
@@ -58,28 +148,13 @@ pub fn one_line(text: &str) -> String {
     out
 }
 
-/// A compact rendering of a dynamic tool's JSON input: the string value of
-/// a lone field, else `key: value` pairs, else the JSON itself.
-fn input_summary(input: &Value) -> String {
-    match input {
-        Value::Object(map) if map.len() == 1 => match map.values().next() {
-            Some(Value::String(s)) => one_line(s),
-            Some(other) => one_line(&other.to_string()),
-            None => String::new(),
-        },
-        Value::Object(map) => one_line(
-            &map.iter()
-                .map(|(key, value)| match value {
-                    Value::String(s) => format!("{key}: {}", one_line(s)),
-                    other => format!("{key}: {other}"),
-                })
-                .collect::<Vec<_>>()
-                .join(", "),
-        ),
-        Value::String(s) => one_line(s),
-        Value::Null => String::new(),
-        other => one_line(&other.to_string()),
-    }
+/// `n` with its noun, singular for one: `1 match`, `3 matches`.
+fn count(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+fn muted(text: impl Into<String>) -> (String, Tone) {
+    (text.into(), Tone::Muted)
 }
 
 fn pretty(value: &Value) -> String {
@@ -89,140 +164,520 @@ fn pretty(value: &Value) -> String {
     }
 }
 
-fn join_nonempty(parts: impl IntoIterator<Item = String>) -> Option<String> {
-    let joined = parts
-        .into_iter()
-        .filter(|part| !part.trim().is_empty())
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    (!joined.is_empty()).then_some(joined)
+fn str_arg<'a>(input: &'a Value, key: &str) -> Option<&'a str> {
+    input
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+/// A compact rendering of a tool's JSON input: the string value of a lone
+/// field, else `key=value` pairs, else the JSON itself. The intent (`i`)
+/// is left out; it shows on its own.
+fn input_summary(input: &Value) -> String {
+    match input {
+        Value::Object(map) => {
+            let fields: Vec<(&String, &Value)> =
+                map.iter().filter(|(key, _)| *key != "i").collect();
+            match fields.as_slice() {
+                [] => String::new(),
+                [(_, Value::String(s))] => one_line(s),
+                fields => one_line(
+                    &fields
+                        .iter()
+                        .map(|(key, value)| match value {
+                            Value::String(s) => format!("{key}={}", one_line(s)),
+                            other => format!("{key}={other}"),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ),
+            }
+        }
+        Value::String(s) => one_line(s),
+        Value::Null => String::new(),
+        other => one_line(&other.to_string()),
+    }
+}
+
+/// `snake_case` tool name as a title: `ast_grep` → `Ast grep`.
+fn humanize(name: &str) -> String {
+    let words = name.replace(['_', '-'], " ");
+    let mut chars = words.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => "Tool".to_owned(),
+    }
+}
+
+/// The file a hashline `edit` input names first (`[PATH#TAG]`).
+fn hashline_path(input: &str) -> Option<&str> {
+    input.lines().find_map(|line| {
+        let inner = line.trim().strip_prefix('[')?.strip_suffix(']')?;
+        let (path, tag) = inner.rsplit_once('#')?;
+        (tag.len() == 4 && tag.chars().all(|c| c.is_ascii_hexdigit())).then_some(path.trim())
+    })
+}
+
+/// A run time like `340ms`, `2.1s`, `1m 05s`, from the item's start and end.
+fn duration(item: &TurnItem) -> Option<String> {
+    let parse = |iso: &Option<String>| OffsetDateTime::parse(iso.as_deref()?, &Rfc3339).ok();
+    let elapsed = parse(&item.completed_at)? - parse(&item.started_at)?;
+    let ms = elapsed.whole_milliseconds().max(0);
+    Some(match ms {
+        0..1_000 => format!("{ms}ms"),
+        1_000..60_000 => format!("{:.1}s", ms as f64 / 1_000.),
+        _ => format!("{}m {:02}s", ms / 60_000, ms % 60_000 / 1_000),
+    })
 }
 
 /// The tool row for `item`, or `None` if it is not a tool item.
-pub fn tool_summary(item: &TurnItem) -> Option<ToolSummary> {
-    let running = matches!(
-        item.status,
-        TurnItemStatus::Pending | TurnItemStatus::Running | TurnItemStatus::Waiting
-    );
-    let status_failed = item.status == TurnItemStatus::Failed;
-    let title = |fallback: &str| {
-        item.title
-            .clone()
-            .filter(|t| !t.trim().is_empty())
-            .unwrap_or_else(|| fallback.to_owned())
-    };
-    let summary = match &item.kind {
-        TurnItemKind::CommandExecution(command) => ToolSummary {
-            icon: ToolIcon::Terminal,
-            title: title("bash"),
-            subtitle: one_line(&command.input),
-            detail: join_nonempty([
-                format!("$ {}", command.input.trim_end()),
-                command.output.clone().unwrap_or_default(),
-                command
-                    .exit_code
-                    .filter(|code| *code != 0)
-                    .map(|code| format!("exit code {code}"))
-                    .unwrap_or_default(),
-            ]),
-            failed: status_failed
-                || command.exit_code.is_some_and(|code| code != 0)
-                || command.output_indicates_failure == Some(true),
-            running,
-        },
-        TurnItemKind::FileChange(change) => {
-            let counts = match (change.additions, change.deletions) {
-                (None, None) => String::new(),
-                (additions, deletions) => {
-                    format!("  +{} −{}", additions.unwrap_or(0), deletions.unwrap_or(0))
-                }
-            };
-            ToolSummary {
-                icon: ToolIcon::File,
-                title: title("edit"),
-                subtitle: format!("{}{counts}", change.file_name),
-                detail: change
-                    .diff_str
-                    .clone()
-                    .or_else(|| change.new_str.clone())
-                    .filter(|d| !d.trim().is_empty()),
-                failed: status_failed,
-                running,
-            }
+pub fn tool_view(item: &TurnItem) -> Option<ToolView> {
+    let status = match item.status {
+        TurnItemStatus::Pending | TurnItemStatus::Running | TurnItemStatus::Waiting => {
+            ToolStatus::Running
         }
-        TurnItemKind::FileSearch(search) => ToolSummary {
-            icon: ToolIcon::Search,
-            title: title("search"),
-            subtitle: search.pattern.as_deref().map(one_line).unwrap_or_default(),
-            detail: search.results.as_ref().and_then(|results| {
-                join_nonempty([results
-                    .iter()
-                    .map(|result| {
-                        let mut line = result.file_name.clone();
-                        if let Some(n) = result.line {
-                            line.push_str(&format!(":{n}"));
-                        }
-                        if let Some(preview) = &result.preview {
-                            line.push_str(&format!("  {}", preview.trim()));
-                        }
-                        line
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")])
-            }),
-            failed: status_failed,
-            running,
-        },
-        TurnItemKind::WebSearch(search) => ToolSummary {
-            icon: ToolIcon::Web,
-            title: title("web search"),
-            subtitle: search
-                .patterns
-                .as_ref()
-                .map(|p| one_line(&p.join(", ")))
-                .unwrap_or_default(),
-            detail: search.results.as_ref().and_then(|results| {
-                join_nonempty([results
-                    .iter()
-                    .map(|result| {
-                        [
-                            result.title.clone(),
-                            result.url.clone(),
-                            result.snippet.clone(),
-                        ]
-                        .into_iter()
-                        .flatten()
-                        .collect::<Vec<_>>()
-                        .join(" — ")
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")])
-            }),
-            failed: status_failed,
-            running,
-        },
-        TurnItemKind::DynamicTool(tool) => ToolSummary {
-            icon: ToolIcon::Tool,
-            title: tool
-                .tool_name
-                .clone()
-                .filter(|n| !n.trim().is_empty())
-                .unwrap_or_else(|| title("tool")),
-            subtitle: input_summary(&tool.input),
-            detail: join_nonempty([
-                pretty(&tool.input),
-                tool.output
-                    .as_ref()
-                    .and_then(|o| o.as_ref())
-                    .map(pretty)
-                    .unwrap_or_default(),
-            ]),
-            failed: status_failed,
-            running,
-        },
+        TurnItemStatus::Failed => ToolStatus::Failed,
+        _ => ToolStatus::Done,
+    };
+    let mut view = match &item.kind {
+        TurnItemKind::CommandExecution(command) => command_view(command),
+        TurnItemKind::FileChange(change) => file_change_view(change),
+        TurnItemKind::FileSearch(search) => file_search_view(search),
+        TurnItemKind::WebSearch(search) => web_search_view(search),
+        TurnItemKind::DynamicTool(tool) => dynamic_view(tool),
         _ => return None,
     };
-    Some(summary)
+    view.status = match (status, &item.kind) {
+        (ToolStatus::Done, TurnItemKind::CommandExecution(command))
+            if command.exit_code.is_some_and(|code| code != 0)
+                || command.output_indicates_failure == Some(true) =>
+        {
+            ToolStatus::Failed
+        }
+        _ => status,
+    };
+    // The server titles a row with the call's intent, else the tool name.
+    view.intent = item
+        .title
+        .clone()
+        .filter(|title| !title.trim().is_empty() && !title.eq_ignore_ascii_case(&view.title))
+        .filter(|title| match &item.kind {
+            TurnItemKind::DynamicTool(tool) => tool.tool_name.as_deref() != Some(title.as_str()),
+            _ => !matches!(
+                title.as_str(),
+                "bash" | "edit" | "write" | "grep" | "glob" | "find"
+            ),
+        });
+    if view.status != ToolStatus::Running
+        && let Some(elapsed) = duration(item)
+    {
+        view.meta.push(muted(elapsed));
+    }
+    // A command shows itself in its box; the header says what it is for.
+    if matches!(item.kind, TurnItemKind::CommandExecution(_))
+        && let Some(intent) = view.intent.take()
+    {
+        view.description = intent;
+        view.prose = true;
+    }
+    Some(view)
+}
+
+fn base(icon: ToolIcon, title: &str, description: String) -> ToolView {
+    ToolView {
+        icon,
+        title: title.to_owned(),
+        description,
+        intent: None,
+        prose: false,
+        meta: Vec::new(),
+        body: None,
+        preview: 0,
+        status: ToolStatus::Done,
+    }
+}
+
+fn command_view(command: &CommandExecutionItem) -> ToolView {
+    let mut view = base(ToolIcon::Terminal, "Bash", one_line(&command.input));
+    if let Some(code) = command.exit_code.filter(|code| *code != 0) {
+        view.meta.push((format!("exit {code}"), Tone::Failed));
+    }
+    view.body = Some(ToolBody::Command {
+        command: command.input.trim_end().to_owned(),
+        output: strip_notices(command.output.as_deref().unwrap_or_default()).to_owned(),
+    });
+    view.preview = 6;
+    view
+}
+
+/// The output without the notices omp appends for the model (`Wall time:
+/// 5.26 seconds`, `Command exited with code 1`); the row shows the run time
+/// and exit code itself.
+fn strip_notices(output: &str) -> &str {
+    let mut output = output.trim_end();
+    loop {
+        let (rest, last) = output.rsplit_once('\n').unwrap_or(("", output));
+        if !(last.starts_with("Wall time: ") || last.starts_with("Command exited with code ")) {
+            return output;
+        }
+        output = rest.trim_end();
+    }
+}
+
+fn file_change_view(change: &FileChangeItem) -> ToolView {
+    // Servers before the scheme check sent writes to `agent://` and the
+    // like as file changes.
+    if change.file_name.contains("://") {
+        return write_view(&change.file_name, change.new_str.as_deref(), None);
+    }
+    let diff = change.diff_str.as_deref().filter(|d| !d.trim().is_empty());
+    match (diff, change.new_str.as_deref()) {
+        (None, Some(content)) => {
+            let mut view = base(ToolIcon::Write, "Write", change.file_name.clone());
+            view.meta
+                .push(muted(count(content.lines().count(), "line", "lines")));
+            view.body = Some(ToolBody::Code {
+                text: content.trim_end().to_owned(),
+                first_line: 1,
+            });
+            view.preview = 8;
+            view
+        }
+        _ => {
+            let mut view = base(ToolIcon::Edit, "Edit", change.file_name.clone());
+            if let (Some(added), Some(removed)) = (change.additions, change.deletions) {
+                view.meta.push((format!("+{added}"), Tone::Added));
+                view.meta.push((format!("−{removed}"), Tone::Removed));
+            }
+            view.body = diff.map(|diff| ToolBody::Diff(diff.trim_end().to_owned()));
+            view.preview = 12;
+            view
+        }
+    }
+}
+
+/// omp's `write`: a file, or an internal URL — a message to a peer agent
+/// (`agent://`), a tool device call (`xd://`), a job command (`proc://`).
+fn write_view(path: &str, content: Option<&str>, output: Option<String>) -> ToolView {
+    match path.split_once("://") {
+        Some(("agent", peer)) => {
+            let mut view = base(ToolIcon::Message, "Message", format!("→ {peer}"));
+            view.body = content.map(|content| ToolBody::Sections(vec![(None, content.to_owned())]));
+            view.preview = 3;
+            view
+        }
+        Some(("xd", device)) => {
+            let device = device.strip_prefix("mcp__").unwrap_or(device);
+            let mut view = base(ToolIcon::Device, "Tool", device.replace("__", " › "));
+            let sections: Vec<(Option<String>, String)> = [
+                content.map(|c| (Some("Input".to_owned()), c.to_owned())),
+                output.map(|o| (Some("Output".to_owned()), o)),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            view.body = (!sections.is_empty()).then_some(ToolBody::Sections(sections));
+            view
+        }
+        Some(("proc", target)) => base(ToolIcon::Process, "Proc", target.to_owned()),
+        _ => {
+            let mut view = base(ToolIcon::Write, "Write", path.to_owned());
+            if let Some(content) = content {
+                view.meta
+                    .push(muted(count(content.lines().count(), "line", "lines")));
+                view.body = Some(ToolBody::Code {
+                    text: content.to_owned(),
+                    first_line: 1,
+                });
+                view.preview = 8;
+            }
+            view
+        }
+    }
+}
+
+fn file_search_view(search: &FileSearchItem) -> ToolView {
+    let pattern = search.pattern.as_deref().map(one_line).unwrap_or_default();
+    let results = search.results.as_deref().unwrap_or_default();
+    let grep = results.iter().any(|r| r.line.is_some())
+        || (results.is_empty() && !pattern.contains(['*', '?', '{']));
+    let mut view = if grep {
+        base(ToolIcon::Grep, "Grep", pattern)
+    } else {
+        base(ToolIcon::Glob, "Glob", pattern)
+    };
+    if search.results.is_some() {
+        let mut files: Vec<&str> = results.iter().map(|r| r.file_name.as_str()).collect();
+        files.dedup();
+        view.meta.push(muted(if grep {
+            format!(
+                "{} · {}",
+                count(results.len(), "match", "matches"),
+                count(files.len(), "file", "files")
+            )
+        } else {
+            count(results.len(), "file", "files")
+        }));
+    }
+    if !results.is_empty() {
+        view.body = Some(ToolBody::List(
+            results
+                .iter()
+                .map(|result| {
+                    let mut line = result.file_name.clone();
+                    if let Some(n) = result.line {
+                        line.push_str(&format!(":{n}"));
+                    }
+                    if let Some(preview) = result.preview.as_deref().filter(|p| !p.is_empty()) {
+                        line.push_str(&format!("  {preview}"));
+                    }
+                    line
+                })
+                .collect(),
+        ));
+        view.preview = 4;
+    }
+    view
+}
+
+fn web_search_view(search: &WebSearchItem) -> ToolView {
+    let query = search
+        .patterns
+        .as_ref()
+        .map(|p| one_line(&p.join(", ")))
+        .unwrap_or_default();
+    let mut view = base(ToolIcon::Web, "Web Search", query);
+    if let Some(results) = &search.results {
+        view.meta
+            .push(muted(count(results.len(), "source", "sources")));
+        view.body = Some(ToolBody::List(
+            results
+                .iter()
+                .map(|result| {
+                    let host = result.url.as_deref().map(|url| {
+                        url.split("://")
+                            .nth(1)
+                            .unwrap_or(url)
+                            .split('/')
+                            .next()
+                            .unwrap_or(url)
+                            .to_owned()
+                    });
+                    match (&result.title, host) {
+                        (Some(title), Some(host)) => format!("{title} ({host})"),
+                        (Some(title), None) => title.clone(),
+                        (None, Some(host)) => host,
+                        (None, None) => String::new(),
+                    }
+                })
+                .collect(),
+        ));
+        view.preview = 4;
+    }
+    view
+}
+
+/// The output text of a dynamic tool, if any.
+fn output_text(tool: &DynamicToolItem) -> Option<String> {
+    tool.output
+        .as_ref()
+        .and_then(|o| o.as_ref())
+        .map(pretty)
+        .filter(|text| !text.trim().is_empty())
+}
+
+/// Drops the `[PATH#TAG]` header omp's `read` puts above a file.
+fn strip_hashline_header(text: &str) -> &str {
+    match text.split_once('\n') {
+        Some((first, rest)) if hashline_path(first).is_some() => rest,
+        _ => text,
+    }
+}
+
+fn dynamic_view(tool: &DynamicToolItem) -> ToolView {
+    let name = tool.tool_name.as_deref().unwrap_or("tool");
+    let input = &tool.input;
+    let output = output_text(tool);
+    let path = str_arg(input, "path");
+    match name {
+        "read" => {
+            let path = path.unwrap_or_default();
+            let icon = match path.split_once("://").map(|(scheme, _)| scheme) {
+                Some("http" | "https") => ToolIcon::Web,
+                Some("agent" | "history") => ToolIcon::Task,
+                Some("proc") => ToolIcon::Process,
+                Some("xd" | "mcp") => ToolIcon::Device,
+                _ => ToolIcon::Read,
+            };
+            let mut view = base(icon, "Read", path.to_owned());
+            if let Some(output) = output {
+                let text = strip_hashline_header(&output).trim_end();
+                view.meta
+                    .push(muted(count(text.lines().count(), "line", "lines")));
+                view.body = Some(
+                    numbered(text)
+                        .unwrap_or_else(|| ToolBody::Sections(vec![(None, text.to_owned())])),
+                );
+            }
+            view
+        }
+        "write" => write_view(path.unwrap_or_default(), str_arg(input, "content"), output),
+        "edit" => {
+            let script = str_arg(input, "input").unwrap_or_default();
+            let target = path.or_else(|| hashline_path(script)).unwrap_or_default();
+            let mut view = base(ToolIcon::Edit, "Edit", target.to_owned());
+            view.body = Some(ToolBody::Sections(
+                [
+                    Some((None, script.to_owned())),
+                    output.map(|o| (Some("Result".to_owned()), o)),
+                ]
+                .into_iter()
+                .flatten()
+                .collect(),
+            ));
+            view
+        }
+        "eval" => {
+            let code = str_arg(input, "code")
+                .or_else(|| str_arg(input, "input"))
+                .unwrap_or_default();
+            let description = str_arg(input, "title")
+                .map(one_line)
+                .unwrap_or_else(|| one_line(code));
+            let mut view = base(ToolIcon::Eval, "Eval", description);
+            if let Some(language) = str_arg(input, "language") {
+                view.meta.push(muted(language));
+            }
+            view.body = Some(ToolBody::Sections(
+                [
+                    (!code.is_empty()).then(|| (None, code.to_owned())),
+                    output.map(|o| (Some("Output".to_owned()), o)),
+                ]
+                .into_iter()
+                .flatten()
+                .collect(),
+            ));
+            view.preview = 6;
+            view
+        }
+        "task" => {
+            let tasks = input.get("tasks").and_then(Value::as_array);
+            let names: Vec<&str> = tasks
+                .into_iter()
+                .flatten()
+                .filter_map(|task| str_arg(task, "name").or_else(|| str_arg(task, "id")))
+                .collect();
+            let description = match (names.is_empty(), tasks.map_or(0, Vec::len)) {
+                (false, _) => names.join(", "),
+                (true, 0) => input_summary(input),
+                (true, n) => count(n, "agent", "agents"),
+            };
+            let mut view = base(ToolIcon::Task, "Task", description);
+            if let Some(agent) = str_arg(input, "agent") {
+                view.meta.push(muted(agent));
+            }
+            view.body = output.map(|o| ToolBody::Sections(vec![(None, o)]));
+            view
+        }
+        "todo" | "todo_write" => {
+            let mut view = base(
+                ToolIcon::Todo,
+                "Todo",
+                str_arg(input, "op").unwrap_or("update").to_owned(),
+            );
+            view.body = output.map(|o| ToolBody::Sections(vec![(None, o)]));
+            view
+        }
+        _ => {
+            let (icon, title) = match name {
+                "wait" => (ToolIcon::Wait, "Wait".to_owned()),
+                "fetch" | "web_fetch" => (ToolIcon::Web, "Fetch".to_owned()),
+                "lsp" => (ToolIcon::Lsp, "LSP".to_owned()),
+                "ast_grep" => (ToolIcon::Ast, "AST Grep".to_owned()),
+                "ast_edit" => (ToolIcon::Ast, "AST Edit".to_owned()),
+                "debug" => (ToolIcon::Debug, "Debug".to_owned()),
+                "browser" | "puppeteer" => (ToolIcon::Browser, "Browser".to_owned()),
+                "computer" => (ToolIcon::Browser, "Computer".to_owned()),
+                "recall" | "retain" | "reflect" => (ToolIcon::Memory, humanize(name)),
+                "delete" | "rm" => (ToolIcon::Delete, "Delete".to_owned()),
+                name if name.starts_with("gh") || name == "github" => {
+                    (ToolIcon::Github, "GitHub".to_owned())
+                }
+                name if name.starts_with("mcp__") => (
+                    ToolIcon::Device,
+                    name.trim_start_matches("mcp__").replace("__", " › "),
+                ),
+                name => (ToolIcon::Tool, humanize(name)),
+            };
+            let mut view = base(icon, &title, input_summary(input));
+            let input_text = match input {
+                Value::Object(map) if map.keys().all(|key| key == "i") => None,
+                Value::Null => None,
+                other => Some(pretty(other)),
+            };
+            let sections: Vec<(Option<String>, String)> = [
+                input_text.map(|i| (Some("Input".to_owned()), i)),
+                output.map(|o| (Some("Output".to_owned()), o)),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            view.body = (!sections.is_empty()).then_some(ToolBody::Sections(sections));
+            view
+        }
+    }
+}
+
+/// One line of a diff, split for display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiffLine<'a> {
+    pub kind: DiffKind,
+    /// The line number omp prints (`+12|`), if any.
+    pub number: Option<&'a str>,
+    pub text: &'a str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffKind {
+    Added,
+    Removed,
+    Context,
+    Hunk,
+}
+
+/// Splits one line of an omp (`+12|text`) or unified (`+text`, `@@ …`) diff.
+pub fn diff_line(line: &str) -> DiffLine<'_> {
+    let (kind, rest) = match line.chars().next() {
+        Some('+') => (DiffKind::Added, &line[1..]),
+        Some('-') => (DiffKind::Removed, &line[1..]),
+        Some('@') if line.starts_with("@@") => {
+            return DiffLine {
+                kind: DiffKind::Hunk,
+                number: None,
+                text: line,
+            };
+        }
+        Some(' ') => (DiffKind::Context, &line[1..]),
+        _ => (DiffKind::Context, line),
+    };
+    match rest.split_once('|') {
+        Some((number, text))
+            if !number.is_empty() && number.trim().chars().all(|c| c.is_ascii_digit()) =>
+        {
+            DiffLine {
+                kind,
+                number: Some(number.trim()),
+                text,
+            }
+        }
+        _ => DiffLine {
+            kind,
+            number: None,
+            text: rest,
+        },
+    }
 }
 
 /// A compact age like `now`, `5m`, `3h`, `2d`, `6w` between an ISO-8601
@@ -289,85 +744,207 @@ mod tests {
     }
 
     #[test]
-    fn summarizes_commands_with_output_and_failure() {
-        let summary = tool_summary(&item(
+    fn commands_fail_on_a_nonzero_exit_and_time_their_run() {
+        let mut failed = item(
             "completed",
-            json!({"type":"command_execution","input":"sleep 30\necho done","output":"done\n","exitCode":1}),
-        ))
-        .unwrap();
-        assert_eq!(summary.icon, ToolIcon::Terminal);
-        assert_eq!(summary.title, "bash");
-        assert_eq!(summary.subtitle, "sleep 30…");
-        assert_eq!(
-            summary.detail.as_deref(),
-            Some("$ sleep 30\necho done\n\ndone\n\n\nexit code 1")
+            json!({"type":"command_execution","input":"sleep 30\necho done",
+                   "output":"done\n\nWall time: 2.10 seconds\n","exitCode":1}),
         );
-        assert!(summary.failed);
-        assert!(!summary.running);
+        failed.title = Some("Waiting for the build".into());
+        failed.started_at = Some("2026-11-01T12:00:00.000Z".into());
+        failed.completed_at = Some("2026-11-01T12:00:02.140Z".into());
+        let view = tool_view(&failed).unwrap();
+        assert_eq!(
+            (view.icon, view.title.as_str()),
+            (ToolIcon::Terminal, "Bash")
+        );
+        // The box shows the command; the header says what it is for.
+        assert_eq!(
+            (view.description.as_str(), view.prose),
+            ("Waiting for the build", true)
+        );
+        assert_eq!(view.status, ToolStatus::Failed);
+        assert_eq!(
+            view.meta,
+            [
+                ("exit 1".to_owned(), Tone::Failed),
+                ("2.1s".to_owned(), Tone::Muted)
+            ]
+        );
+        assert_eq!(
+            view.body,
+            Some(ToolBody::Command {
+                command: "sleep 30\necho done".into(),
+                output: "done".into()
+            })
+        );
 
-        let running = tool_summary(&item(
-            "running",
-            json!({"type":"command_execution","input":"ls"}),
-        ))
-        .unwrap();
-        assert!(running.running);
-        assert!(!running.failed);
-        assert_eq!(running.detail.as_deref(), Some("$ ls"));
+        let mut running = item("running", json!({"type":"command_execution","input":"ls"}));
+        running.title = Some("bash".into());
+        let view = tool_view(&running).unwrap();
+        assert_eq!(view.status, ToolStatus::Running);
+        assert_eq!(
+            (view.description.as_str(), view.prose),
+            ("ls", false),
+            "the bare tool name is not an intent"
+        );
     }
 
     #[test]
-    fn summarizes_files_searches_and_dynamic_tools() {
-        let edit = tool_summary(&item(
+    fn edits_writes_and_searches_read_like_omp() {
+        let edit = tool_view(&item(
             "completed",
-            json!({"type":"file_change","fileName":"src/a.rs","additions":3,"deletions":1,"diffStr":"@@ -1 +1 @@"}),
+            json!({"type":"file_change","fileName":"src/a.rs","additions":3,"deletions":1,"diffStr":"+1|x"}),
         ))
         .unwrap();
-        assert_eq!(edit.subtitle, "src/a.rs  +3 −1");
-        assert_eq!(edit.detail.as_deref(), Some("@@ -1 +1 @@"));
-
-        let search = tool_summary(&item(
-            "completed",
-            json!({"type":"file_search","pattern":"fn main","results":[{"fileName":"a.rs","line":3,"preview":"  fn main() {"}]}),
-        ))
-        .unwrap();
-        assert_eq!(search.subtitle, "fn main");
-        assert_eq!(search.detail.as_deref(), Some("a.rs:3  fn main() {"));
-
-        let web = tool_summary(&item(
-            "completed",
-            json!({"type":"web_search","patterns":["gpui","zed"],"results":[{"title":"Zed","url":"https://zed.dev"}]}),
-        ))
-        .unwrap();
-        assert_eq!(web.subtitle, "gpui, zed");
-        assert_eq!(web.detail.as_deref(), Some("Zed — https://zed.dev"));
-
-        let ask = tool_summary(&item(
-            "completed",
-            json!({"type":"dynamic_tool","toolName":"read","input":{"path":"/tmp/x"},"output":"contents"}),
-        ))
-        .unwrap();
-        assert_eq!(ask.title, "read");
-        assert_eq!(ask.subtitle, "/tmp/x");
         assert_eq!(
-            ask.detail.as_deref(),
-            Some("{\n  \"path\": \"/tmp/x\"\n}\n\ncontents")
+            (edit.title.as_str(), edit.description.as_str()),
+            ("Edit", "src/a.rs")
         );
+        assert_eq!(
+            edit.meta,
+            [
+                ("+3".to_owned(), Tone::Added),
+                ("−1".to_owned(), Tone::Removed)
+            ]
+        );
+        assert_eq!(edit.body, Some(ToolBody::Diff("+1|x".into())));
 
-        let pairs = tool_summary(&item(
+        let write = tool_view(&item(
             "completed",
-            json!({"type":"dynamic_tool","toolName":null,"title":"grep","input":{"a":1,"b":"two"}}),
+            json!({"type":"file_change","fileName":"b.txt","newStr":"one\ntwo\n"}),
         ))
         .unwrap();
-        assert_eq!(pairs.title, "grep");
-        assert_eq!(pairs.subtitle, "a: 1, b: two");
-
-        assert!(
-            tool_summary(&item(
-                "completed",
-                json!({"type":"reasoning","text":"x","streaming":false})
-            ))
-            .is_none()
+        assert_eq!(
+            (write.title.as_str(), write.icon),
+            ("Write", ToolIcon::Write)
         );
+        assert_eq!(write.meta, [("2 lines".to_owned(), Tone::Muted)]);
+
+        let grep = tool_view(&item(
+            "completed",
+            json!({"type":"file_search","pattern":"fn main","results":[
+                {"fileName":"a.rs","line":3,"preview":"fn main() {"},
+                {"fileName":"a.rs","line":9,"preview":"fn main2()"}]}),
+        ))
+        .unwrap();
+        assert_eq!((grep.title.as_str(), grep.icon), ("Grep", ToolIcon::Grep));
+        assert_eq!(grep.meta, [("2 matches · 1 file".to_owned(), Tone::Muted)]);
+        assert_eq!(
+            grep.body,
+            Some(ToolBody::List(vec![
+                "a.rs:3  fn main() {".into(),
+                "a.rs:9  fn main2()".into()
+            ]))
+        );
+
+        let glob = tool_view(&item(
+            "running",
+            json!({"type":"file_search","pattern":"src/**/*.rs"}),
+        ))
+        .unwrap();
+        assert_eq!(glob.title, "Glob");
+    }
+
+    #[test]
+    fn dynamic_tools_get_their_omp_titles() {
+        let read = tool_view(&item(
+            "completed",
+            json!({"type":"dynamic_tool","toolName":"read","input":{"path":"PLAN.md:7-8"},
+                   "output":"[PLAN.md#C34C]\n7:# plan\n8:"}),
+        ))
+        .unwrap();
+        assert_eq!(
+            (read.title.as_str(), read.description.as_str()),
+            ("Read", "PLAN.md:7-8")
+        );
+        assert_eq!(read.meta, [("2 lines".to_owned(), Tone::Muted)]);
+        assert_eq!(
+            read.body,
+            Some(ToolBody::Code {
+                text: "# plan\n".into(),
+                first_line: 7
+            })
+        );
+        // Not one numbered range: shown as it is.
+        let listing = tool_view(&item(
+            "completed",
+            json!({"type":"dynamic_tool","toolName":"read","input":{"path":"src/"},
+                   "output":"main.rs\nlib.rs"}),
+        ))
+        .unwrap();
+        assert_eq!(
+            listing.body,
+            Some(ToolBody::Sections(vec![(None, "main.rs\nlib.rs".into())]))
+        );
+
+        // An edit from a server that predates hashline mapping.
+        let edit = tool_view(&item(
+            "completed",
+            json!({"type":"dynamic_tool","toolName":"edit","input":{"input":"[README.md#AF62]\nPUT 1:\n+x"}}),
+        ))
+        .unwrap();
+        assert_eq!(
+            (edit.title.as_str(), edit.description.as_str()),
+            ("Edit", "README.md")
+        );
+
+        let message = tool_view(&item(
+            "completed",
+            json!({"type":"dynamic_tool","toolName":"write","input":{"path":"agent://Hexmap","content":"hi"}}),
+        ))
+        .unwrap();
+        assert_eq!(
+            (
+                message.icon,
+                message.title.as_str(),
+                message.description.as_str()
+            ),
+            (ToolIcon::Message, "Message", "→ Hexmap")
+        );
+
+        let eval = tool_view(&item(
+            "completed",
+            json!({"type":"dynamic_tool","toolName":"eval","input":{"code":"1+1","language":"js","title":"Adding"},
+                   "output":"2"}),
+        ))
+        .unwrap();
+        assert_eq!(
+            (eval.title.as_str(), eval.description.as_str()),
+            ("Eval", "Adding")
+        );
+        assert_eq!(eval.meta, [("js".to_owned(), Tone::Muted)]);
+
+        let other = tool_view(&item(
+            "completed",
+            json!({"type":"dynamic_tool","toolName":"search_tool_bm25","input":{"i":"Finding","query":"x","limit":2}}),
+        ))
+        .unwrap();
+        assert_eq!(other.title, "Search tool bm25");
+        assert_eq!(other.description, "query=x, limit=2");
+    }
+
+    #[test]
+    fn diff_lines_split_omp_and_unified_forms() {
+        assert_eq!(
+            diff_line("+13|    },"),
+            DiffLine {
+                kind: DiffKind::Added,
+                number: Some("13"),
+                text: "    },"
+            }
+        );
+        assert_eq!(diff_line(" 3|  x").kind, DiffKind::Context);
+        assert_eq!(diff_line(" 3|  x").number, Some("3"));
+        assert_eq!(
+            diff_line("-old"),
+            DiffLine {
+                kind: DiffKind::Removed,
+                number: None,
+                text: "old"
+            }
+        );
+        assert_eq!(diff_line("@@ -1 +1 @@").kind, DiffKind::Hunk);
     }
 
     #[test]
