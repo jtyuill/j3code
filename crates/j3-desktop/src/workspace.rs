@@ -407,8 +407,9 @@ impl Workspace {
         }
     }
 
-    /// Raises attention toasts and sounds for `env`'s status changes, and
-    /// acknowledges a completion of the open thread (it was watched).
+    /// Raises attention toasts and, while the window is in the background,
+    /// sounds for `env`'s status changes, and acknowledges a completion of
+    /// the open thread (it was watched).
     fn on_environment_changed(
         &mut self,
         env: Entity<Environment>,
@@ -420,18 +421,29 @@ impl Workspace {
             (env.key().clone(), env.state().clone())
         };
         let open = self.open_key(cx).filter(|open| open.env == key);
+        // The open thread is only watched while the window has focus: a run
+        // that finishes behind another app alerts like any other.
+        let focused = window.is_window_active();
         let alerts = self.attention.observe(
             &key,
             &state.shell,
-            open.as_ref().map(|open| open.thread_id.as_str()),
+            open.as_ref()
+                .filter(|_| focused)
+                .map(|open| open.thread_id.as_str()),
         );
         if !alerts.is_empty() {
             let ui = self.preferences.read(cx).ui().clone();
             for alert in alerts {
-                if ui.sounds {
+                if ui.sounds && !focused {
                     alert.sound().play(Services::global(cx).runtime());
                 }
-                if ui.toasts {
+                // The open thread's own run ending (heard in the
+                // background) needs no toast: it is on screen.
+                let on_screen = alert.kind == AgentNotification::Finished
+                    && open
+                        .as_ref()
+                        .is_some_and(|open| open.thread_id == alert.thread_id);
+                if ui.toasts && !on_screen {
                     self.push_attention_toast(alert, window, cx);
                 }
             }

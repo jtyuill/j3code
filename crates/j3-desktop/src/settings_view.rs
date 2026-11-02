@@ -425,7 +425,7 @@ impl SettingsView {
                     ))
                     .item(switch(
                         "Sounds",
-                        "Play a system sound.",
+                        "Chime while j3 is in the background: one sound for a finished run, another for a question.",
                         |ui| ui.sounds,
                         |ui, value| ui.sounds = value,
                     )),

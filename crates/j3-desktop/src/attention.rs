@@ -1,9 +1,13 @@
 //! herdr-style attention alerts: watches every thread's agent status and
-//! reports when one becomes blocked (always) or finishes while it is not the
-//! open thread. The workspace turns alerts into toasts and sounds, as the
-//! notification preferences allow.
+//! reports when one becomes blocked (always) or finishes while the user is
+//! not watching it. The workspace turns alerts into toasts and, while the
+//! window is in the background, sounds, as the notification preferences
+//! allow.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+};
 
 use gpui_kit::SharedString;
 use j3_client::{
@@ -99,54 +103,80 @@ impl AttentionMonitor {
     }
 }
 
-/// herdr's two sounds.
+/// The two alert sounds, synthesized for j3 (`assets/sounds`): a soft
+/// rising chime when a run finishes, a questioning three-note ping when a
+/// thread needs an answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sound {
     /// A thread needs you.
     Request,
-    /// A background thread finished.
+    /// A thread finished.
     Done,
 }
 
 impl Sound {
-    /// The command that plays it on this platform, if any.
-    fn command(self) -> Option<(&'static str, Vec<String>)> {
-        if cfg!(target_os = "macos") {
-            let name = match self {
-                Self::Request => "Ping",
-                Self::Done => "Glass",
-            };
-            Some((
-                "afplay",
-                vec![format!("/System/Library/Sounds/{name}.aiff")],
-            ))
-        } else if cfg!(target_os = "linux") {
-            let id = match self {
-                Self::Request => "dialog-warning",
-                Self::Done => "complete",
-            };
-            Some(("canberra-gtk-play", vec!["-i".into(), id.into()]))
-        } else {
-            None
+    fn name(self) -> &'static str {
+        match self {
+            Self::Request => "request",
+            Self::Done => "done",
         }
     }
 
-    /// Plays the sound on `runtime` without waiting for it. A missing
-    /// player (e.g. no `canberra-gtk-play`) stays silent.
+    fn wav(self) -> &'static [u8] {
+        match self {
+            Self::Request => include_bytes!("../assets/sounds/request.wav"),
+            Self::Done => include_bytes!("../assets/sounds/done.wav"),
+        }
+    }
+
+    /// The players to try, in order; the first one that starts wins.
+    fn players() -> &'static [&'static str] {
+        if cfg!(target_os = "macos") {
+            &["afplay"]
+        } else {
+            // PulseAudio (or PipeWire's pulse server), PipeWire, ALSA.
+            &["paplay", "pw-play", "aplay"]
+        }
+    }
+
+    /// The sound as a file the players can open: written once per app
+    /// version to the cache directory (rewritten when its size differs).
+    fn file(self) -> std::io::Result<PathBuf> {
+        let dir = dirs::cache_dir()
+            .unwrap_or_else(std::env::temp_dir)
+            .join("j3")
+            .join("sounds");
+        let path = dir.join(format!("{}.wav", self.name()));
+        let wav = self.wav();
+        let current = std::fs::metadata(&path).is_ok_and(|meta| meta.len() == wav.len() as u64);
+        if !current {
+            std::fs::create_dir_all(&dir)?;
+            std::fs::write(&path, wav)?;
+        }
+        Ok(path)
+    }
+
+    /// Plays the sound on `runtime` without waiting for it. No player (or no
+    /// audio device) stays silent.
     pub fn play(self, runtime: &Handle) {
-        let Some((program, args)) = self.command() else {
-            return;
-        };
         runtime.spawn(async move {
-            let status = tokio::process::Command::new(program)
-                .args(&args)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .await;
-            if let Err(e) = status {
-                tracing::debug!("{program}: {e}");
+            let path = match tokio::task::spawn_blocking(move || self.file()).await {
+                Ok(Ok(path)) => path,
+                Ok(Err(e)) => return tracing::debug!("writing the {} sound: {e}", self.name()),
+                Err(e) => return tracing::debug!("{e}"),
+            };
+            for program in Self::players() {
+                let status = tokio::process::Command::new(program)
+                    .arg(&path)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .await;
+                match status {
+                    Ok(_) => return,
+                    Err(e) => tracing::debug!("{program}: {e}"),
+                }
             }
         });
     }
