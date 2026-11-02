@@ -1733,3 +1733,82 @@ async fn the_header_commits_uncommitted_changes(cx: &mut TestAppContext) {
 
     app.stop(cx);
 }
+
+#[gpui_kit::test]
+async fn the_feed_keeps_following_the_reply_after_a_wheel_scroll_at_the_bottom(
+    cx: &mut TestAppContext,
+) {
+    let app = Harness::start("follow", cx).await;
+    let project_id = app.project(cx).await;
+    app.open_running_thread(cx, &project_id, "long").await;
+    app.script.emit(json!({"type": "agent_start"}));
+    app.script
+        .text("m1", json!({"type": "text_start", "contentIndex": 0}));
+    // The reply overflows the feed, which follows its bottom edge.
+    stream_paragraphs(&app, 0..30, cx).await;
+    app.until(cx, |window, _| {
+        reply_row(window).is_some_and(|row| row.bounds().top() < px(0.))
+    })
+    .await;
+    let (top, pinned) = app.update(cx, |window, _| {
+        let bounds = reply_row(window).unwrap().bounds();
+        (bounds.top(), bounds.bottom())
+    });
+
+    // A wheel scroll down at the bottom, as a trackpad flick ending there,
+    // over the visible end of the reply.
+    app.update(cx, |window, cx| {
+        let bounds = reply_row(window).unwrap().bounds();
+        let position = gpui_kit::point(bounds.center().x, bounds.bottom() - px(40.));
+        window.pointer_move(position, None, cx);
+        window.dispatch_event(
+            gpui_kit::PlatformInput::Scroll(gpui_kit::ScrollEvent {
+                position,
+                delta: gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.), px(-80.))),
+                ..Default::default()
+            }),
+            cx,
+        );
+    });
+
+    // More text: once it is laid out and the edge bounce has settled, the
+    // reply's bottom edge is in view where it was.
+    stream_paragraphs(&app, 30..40, cx).await;
+    app.until(cx, |window, _| {
+        reply_row(window).is_some_and(|row| {
+            row.bounds().top() < top - px(200.) && row.bounds().bottom() == pinned
+        })
+    })
+    .await;
+    app.stop(cx);
+}
+
+/// Streams `Paragraph {i}: …` for each `i` into reply `m1` and waits until
+/// the feed shows the last one.
+async fn stream_paragraphs(app: &Harness, range: std::ops::Range<usize>, cx: &mut TestAppContext) {
+    let marker = format!("Paragraph {}:", range.end - 1);
+    for i in range {
+        let delta = format!(
+            "Paragraph {i}: enough words to wrap across the column at least once or twice.\n\n"
+        );
+        app.script.text(
+            "m1",
+            json!({"type": "text_delta", "contentIndex": 0, "delta": delta}),
+        );
+    }
+    app.until(cx, move |window, _| {
+        reply_row(window).is_some_and(|row| row.label().unwrap().contains(&marker))
+    })
+    .await;
+}
+
+/// The streaming reply of the follow test (the row labelled with its text).
+fn reply_row(window: &Window) -> Option<ElementSnapshot> {
+    let feed = ElementId::Name("feed".into());
+    window.elements().into_iter().find(|row| {
+        row.path().contains(&feed)
+            && row
+                .label()
+                .is_some_and(|label| label.starts_with("Paragraph 0:"))
+    })
+}

@@ -790,16 +790,27 @@ impl ThreadView {
             let feed = state.feed();
             let item = &feed[visible[ix]].item;
             let previous = ix.checked_sub(1).map(|prev| &feed[visible[prev]].item);
-            h_flex().w_full().justify_center().child(
-                div()
-                    .w_full()
-                    .max_w(rems(measure))
-                    .child(render_item(item, previous, &row, window, cx)),
-            )
+            h_flex()
+                .w_full()
+                .justify_center()
+                .when(ix == 0, |this| this.pt_2())
+                .when(ix + 1 == visible.len(), |this| this.pb_2())
+                .child(
+                    div()
+                        .w_full()
+                        .max_w(rems(measure))
+                        .child(render_item(item, previous, &row, window, cx)),
+                )
         })
         // `render_item` spaces rows itself (tool calls sit close together),
         // so drop the scroller's fixed gap between rows.
         .with_row_style(gpui_kit::StyleRefinement::default().pb_0())
+        // No vertical list padding: the first and last rows carry it. A
+        // wheel or trackpad scroll goes through the list's scrollbar offset,
+        // which leaves the padding out of its range: with padding, scrolling
+        // down at the bottom moved the list up by it, cut the last row off
+        // and stopped following the reply.
+        .with_list_style(gpui_kit::StyleRefinement::default().py_0())
         .size_full()
         .into_any_element()
     }
