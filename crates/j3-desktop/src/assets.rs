@@ -1,7 +1,7 @@
 //! The app's icon assets: GPUI Kit's component icons plus the Lucide icons
-//! the thread sidebars use (the same ones t3code's sidebar shows), the feed's
-//! tool calls, the composer's usage gauge, and the model picker's provider
-//! logos.
+//! the app draws beyond them (the thread sidebars' — the same ones t3code's
+//! sidebar shows —, the feed's tool calls, the file pane's file types, the
+//! agents hub, the usage gauge) and the model picker's provider logos.
 
 use std::borrow::Cow;
 
@@ -18,15 +18,26 @@ gpui_kit::assets::icon_assets!(
         Braces,
         Brain,
         Bug,
+        Circle,
         CircleDashed,
         CircleDotDashed,
+        CircleSlash,
         Clock,
         Code,
+        FileArchive,
+        FileBraces,
+        FileCode,
+        FileCog,
+        FileImage,
+        FileKey,
+        FileLock,
         FilePen,
         FilePlus,
+        FileTerminal,
         FileX,
         FolderPlus,
         FolderSearch,
+        FolderTree,
         Gauge,
         Hourglass,
         ListFilter,
@@ -41,6 +52,7 @@ gpui_kit::assets::icon_assets!(
         ScanSearch,
         SquarePen,
         Wrench,
+        X,
     ]
 );
 
