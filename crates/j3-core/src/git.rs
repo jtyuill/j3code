@@ -1,7 +1,9 @@
-//! t3's git workflow over the `git` CLI (`vcs.refreshStatus`, `vcs.pull`,
-//! `git.runStackedAction`): status, fast-forward pull, and the commit / push
-//! stacked actions with omp-generated commit messages. Pull requests and
-//! feature branches are not served.
+//! t3's git workflow over the host's `git` and `gh` CLIs (`vcs.refreshStatus`,
+//! `vcs.pull`, `git.runStackedAction`): status, fast-forward pull, and the
+//! commit / push / pull request stacked actions with omp-generated commit
+//! messages and PR text. Credentials, identity and `gh` login are the host
+//! user's own (`~/.gitconfig`, `~/.config/gh`), nothing is configured here.
+//! Pull requests need a GitHub remote; feature branches are not served.
 //!
 //! Mirrors t3's `GitManager` (`apps/server/src/git/GitManager.ts`) and
 //! `GitVcsDriverCore` (`apps/server/src/vcs/GitVcsDriverCore.ts`).
@@ -10,8 +12,8 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     process::{Output, Stdio},
-    sync::{Mutex, PoisonError},
-    time::Duration,
+    sync::{LazyLock, Mutex, PoisonError},
+    time::{Duration, Instant},
 };
 
 use futures_util::stream::{self, BoxStream, StreamExt};
@@ -20,7 +22,8 @@ use j3_protocol::t3::git::{
     GitBranchStepStatus, GitCommitStep, GitCommitStepStatus, GitManagerServiceError, GitPrStep,
     GitPrStepStatus, GitPushStep, GitPushStepStatus, GitRunStackedActionInput,
     GitRunStackedActionResult, GitStackedAction, GitToast, GitToastCta, GitToastRunAction,
-    VcsPullResult, VcsPullStatus, VcsStatusResult, VcsWorkingTree, VcsWorkingTreeFile,
+    SourceControlProviderInfo, VcsChangeRequest, VcsChangeRequestState, VcsPullResult,
+    VcsPullStatus, VcsStatusResult, VcsWorkingTree, VcsWorkingTreeFile,
 };
 use serde::Deserialize;
 use tokio::sync::mpsc;
@@ -44,34 +47,68 @@ const SHORT_SHA_LENGTH: usize = 7;
 const TOAST_DESCRIPTION_MAX: usize = 72;
 /// The system prompt of commit message generation.
 const COMMIT_SYSTEM_PROMPT: &str = "You write concise git commit messages.";
+/// The system prompt of pull request text generation.
+const PR_SYSTEM_PROMPT: &str = "You write GitHub pull request titles and descriptions.";
+/// How long a branch's pull request is remembered between status polls.
+const PR_CACHE_TTL: Duration = Duration::from_secs(60);
+/// `gh` talks to the network; `gh pr create` also runs `git push` hooks.
+const GH_TIMEOUT: Duration = Duration::from_secs(60);
 
 // ---------------------------------------------------------------------------
 // Running git
 // ---------------------------------------------------------------------------
 
-/// `git` in one directory. `cwd` is the client's string, used in errors.
+/// `git` (or `gh`) in one directory. `cwd` is the client's string, used in
+/// errors. Both run with the server's environment, so they use the host
+/// user's git config, ssh keys and `gh` login; only prompts are switched off,
+/// because nobody is there to answer them.
 struct Git<'a> {
+    program: &'static str,
     dir: &'a Path,
     cwd: &'a str,
 }
 
 impl<'a> Git<'a> {
     fn new(dir: &'a Path, cwd: &'a str) -> Self {
-        Self { dir, cwd }
+        Self {
+            program: "git",
+            dir,
+            cwd,
+        }
     }
 
-    /// Runs `git <args>` and returns its output whatever the exit status.
+    /// The GitHub CLI, run in `dir` like [`Git::new`].
+    fn gh(dir: &'a Path, cwd: &'a str) -> Self {
+        Self {
+            program: "gh",
+            dir,
+            cwd,
+        }
+    }
+
+    /// Runs `<program> <args>` and returns its output whatever the exit
+    /// status.
     async fn output(&self, operation: &str, args: &[&str], timeout: Duration) -> GitResult<Output> {
-        let mut command = tokio::process::Command::new("git");
+        let mut command = tokio::process::Command::new(self.program);
         command
             .args(args)
             .current_dir(self.dir)
             .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GH_PROMPT_DISABLED", "1")
+            .env("GH_NO_UPDATE_NOTIFIER", "1")
+            .env("GH_PAGER", "cat")
+            .env("NO_COLOR", "1")
             .env("LC_ALL", "C")
             .stdin(Stdio::null())
             .kill_on_drop(true);
         match tokio::time::timeout(timeout, command.output()).await {
             Ok(Ok(output)) => Ok(output),
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => Err(self.error(
+                operation,
+                args,
+                None,
+                format!("`{}` is not installed on this host.", self.program),
+            )),
             Ok(Err(error)) => Err(self.error(operation, args, None, format!("{error}"))),
             Err(_) => Err(self.error(
                 operation,
@@ -99,7 +136,7 @@ impl<'a> Git<'a> {
             .into_iter()
             .find(|text| !text.is_empty())
             .map(str::to_owned)
-            .unwrap_or_else(|| format!("{} failed", command_line(args)));
+            .unwrap_or_else(|| format!("{} failed", command_line(self.program, args)));
         Err(self.error(operation, args, output.status.code().map(i64::from), detail))
     }
 
@@ -125,7 +162,7 @@ impl<'a> Git<'a> {
     ) -> Box<GitManagerServiceError> {
         Box::new(GitManagerServiceError::command(
             operation,
-            command_line(args),
+            command_line(self.program, args),
             self.cwd,
             exit_code,
             detail,
@@ -133,8 +170,8 @@ impl<'a> Git<'a> {
     }
 }
 
-fn command_line(args: &[&str]) -> String {
-    let mut line = String::from("git");
+fn command_line(program: &str, args: &[&str]) -> String {
+    let mut line = String::from(program);
     for arg in args {
         line.push(' ');
         line.push_str(arg);
@@ -159,9 +196,20 @@ struct Details {
     primary_remote: Option<String>,
 }
 
-/// `vcs.refreshStatus`: the working tree and branch state of `cwd`.
+/// `vcs.refreshStatus`: the working tree and branch state of `cwd`, and on a
+/// GitHub remote the branch's pull request.
 pub async fn status(cwd: &str) -> GitResult<VcsStatusResult> {
-    Ok(details(cwd).await?.status)
+    let mut status = details(cwd).await?.status;
+    // A pushed feature branch may have a PR; the default branch and an
+    // unpublished branch cannot, so `gh` is not asked.
+    if status.source_control_provider.is_some()
+        && status.has_upstream
+        && !status.is_default_ref
+        && let Some(branch) = &status.ref_name
+    {
+        status.pr = cached_pull_request(cwd, branch).await;
+    }
+    Ok(status)
 }
 
 async fn details(cwd: &str) -> GitResult<Details> {
@@ -256,6 +304,16 @@ async fn details(cwd: &str) -> GitResult<Details> {
         .or(remotes.first())
         .map(|remote| (*remote).to_owned());
 
+    let source_control_provider = match &primary_remote {
+        // The URL as configured, before `url.*.insteadOf` rewrites it.
+        Some(remote) => git
+            .try_line(&["config", "--get", &format!("remote.{remote}.url")])
+            .await?
+            .filter(|url| is_github_remote(url))
+            .map(|_| SourceControlProviderInfo::github()),
+        None => None,
+    };
+
     let is_default_ref = match &ref_name {
         None => false,
         Some(branch) => {
@@ -296,7 +354,7 @@ async fn details(cwd: &str) -> GitResult<Details> {
     Ok(Details {
         status: VcsStatusResult {
             is_repo: true,
-            source_control_provider: None,
+            source_control_provider,
             has_primary_remote: primary_remote.is_some(),
             is_default_ref,
             ref_name,
@@ -521,16 +579,6 @@ async fn run_action(
 ) -> GitResult<GitRunStackedActionResult> {
     const OPERATION: &str = "runStackedAction";
     let cwd = input.cwd.as_str();
-    if matches!(
-        input.action,
-        GitStackedAction::CreatePr | GitStackedAction::CommitPushPr
-    ) {
-        return Err(manager(
-            OPERATION,
-            cwd,
-            "Pull requests are not supported by this server.",
-        ));
-    }
     if input.feature_branch == Some(true) {
         return Err(manager(
             OPERATION,
@@ -543,10 +591,17 @@ async fn run_action(
         return Err(manager(OPERATION, cwd, "Not a git repository."));
     }
     let wants_commit = input.action.commits();
-    let wants_push = input.action.pushes();
+    let wants_pr = matches!(
+        input.action,
+        GitStackedAction::CreatePr | GitStackedAction::CommitPushPr
+    );
+    // A pull request needs its branch on the remote; `push_step` does
+    // nothing for a branch that is there already.
+    let wants_push = input.action.pushes() || wants_pr;
     let phases = [
         wants_commit.then_some(GitActionProgressPhase::Commit),
         wants_push.then_some(GitActionProgressPhase::Push),
+        wants_pr.then_some(GitActionProgressPhase::Pr),
     ]
     .into_iter()
     .flatten()
@@ -554,8 +609,15 @@ async fn run_action(
     progress.emit(GitActionProgress::ActionStarted { phases });
 
     let branch = initial.status.ref_name.clone();
-    if wants_push && branch.is_none() {
+    if (wants_push || wants_pr) && branch.is_none() {
         return Err(manager(OPERATION, cwd, "Cannot push from detached HEAD."));
+    }
+    if wants_pr && initial.status.source_control_provider.is_none() {
+        return Err(manager(
+            OPERATION,
+            cwd,
+            "Pull requests need a GitHub remote; this repository has none.",
+        ));
     }
 
     let commit = if wants_commit {
@@ -582,7 +644,29 @@ async fn run_action(
         },
     };
 
-    let toast = toast(input.action, &commit, &push);
+    let pr = match (&branch, wants_pr) {
+        (Some(branch), true) => {
+            progress.set_phase(GitActionProgressPhase::Pr);
+            // The push moved the branch; read the state it left.
+            let current = details(cwd).await?;
+            pr_step(omp, cwd, branch, &current, progress).await?
+        }
+        _ => GitPrStep {
+            status: GitPrStepStatus::SkippedNotRequested,
+            url: None,
+            number: None,
+            base_branch: None,
+            head_branch: None,
+            title: None,
+        },
+    };
+
+    // A pushed feature branch without a pull request gets one offered.
+    let offers_pr = pr.status == GitPrStepStatus::SkippedNotRequested
+        && push.status == GitPushStepStatus::Pushed
+        && initial.status.source_control_provider.is_some()
+        && !initial.status.is_default_ref;
+    let toast = toast(input.action, &commit, &push, &pr, offers_pr);
     let result = GitRunStackedActionResult {
         action: input.action,
         branch: GitBranchStep {
@@ -591,14 +675,7 @@ async fn run_action(
         },
         commit,
         push,
-        pr: GitPrStep {
-            status: GitPrStepStatus::SkippedNotRequested,
-            url: None,
-            number: None,
-            base_branch: None,
-            head_branch: None,
-            title: None,
-        },
+        pr,
         toast,
     };
     progress.emit(GitActionProgress::ActionFinished {
@@ -754,6 +831,393 @@ async fn push_step(cwd: &str, branch: &str) -> GitResult<GitPushStep> {
 }
 
 // ---------------------------------------------------------------------------
+// Pull requests (GitHub, through `gh`)
+// ---------------------------------------------------------------------------
+
+/// Whether a remote URL (`git@github.com:o/r.git`, `ssh://git@github.com/o/r`,
+/// `https://github.com/o/r`) points at github.com.
+fn is_github_remote(url: &str) -> bool {
+    let url = url.trim();
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    // `user:token@host:port` (or scp-style `user@host:path`) before the path.
+    let authority = rest.split('/').next().unwrap_or("");
+    let host = authority.rsplit('@').next().unwrap_or("");
+    host.split(':')
+        .next()
+        .is_some_and(|host| host.eq_ignore_ascii_case("github.com"))
+}
+
+/// `gh pr list --json` entry.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GhPullRequest {
+    number: u64,
+    title: String,
+    url: String,
+    base_ref_name: String,
+    head_ref_name: String,
+    state: String,
+    #[serde(default)]
+    is_draft: bool,
+    #[serde(default)]
+    updated_at: Option<String>,
+}
+
+impl GhPullRequest {
+    fn into_change_request(self) -> Option<VcsChangeRequest> {
+        let state = match self.state.to_ascii_uppercase().as_str() {
+            "OPEN" => VcsChangeRequestState::Open,
+            "MERGED" => VcsChangeRequestState::Merged,
+            "CLOSED" => VcsChangeRequestState::Closed,
+            _ => return None,
+        };
+        Some(VcsChangeRequest {
+            number: self.number,
+            title: self.title,
+            url: self.url,
+            base_ref: self.base_ref_name,
+            head_ref: self.head_ref_name,
+            state,
+            is_draft: Some(self.is_draft),
+            updated_at: self.updated_at,
+        })
+    }
+}
+
+/// The pull request `gh pr list --json` output names for the branch: the
+/// open one, else the most recently updated.
+fn pick_pull_request(json: &str) -> Option<VcsChangeRequest> {
+    let listed: Vec<GhPullRequest> = serde_json::from_str(json).ok()?;
+    listed
+        .into_iter()
+        .filter_map(GhPullRequest::into_change_request)
+        .max_by(|a, b| {
+            let open = |pr: &VcsChangeRequest| pr.state == VcsChangeRequestState::Open;
+            open(a)
+                .cmp(&open(b))
+                .then_with(|| a.updated_at.cmp(&b.updated_at))
+        })
+}
+
+const PR_FIELDS: &str = "number,title,url,baseRefName,headRefName,state,isDraft,updatedAt";
+
+/// The branch's pull request as `gh` reports it now.
+async fn find_pull_request(cwd: &str, branch: &str) -> GitResult<Option<VcsChangeRequest>> {
+    let gh = Git::gh(Path::new(cwd), cwd);
+    let json = gh
+        .run_with(
+            "GitHubCli.listPullRequests",
+            &[
+                "pr", "list", "--head", branch, "--state", "all", "--limit", "20", "--json",
+                PR_FIELDS,
+            ],
+            GH_TIMEOUT,
+        )
+        .await?;
+    Ok(pick_pull_request(&json))
+}
+
+type PrCache = HashMap<(String, String), (Instant, Option<VcsChangeRequest>)>;
+
+/// Status polls every 30 s; `gh` goes to the network, so its answer is kept
+/// for [`PR_CACHE_TTL`]. A missing or logged-out `gh` is no PR, not an error.
+static PR_CACHE: LazyLock<Mutex<PrCache>> = LazyLock::new(Mutex::default);
+
+async fn cached_pull_request(cwd: &str, branch: &str) -> Option<VcsChangeRequest> {
+    let key = (cwd.to_owned(), branch.to_owned());
+    if let Some((at, pr)) = PR_CACHE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(&key)
+        && at.elapsed() < PR_CACHE_TTL
+    {
+        return pr.clone();
+    }
+    let pr = find_pull_request(cwd, branch)
+        .await
+        .inspect_err(|error| {
+            tracing::debug!("pull request of {branch} in {cwd}: {}", error.message())
+        })
+        .ok()
+        .flatten();
+    PR_CACHE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(key, (Instant::now(), pr.clone()));
+    pr
+}
+
+fn forget_pull_request(cwd: &str, branch: &str) {
+    PR_CACHE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(&(cwd.to_owned(), branch.to_owned()));
+}
+
+/// t3's `runPrStep`: the branch's open pull request, or a new one with
+/// omp-written text. `branch` is pushed already.
+async fn pr_step(
+    omp: &OmpLauncher,
+    cwd: &str,
+    branch: &str,
+    details: &Details,
+    progress: &Progress<'_>,
+) -> GitResult<GitPrStep> {
+    const OPERATION: &str = "runPrStep";
+    if details.status.source_control_provider.is_none() {
+        return Err(manager(
+            OPERATION,
+            cwd,
+            "Pull requests need a GitHub remote; this repository has none.",
+        ));
+    }
+    if details.status.is_default_ref {
+        return Err(manager(
+            OPERATION,
+            cwd,
+            format!(
+                "`{branch}` is the default branch. Switch to a feature branch to open a pull request."
+            ),
+        ));
+    }
+    progress.phase_started(GitActionProgressPhase::Pr, "Looking for a pull request...");
+    if let Some(existing) = find_pull_request(cwd, branch)
+        .await?
+        .filter(|pr| pr.state == VcsChangeRequestState::Open)
+    {
+        forget_pull_request(cwd, branch);
+        return Ok(GitPrStep {
+            status: GitPrStepStatus::OpenedExisting,
+            url: Some(existing.url),
+            number: Some(existing.number),
+            base_branch: Some(existing.base_ref),
+            head_branch: Some(existing.head_ref),
+            title: Some(existing.title),
+        });
+    }
+
+    let git = Git::new(Path::new(cwd), cwd);
+    let remote = details.primary_remote.as_deref().unwrap_or("origin");
+    let base = base_branch(&git, remote).await?.ok_or_else(|| {
+        manager(
+            OPERATION,
+            cwd,
+            "Could not tell which branch the pull request should target.",
+        )
+    })?;
+    let remote_base = format!("{remote}/{base}");
+    let base_ref = if git
+        .try_line(&[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/remotes/{remote_base}"),
+        ])
+        .await?
+        .is_some()
+    {
+        remote_base
+    } else {
+        base.clone()
+    };
+
+    let commits = git
+        .run(
+            "GitHubCli.prContext.commits",
+            &[
+                "log",
+                "--reverse",
+                "-n",
+                "40",
+                "--format=- %s",
+                &format!("{base_ref}..HEAD"),
+            ],
+        )
+        .await?;
+    if commits.trim().is_empty() {
+        return Err(manager(
+            OPERATION,
+            cwd,
+            format!(
+                "`{branch}` has no commits that `{base}` lacks, so there is nothing to open a pull request for."
+            ),
+        ));
+    }
+    let range = format!("{base_ref}...HEAD");
+    let stat = git
+        .run("GitHubCli.prContext.stat", &["diff", "--stat", &range])
+        .await?;
+    let patch = git
+        .run(
+            "GitHubCli.prContext.patch",
+            &["diff", "--no-ext-diff", "--patch", "--minimal", &range],
+        )
+        .await?;
+
+    progress.phase_started(GitActionProgressPhase::Pr, "Generating PR content...");
+    let prompt = pr_prompt(&base, branch, commits.trim(), stat.trim(), &patch);
+    let generated = generate_pull_request(omp, &prompt, Path::new(cwd)).await?;
+    let title = generated.title;
+    let body = generated.body;
+
+    progress.phase_started(GitActionProgressPhase::Pr, "Creating pull request...");
+    let gh = Git::gh(Path::new(cwd), cwd);
+    let created = gh
+        .run_with(
+            "GitHubCli.createPullRequest",
+            &[
+                "pr", "create", "--base", &base, "--head", branch, "--title", &title, "--body",
+                &body,
+            ],
+            GH_TIMEOUT,
+        )
+        .await?;
+    forget_pull_request(cwd, branch);
+    let url = created
+        .lines()
+        .map(str::trim)
+        .rfind(|line| line.starts_with("http"))
+        .map(str::to_owned);
+    let number = url.as_deref().and_then(pull_request_number);
+    Ok(GitPrStep {
+        status: GitPrStepStatus::Created,
+        url,
+        number,
+        base_branch: Some(base),
+        head_branch: Some(branch.to_owned()),
+        title: Some(title),
+    })
+}
+
+/// `…/pull/123` -> 123.
+fn pull_request_number(url: &str) -> Option<u64> {
+    let (_, tail) = url.rsplit_once("/pull/")?;
+    tail.split(['/', '?', '#']).next()?.parse().ok()
+}
+
+/// The branch pull requests target: the remote's HEAD, else `main` or
+/// `master` when the remote has it, else what `gh` says is the default.
+async fn base_branch(git: &Git<'_>, remote: &str) -> GitResult<Option<String>> {
+    let head = git
+        .try_line(&[
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            &format!("refs/remotes/{remote}/HEAD"),
+        ])
+        .await?
+        .and_then(|head| head.strip_prefix(&format!("{remote}/")).map(str::to_owned));
+    if head.is_some() {
+        return Ok(head);
+    }
+    for name in ["main", "master"] {
+        let exists = git
+            .try_line(&[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/remotes/{remote}/{name}"),
+            ])
+            .await?
+            .is_some();
+        if exists {
+            return Ok(Some(name.to_owned()));
+        }
+    }
+    let gh = Git::gh(git.dir, git.cwd);
+    let name = gh
+        .try_line(&[
+            "repo",
+            "view",
+            "--json",
+            "defaultBranchRef",
+            "--jq",
+            ".defaultBranchRef.name",
+        ])
+        .await?;
+    Ok(name.filter(|name| !name.is_empty()))
+}
+
+fn pr_prompt(base: &str, head: &str, commits: &str, stat: &str, patch: &str) -> String {
+    [
+        PR_SYSTEM_PROMPT,
+        "Return a JSON object with keys: title, body.",
+        "Rules:",
+        "- title must be imperative, <= 72 chars, and no trailing period",
+        "- body is markdown: a short summary, then bullet points of the notable changes",
+        "- describe only what the commits and diff show",
+        "",
+        &format!("Base branch: {base}"),
+        &format!("Head branch: {head}"),
+        "",
+        "Commits:",
+        &limit_section(commits, 6_000),
+        "",
+        "Diff stat:",
+        &limit_section(stat, 6_000),
+        "",
+        "Diff:",
+        &limit_section(patch, 40_000),
+    ]
+    .join("\n")
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct PullRequestText {
+    title: String,
+    body: String,
+}
+
+#[derive(Deserialize)]
+struct GeneratedPullRequest {
+    title: String,
+    #[serde(default)]
+    body: String,
+}
+
+async fn generate_pull_request(
+    omp: &OmpLauncher,
+    prompt: &str,
+    cwd: &Path,
+) -> GitResult<PullRequestText> {
+    const OPERATION: &str = "generatePullRequestContent";
+    let reply = omp
+        .generate_text(prompt, PR_SYSTEM_PROMPT, cwd)
+        .await
+        .map_err(|error| {
+            Box::new(GitManagerServiceError::text_generation(
+                OPERATION,
+                error.to_string(),
+            ))
+        })?;
+    let generated: GeneratedPullRequest = parse_json(&reply).ok_or_else(|| {
+        Box::new(GitManagerServiceError::text_generation(
+            OPERATION,
+            format!(
+                "omp did not return a pull request JSON object: {}",
+                reply.trim()
+            ),
+        ))
+    })?;
+    Ok(sanitize_pull_request(generated))
+}
+
+/// The title is one line without a closing period, at most 72 characters;
+/// without one the PR is named after its work.
+fn sanitize_pull_request(generated: GeneratedPullRequest) -> PullRequestText {
+    let first = generated.title.trim().lines().next().unwrap_or("").trim();
+    let title = first.trim_end_matches('.').trim();
+    PullRequestText {
+        title: if title.is_empty() {
+            "Update project files".to_owned()
+        } else {
+            take_chars(title, 72).trim_end().to_owned()
+        },
+        body: generated.body.trim().to_owned(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Commit messages
 // ---------------------------------------------------------------------------
 
@@ -842,10 +1306,14 @@ async fn generate_commit_message(
 
 /// The JSON object in a model reply, tolerating code fences and prose
 /// around it.
-fn parse_generated(reply: &str) -> Option<GeneratedCommitMessage> {
+fn parse_json<T: serde::de::DeserializeOwned>(reply: &str) -> Option<T> {
     let start = reply.find('{')?;
     let end = reply.rfind('}')?;
     serde_json::from_str(reply.get(start..=end)?).ok()
+}
+
+fn parse_generated(reply: &str) -> Option<GeneratedCommitMessage> {
+    parse_json(reply)
 }
 
 /// t3's `sanitizeCommitMessage`.
@@ -886,16 +1354,36 @@ fn truncate_text(value: Option<&str>) -> Option<String> {
     ))
 }
 
-/// t3's `summarizeGitActionResult` plus the CTA of `buildCompletionToast`
-/// (no pull requests: the only CTA is "Push" after a plain commit).
-fn toast(action: GitStackedAction, commit: &GitCommitStep, push: &GitPushStep) -> GitToast {
+/// t3's `summarizeGitActionResult` plus the CTA of `buildCompletionToast`:
+/// "View PR" after a pull request, "Push" after a plain commit, and "Create
+/// PR" after a push to a feature branch on GitHub (`offers_pr`).
+fn toast(
+    action: GitStackedAction,
+    commit: &GitCommitStep,
+    push: &GitPushStep,
+    pr: &GitPrStep,
+    offers_pr: bool,
+) -> GitToast {
     let short_sha = commit
         .commit_sha
         .as_deref()
         .filter(|sha| !sha.is_empty())
         .map(|sha| take_chars(sha, SHORT_SHA_LENGTH));
     let description = truncate_text(commit.subject.as_deref());
-    let (title, description) = if push.status == GitPushStepStatus::Pushed {
+    let pr_number = pr
+        .number
+        .map_or_else(String::new, |number| format!(" #{number}"));
+    let (title, description) = if pr.status == GitPrStepStatus::Created {
+        (
+            format!("Created PR{pr_number}"),
+            truncate_text(pr.title.as_deref()),
+        )
+    } else if pr.status == GitPrStepStatus::OpenedExisting {
+        (
+            format!("Opened PR{pr_number}"),
+            truncate_text(pr.title.as_deref()),
+        )
+    } else if push.status == GitPushStepStatus::Pushed {
         let mut title = String::from("Pushed");
         if let Some(sha) = short_sha {
             title.push(' ');
@@ -915,16 +1403,20 @@ fn toast(action: GitStackedAction, commit: &GitCommitStep, push: &GitPushStep) -
     } else {
         ("Done".to_owned(), None)
     };
-    let cta = if action == GitStackedAction::Commit && commit.status == GitCommitStepStatus::Created
-    {
-        GitToastCta::RunAction {
-            label: "Push".to_owned(),
-            action: GitToastRunAction {
-                kind: GitStackedAction::Push,
-            },
+    let run = |label: &str, kind: GitStackedAction| GitToastCta::RunAction {
+        label: label.to_owned(),
+        action: GitToastRunAction { kind },
+    };
+    let cta = match (&pr.url, action) {
+        (Some(url), _) => GitToastCta::OpenPr {
+            label: "View PR".to_owned(),
+            url: url.clone(),
+        },
+        (None, GitStackedAction::Commit) if commit.status == GitCommitStepStatus::Created => {
+            run("Push", GitStackedAction::Push)
         }
-    } else {
-        GitToastCta::None
+        (None, _) if offers_pr => run("Create PR", GitStackedAction::CreatePr),
+        _ => GitToastCta::None,
     };
     GitToast {
         title,
@@ -1016,5 +1508,80 @@ mod tests {
             format!("{}...", "x".repeat(69))
         );
         assert_eq!(truncate_text(Some("")), None);
+    }
+
+    #[test]
+    fn github_remotes_are_recognised_by_host() {
+        for url in [
+            "git@github.com:acme/widgets.git",
+            "ssh://git@github.com/acme/widgets",
+            "https://github.com/acme/widgets.git",
+            "https://user:token@GitHub.com/acme/widgets",
+            "github.com:acme/widgets.git",
+        ] {
+            assert!(is_github_remote(url), "{url}");
+        }
+        for url in [
+            "git@gitlab.com:acme/widgets.git",
+            "https://example.com/github.com/acme/widgets",
+            "https://github.com.evil.test/acme/widgets",
+            "/srv/git/widgets.git",
+            "",
+        ] {
+            assert!(!is_github_remote(url), "{url}");
+        }
+    }
+
+    #[test]
+    fn pull_request_numbers_come_from_urls() {
+        assert_eq!(
+            pull_request_number("https://github.com/acme/widgets/pull/12"),
+            Some(12)
+        );
+        assert_eq!(
+            pull_request_number("https://github.com/acme/widgets/pull/12/files?w=1"),
+            Some(12)
+        );
+        assert_eq!(pull_request_number("https://github.com/acme/widgets"), None);
+    }
+
+    #[test]
+    fn the_open_pull_request_beats_newer_closed_ones() {
+        let listed = r#"[
+          {"number": 1, "title": "a", "url": "u1", "baseRefName": "main", "headRefName": "f",
+           "state": "MERGED", "isDraft": false, "updatedAt": "2026-10-02T00:00:00Z"},
+          {"number": 2, "title": "b", "url": "u2", "baseRefName": "main", "headRefName": "f",
+           "state": "OPEN", "isDraft": false, "updatedAt": "2026-10-01T00:00:00Z"},
+          {"number": 3, "title": "c", "url": "u3", "baseRefName": "main", "headRefName": "f",
+           "state": "CLOSED", "isDraft": false, "updatedAt": "2026-09-01T00:00:00Z"}
+        ]"#;
+        assert_eq!(pick_pull_request(listed).unwrap().number, 2);
+        let closed_only = listed.replace("OPEN", "CLOSED");
+        let picked = pick_pull_request(&closed_only).unwrap();
+        assert_eq!(
+            (picked.number, picked.state),
+            (1, VcsChangeRequestState::Merged)
+        );
+        assert_eq!(pick_pull_request("[]"), None);
+        assert_eq!(pick_pull_request("not json"), None);
+    }
+
+    #[test]
+    fn generated_pull_request_text_is_sanitized() {
+        let generated: GeneratedPullRequest =
+            parse_json("```json\n{\"title\": \"Add widgets.\\nmore\", \"body\": \" - a \"}\n```")
+                .unwrap();
+        assert_eq!(
+            sanitize_pull_request(generated),
+            PullRequestText {
+                title: "Add widgets".into(),
+                body: "- a".into()
+            }
+        );
+        let empty = sanitize_pull_request(GeneratedPullRequest {
+            title: "".into(),
+            body: String::new(),
+        });
+        assert_eq!(empty.title, "Update project files");
     }
 }

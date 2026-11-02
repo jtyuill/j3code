@@ -619,8 +619,7 @@ impl Harness {
         self.until(cx, |window, _| in_sidebar(window, &row)).await;
         self.update(cx, |window, cx| click_sidebar(window, &row, cx));
         // The thread view's composer offers Stop while the run is active.
-        self.until(cx, |window, _| window.try_find("stop-run").is_some())
-            .await;
+        self.until(cx, |window, _| stoppable(window)).await;
         self.until_thread(cx, &thread_id, |state| state.can_steer())
             .await;
         thread_id
@@ -643,6 +642,12 @@ impl Harness {
             let _ = std::fs::remove_dir_all(dir);
         }
     }
+}
+
+/// Whether the composer's one button offers Stop: a run is active and the
+/// draft is empty.
+fn stoppable(window: &Window) -> bool {
+    label_of(window, "send-message").as_deref() == Some("Stop")
 }
 
 /// Whether an observed element carries exactly this accessible label.
@@ -1224,7 +1229,7 @@ async fn new_thread_launches_from_the_composer_and_streams_the_reply(cx: &mut Te
     })
     .await;
     app.update(cx, |window, cx| {
-        assert!(window.try_find("stop-run").is_none());
+        assert!(!stoppable(window));
         // An empty message is not sent.
         window.press("enter", cx);
         window.input("Say hi", cx);
@@ -1279,7 +1284,7 @@ async fn new_thread_launches_from_the_composer_and_streams_the_reply(cx: &mut Te
 
     app.script.settle("completed");
     app.until(cx, |window, _| {
-        in_sidebar(window, "Say hi") && window.try_find("stop-run").is_none()
+        in_sidebar(window, "Say hi") && !stoppable(window)
     })
     .await;
     // The launch carried the composer's model (the one the fake omp lists).
@@ -1353,38 +1358,22 @@ async fn a_pending_question_is_answered_from_its_card(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-async fn enter_steers_and_secondary_enter_queues_while_running(cx: &mut TestAppContext) {
+async fn enter_queues_while_running_and_the_queued_message_can_steer(cx: &mut TestAppContext) {
     let app = Harness::start("steer", cx).await;
     let project_id = app.project(cx).await;
     let thread_id = app.open_running_thread(cx, &project_id, "first").await;
 
-    // Enter steers the running turn.
+    // One button: Stop with nothing typed, Queue once there is a draft.
     app.click_composer(cx);
     app.update(cx, |window, cx| {
-        assert_eq!(window.find("send-message").label(), Some("Steer"));
+        assert_eq!(window.find("send-message").label(), Some("Stop"));
         // Shift+Enter breaks the line and sends nothing.
-        window.input("steer", cx);
-        window.press("shift-enter", cx);
-        assert_eq!(window.find_by_label("Message").value(), Some("steer\n"));
-        window.input("this", cx);
-        window.press("enter", cx);
-    });
-    app.until_called(cx, "steer:steer\nthis").await;
-    app.until(cx, |window, _| feed_row(window, "steer\nthis").is_some())
-        .await;
-    app.until_thread(cx, &thread_id, |state| {
-        state.feed().iter().any(|row| matches!(&row.item.kind,
-            TurnItemKind::UserMessage(m) if m.input_intent == UserMessageInputIntent::Steer && m.text == "steer\nthis"))
-    })
-    .await;
-    app.update(cx, |window, _| {
-        assert_eq!(window.find_by_label("Message").value(), Some(""));
-    });
-
-    // ⌘⏎ queues; the message shows in the queue panel, not the turn.
-    app.update(cx, |window, cx| {
         window.input("queue me", cx);
-        window.press("secondary-enter", cx);
+        assert_eq!(window.find("send-message").label(), Some("Queue"));
+        window.press("shift-enter", cx);
+        assert_eq!(window.find_by_label("Message").value(), Some("queue me\n"));
+        // Enter queues the (trimmed) draft; it does not steer the running turn.
+        window.press("enter", cx);
     });
     app.until_thread(cx, &thread_id, |state| state.queued_runs().len() == 1)
         .await;
@@ -1396,6 +1385,9 @@ async fn enter_steers_and_secondary_enter_queues_while_running(cx: &mut TestAppC
         assert_eq!(queued.text, "queue me");
         queued.run.id.clone()
     };
+    app.update(cx, |window, _| {
+        assert_eq!(window.find_by_label("Message").value(), Some(""));
+    });
     let row = format!("queued-{queued}");
     app.until(cx, |window, _| {
         label_of(window, &row).as_deref() == Some("queue me")
@@ -1404,9 +1396,21 @@ async fn enter_steers_and_secondary_enter_queues_while_running(cx: &mut TestAppC
     app.update(cx, |window, _| {
         assert!(window.try_find(format!("send-now-{queued}")).is_some());
         assert!(window.try_find(format!("steer-{queued}")).is_some());
+        // The draft is gone, so the button offers Stop again.
+        assert_eq!(window.find("send-message").label(), Some("Stop"));
     });
     assert!(!app.script.called("steer:queue me"));
     assert!(!app.script.called("prompt:queue me:0"));
+
+    // Steer on the queued message sends it into the running turn.
+    app.update(cx, |window, cx| window.click(format!("steer-{queued}"), cx));
+    app.until_called(cx, "steer:queue me").await;
+    app.until_thread(cx, &thread_id, |state| {
+        state.queued_runs().is_empty()
+            && state.feed().iter().any(|row| matches!(&row.item.kind,
+                TurnItemKind::UserMessage(m) if m.input_intent == UserMessageInputIntent::PromotedQueuedToSteer && m.text == "queue me"))
+    })
+    .await;
 
     app.stop(cx);
 }
@@ -1418,12 +1422,12 @@ async fn stop_interrupts_the_run(cx: &mut TestAppContext) {
     let thread_id = app.open_running_thread(cx, &project_id, "long task").await;
 
     // The Stop button.
-    app.update(cx, |window, cx| window.click("stop-run", cx));
+    app.update(cx, |window, cx| window.click("send-message", cx));
     app.until_called(cx, "abort").await;
     app.until_thread(cx, &thread_id, |state| state.active_run().is_none())
         .await;
     app.until(cx, |window, _| {
-        window.try_find("stop-run").is_none()
+        !stoppable(window)
             && window.find("send-message").label() == Some("Send")
             && in_sidebar(window, "long task")
     })
@@ -1438,11 +1442,9 @@ async fn stop_interrupts_the_run(cx: &mut TestAppContext) {
     });
     app.until_called(cx, "prompt:again:0").await;
     app.script.emit(json!({"type": "agent_start"}));
-    app.until(cx, |window, _| window.try_find("stop-run").is_some())
-        .await;
+    app.until(cx, |window, _| stoppable(window)).await;
     app.update(cx, |window, cx| window.press("cmd-.", cx));
-    app.until(cx, |window, _| window.try_find("stop-run").is_none())
-        .await;
+    app.until(cx, |window, _| !stoppable(window)).await;
     assert_eq!(
         app.script
             .calls()

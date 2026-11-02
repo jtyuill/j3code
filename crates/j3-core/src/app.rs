@@ -1059,6 +1059,7 @@ impl Inner {
             .send(Request::Launch {
                 command_id: input.command_id.clone(),
                 input: initial.map(Box::new),
+                generate_title: input.generate_title != Some(false),
                 reply,
             })
             .is_err()

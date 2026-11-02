@@ -1,8 +1,8 @@
 //! The thread header's git control, ported from t3's `GitActionsControl`
-//! (`apps/web/src/components/GitActionsControl.tsx`) without pull requests,
-//! feature branches or per-file selection: the quick action button with a
-//! menu (Commit…, Push, Pull), the commit dialog, and progress and result
-//! notifications.
+//! (`apps/web/src/components/GitActionsControl.tsx`) without feature
+//! branches or per-file selection: the quick action button with a menu
+//! (Commit…, Push, Pull, and on GitHub Create PR / View PR), the commit
+//! dialog, and progress and result notifications.
 
 use std::{rc::Rc, time::Duration};
 
@@ -25,7 +25,8 @@ use gpui_kit::{
 use j3_client::{
     GitActionUpdate,
     t3::git::{
-        GitActionProgress, GitStackedAction, GitToast, GitToastCta, VcsPullStatus, VcsStatusResult,
+        GitActionProgress, GitStackedAction, GitToast, GitToastCta, VcsChangeRequestState,
+        VcsPullStatus, VcsStatusResult,
     },
     workflow::git::{self, QuickActionKind},
 };
@@ -183,6 +184,13 @@ impl GitControl {
         .detach();
     }
 
+    /// Opens the branch's pull request in the browser.
+    fn open_pr(&mut self, cx: &mut Context<Self>) {
+        if let Some(pr) = self.status.as_ref().and_then(|status| status.pr.as_ref()) {
+            cx.open_url(&pr.url);
+        }
+    }
+
     /// Pulls (`vcs.pull`) and reports the outcome.
     fn pull(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(cwd) = self.cwd.clone() else {
@@ -248,6 +256,14 @@ impl GitControl {
                 .placeholder("Leave empty to auto-generate")
         });
         let control = cx.weak_entity();
+        // A GitHub feature branch without a pull request can open one.
+        let offers_pr = status.source_control_provider.is_some()
+            && !status.is_default_ref
+            && status.has_primary_remote
+            && status
+                .pr
+                .as_ref()
+                .is_none_or(|pr| pr.state != VcsChangeRequestState::Open);
         let status = Rc::new(status);
         let dialog_message = message.clone();
         let width = window.rem_size() * 32.;
@@ -262,6 +278,11 @@ impl GitControl {
                 dialog_message.clone(),
                 GitStackedAction::CommitPush,
             );
+            let commit_push_pr = commit_runner(
+                control.clone(),
+                dialog_message.clone(),
+                GitStackedAction::CommitPushPr,
+            );
             dialog
                 .title("Commit changes")
                 .w(width)
@@ -273,6 +294,17 @@ impl GitControl {
                             DialogClose::new()
                                 .child(Button::new("dialog-cancel").outline().label("Cancel")),
                         )
+                        .when(offers_pr, |footer| {
+                            footer.child(
+                                Button::new("git-commit-push-pr")
+                                    .outline()
+                                    .label("Commit, push & PR")
+                                    .on_click(move |_, window, cx| {
+                                        commit_push_pr(window, cx);
+                                        window.close_dialog(cx);
+                                    }),
+                            )
+                        })
                         .child(
                             Button::new("git-commit-push")
                                 .outline()
@@ -420,24 +452,27 @@ fn first_phase(action: GitStackedAction, generates: bool) -> &'static str {
     }
 }
 
-/// The server's success toast; a `run_action` follow-up (e.g. Push after
-/// Commit) becomes the notification's button.
+/// The server's success toast. Its call to action becomes the notification's
+/// button: "View PR" opens the pull request, and a `run_action` follow-up
+/// (Push after Commit, Create PR after a push) runs.
 fn notify_toast(
     toast: GitToast,
     control: WeakEntity<GitControl>,
     window: &mut Window,
     cx: &mut App,
 ) {
+    enum FollowUp {
+        Run(GitStackedAction),
+        Open(SharedString),
+    }
     let follow_up = match toast.cta {
-        GitToastCta::RunAction { label, action }
-            if !matches!(
-                action.kind,
-                GitStackedAction::CreatePr | GitStackedAction::CommitPushPr
-            ) =>
-        {
-            Some((SharedString::from(label), action.kind))
+        GitToastCta::RunAction { label, action } => {
+            Some((SharedString::from(label), FollowUp::Run(action.kind)))
         }
-        _ => None,
+        GitToastCta::OpenPr { label, url } => {
+            Some((SharedString::from(label), FollowUp::Open(url.into())))
+        }
+        GitToastCta::None => None,
     };
     window.push_notification(
         Notification::new()
@@ -446,17 +481,25 @@ fn notify_toast(
                 note.message(description)
             })
             .with_type(NotificationType::Success)
-            .when_some(follow_up, |note, (label, action)| {
+            .when_some(follow_up, |note, (label, follow_up)| {
+                let follow_up = Rc::new(follow_up);
                 note.action(move |_, _, cx| {
-                    let (control, note) = (control.clone(), cx.entity().downgrade());
+                    let (control, note, follow_up) =
+                        (control.clone(), cx.entity().downgrade(), follow_up.clone());
                     Button::new("git-toast-action")
                         .small()
                         .primary()
                         .label(label.clone())
                         .on_click(move |_, window, cx| {
                             let _ = note.update(cx, |note, cx| note.dismiss(window, cx));
-                            let _ = control
-                                .update(cx, |this, cx| this.run_action(action, None, window, cx));
+                            match &*follow_up {
+                                FollowUp::Run(action) => {
+                                    let _ = control.update(cx, |this, cx| {
+                                        this.run_action(*action, None, window, cx)
+                                    });
+                                }
+                                FollowUp::Open(url) => cx.open_url(url),
+                            }
                         })
                 })
             }),
@@ -506,6 +549,7 @@ impl Render for GitControl {
                     let _ = control.update(cx, |this, cx| match quick.kind {
                         QuickActionKind::Run(action) => this.run_action(action, None, window, cx),
                         QuickActionKind::Pull => this.pull(window, cx),
+                        QuickActionKind::OpenPr => this.open_pr(cx),
                         QuickActionKind::Hint(_) => {}
                     });
                 })
@@ -532,6 +576,15 @@ impl Render for GitControl {
                         this.run_action(GitStackedAction::Push, None, window, cx)
                     }))
                     .item(item("Pull", menu.pull, GitControl::pull))
+                    .when(menu.view_pr || menu.create_pr, |popup| {
+                        popup.separator().item(if menu.view_pr {
+                            item("View PR", true, |this, _, cx| this.open_pr(cx))
+                        } else {
+                            item("Create PR", true, |this, window, cx| {
+                                this.run_action(GitStackedAction::CreatePr, None, window, cx)
+                            })
+                        })
+                    })
             })
             .into_any_element()
     }

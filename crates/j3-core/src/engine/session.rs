@@ -14,11 +14,12 @@ use crate::omp::{
         AbortCommand, AvailableSlashCommand, CancelSubagentCommand, Command, Event,
         ExtensionUiResponse, GetAvailableCommandsCommand, GetStateCommand,
         GetSubagentMessagesCommand, GoalCommand, GoalOp, GoalResult, ImageContent, PromptAck,
-        PromptCommand, SessionState, SetModelCommand, SetSubagentSubscriptionCommand,
-        SetThinkingLevelCommand, SteerCommand, SubagentMessages, SubagentSubscriptionLevel,
-        ThinkingLevel,
+        PromptCommand, SessionState, SetModelCommand, SetSessionNameCommand,
+        SetSubagentSubscriptionCommand, SetThinkingLevelCommand, SteerCommand, SubagentMessages,
+        SubagentSubscriptionLevel, ThinkingLevel,
     },
 };
+use crate::title;
 
 pub type Events = mpsc::UnboundedReceiver<Event>;
 pub type Result<T, E = omp::Error> = std::result::Result<T, E>;
@@ -50,6 +51,10 @@ pub trait AgentSession: Send + Sync + 'static {
     /// omp `get_subagent_messages` for one subagent's whole transcript.
     fn subagent_messages(&self, subagent_id: String) -> BoxFuture<'_, Result<SubagentMessages>>;
     fn respond_ui(&self, response: ExtensionUiResponse) -> Result<()>;
+    /// omp `set_session_name`: the title `omp --resume` lists the session by.
+    fn set_session_name(&self, _name: String) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
     fn close(self: Box<Self>) -> BoxFuture<'static, ()>;
 }
 
@@ -60,6 +65,12 @@ pub trait SessionFactory: Send + Sync + 'static {
         cwd: PathBuf,
         resume: Option<PathBuf>,
     ) -> BoxFuture<'static, Result<(Box<dyn AgentSession>, Events)>>;
+
+    /// The title omp gives a thread that opens with `message` in `cwd`;
+    /// `None` when there is none.
+    fn title(&self, _cwd: PathBuf, _message: String) -> BoxFuture<'static, Option<String>> {
+        Box::pin(async { None })
+    }
 }
 
 /// `set_event_filter` with `messageUpdates: "delta"`: every event, with
@@ -160,6 +171,10 @@ impl AgentSession for Omp {
         self.0.respond_ui(response)
     }
 
+    fn set_session_name(&self, name: String) -> BoxFuture<'_, Result<()>> {
+        Box::pin(self.0.call(SetSessionNameCommand { name }))
+    }
+
     fn close(self: Box<Self>) -> BoxFuture<'static, ()> {
         Box::pin(async move {
             if let Err(error) = self.0.close().await {
@@ -204,5 +219,10 @@ impl SessionFactory for OmpFactory {
             }
             Ok((Box::new(Omp(session)) as Box<dyn AgentSession>, events))
         })
+    }
+
+    fn title(&self, cwd: PathBuf, message: String) -> BoxFuture<'static, Option<String>> {
+        let launcher = self.0.clone();
+        Box::pin(async move { title::generate(&launcher, &message, &cwd).await })
     }
 }

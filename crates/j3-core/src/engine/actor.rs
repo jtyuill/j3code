@@ -71,8 +71,13 @@ pub enum Request {
     Launch {
         command_id: String,
         input: Option<Box<UserInput>>,
+        /// Ask omp to name the thread from its first message.
+        generate_title: bool,
         reply: LaunchReply,
     },
+    /// omp named the thread. Applied only while the thread still has the
+    /// title `from` it was launched with, so a rename in between wins.
+    Retitle { from: String, title: String },
     /// Current projection.
     Projection {
         reply: oneshot::Sender<ThreadProjection>,
@@ -123,6 +128,7 @@ pub fn spawn(
 ) -> ThreadHandle {
     let (tx, rx) = mpsc::unbounded_channel();
     let actor = Actor {
+        mailbox: tx.downgrade(),
         config,
         model,
         session: None,
@@ -142,6 +148,8 @@ pub fn spawn(
 }
 
 struct Actor {
+    /// Weak, so the actor's own handle does not keep its mailbox open.
+    mailbox: mpsc::WeakUnboundedSender<Request>,
     config: ActorConfig,
     model: ThreadModel,
     session: Option<Box<dyn AgentSession>>,
@@ -569,6 +577,37 @@ impl Actor {
         }
     }
 
+    /// Asks omp to name the thread from its first message, off the actor's
+    /// task; the answer comes back as [`Request::Retitle`].
+    fn generate_title(&self, text: &str) {
+        let title = self
+            .config
+            .factory
+            .title(PathBuf::from(self.cwd()), text.to_owned());
+        let from = self.model.proj.thread.title.clone();
+        let mailbox = self.mailbox.clone();
+        tokio::spawn(async move {
+            if let Some(title) = title.await
+                && let Some(mailbox) = mailbox.upgrade()
+            {
+                let _ = mailbox.send(Request::Retitle { from, title });
+            }
+        });
+    }
+
+    async fn retitle(&mut self, from: &str, title: &str) {
+        if self.model.proj.thread.title != from || self.model.rename(title).is_err() {
+            return;
+        }
+        let _ = self.commit_now(None);
+        // Mirror it into the omp session, so `omp --resume` lists the same name.
+        if let Some(session) = &self.session
+            && let Err(error) = session.set_session_name(title.to_owned()).await
+        {
+            tracing::debug!(%error, "omp set_session_name");
+        }
+    }
+
     async fn images(&self, attachments: &[ChatAttachment]) -> Vec<ImageContent> {
         let mut images = Vec::new();
         for attachment in attachments {
@@ -741,6 +780,7 @@ impl Actor {
             Request::Launch {
                 command_id,
                 input,
+                generate_title,
                 reply,
             } => {
                 if let Some(input) = &input {
@@ -755,9 +795,13 @@ impl Actor {
                 let projection = self.model.proj.to_wire();
                 let _ = reply.send(result.map(|sequence| (sequence, projection)));
                 if let Some(input) = input {
+                    if generate_title {
+                        self.generate_title(&input.text);
+                    }
                     self.send_prompt(*input).await;
                 }
             }
+            Request::Retitle { from, title } => self.retitle(&from, &title).await,
             Request::Projection { reply } => {
                 self.flush();
                 let _ = reply.send(self.model.proj.to_wire());

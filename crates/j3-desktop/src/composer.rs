@@ -6,7 +6,7 @@ use std::{path::Path, sync::Arc, time::Instant};
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, IndexPath, Sizable as _,
+    ActiveTheme as _, Icon, IconName, IndexPath, Sizable as _,
     button::{Button, ButtonVariants as _},
     combobox::{Combobox, ComboboxEvent, ComboboxState},
     h_flex,
@@ -46,8 +46,6 @@ pub struct Submission {
     pub text: String,
     pub attachments: Vec<ChatAttachment>,
     pub model: ModelSelection,
-    /// The user asked to queue (secondary send) rather than steer/start.
-    pub queue: bool,
 }
 
 pub enum ComposerEvent {
@@ -57,11 +55,42 @@ pub enum ComposerEvent {
     OpenAgentHub,
 }
 
-/// Whether the thread has an active run, which changes what Enter does.
+/// Whether the thread has an active run, which turns Send into Queue (or
+/// Stop, with nothing to queue).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunState {
     Idle,
-    Running { can_steer: bool },
+    Running,
+}
+
+/// What the composer's one button does, and so which icon it shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendAction {
+    /// Starts a run.
+    Send,
+    /// Holds the draft until the current run ends.
+    Queue,
+    /// Interrupts the current run; there is no draft to queue.
+    Stop,
+}
+
+impl SendAction {
+    fn icon(self) -> IconName {
+        match self {
+            Self::Send => IconName::ArrowUp,
+            Self::Queue => IconName::Inbox,
+            Self::Stop => IconName::Square,
+        }
+    }
+
+    /// The accessible name; the button shows no text.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Send => "Send",
+            Self::Queue => "Queue",
+            Self::Stop => "Stop",
+        }
+    }
 }
 
 enum Upload {
@@ -358,8 +387,7 @@ impl Composer {
         self.run_state = run_state;
         let placeholder = match run_state {
             RunState::Idle => "Message omp…",
-            RunState::Running { can_steer: true } => "Steer the run…",
-            RunState::Running { can_steer: false } => "Queue a message…",
+            RunState::Running => "Queue a message…",
         };
         self.input.update(cx, |input, cx| {
             input.set_placeholder(placeholder, window, cx)
@@ -413,10 +441,7 @@ impl Composer {
                 cx.notify();
             }
             // Shift+Enter inserts a newline, yet the textarea still reports it.
-            InputEvent::PressEnter {
-                secondary,
-                shift: false,
-            } => self.submit(*secondary, window, cx),
+            InputEvent::PressEnter { shift: false, .. } => self.submit(window, cx),
             InputEvent::PressEnter { .. } | InputEvent::Focus | InputEvent::Blur => {}
         }
     }
@@ -441,7 +466,20 @@ impl Composer {
         }
     }
 
-    fn submit(&mut self, queue: bool, _: &mut Window, cx: &mut Context<Self>) {
+    /// Whether there is anything to send: text or an image.
+    fn has_draft(&self, cx: &App) -> bool {
+        !self.input.read(cx).value().trim().is_empty() || !self.images.is_empty()
+    }
+
+    fn send_action(&self, cx: &App) -> SendAction {
+        match self.run_state {
+            RunState::Idle => SendAction::Send,
+            RunState::Running if self.has_draft(cx) => SendAction::Queue,
+            RunState::Running => SendAction::Stop,
+        }
+    }
+
+    fn submit(&mut self, _: &mut Window, cx: &mut Context<Self>) {
         if self.busy {
             return;
         }
@@ -477,7 +515,6 @@ impl Composer {
             text,
             attachments,
             model,
-            queue,
         }));
         cx.notify();
     }
@@ -985,15 +1022,17 @@ impl Focusable for Composer {
 impl Render for Composer {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let weak = cx.weak_entity();
-        let running = matches!(self.run_state, RunState::Running { .. });
-        let can_steer = matches!(self.run_state, RunState::Running { can_steer: true });
+        let action = self.send_action(cx);
         let completions = self.render_completions(cx);
         let images = self.render_images(cx);
         let model_picker = self.render_model_picker(cx);
         let usage_button = self.render_usage_button(cx);
         let key = |keys: &str| crate::actions::shortcut(keys, cx);
-        let stop_tooltip = format!("Stop the run ({})", key("secondary-."));
-        let queue_tooltip = format!("Queue after the current run ({})", key("secondary-enter"));
+        let tooltip = match action {
+            SendAction::Send => format!("Send ({})", key("enter")),
+            SendAction::Queue => format!("Queue after the current run ({})", key("enter")),
+            SendAction::Stop => format!("Stop the run ({})", key("secondary-.")),
+        };
         // An empty catalog is nearly always a server problem (e.g. omp not
         // found); say what the server reported instead of showing nothing.
         let catalog_note: Option<SharedString> = if self.choices.is_empty() {
@@ -1087,48 +1126,18 @@ impl Render for Composer {
                     .child(model_picker)
                     .child(usage_button)
                     .child(div().flex_1())
-                    .when(running, |this| {
-                        this.child(
-                            Button::new("stop-run")
-                                .xsmall()
-                                .outline()
-                                .icon(IconName::Square)
-                                .label("Stop")
-                                .tooltip(stop_tooltip)
-                                .on_click(cx.listener(|_, _, _, cx| cx.emit(ComposerEvent::Stop))),
-                        )
-                    })
-                    .when(running, |this| {
-                        this.child(
-                            Button::new("queue-message")
-                                .xsmall()
-                                .outline()
-                                .label("Queue")
-                                .tooltip(queue_tooltip)
-                                .disabled(self.busy)
-                                .on_click(
-                                    cx.listener(|this, _, window, cx| {
-                                        this.submit(true, window, cx)
-                                    }),
-                                ),
-                        )
-                    })
                     .child(
                         Button::new("send-message")
                             .xsmall()
                             .primary()
-                            .icon(IconName::ArrowUp)
-                            .label(if can_steer {
-                                "Steer"
-                            } else if running {
-                                "Queue"
-                            } else {
-                                "Send"
-                            })
+                            .icon(action.icon())
+                            .accessibility_label(action.name())
+                            .tooltip(tooltip)
                             .loading(self.busy)
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.submit(false, window, cx)),
-                            ),
+                            .on_click(cx.listener(move |this, _, window, cx| match action {
+                                SendAction::Stop => cx.emit(ComposerEvent::Stop),
+                                SendAction::Send | SendAction::Queue => this.submit(window, cx),
+                            })),
                     ),
             )
     }

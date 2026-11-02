@@ -54,6 +54,8 @@ struct Script {
     events: Mutex<Option<mpsc::UnboundedSender<Event>>>,
     ui_responses: Mutex<Vec<ExtensionUiResponse>>,
     starts: Mutex<usize>,
+    /// What the fake omp names threads; none by default, like a greeting.
+    title: Mutex<Option<String>>,
 }
 
 impl Script {
@@ -215,6 +217,14 @@ impl AgentSession for FakeSession {
         Ok(())
     }
 
+    fn set_session_name(
+        &self,
+        name: String,
+    ) -> BoxFuture<'_, j3_core::engine::session::Result<()>> {
+        self.0.record(format!("set_session_name:{name}"));
+        Box::pin(async { Ok(()) })
+    }
+
     fn close(self: Box<Self>) -> BoxFuture<'static, ()> {
         self.0.record("close".into());
         Box::pin(async {})
@@ -236,6 +246,11 @@ impl SessionFactory for FakeFactory {
             *script.starts.lock().unwrap() += 1;
             Ok((Box::new(FakeSession(script)) as Box<dyn AgentSession>, rx))
         })
+    }
+
+    fn title(&self, _cwd: PathBuf, _message: String) -> BoxFuture<'static, Option<String>> {
+        let title = self.0.title.lock().unwrap().clone();
+        Box::pin(async move { title })
     }
 }
 
@@ -1586,4 +1601,55 @@ async fn engine_app_auto_settle_sweep_and_persistence() {
     app.shutdown().await;
     let _ = std::fs::remove_dir_all(&env.data_dir);
     let _ = std::fs::remove_dir_all(&env.project_dir);
+}
+
+#[tokio::test]
+async fn engine_app_threads_take_the_title_omp_names() {
+    let env = env("titles").await;
+    *env.script.title.lock().unwrap() = Some("Fix retry queue dropping jobs".into());
+    launch(
+        &env,
+        "c-t1",
+        "T1",
+        "the retry queue drops jobs when redis restarts",
+    )
+    .await;
+    let named = wait_for(&env.app, "T1", "omp's title", |p| {
+        p.thread.title == "Fix retry queue dropping jobs"
+    })
+    .await;
+    assert_eq!(named.thread.title, "Fix retry queue dropping jobs");
+    assert_eq!(
+        shell_row(&env.app, "T1").await.title,
+        "Fix retry queue dropping jobs"
+    );
+    wait_calls(&env.script, "the name in the omp session", |calls| {
+        calls
+            .iter()
+            .any(|call| call == "set_session_name:Fix retry queue dropping jobs")
+    })
+    .await;
+
+    // No title from omp (a greeting): the title from the message stays.
+    *env.script.title.lock().unwrap() = None;
+    launch(&env, "c-t2", "T2", "hi").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(thread(&env.app, "T2").await.title, "hi");
+
+    // `generateTitle: false` keeps the title the client gave.
+    *env.script.title.lock().unwrap() = Some("Late title".into());
+    call(
+        &env.app,
+        "orchestration.launchThread",
+        json!({"commandId": "c-t3", "creationSource": "mobile", "threadId": "T3",
+               "projectId": "P1", "title": "first words", "generateTitle": false,
+               "modelSelection": selection(),
+               "runtimeMode": "full-access", "interactionMode": "default",
+               "workspaceStrategy": {"type": "root"},
+               "initialMessage": {"messageId": "T3-m1", "text": "first words", "attachments": []}}),
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(thread(&env.app, "T3").await.title, "first words");
 }

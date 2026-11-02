@@ -428,9 +428,7 @@ impl ThreadView {
         }
 
         let run_state = match state.active_run() {
-            Some(_) => RunState::Running {
-                can_steer: state.can_steer(),
-            },
+            Some(_) => RunState::Running,
             None => RunState::Idle,
         };
         self.composer.update(cx, |composer, cx| {
@@ -603,10 +601,11 @@ impl ThreadView {
     }
 
     fn send(&mut self, submission: Submission, window: &mut Window, cx: &mut Context<Self>) {
+        // Messages sent into a running thread wait their turn; the queue
+        // panel's Steer sends one into the run.
         let mode = match self.state.active_run() {
             None => SendMode::Start,
-            Some(_) if submission.queue || !self.state.can_steer() => SendMode::Queue,
-            Some(_) => SendMode::Auto,
+            Some(_) => SendMode::Queue,
         };
         let connection = self.connection(cx);
         let thread_id = self.thread_id().to_owned();

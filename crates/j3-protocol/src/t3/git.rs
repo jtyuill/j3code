@@ -1,11 +1,10 @@
 //! The git workflow methods (`C/git.ts` = `G`, tags in `C/rpc.ts:208-221`):
 //! `vcs.refreshStatus`, `vcs.pull` and the streaming `git.runStackedAction`.
-//! j3 serves the commit/push half; pull requests (`create_pr`,
-//! `commit_push_pr`), feature branches and the source-control provider are
-//! cut, so the fields that carry them are always empty.
+//! j3 serves commit, push and, through the host's `gh`, GitHub pull requests
+//! (`create_pr`, `commit_push_pr`, and the open PR in the status). Feature
+//! branches are cut.
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 /// `vcs.refreshStatus` (`WsVcsRefreshStatusRpc`, `C/rpc.ts:647-651`).
 pub const VCS_REFRESH_STATUS: &str = "vcs.refreshStatus";
@@ -88,15 +87,60 @@ pub struct VcsWorkingTree {
     pub deletions: u64,
 }
 
+/// `SourceControlProviderInfo` (`C/sourceControl.ts:12-16`): the host a
+/// repository's remote lives on. j3 knows GitHub only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceControlProviderInfo {
+    pub kind: String,
+    pub name: String,
+    pub base_url: String,
+}
+
+impl SourceControlProviderInfo {
+    pub fn github() -> Self {
+        Self {
+            kind: "github".to_owned(),
+            name: "GitHub".to_owned(),
+            base_url: "https://github.com".to_owned(),
+        }
+    }
+}
+
+/// `VcsStatusChangeRequestState` (`G:52`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VcsChangeRequestState {
+    Open,
+    Closed,
+    Merged,
+}
+
+/// `VcsStatusChangeRequest` (`G:203-214`): the pull request of the branch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VcsChangeRequest {
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    pub base_ref: String,
+    pub head_ref: String,
+    pub state: VcsChangeRequestState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_draft: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+}
+
 /// `VcsStatusResult` (`G:202-240`): the local and remote halves together.
-/// `sourceControlProvider` is never sent and `pr` is always `null` (j3 has
-/// no source-control provider).
+/// `sourceControlProvider` is set for GitHub remotes and `pr` is the
+/// branch's latest pull request there, read through `gh`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VcsStatusResult {
     pub is_repo: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_control_provider: Option<Value>,
+    pub source_control_provider: Option<SourceControlProviderInfo>,
     pub has_primary_remote: bool,
     pub is_default_ref: bool,
     /// `None` on a detached HEAD.
@@ -108,8 +152,7 @@ pub struct VcsStatusResult {
     pub behind_count: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ahead_of_default_count: Option<u64>,
-    /// `VcsStatusChangeRequest | null`; always `null` from j3.
-    pub pr: Option<Value>,
+    pub pr: Option<VcsChangeRequest>,
 }
 
 impl VcsStatusResult {
