@@ -1160,13 +1160,15 @@ impl Connection {
 
     /// Starts a commit/push (`git.runStackedAction`) in `cwd` on the
     /// connection's runtime. `commit_message` `None` lets the server write
-    /// one. Progress and outcome arrive through the returned [`GitAction`];
-    /// dropping it interrupts the action.
+    /// one, falling back to `model` (the thread's) when omp's small models
+    /// cannot be reached. Progress and outcome arrive through the returned
+    /// [`GitAction`]; dropping it interrupts the action.
     pub fn run_git_action(
         &self,
         cwd: &str,
         action: GitStackedAction,
         commit_message: Option<String>,
+        model: Option<String>,
     ) -> GitAction {
         let shared = Arc::clone(&self.inner.shared);
         let payload = encode(&GitRunStackedActionInput {
@@ -1176,6 +1178,7 @@ impl Connection {
             commit_message,
             feature_branch: None,
             file_paths: None,
+            model,
         });
         let (tx, updates) = mpsc::unbounded_channel();
         let task = self.inner.shared.runtime.spawn(async move {

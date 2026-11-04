@@ -94,6 +94,7 @@ fn input(cwd: &Path, action: GitStackedAction, message: Option<&str>) -> GitRunS
         commit_message: message.map(str::to_owned),
         feature_branch: None,
         file_paths: None,
+        model: None,
     }
 }
 
@@ -716,6 +717,58 @@ async fn failed_generation_is_a_text_generation_error() {
         events.last().unwrap().progress,
         GitActionProgress::ActionFailed { phase: Some(_), .. }
     ));
+}
+
+#[tokio::test]
+async fn generation_falls_back_from_smol_to_tiny_to_the_thread_model() {
+    let root = TempDir::new();
+    let (work, _) = repo(&root);
+    let tried = root.0.join("tried.txt");
+    let script = root.0.join("omp");
+    // Answers only with the thread's model; records every model asked.
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\ncat >/dev/null\nwhile [ \"$1\" != --model ]; do shift; done\n\
+             echo \"$2\" >> '{}'\n\
+             [ \"$2\" = anthropic/thread-model ] || {{ echo unreachable >&2; exit 1; }}\n\
+             printf '{{\"subject\": \"Add a\"}}'\n",
+            tried.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    write(&work, "a.txt", "a\n");
+
+    let mut with_model = input(&work, GitStackedAction::Commit, None);
+    with_model.model = Some("anthropic/thread-model".into());
+    let (_, failure) = run(OmpLauncher::new(&script), with_model).await;
+    assert!(failure.is_none(), "{failure:?}");
+    assert_eq!(git(&work, &["log", "-1", "--format=%s"]), "Add a");
+    assert_eq!(
+        std::fs::read_to_string(&tried).unwrap(),
+        "pi/smol\npi/tiny\nanthropic/thread-model\n"
+    );
+
+    // Without a thread model, a failing tiny is the last word.
+    std::fs::remove_file(&tried).unwrap();
+    write(&work, "b.txt", "b\n");
+    let (_, failure) = run(
+        OmpLauncher::new(&script),
+        input(&work, GitStackedAction::Commit, None),
+    )
+    .await;
+    assert!(
+        matches!(
+            failure,
+            Some(GitManagerServiceError::TextGenerationError { .. })
+        ),
+        "{failure:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&tried).unwrap(),
+        "pi/smol\npi/tiny\n"
+    );
 }
 
 #[tokio::test]

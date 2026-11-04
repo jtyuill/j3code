@@ -649,7 +649,7 @@ async fn run_action(
             progress.set_phase(GitActionProgressPhase::Pr);
             // The push moved the branch; read the state it left.
             let current = details(cwd).await?;
-            pr_step(omp, cwd, branch, &current, progress).await?
+            pr_step(omp, cwd, branch, &current, input.model.as_deref(), progress).await?
         }
         _ => GitPrStep {
             status: GitPrStepStatus::SkippedNotRequested,
@@ -745,7 +745,7 @@ async fn commit_step(
                 )
                 .await?;
             let prompt = commit_message_prompt(branch, staged_summary, &staged_patch);
-            generate_commit_message(omp, &prompt, Path::new(cwd)).await?
+            generate_commit_message(omp, &prompt, Path::new(cwd), input.model.as_deref()).await?
         }
     };
 
@@ -955,12 +955,14 @@ fn forget_pull_request(cwd: &str, branch: &str) {
 }
 
 /// t3's `runPrStep`: the branch's open pull request, or a new one with
-/// omp-written text. `branch` is pushed already.
+/// omp-written text (`thread_model` as in [`generate_text`]). `branch` is
+/// pushed already.
 async fn pr_step(
     omp: &OmpLauncher,
     cwd: &str,
     branch: &str,
     details: &Details,
+    thread_model: Option<&str>,
     progress: &Progress<'_>,
 ) -> GitResult<GitPrStep> {
     const OPERATION: &str = "runPrStep";
@@ -1056,7 +1058,7 @@ async fn pr_step(
 
     progress.phase_started(GitActionProgressPhase::Pr, "Generating PR content...");
     let prompt = pr_prompt(&base, branch, commits.trim(), stat.trim(), &patch);
-    let generated = generate_pull_request(omp, &prompt, Path::new(cwd)).await?;
+    let generated = generate_pull_request(omp, &prompt, Path::new(cwd), thread_model).await?;
     let title = generated.title;
     let body = generated.body;
 
@@ -1179,10 +1181,10 @@ async fn generate_pull_request(
     omp: &OmpLauncher,
     prompt: &str,
     cwd: &Path,
+    thread_model: Option<&str>,
 ) -> GitResult<PullRequestText> {
     const OPERATION: &str = "generatePullRequestContent";
-    let reply = omp
-        .generate_text(prompt, PR_SYSTEM_PROMPT, cwd)
+    let reply = generate_text(omp, prompt, PR_SYSTEM_PROMPT, cwd, thread_model)
         .await
         .map_err(|error| {
             Box::new(GitManagerServiceError::text_generation(
@@ -1281,10 +1283,10 @@ async fn generate_commit_message(
     omp: &OmpLauncher,
     prompt: &str,
     cwd: &Path,
+    thread_model: Option<&str>,
 ) -> GitResult<CommitMessage> {
     const OPERATION: &str = "generateCommitMessage";
-    let reply = omp
-        .generate_text(prompt, COMMIT_SYSTEM_PROMPT, cwd)
+    let reply = generate_text(omp, prompt, COMMIT_SYSTEM_PROMPT, cwd, thread_model)
         .await
         .map_err(|error| {
             Box::new(GitManagerServiceError::text_generation(
@@ -1302,6 +1304,35 @@ async fn generate_commit_message(
         ))
     })?;
     Ok(sanitize_commit_message(generated))
+}
+
+/// Asks omp's `pi/smol`, then `pi/tiny`, then the thread's own model, and
+/// answers with the first reply. A model that cannot be reached (omp fails
+/// or times out with it) moves on to the next; the last failure is the
+/// error.
+async fn generate_text(
+    omp: &OmpLauncher,
+    prompt: &str,
+    system: &str,
+    cwd: &Path,
+    thread_model: Option<&str>,
+) -> crate::omp::Result<String> {
+    let models = [
+        Some(crate::omp::SMOL_MODEL),
+        Some(crate::omp::TINY_MODEL),
+        thread_model,
+    ];
+    let mut last = None;
+    for model in models.into_iter().flatten() {
+        match omp.generate_text(prompt, system, cwd, model).await {
+            Ok(reply) => return Ok(reply),
+            Err(error) => {
+                tracing::warn!(%error, model, "omp could not generate git text");
+                last = Some(error);
+            }
+        }
+    }
+    Err(last.expect("at least one model is tried"))
 }
 
 /// The JSON object in a model reply, tolerating code fences and prose

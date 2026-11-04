@@ -58,6 +58,11 @@ const USAGE_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a one-shot text generation (`omp -p`) may take.
 const TEXT_TIMEOUT: Duration = Duration::from_secs(90);
 
+/// omp's fast model role.
+pub const SMOL_MODEL: &str = "pi/smol";
+/// omp's smallest model role.
+pub const TINY_MODEL: &str = "pi/tiny";
+
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// How omp processes are launched. Shared by every thread of a server.
@@ -188,11 +193,18 @@ impl OmpLauncher {
         Ok(output.stdout)
     }
 
-    /// Runs a one-shot, tool-less `omp -p` in `cwd` with omp's fast model
-    /// (`pi/smol`) and returns its reply. `prompt` goes on stdin; `system`
-    /// replaces omp's system prompt. Uses the launcher's environment, not its
-    /// extra arguments (those are for `--mode rpc`).
-    pub async fn generate_text(&self, prompt: &str, system: &str, cwd: &Path) -> Result<String> {
+    /// Runs a one-shot, tool-less `omp -p` in `cwd` with `model` (an omp
+    /// model, or a role like [`SMOL_MODEL`]) and returns its reply. `prompt`
+    /// goes on stdin; `system` replaces omp's system prompt. Uses the
+    /// launcher's environment, not its extra arguments (those are for
+    /// `--mode rpc`).
+    pub async fn generate_text(
+        &self,
+        prompt: &str,
+        system: &str,
+        cwd: &Path,
+        model: &str,
+    ) -> Result<String> {
         let mut process = tokio::process::Command::new(&self.program);
         process
             .current_dir(cwd)
@@ -209,9 +221,9 @@ impl OmpLauncher {
                 "--thinking",
                 "off",
                 "--model",
-                "pi/smol",
-                "--system-prompt",
             ])
+            .arg(model)
+            .arg("--system-prompt")
             .arg(system)
             .envs(self.env.iter().map(|(k, v)| (k, v)))
             .stdin(Stdio::piped())

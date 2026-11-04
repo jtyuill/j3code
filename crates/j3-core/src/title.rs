@@ -44,7 +44,10 @@ pub async fn generate(omp: &OmpLauncher, message: &str, cwd: &Path) -> Option<St
         return None;
     }
     let prompt = format!("<user>\n{}\n</user>", message.trim());
-    match omp.generate_text(&prompt, TITLE_SYSTEM_PROMPT, cwd).await {
+    match omp
+        .generate_text(&prompt, TITLE_SYSTEM_PROMPT, cwd, crate::omp::SMOL_MODEL)
+        .await
+    {
         Ok(reply) => parse(&reply),
         Err(error) => {
             tracing::warn!(%error, "omp could not name the thread");
