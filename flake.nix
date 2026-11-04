@@ -76,8 +76,32 @@
               nativeBuildInputs = [
                 pkgs.pkg-config
                 pkgs.makeWrapper
+                pkgs.copyDesktopItems
+                pkgs.imagemagick
               ];
               buildInputs = linuxGuiLibs pkgs;
+              # Named after the window's app id (APP_ID in crates/j3-desktop/src/main.rs),
+              # so the compositor ties the window to this entry and its icon.
+              desktopItems = [
+                (pkgs.makeDesktopItem {
+                  name = "dev.jacobyuill.j3code";
+                  desktopName = "j3";
+                  comment = "Desktop client for the omp coding agent";
+                  exec = "j3";
+                  icon = "dev.jacobyuill.j3code";
+                  categories = [ "Development" ];
+                  startupWMClass = "dev.jacobyuill.j3code";
+                })
+              ];
+              # Icon: the iOS app icon, as in contrib/macos/bundle.sh.
+              postInstall = ''
+                for size in 128 256 512; do
+                  dir=$out/share/icons/hicolor/''${size}x''${size}/apps
+                  mkdir -p $dir
+                  magick ${./apps/mobile/assets/brand/ios-icon-1024.png} -resize ''${size}x''${size} \
+                    $dir/dev.jacobyuill.j3code.png
+                done
+              '';
               postFixup = ''
                 wrapProgram $out/bin/j3 \
                   --prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath (linuxGuiLibs pkgs)}

@@ -50,6 +50,9 @@ use crate::{
     assets::AppAssets, local_server::LocalServer, services::Services, workspace::Workspace,
 };
 
+/// Wayland app id / X11 WM_CLASS; the Linux desktop entry is `<APP_ID>.desktop`.
+const APP_ID: &str = "dev.jacobyuill.j3code";
+
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
@@ -134,6 +137,9 @@ fn open_main_window(cx: &mut App) {
                 Theme::global(cx).font_size * titlebar::ROW_HEIGHT,
             )),
         }),
+        // Matches the Linux desktop entry (flake.nix) so the launcher icon
+        // and taskbar grouping apply to the window.
+        app_id: Some(APP_ID.into()),
         ..Default::default()
     };
     let opened = gpui_kit::open_window(options, cx, |window, cx| {
