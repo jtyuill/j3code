@@ -1038,19 +1038,21 @@ impl Connection {
             ChatAttachment::File(file) => (file.name.clone(), file.mime_type.clone()),
             ChatAttachment::Unknown(other) => (other.name.clone(), other.mime_type.clone()),
         };
+        self.resource_url(AssetResource::Attachment {
+            attachment_id: attachment.id().to_owned(),
+            file_name: Some(file_name),
+            mime_type: Some(mime_type),
+            disposition: Some(AssetDisposition::Inline),
+            render_intent: None,
+        })
+        .await
+    }
+
+    /// An absolute URL serving `resource` (`assets.createUrl`): an
+    /// attachment, a tool's output image or an image file on the host.
+    pub async fn resource_url(&self, resource: AssetResource) -> Result<String, Error> {
         let result: AssetCreateUrlResult = self
-            .call(
-                "assets.createUrl",
-                &AssetCreateUrlInput {
-                    resource: AssetResource::Attachment {
-                        attachment_id: attachment.id().to_owned(),
-                        file_name: Some(file_name),
-                        mime_type: Some(mime_type),
-                        disposition: Some(AssetDisposition::Inline),
-                        render_intent: None,
-                    },
-                },
-            )
+            .call("assets.createUrl", &AssetCreateUrlInput { resource })
             .await?;
         Ok(self.inner.shared.url(&result.relative_url)?.to_string())
     }

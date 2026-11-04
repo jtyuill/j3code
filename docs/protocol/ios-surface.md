@@ -403,9 +403,13 @@ Payload `{}`, success `{}`. Answer quickly; the probe has a 3 s or 15 s timeout.
 - Payload `{resource: AssetResource}`, tagged by `_tag` (`C/assets.ts:20-67`). j3 needs these variants:
   - `{_tag:"attachment", attachmentId, fileName?, mimeType?, disposition?:"inline"|"attachment"}`
   - `{_tag:"project-favicon", cwd, path?}`
+  - `{_tag:"tool-output-image", threadId, itemId, index}`: image `index` of a `dynamic_tool` item's output, counted over its raster image blocks like `toolOutputImages` (`packages/shared/src/toolOutput.ts:242-260`).
+  - `{_tag:"workspace-file", threadId, path}`: an image file on the host, used for markdown images. `path` is relative to the thread's project (and must stay inside it) or absolute.
 - Success `{relativeUrl, expiresAt: number, sourcePath?, imageDimensions?:{width,height}, fileRevision?}` (`:76-85`).
 - An unknown attachment must fail with `AssetAttachmentNotFoundError`. The client then re-uploads (`CR/state/attachments.ts:40-47`).
 - Favicon: return a `relativeUrl` whose last segment is `project-favicon-missing` (`packages/shared/src/projectFavicon.ts:3,35-44`), or fail. Either way the UI shows no icon.
+- Tool output images: when an omp tool result carries `{type:"image", data, mimeType}` blocks (GIF, JPEG, PNG or WebP, at most 8, each within the 10 MiB image limit), j3 stores each image as an attachment and sets the item's `output` to t3's block list: the text as `{type:"text", text}`, then `{type:"image", mimeType, attachmentId}` per image, with the bytes left out. `tool-output-image` resolves through `attachmentId`; a missing image fails with `AssetWorkspaceAssetNotFoundError`.
+- Workspace files: only GIF, JPEG, PNG and WebP files up to 10 MiB qualify (`AssetPreviewTypeValidationError` otherwise). A relative path leaving the project fails with `AssetWorkspacePathValidationError`, a missing file with `AssetWorkspaceAssetNotFoundError{checkedPath}`, an unknown thread with `AssetWorkspaceContextNotFoundError`. The URL is a one-hour grant held in server memory, so it stops working when the server restarts.
 
 ```json
 {"resource":{"_tag":"attachment","attachmentId":"att_9k2m","mimeType":"image/jpeg","disposition":"inline"}}

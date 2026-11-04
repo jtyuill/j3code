@@ -6,7 +6,7 @@
 use j3_core::{
     engine::{
         actor::commit_thread,
-        model::{Effect, NewThread, ThreadModel, UserInput},
+        model::{Effect, NewThread, ThreadModel, UserInput, tool_output_image},
     },
     hub::{Hub, ThreadEvent},
     omp::omp_rpc::{
@@ -436,6 +436,67 @@ fn engine_mapping_streaming_text_is_coalescable() {
     assert!(updates.iter().any(|body| matches!(body,
         DomainEventBody::TurnItemUpdated(item)
             if matches!(&item.kind, TurnItemKind::AssistantMessage(m) if m.text == "Hello" && m.streaming))));
+}
+
+#[test]
+fn engine_mapping_tool_images_become_attachments() {
+    let mut harness = Harness::new();
+    harness.start("look");
+    let feed = |harness: &mut Harness, value: Value| {
+        harness.model.apply(&Event::Notification(
+            RpcNotification::from_value(value).unwrap(),
+        ))
+    };
+    feed(&mut harness, json!({"type": "agent_start"}));
+    feed(
+        &mut harness,
+        json!({"type": "tool_execution_start", "toolCallId": "c1", "toolName": "read",
+               "args": {"path": "logo.png"}}),
+    );
+    let effects = feed(
+        &mut harness,
+        json!({"type": "tool_execution_end", "toolCallId": "c1", "toolName": "read",
+               "result": {"content": [
+                   {"type": "text", "text": "Read image file [image/png]"},
+                   {"type": "image", "data": "iVBORw0KGgo=", "mimeType": "image/png"},
+                   {"type": "image", "data": "PHN2Zz4=", "mimeType": "image/svg+xml"},
+               ]}, "isError": false}),
+    );
+    harness.commit();
+    let stored: Vec<_> = effects
+        .into_iter()
+        .filter_map(|effect| match effect {
+            Effect::StoreToolImages(images) => Some(images),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    // SVG is not a raster type the clients render; it is left out.
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].mime_type, "image/png");
+    assert_eq!(stored[0].data, "iVBORw0KGgo=");
+    let output = harness
+        .projection()
+        .turn_items
+        .into_iter()
+        .find_map(|item| match item.kind {
+            TurnItemKind::DynamicTool(tool) => tool.output.flatten(),
+            _ => None,
+        })
+        .unwrap();
+    // t3's blocks: the text, then the image without its bytes.
+    assert_eq!(
+        output,
+        json!([
+            {"type": "text", "text": "Read image file [image/png]"},
+            {"type": "image", "mimeType": "image/png", "attachmentId": stored[0].attachment_id},
+        ])
+    );
+    assert_eq!(
+        tool_output_image(&output, 0),
+        Some(stored[0].attachment_id.as_str())
+    );
+    assert_eq!(tool_output_image(&output, 1), None);
 }
 
 #[test]

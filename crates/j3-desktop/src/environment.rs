@@ -1,11 +1,16 @@
 //! One environment (j3 server) as a GPUI entity: its connection, the latest
-//! connection state, and attachment images fetched from it.
+//! connection state, and the chat images fetched through it.
 
 use std::{collections::HashMap, sync::Arc};
 
+use base64::Engine as _;
 use gpui_kit::{App, Context, Entity, Image, ImageFormat, SharedString, Task};
 use j3_client::{
-    Connection, ConnectionState, ConnectionStatus, t3::chat_attachment::ChatAttachment,
+    Connection, ConnectionState, ConnectionStatus,
+    t3::{
+        assets::{AssetDisposition, AssetResource},
+        chat_attachment::ChatAttachment,
+    },
 };
 
 use crate::{local_server::LocalServerStatus, services::Services};
@@ -17,12 +22,100 @@ pub enum EnvironmentKind {
     Remote,
 }
 
-/// An attachment image being fetched for display.
+/// An image being fetched for display.
 #[derive(Clone)]
 pub enum ImageLoad {
     Loading,
     Loaded(Arc<Image>),
     Failed,
+}
+
+/// An image the chat shows, by where its bytes come from.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ImageRef {
+    /// An uploaded image attachment.
+    Attachment {
+        id: String,
+        name: String,
+        mime_type: String,
+    },
+    /// Image `index` of a tool call's output.
+    ToolOutput {
+        thread_id: String,
+        item_id: String,
+        index: u64,
+    },
+    /// An image file on the thread's host: relative to its project, or
+    /// absolute.
+    HostFile { thread_id: String, path: String },
+    /// An `http(s):` or `data:` URL, read by this app itself.
+    Url(String),
+}
+
+impl ImageRef {
+    /// The image of an attachment; None for other files.
+    pub fn attachment(attachment: &ChatAttachment) -> Option<Self> {
+        match attachment {
+            ChatAttachment::Image(image) => Some(Self::Attachment {
+                id: image.id.clone(),
+                name: image.name.clone(),
+                mime_type: image.mime_type.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// The image a markdown `![](url)` in thread `thread_id` names: web and
+    /// `data:` URLs as they are, anything else a (percent-encoded) path on
+    /// the thread's host, with or without `file://`.
+    pub fn markdown(url: &str, thread_id: &str) -> Self {
+        let url = url.trim();
+        let scheme = url
+            .split_once(':')
+            .map(|(scheme, _)| scheme.to_ascii_lowercase());
+        match scheme.as_deref() {
+            Some("http" | "https" | "data") => Self::Url(url.to_owned()),
+            _ => {
+                let path = url.strip_prefix("file://").unwrap_or(url);
+                let path = path.split(['?', '#']).next().unwrap_or_default();
+                Self::HostFile {
+                    thread_id: thread_id.to_owned(),
+                    path: String::from_utf8_lossy(&percent_decode(path)).into_owned(),
+                }
+            }
+        }
+    }
+
+    /// The server resource holding the image; None for URLs.
+    fn resource(&self) -> Option<AssetResource> {
+        Some(match self {
+            Self::Attachment {
+                id,
+                name,
+                mime_type,
+            } => AssetResource::Attachment {
+                attachment_id: id.clone(),
+                file_name: Some(name.clone()),
+                mime_type: Some(mime_type.clone()),
+                disposition: Some(AssetDisposition::Inline),
+                render_intent: None,
+            },
+            Self::ToolOutput {
+                thread_id,
+                item_id,
+                index,
+            } => AssetResource::ToolOutputImage {
+                thread_id: thread_id.clone(),
+                item_id: item_id.clone(),
+                index: *index,
+            },
+            Self::HostFile { thread_id, path } => AssetResource::WorkspaceFile {
+                thread_id: thread_id.clone(),
+                path: path.clone(),
+            },
+            Self::Url(_) => return None,
+        })
+    }
 }
 
 pub struct Environment {
@@ -32,7 +125,7 @@ pub struct Environment {
     kind: EnvironmentKind,
     connection: Connection,
     state: Arc<ConnectionState>,
-    images: HashMap<String, ImageLoad>,
+    images: HashMap<ImageRef, ImageLoad>,
     _watch: Task<()>,
 }
 
@@ -141,43 +234,37 @@ impl Environment {
         lines.join("\n")
     }
 
-    /// The image of an attachment, fetching it on first use. Notifies when a
+    /// An image for the chat, fetching it on first use. Notifies when a
     /// fetch finishes.
-    pub fn image(&mut self, attachment: &ChatAttachment, cx: &mut Context<Self>) -> ImageLoad {
-        let (id, mime_type) = match attachment {
-            ChatAttachment::Image(image) => (image.id.clone(), image.mime_type.clone()),
-            _ => return ImageLoad::Failed,
-        };
-        if let Some(load) = self.images.get(&id) {
+    pub fn image(&mut self, image: &ImageRef, cx: &mut Context<Self>) -> ImageLoad {
+        if let Some(load) = self.images.get(image) {
             return load.clone();
         }
-        self.images.insert(id.clone(), ImageLoad::Loading);
+        self.images.insert(image.clone(), ImageLoad::Loading);
         let connection = self.connection.clone();
-        let attachment = attachment.clone();
-        let services = Services::global(cx);
-        let runtime = services.runtime().clone();
+        let image = image.clone();
+        let runtime = Services::global(cx).runtime().clone();
         cx.spawn(async move |this, cx| {
-            let bytes = match connection.asset_url(&attachment).await {
-                Ok(url) => {
-                    let (tx, rx) = tokio::sync::oneshot::channel();
-                    runtime.spawn(async move {
-                        let _ = tx.send(fetch(&url).await);
-                    });
-                    rx.await.ok().flatten()
-                }
-                Err(e) => {
-                    tracing::warn!("asset url for {id}: {e}");
-                    None
-                }
+            let bytes = match (&image, image.resource()) {
+                (ImageRef::Url(url), _) if url.starts_with("data:") => data_url(url),
+                (ImageRef::Url(url), _) => fetch_on(&runtime, url.clone()).await,
+                (_, Some(resource)) => match connection.resource_url(resource).await {
+                    Ok(url) => fetch_on(&runtime, url).await,
+                    Err(e) => {
+                        tracing::debug!("asset url for {image:?}: {e}");
+                        None
+                    }
+                },
+                (_, None) => None,
             };
-            let load = match (bytes, image_format(&mime_type)) {
-                (Some(bytes), Some(format)) => {
+            let load = match bytes.and_then(|bytes| Some((sniff_format(&bytes)?, bytes))) {
+                Some((format, bytes)) => {
                     ImageLoad::Loaded(Arc::new(Image::from_bytes(format, bytes)))
                 }
-                _ => ImageLoad::Failed,
+                None => ImageLoad::Failed,
             };
             let _ = this.update(cx, |this, cx| {
-                this.images.insert(id, load);
+                this.images.insert(image, load);
                 cx.notify();
             });
         })
@@ -216,21 +303,94 @@ pub fn distinct_environments(
         .collect()
 }
 
+/// The body of `url`, fetched on the tokio runtime (reqwest needs it).
+async fn fetch_on(runtime: &tokio::runtime::Handle, url: String) -> Option<Vec<u8>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    runtime.spawn(async move {
+        let _ = tx.send(fetch(&url).await);
+    });
+    rx.await.ok().flatten()
+}
+
 async fn fetch(url: &str) -> Option<Vec<u8>> {
     let response = reqwest::get(url).await.ok()?.error_for_status().ok()?;
     response.bytes().await.ok().map(|bytes| bytes.to_vec())
 }
 
-/// The GPUI image format for an image MIME type.
-pub fn image_format(mime_type: &str) -> Option<ImageFormat> {
-    Some(match mime_type {
-        "image/png" => ImageFormat::Png,
-        "image/jpeg" | "image/jpg" => ImageFormat::Jpeg,
-        "image/webp" => ImageFormat::Webp,
-        "image/gif" => ImageFormat::Gif,
-        "image/bmp" => ImageFormat::Bmp,
-        "image/tiff" => ImageFormat::Tiff,
-        _ => return None,
+/// The bytes a `data:` URL carries (base64 or percent-encoded).
+fn data_url(url: &str) -> Option<Vec<u8>> {
+    let (header, payload) = url.strip_prefix("data:")?.split_once(',')?;
+    if header.ends_with(";base64") {
+        let payload: String = percent_decode(payload)
+            .into_iter()
+            .filter(|byte| !byte.is_ascii_whitespace())
+            .map(char::from)
+            .collect();
+        base64::engine::general_purpose::STANDARD
+            .decode(payload)
+            .ok()
+    } else {
+        Some(percent_decode(payload))
+    }
+}
+
+/// `%XX` escapes decoded; malformed escapes stay as they are.
+fn percent_decode(text: &str) -> Vec<u8> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut ix = 0;
+    while ix < bytes.len() {
+        let hex = |byte: u8| (byte as char).to_digit(16);
+        match (
+            bytes[ix],
+            bytes.get(ix + 1).copied(),
+            bytes.get(ix + 2).copied(),
+        ) {
+            (b'%', Some(high), Some(low)) if hex(high).is_some() && hex(low).is_some() => {
+                out.push((hex(high).unwrap_or(0) * 16 + hex(low).unwrap_or(0)) as u8);
+                ix += 3;
+            }
+            (byte, _, _) => {
+                out.push(byte);
+                ix += 1;
+            }
+        }
+    }
+    out
+}
+
+/// The image format of `bytes`, from their signature.
+fn sniff_format(bytes: &[u8]) -> Option<ImageFormat> {
+    Some(match bytes {
+        [0x89, b'P', b'N', b'G', ..] => ImageFormat::Png,
+        [0xFF, 0xD8, 0xFF, ..] => ImageFormat::Jpeg,
+        [b'G', b'I', b'F', b'8', ..] => ImageFormat::Gif,
+        [
+            b'R',
+            b'I',
+            b'F',
+            b'F',
+            _,
+            _,
+            _,
+            _,
+            b'W',
+            b'E',
+            b'B',
+            b'P',
+            ..,
+        ] => ImageFormat::Webp,
+        [b'B', b'M', ..] => ImageFormat::Bmp,
+        [b'I', b'I', 42, 0, ..] | [b'M', b'M', 0, 42, ..] => ImageFormat::Tiff,
+        _ => {
+            let head = String::from_utf8_lossy(&bytes[..bytes.len().min(512)]);
+            let head = head.trim_start_matches('\u{feff}').trim_start();
+            if head.starts_with("<svg") || (head.starts_with("<?xml") && head.contains("<svg")) {
+                ImageFormat::Svg
+            } else {
+                return None;
+            }
+        }
     })
 }
 
@@ -245,5 +405,34 @@ mod tests {
         assert_eq!(distinct(&ids), [0, 2, 3, 4]);
         assert_eq!(distinct(&[Some("x"), Some("y")]), [0, 1]);
         assert_eq!(distinct(&[]), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn markdown_images_resolve_to_urls_or_host_files() {
+        let host = |path: &str| ImageRef::HostFile {
+            thread_id: "T".into(),
+            path: path.into(),
+        };
+        assert_eq!(
+            ImageRef::markdown("https://x.dev/a.png", "T"),
+            ImageRef::Url("https://x.dev/a.png".into())
+        );
+        assert_eq!(
+            ImageRef::markdown("viz/my%20plot.png", "T"),
+            host("viz/my plot.png")
+        );
+        assert_eq!(
+            ImageRef::markdown("file:///tmp/shot.png?v=2#x", "T"),
+            host("/tmp/shot.png")
+        );
+        let png = "data:image/png;base64,iVBORw0K\nGgo=";
+        assert_eq!(
+            ImageRef::markdown(png, "T"),
+            ImageRef::Url(png.trim().into())
+        );
+        let bytes = data_url(png).unwrap();
+        assert_eq!(sniff_format(&bytes), Some(ImageFormat::Png));
+        let svg = data_url("data:image/svg+xml,%3Csvg%20xmlns='x'/%3E").unwrap();
+        assert_eq!(sniff_format(&svg), Some(ImageFormat::Svg));
     }
 }

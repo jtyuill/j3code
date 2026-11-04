@@ -27,7 +27,7 @@ use j3_protocol::t3::{
         WebSearchItem, WebSearchResult,
     },
 };
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 
 use super::projection::{DRIVER, Kind, PROVIDER_INSTANCE, Projection};
 use crate::omp::omp_rpc::{
@@ -59,6 +59,95 @@ pub enum Effect {
     /// Read the transcript of finished subagent `subagent_id` and feed it to
     /// [`ThreadModel::apply_subagent_transcript`].
     FetchSubagentResult { subagent_id: String },
+    /// Store images a tool returned, under the attachment ids its item's
+    /// output names.
+    StoreToolImages(Vec<ToolImage>),
+}
+
+/// An image block of a tool result, to keep as an attachment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolImage {
+    pub attachment_id: String,
+    pub mime_type: String,
+    /// Base64, as omp sent it.
+    pub data: String,
+}
+
+/// Most images kept from one tool result (`MAX_TOOL_OUTPUT_IMAGES`).
+const MAX_TOOL_OUTPUT_IMAGES: usize = 8;
+
+/// The raster image blocks (`{type:"image", data, mimeType}`) of a tool
+/// result, each with a new attachment id; at most
+/// [`MAX_TOOL_OUTPUT_IMAGES`], none larger than the image upload limit.
+fn result_images(result: &Value) -> Vec<ToolImage> {
+    const MAX_BASE64: usize = (crate::attachments::MAX_IMAGE_BYTES as usize).div_ceil(3) * 4;
+    let Some(content) = result.get("content").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    content
+        .iter()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("image"))
+        .filter_map(|block| {
+            let mime_type = block.get("mimeType")?.as_str()?.to_ascii_lowercase();
+            let data = block.get("data")?.as_str()?;
+            (crate::attachments::SUPPORTED_IMAGE_MIME_TYPES.contains(&mime_type.as_str())
+                && !data.is_empty()
+                && data.len() <= MAX_BASE64)
+                .then(|| ToolImage {
+                    attachment_id: crate::attachments::new_id(),
+                    mime_type,
+                    data: data.to_owned(),
+                })
+        })
+        .take(MAX_TOOL_OUTPUT_IMAGES)
+        .collect()
+}
+
+/// Gives a dynamic tool's output its images: t3's output blocks, the text
+/// first and then one `{type:"image", mimeType}` per image, which also
+/// names the j3 attachment holding its bytes (`attachmentId`). False when
+/// the item is not a dynamic tool.
+fn attach_tool_images(item: &mut TurnItem, images: &[ToolImage]) -> bool {
+    let TurnItemKind::DynamicTool(tool) = &mut item.kind else {
+        return false;
+    };
+    let mut blocks = Vec::with_capacity(images.len() + 1);
+    if let Some(Some(Value::String(text))) = tool.output.take() {
+        blocks.push(json!({"type": "text", "text": text}));
+    }
+    blocks.extend(images.iter().map(|image| {
+        json!({"type": "image", "mimeType": image.mime_type, "attachmentId": image.attachment_id})
+    }));
+    tool.output = Some(Some(Value::Array(blocks)));
+    true
+}
+
+/// The image blocks of a dynamic tool's output that clients show, in the
+/// order that numbers `tool-output-image` assets (t3's `toolOutputImages`):
+/// raster types only, at most [`MAX_TOOL_OUTPUT_IMAGES`].
+pub fn tool_output_images(output: &Value) -> impl Iterator<Item = &Value> {
+    output
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|block| {
+            block.get("type").and_then(Value::as_str) == Some("image")
+                && block
+                    .get("mimeType")
+                    .and_then(Value::as_str)
+                    .is_some_and(|mime| {
+                        crate::attachments::SUPPORTED_IMAGE_MIME_TYPES.contains(&mime)
+                    })
+        })
+        .take(MAX_TOOL_OUTPUT_IMAGES)
+}
+
+/// The attachment holding image `index` of a dynamic tool's output.
+pub fn tool_output_image(output: &Value, index: usize) -> Option<&str> {
+    tool_output_images(output)
+        .nth(index)?
+        .get("attachmentId")?
+        .as_str()
 }
 
 /// A command the model refuses; the message is shown to the user.
@@ -1703,11 +1792,13 @@ impl ThreadModel {
                 if let Some(item_id) = item_id {
                     let failed = end.is_error == Some(true);
                     let text = end.result.as_ref().and_then(result_text);
+                    let images = end.result.as_ref().map(result_images).unwrap_or_default();
                     let details = end
                         .result
                         .as_ref()
                         .and_then(|result| result.get("details"))
                         .cloned();
+                    let mut attached = false;
                     self.update_item(&item_id, false, |item| {
                         item.status = if failed {
                             TurnItemStatus::Failed
@@ -1717,7 +1808,13 @@ impl ThreadModel {
                         if let Some(text) = text {
                             set_tool_output(item, text, details.as_ref());
                         }
+                        if !images.is_empty() {
+                            attached = attach_tool_images(item, &images);
+                        }
                     });
+                    if attached {
+                        effects.push(Effect::StoreToolImages(images));
+                    }
                 }
                 if end.tool_name == TODO_TOOL {
                     effects.push(Effect::RefreshState);

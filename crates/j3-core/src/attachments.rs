@@ -4,11 +4,14 @@
 //!
 //! Layout: `dir/<id>.json` holds the declared metadata from
 //! `createUploadUrl`; `dir/<id>` holds the bytes once uploaded (HTTP H4).
+//! Images tools return are stored the same way ([`AttachmentStore::store_image`]).
 //! Ids are random `[a-z0-9_]` strings and double as the upload and asset
-//! tokens; there is no auth and no signing.
+//! tokens; there is no auth and no signing. Host image files
+//! (`workspace-file` assets) are served through in-memory grants: a random
+//! id that maps to the file's path until it expires.
 
 use std::{
-    collections::hash_map::RandomState,
+    collections::{HashMap, hash_map::RandomState},
     fmt::Write as _,
     hash::{BuildHasher, Hasher},
     io::{self, ErrorKind},
@@ -49,6 +52,16 @@ pub struct AttachmentStore {
     /// Serializes publishing uploaded bytes, so each id is written once.
     publish: Mutex<()>,
     next_part: AtomicU64,
+    /// Host image files granted by `assets.createUrl`, by grant id.
+    grants: std::sync::Mutex<HashMap<String, Grant>>,
+}
+
+/// A host image file readable through `/api/assets/<id>/…` until `expires_at`.
+struct Grant {
+    path: PathBuf,
+    mime_type: String,
+    name: String,
+    expires_at: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,6 +116,7 @@ impl AttachmentStore {
             dir,
             publish: Mutex::new(()),
             next_part: AtomicU64::new(0),
+            grants: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -124,6 +138,94 @@ impl AttachmentStore {
         };
         let bytes = fs::read(self.dir.join(attachment_id)).await?;
         Ok((bytes, meta.mime_type))
+    }
+
+    /// Stores an image a tool returned as attachment `attachment_id`.
+    pub(crate) async fn store_image(
+        &self,
+        attachment_id: &str,
+        name: &str,
+        mime_type: &str,
+        bytes: &[u8],
+    ) -> io::Result<()> {
+        let meta = serde_json::to_vec(&Meta {
+            kind: AttachmentKind::Image,
+            name: name.to_owned(),
+            mime_type: mime_type.to_owned(),
+            size_bytes: bytes.len() as u64,
+            created_at: now_ms(),
+        })
+        .map_err(io::Error::other)?;
+        fs::write(self.meta_path(attachment_id), meta).await?;
+        match self.store_upload(attachment_id, bytes).await? {
+            UploadOutcome::Stored => Ok(()),
+            UploadOutcome::Conflict => Err(io::Error::new(
+                ErrorKind::AlreadyExists,
+                format!("attachment {attachment_id} already holds other bytes"),
+            )),
+        }
+    }
+
+    /// The `assets.createUrl` result for attachment `attachment_id`, or None
+    /// if it is unknown or its bytes have not arrived. `file_name` defaults
+    /// to the name declared at upload.
+    pub(crate) async fn attachment_url(
+        &self,
+        attachment_id: &str,
+        file_name: Option<String>,
+    ) -> io::Result<Option<Value>> {
+        Ok(self.stored(attachment_id).await?.map(|stored| {
+            json!({
+                "relativeUrl": asset_url(attachment_id, &file_name.unwrap_or(stored.name)),
+                "expiresAt": now_ms() + ASSET_URL_TTL_MS,
+            })
+        }))
+    }
+
+    /// Grants reading the host image file `path` for the asset URL lifetime;
+    /// the `assets.createUrl` result.
+    pub(crate) fn grant_file(&self, path: PathBuf, mime_type: &str) -> Value {
+        let now = now_ms();
+        let expires_at = now + ASSET_URL_TTL_MS;
+        let name = path.file_name().map_or_else(
+            || "image".to_owned(),
+            |name| name.to_string_lossy().into_owned(),
+        );
+        let id = new_id();
+        let url = asset_url(&id, &name);
+        let mut grants = self
+            .grants
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        grants.retain(|_, grant| grant.expires_at > now);
+        grants.insert(
+            id,
+            Grant {
+                path,
+                mime_type: mime_type.to_owned(),
+                name,
+                expires_at,
+            },
+        );
+        json!({"relativeUrl": url, "expiresAt": expires_at})
+    }
+
+    /// The live grant `id`: its path, MIME type and file name.
+    fn grant(&self, id: &str) -> Option<(PathBuf, String, String)> {
+        let grants = self
+            .grants
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        grants
+            .get(id)
+            .filter(|grant| grant.expires_at > now_ms())
+            .map(|grant| {
+                (
+                    grant.path.clone(),
+                    grant.mime_type.clone(),
+                    grant.name.clone(),
+                )
+            })
     }
 
     /// Declared size of an upload-able id, or None if the id is unknown.
@@ -161,9 +263,23 @@ impl AttachmentStore {
         written.map(|()| UploadOutcome::Stored)
     }
 
-    /// The uploaded attachment `attachment_id`, or None if it is unknown or
-    /// its bytes have not arrived.
+    /// The uploaded attachment (or granted host file) `attachment_id`, or
+    /// None if it is unknown or its bytes have not arrived.
     pub(crate) async fn stored(&self, attachment_id: &str) -> io::Result<Option<StoredAttachment>> {
+        if let Some((path, mime_type, name)) = self.grant(attachment_id) {
+            return match fs::metadata(&path).await {
+                Ok(file) if file.is_file() => Ok(Some(StoredAttachment {
+                    path,
+                    size: file.len(),
+                    kind: AttachmentKind::Image,
+                    mime_type,
+                    name,
+                })),
+                Ok(_) => Ok(None),
+                Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(error),
+            };
+        }
         let Some(meta) = self.meta(attachment_id).await? else {
             return Ok(None);
         };
@@ -256,14 +372,11 @@ impl AttachmentStore {
                     Ok(input) => input,
                     Err(issue) => return Response::die(issue),
                 };
-                match self.stored(&input.attachment_id).await {
-                    Ok(Some(stored)) => {
-                        let file_name = input.file_name.unwrap_or(stored.name);
-                        Response::ok(json!({
-                            "relativeUrl": asset_url(&input.attachment_id, &file_name),
-                            "expiresAt": now_ms() + ASSET_URL_TTL_MS,
-                        }))
-                    }
+                match self
+                    .attachment_url(&input.attachment_id, input.file_name)
+                    .await
+                {
+                    Ok(Some(result)) => Response::ok(result),
                     Ok(None) => not_found("AssetAttachmentNotFoundError"),
                     Err(error) => Response::die(error.to_string()),
                 }
@@ -275,6 +388,8 @@ impl AttachmentStore {
                 })),
                 Err(issue) => Response::die(issue),
             },
+            // `workspace-file` and `tool-output-image` need the thread; the
+            // app answers them before this store is asked.
             Some("workspace-file" | "media-file" | "draft-workspace-file") => {
                 not_found("AssetWorkspaceContextNotFoundError")
             }
@@ -518,7 +633,7 @@ pub(crate) fn is_valid_id(id: &str) -> bool {
 /// `att_` + 128 random bits in hex. `RandomState` keys come from the OS
 /// randomness source; ids are unguessable enough to act as bearer-less
 /// tokens, which is all the no-auth design needs.
-fn new_id() -> String {
+pub(crate) fn new_id() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let mut id = String::with_capacity(4 + 32);
     id.push_str("att_");

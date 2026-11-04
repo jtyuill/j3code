@@ -19,6 +19,7 @@ use j3_protocol::j3::{
 };
 use j3_protocol::t3::{
     self,
+    assets::{AssetCreateUrlInput, AssetResource},
     commands::{
         DispatchCommandResult, OrchestrationV2Command, OrchestrationV2DispatchCommandError,
         OrchestrationV2GetShellSnapshotError, OrchestrationV2GetThreadProjectionError,
@@ -37,7 +38,7 @@ use j3_protocol::t3::{
     },
     orchestration::{
         Actor as Creator, CreationSource, ShellSnapshot, ThreadProjection, ThreadShell,
-        WorkspaceStrategy,
+        TurnItemKind, WorkspaceStrategy,
     },
     project::{
         PROJECTS_LIST_ENTRIES, PROJECTS_READ_FILE, Project, ProjectListEntriesInput,
@@ -63,7 +64,7 @@ use crate::{
     engine::{
         actor::{self, ActorConfig, Request, ThreadHandle},
         model::{
-            NewThread, Reject, ThreadModel, UserInput,
+            NewThread, Reject, ThreadModel, UserInput, tool_output_image,
             triage::{self, DAY_MS},
         },
         projection::Projection,
@@ -584,6 +585,11 @@ impl Inner {
     // -----------------------------------------------------------------------
 
     async fn call(&self, tag: &str, payload: Value) -> Response {
+        if tag == "assets.createUrl"
+            && let Some(response) = self.thread_asset_url(&payload).await
+        {
+            return response;
+        }
         if let Some(response) = self.attachments.handle(tag, payload.clone()).await {
             return response;
         }
@@ -716,20 +722,109 @@ impl Inner {
         }
     }
 
-    /// The workspace root of a live thread's project, where its terminals
-    /// start; an unknown thread is a `TerminalSessionLookupError`.
-    fn thread_root(&self, thread_id: &str, terminal_id: &str) -> Result<String, TerminalError> {
+    /// `assets.createUrl` for the resources that belong to a thread
+    /// (`tool-output-image`, `workspace-file`); None for the others, which
+    /// the attachment store answers.
+    async fn thread_asset_url(&self, payload: &Value) -> Option<Response> {
+        let tag = payload.pointer("/resource/_tag").and_then(Value::as_str);
+        if !matches!(tag, Some("tool-output-image" | "workspace-file")) {
+            return None;
+        }
+        let resource = payload.get("resource").cloned().unwrap_or(Value::Null);
+        let fail = |tag: &str, extra: Value| {
+            let mut error = json!({"_tag": tag, "resource": resource});
+            if let (Some(error), Value::Object(extra)) = (error.as_object_mut(), extra) {
+                error.extend(extra);
+            }
+            Response::fail(error)
+        };
+        let input = match decode::<AssetCreateUrlInput>("assets.createUrl", payload.clone()) {
+            Ok(input) => input,
+            Err(response) => return Some(response),
+        };
+        Some(match input.resource {
+            AssetResource::ToolOutputImage {
+                thread_id,
+                item_id,
+                index,
+            } => {
+                let attachment_id = self
+                    .projection(&thread_id)
+                    .await
+                    .ok()
+                    .and_then(|projection| {
+                        projection
+                            .turn_items
+                            .into_iter()
+                            .find(|item| item.id == item_id)
+                            .and_then(|item| match item.kind {
+                                TurnItemKind::DynamicTool(tool) => tool.output.flatten(),
+                                _ => None,
+                            })
+                            .and_then(|output| {
+                                tool_output_image(&output, index as usize).map(str::to_owned)
+                            })
+                    });
+                let url = match attachment_id {
+                    Some(id) => self.attachments.attachment_url(&id, None).await,
+                    None => Ok(None),
+                };
+                match url {
+                    Ok(Some(result)) => Response::ok(result),
+                    Ok(None) => fail("AssetWorkspaceAssetNotFoundError", Value::Null),
+                    Err(error) => Response::die(error.to_string()),
+                }
+            }
+            AssetResource::WorkspaceFile { thread_id, path } => {
+                let Some(root) = self.project_root(&thread_id) else {
+                    return Some(fail("AssetWorkspaceContextNotFoundError", Value::Null));
+                };
+                let resolved = tokio::task::spawn_blocking(move || files::image_file(&root, &path))
+                    .await
+                    .map_err(|error| error.to_string());
+                match resolved {
+                    Ok(Ok((path, mime_type))) => {
+                        Response::ok(self.attachments.grant_file(path, mime_type))
+                    }
+                    Ok(Err(files::ImageFileError::OutsideRoot)) => fail(
+                        "AssetWorkspacePathValidationError",
+                        json!({"cause": "the path leaves the project root"}),
+                    ),
+                    Ok(Err(files::ImageFileError::NotImage)) => {
+                        fail("AssetPreviewTypeValidationError", Value::Null)
+                    }
+                    Ok(Err(files::ImageFileError::NotFound(path))) => fail(
+                        "AssetWorkspaceAssetNotFoundError",
+                        json!({"checkedPath": path.to_string_lossy()}),
+                    ),
+                    Err(error) => Response::die(error),
+                }
+            }
+            _ => return None,
+        })
+    }
+
+    /// The workspace root of a live thread's project.
+    fn project_root(&self, thread_id: &str) -> Option<String> {
         let project_id = self
             .hub
             .read(|store| store.thread(thread_id))
             .ok()
             .flatten()
             .filter(|row| !row.deleted)
-            .map(|row| row.project_id);
-        project_id
-            .and_then(|id| self.hub.read(|store| store.project(&id)).ok().flatten())
+            .map(|row| row.project_id)?;
+        self.hub
+            .read(|store| store.project(&project_id))
+            .ok()
+            .flatten()
             .and_then(|json| serde_json::from_value::<Project>(json).ok())
             .map(|project| project.workspace_root)
+    }
+
+    /// The workspace root of a live thread's project, where its terminals
+    /// start; an unknown thread is a `TerminalSessionLookupError`.
+    fn thread_root(&self, thread_id: &str, terminal_id: &str) -> Result<String, TerminalError> {
+        self.project_root(thread_id)
             .ok_or_else(|| TerminalError::session_lookup(thread_id, terminal_id))
     }
 

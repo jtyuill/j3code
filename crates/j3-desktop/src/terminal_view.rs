@@ -25,7 +25,7 @@ use gpui_kit::{
     Pixels, Render, Rgba, Role, ScrollEvent, ShapedLine, SharedString,
     StatefulInteractiveElement as _, StrikethroughStyle, Styled as _, Task, TestSupportExt as _,
     TextAlign, TextRun, UTF16Selection, UnderlineStyle, Window, canvas, div, fill, font, outline,
-    point, px, rems, size,
+    point, px, size,
 };
 use j3_client::{
     Connection, Error,
@@ -614,9 +614,9 @@ impl TerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> TerminalLayout {
-        // The theme's mono font at `text_sm`, like the feed's code.
+        // The theme's mono font at the terminal font size.
         let font_family = cx.theme().mono_font_family.clone();
-        let font_size = rems(0.875).to_pixels(window.rem_size());
+        let font_size = crate::appearance::terminal_font_size(cx);
         let base_font = font(font_family);
         let text_system = window.text_system().clone();
         let font_id = text_system.resolve_font(&base_font);

@@ -12,6 +12,7 @@ use gpui_kit::component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt as _,
     button::{Button, ButtonVariants as _},
     h_flex,
+    shimmer::ShimmerText,
     spinner::Spinner,
     text::{TextView, TextViewState},
     tooltip::Tooltip,
@@ -19,9 +20,10 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, Entity, ImageSource, InteractiveElement as _, IntoElement, ObjectFit,
-    ParentElement as _, Pixels, SharedString, StatefulInteractiveElement as _, Styled as _,
-    StyledImage as _, TestSupportExt as _, WeakEntity, Window, div, img, px, relative,
+    AnyElement, App, Entity, ImageCacheError, ImageSource, InteractiveElement as _, IntoElement,
+    ObjectFit, ParentElement as _, Pixels, SharedString, SharedUri,
+    StatefulInteractiveElement as _, Styled as _, StyledImage as _, TestSupportExt as _,
+    WeakEntity, Window, div, img, px, relative,
 };
 use j3_client::{
     ThreadState,
@@ -36,10 +38,13 @@ use j3_client::{
 use serde_json::Value;
 
 use crate::{
-    environment::{Environment, ImageLoad},
+    environment::{Environment, ImageLoad, ImageRef},
     feed::{DiffKind, Tone, ToolBody, ToolIcon, ToolStatus, tool_view},
     thread_view::ThreadView,
 };
+
+/// Tallest a tool's output image is drawn.
+const MAX_OUTPUT_IMAGE_HEIGHT: Pixels = px(360.);
 
 /// Longest tool detail shown, in lines; the rest is summarized.
 const MAX_DETAIL_LINES: usize = 400;
@@ -96,7 +101,8 @@ pub fn render_item(
                 .child(
                     TextView::new(state)
                         .selectable(true)
-                        .stream_fade(message.streaming),
+                        .stream_fade(message.streaming)
+                        .image_source(markdown_images(&row.environment, &item.thread_id)),
                 )
                 .into_any_element(),
             None => div()
@@ -373,9 +379,12 @@ fn user_message(
         .iter()
         .enumerate()
         .map(|(ix, attachment)| {
-            let load = row
-                .environment
-                .update(cx, |environment, cx| environment.image(attachment, cx));
+            let load = match ImageRef::attachment(attachment) {
+                Some(image) => row
+                    .environment
+                    .update(cx, |environment, cx| environment.image(&image, cx)),
+                None => ImageLoad::Failed,
+            };
             attachment_thumbnail(&format!("{id}-{ix}"), attachment, load, cx)
         })
         .collect();
@@ -451,6 +460,86 @@ fn attachment_thumbnail(
     }
 }
 
+/// Markdown images of a thread's messages, fetched through its environment
+/// (see [`ImageRef::markdown`]).
+fn markdown_images(
+    environment: &Entity<Environment>,
+    thread_id: &str,
+) -> impl Fn(&SharedUri) -> ImageSource + Send + Sync + 'static {
+    let environment = environment.downgrade();
+    let thread_id = thread_id.to_owned();
+    move |uri| {
+        let image = ImageRef::markdown(uri.as_ref(), &thread_id);
+        let environment = environment.clone();
+        ImageSource::Custom(Arc::new(move |window, cx| {
+            let load = environment
+                .upgrade()?
+                .update(cx, |environment, cx| environment.image(&image, cx));
+            match load {
+                ImageLoad::Loaded(image) => image.use_render_image(window, cx).map(Ok),
+                ImageLoad::Loading => None,
+                ImageLoad::Failed => Some(Err(ImageCacheError::Asset(
+                    "the image could not be loaded".into(),
+                ))),
+            }
+        }))
+    }
+}
+
+/// Image `index` of a tool's output, as large as it is up to the feed's
+/// width and [`MAX_OUTPUT_IMAGE_HEIGHT`].
+fn output_image(item: &TurnItem, index: u64, row: &RowContext, cx: &mut App) -> AnyElement {
+    let image = ImageRef::ToolOutput {
+        thread_id: item.thread_id.clone(),
+        item_id: item.id.clone(),
+        index,
+    };
+    let load = row
+        .environment
+        .update(cx, |environment, cx| environment.image(&image, cx));
+    let theme = cx.theme();
+    let frame = div()
+        .id(SharedString::from(format!(
+            "tool-image-{}-{index}",
+            item.id
+        )))
+        .test_support()
+        .aria_label(match load {
+            ImageLoad::Loaded(_) => "Tool output image",
+            ImageLoad::Loading => "Loading image",
+            ImageLoad::Failed => "Image unavailable",
+        })
+        .flex()
+        .items_center()
+        .justify_center()
+        .max_w_full()
+        .overflow_hidden()
+        .rounded(theme.radius)
+        .border_1()
+        .border_color(theme.border);
+    match load {
+        ImageLoad::Loaded(image) => frame
+            .child(
+                img(ImageSource::Image(image))
+                    .max_w_full()
+                    .max_h(MAX_OUTPUT_IMAGE_HEIGHT)
+                    .object_fit(ObjectFit::Contain),
+            )
+            .into_any_element(),
+        ImageLoad::Loading => frame
+            .size_16()
+            .child(Spinner::new().xsmall())
+            .into_any_element(),
+        ImageLoad::Failed => frame
+            .px_2()
+            .py_1()
+            .text_xs()
+            .text_color(theme.muted_foreground)
+            .child("Image unavailable")
+            .into_any_element(),
+    }
+}
+
 fn toggle(
     view: &WeakEntity<ThreadView>,
     id: String,
@@ -485,8 +574,18 @@ fn reasoning_row(id: &str, streaming: bool, row: &RowContext, cx: &App) -> AnyEl
                 .cursor_pointer()
                 .hover(|this| this.text_color(theme.foreground))
                 .child(Icon::new(Lucide::Brain).small())
-                .child(if streaming { "Thinking…" } else { "Thought" })
-                .when(streaming, |this| this.child(Spinner::new().xsmall()))
+                .map(|this| {
+                    if streaming {
+                        // A highlight sweeping through the label instead of a
+                        // spinner; the row keeps the same size.
+                        this.child(
+                            ShimmerText::new("Thinking…")
+                                .id(SharedString::from(format!("thinking-{id}"))),
+                        )
+                    } else {
+                        this.child("Thought")
+                    }
+                })
                 .child(disclosure(expanded, cx))
                 .on_click(toggle(&row.view, id.to_owned())),
         )
@@ -540,10 +639,14 @@ fn tool_icon(icon: ToolIcon) -> Icon {
 /// A tool call the way omp's TUI draws it: `icon Title description meta`,
 /// then a framed preview of its body (the command and the end of its
 /// output, the start of a diff, the first matches) that expands in place.
-fn tool_row(item: &TurnItem, row: &RowContext, cx: &App) -> AnyElement {
+fn tool_row(item: &TurnItem, row: &RowContext, cx: &mut App) -> AnyElement {
     let Some(view) = tool_view(item) else {
         return div().into_any_element();
     };
+    let images: Vec<AnyElement> = (0..view.images as u64)
+        .map(|index| output_image(item, index, row, cx))
+        .collect();
+    let cx: &App = cx;
     let id = item.id.clone();
     let expanded = row.expanded.contains(&id);
     let theme = cx.theme();
@@ -556,6 +659,22 @@ fn tool_row(item: &TurnItem, row: &RowContext, cx: &App) -> AnyElement {
         ToolStatus::Done => theme.muted_foreground,
     };
     let label = [view.title.as_str(), view.description.as_str()].join(" ");
+    // The description and meta are smaller than the title: line them up on
+    // its baseline.
+    let title_font = (&theme.font_family, 0.875);
+    let description_shift = crate::appearance::baseline_shift(
+        cx,
+        (
+            if view.prose {
+                &theme.font_family
+            } else {
+                &mono
+            },
+            0.75,
+        ),
+        title_font,
+    );
+    let meta_shift = crate::appearance::baseline_shift(cx, (&theme.font_family, 0.75), title_font);
     let header = h_flex()
         .id(SharedString::from(format!("tool-toggle-{id}")))
         .test_support()
@@ -584,6 +703,8 @@ fn tool_row(item: &TurnItem, row: &RowContext, cx: &App) -> AnyElement {
             div()
                 .flex_1()
                 .min_w_0()
+                .relative()
+                .top(description_shift)
                 .truncate()
                 .text_xs()
                 .when(!view.prose, |this| this.font_family(mono.clone()))
@@ -593,6 +714,8 @@ fn tool_row(item: &TurnItem, row: &RowContext, cx: &App) -> AnyElement {
         .children(view.meta.iter().map(|(text, tone)| {
             div()
                 .flex_shrink_0()
+                .relative()
+                .top(meta_shift)
                 .text_xs()
                 .text_color(match tone {
                     Tone::Muted => theme.muted_foreground,
@@ -649,7 +772,20 @@ fn tool_row(item: &TurnItem, row: &RowContext, cx: &App) -> AnyElement {
                     )
                 })
         });
-    v_flex().child(header).children(body).into_any_element()
+    v_flex()
+        .child(header)
+        .children(body)
+        .when(!images.is_empty(), |this| {
+            this.child(
+                h_flex()
+                    .ml(TOOL_INDENT)
+                    .mt_1()
+                    .flex_wrap()
+                    .gap_2()
+                    .children(images),
+            )
+        })
+        .into_any_element()
 }
 
 /// A framed monospace block, like the TUI's boxed tool output.
@@ -663,7 +799,7 @@ fn frame(cx: &App) -> gpui_kit::Stateful<gpui_kit::Div> {
         .border_1()
         .border_color(theme.border)
         .bg(theme.secondary.opacity(0.35))
-        .text_xs()
+        .text_size(theme.mono_font_size)
         .line_height(relative(1.45))
         .font_family(theme.mono_font_family.clone())
 }
@@ -820,7 +956,7 @@ fn render_body(
         ToolBody::List(lines) => {
             let shown = lines.len().min(limit);
             v_flex()
-                .text_xs()
+                .text_size(theme.mono_font_size)
                 .line_height(relative(1.45))
                 .font_family(theme.mono_font_family.clone())
                 .children(lines[..shown].iter().enumerate().map(|(ix, line)| {

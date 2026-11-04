@@ -33,6 +33,20 @@ pub const DEFAULT_TEXT_MEASURE: f32 = 38.;
 pub const TEXT_MEASURE_MIN: f32 = 28.;
 pub const TEXT_MEASURE_MAX: f32 = 64.;
 
+/// Interface font size in px at 100% zoom: the rem size, so text, spacing
+/// and controls all follow it.
+pub const DEFAULT_INTERFACE_FONT_SIZE: f32 = 16.;
+pub const INTERFACE_FONT_SIZE_MIN: f32 = 12.;
+pub const INTERFACE_FONT_SIZE_MAX: f32 = 20.;
+/// Code font size in px at 100% zoom: tool output and the file preview.
+pub const DEFAULT_CODE_FONT_SIZE: f32 = 12.;
+pub const CODE_FONT_SIZE_MIN: f32 = 10.;
+pub const CODE_FONT_SIZE_MAX: f32 = 18.;
+/// Terminal font size in px at 100% zoom.
+pub const DEFAULT_TERMINAL_FONT_SIZE: f32 = 14.;
+pub const TERMINAL_FONT_SIZE_MIN: f32 = 8.;
+pub const TERMINAL_FONT_SIZE_MAX: f32 = 20.;
+
 /// The zoom levels the zoom commands step through; 1 is 100%.
 pub const ZOOM_LEVELS: [f32; 9] = [0.75, 0.8, 0.9, 1., 1.1, 1.25, 1.5, 1.75, 2.];
 
@@ -65,6 +79,12 @@ pub struct UiSettings {
     /// default monospace font.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mono_font: Option<String>,
+    /// Interface font size in px at 100% zoom.
+    pub interface_font_size: f32,
+    /// Code font size in px at 100% zoom.
+    pub code_font_size: f32,
+    /// Terminal font size in px at 100% zoom.
+    pub terminal_font_size: f32,
     /// Scale of the whole interface; 1 is 100%.
     pub zoom: f32,
     /// Starred models (slugs such as `anthropic/claude-opus-5-5`), pinned
@@ -86,6 +106,9 @@ impl Default for UiSettings {
             text_measure: DEFAULT_TEXT_MEASURE,
             ui_font: None,
             mono_font: None,
+            interface_font_size: DEFAULT_INTERFACE_FONT_SIZE,
+            code_font_size: DEFAULT_CODE_FONT_SIZE,
+            terminal_font_size: DEFAULT_TERMINAL_FONT_SIZE,
             favorite_models: Vec::new(),
             zoom: 1.,
         }
@@ -108,6 +131,36 @@ impl UiSettings {
     /// edited by hand could hold anything).
     pub fn measure(&self) -> f32 {
         self.text_measure.clamp(TEXT_MEASURE_MIN, TEXT_MEASURE_MAX)
+    }
+
+    /// The interface font size, kept inside the range the setting offers.
+    pub fn interface_font_size(&self) -> f32 {
+        font_size(
+            self.interface_font_size,
+            DEFAULT_INTERFACE_FONT_SIZE,
+            INTERFACE_FONT_SIZE_MIN,
+            INTERFACE_FONT_SIZE_MAX,
+        )
+    }
+
+    /// The code font size, kept inside the range the setting offers.
+    pub fn code_font_size(&self) -> f32 {
+        font_size(
+            self.code_font_size,
+            DEFAULT_CODE_FONT_SIZE,
+            CODE_FONT_SIZE_MIN,
+            CODE_FONT_SIZE_MAX,
+        )
+    }
+
+    /// The terminal font size, kept inside the range the setting offers.
+    pub fn terminal_font_size(&self) -> f32 {
+        font_size(
+            self.terminal_font_size,
+            DEFAULT_TERMINAL_FONT_SIZE,
+            TERMINAL_FONT_SIZE_MIN,
+            TERMINAL_FONT_SIZE_MAX,
+        )
     }
 
     /// The zoom, kept inside the levels the setting offers.
@@ -149,6 +202,16 @@ impl UiSettings {
     }
 }
 
+/// A font size clamped to `min..=max`; a non-number (a hand-edited file)
+/// is the default.
+fn font_size(value: f32, default: f32, min: f32, max: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(min, max)
+    } else {
+        default
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,6 +227,18 @@ mod tests {
         assert!(ui.toasts && ui.sounds && ui.working_shelf);
         assert_eq!(ui.text_measure, DEFAULT_TEXT_MEASURE);
         assert_eq!((ui.zoom, ui.ui_font.as_deref()), (1., None));
+        assert_eq!(
+            (
+                ui.interface_font_size,
+                ui.code_font_size,
+                ui.terminal_font_size
+            ),
+            (
+                DEFAULT_INTERFACE_FONT_SIZE,
+                DEFAULT_CODE_FONT_SIZE,
+                DEFAULT_TERMINAL_FONT_SIZE
+            )
+        );
         assert!(!ui.is_expanded(Shelf::Settled));
 
         let ui: UiSettings =
@@ -182,6 +257,19 @@ mod tests {
         assert_eq!(ui.measure(), TEXT_MEASURE_MAX);
         ui.text_measure = 42.;
         assert_eq!(ui.measure(), 42.);
+    }
+
+    #[test]
+    fn font_sizes_stay_in_range() {
+        let ui = UiSettings {
+            interface_font_size: 4.,
+            code_font_size: 40.,
+            terminal_font_size: 11.,
+            ..UiSettings::default()
+        };
+        assert_eq!(ui.interface_font_size(), INTERFACE_FONT_SIZE_MIN);
+        assert_eq!(ui.code_font_size(), CODE_FONT_SIZE_MAX);
+        assert_eq!(ui.terminal_font_size(), 11.);
     }
 
     #[test]
@@ -214,6 +302,9 @@ mod tests {
             text_measure: 42.,
             ui_font: Some("Inter".into()),
             mono_font: None,
+            interface_font_size: 15.,
+            code_font_size: 13.,
+            terminal_font_size: 12.,
             favorite_models: Vec::new(),
             zoom: 1.25,
         };
@@ -229,6 +320,7 @@ mod tests {
             json!({"workflow": "herdr", "workingShelf": false, "statusIndicators": "symbols",
                 "agentOrder": "attention", "toasts": false, "sounds": true,
                 "expandedShelves": ["settled"], "textMeasure": 42.0, "uiFont": "Inter",
+                "interfaceFontSize": 15.0, "codeFontSize": 13.0, "terminalFontSize": 12.0,
                 "favoriteModels": ["a/one"], "zoom": 1.25})
         );
         assert_eq!(serde_json::from_value::<UiSettings>(value).unwrap(), ui);

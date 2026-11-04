@@ -1903,6 +1903,58 @@ async fn the_file_pane_browses_and_previews_the_project(cx: &mut TestAppContext)
     app.stop(cx);
 }
 
+/// A 1×1 PNG.
+const PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+
+#[gpui_kit::test]
+async fn tool_and_host_images_come_from_the_threads_server(cx: &mut TestAppContext) {
+    use base64::Engine as _;
+    use j3_client::t3::assets::AssetResource;
+
+    let app = Harness::start("images", cx).await;
+    let png = base64::engine::general_purpose::STANDARD
+        .decode(PNG_BASE64)
+        .unwrap();
+    std::fs::write(app.project_dir.join("plot.png"), &png).unwrap();
+    std::fs::write(app.project_dir.join("notes.txt"), "text").unwrap();
+    let project_id = app.project(cx).await;
+    let thread_id = app.open_running_thread(cx, &project_id, "look").await;
+
+    // A tool that returns an image: the row draws it, fetched from the
+    // server as a `tool-output-image` asset.
+    app.script
+        .emit(json!({"type": "tool_execution_start", "toolCallId": "c1",
+        "toolName": "read", "args": {"path": "plot.png"}}));
+    app.script.emit(
+        json!({"type": "tool_execution_end", "toolCallId": "c1", "toolName": "read",
+        "result": {"content": [
+            {"type": "text", "text": "Read image file [image/png]"},
+            {"type": "image", "data": PNG_BASE64, "mimeType": "image/png"},
+        ]}, "isError": false}),
+    );
+    app.until(cx, |window, _| has_label(window, "Tool output image"))
+        .await;
+
+    // Markdown images name files on the thread's host (`workspace-file`):
+    // images in the project are served; other files and escapes are not.
+    let fetch = |path: &str| {
+        let connection = app.connection.clone();
+        let resource = AssetResource::WorkspaceFile {
+            thread_id: thread_id.clone(),
+            path: path.to_owned(),
+        };
+        app.runtime.as_ref().unwrap().spawn(async move {
+            let url = connection.resource_url(resource).await.ok()?;
+            let response = reqwest::get(url).await.ok()?.error_for_status().ok()?;
+            Some(response.bytes().await.ok()?.to_vec())
+        })
+    };
+    assert_eq!(fetch("plot.png").await.unwrap(), Some(png));
+    assert_eq!(fetch("notes.txt").await.unwrap(), None);
+    assert_eq!(fetch("../plot.png").await.unwrap(), None);
+    app.stop(cx);
+}
+
 #[gpui_kit::test]
 async fn the_feed_keeps_following_the_reply_after_a_wheel_scroll_at_the_bottom(
     cx: &mut TestAppContext,

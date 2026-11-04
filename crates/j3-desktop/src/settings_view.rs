@@ -1,5 +1,5 @@
 //! Settings, as a full-window view: the thread workflow and its options,
-//! notifications, environments, projects and archived threads. Preference
+//! appearance (zoom, fonts and font sizes), notifications, environments, projects and archived threads. Preference
 //! changes apply and save at once; environment and project commands go to
 //! the workspace.
 
@@ -31,7 +31,11 @@ use crate::{
     preferences::Preferences,
     titlebar,
     ui_settings::{
-        DEFAULT_TEXT_MEASURE, TEXT_MEASURE_MAX, TEXT_MEASURE_MIN, UiSettings, Workflow, ZOOM_LEVELS,
+        CODE_FONT_SIZE_MAX, CODE_FONT_SIZE_MIN, DEFAULT_CODE_FONT_SIZE,
+        DEFAULT_INTERFACE_FONT_SIZE, DEFAULT_TERMINAL_FONT_SIZE, DEFAULT_TEXT_MEASURE,
+        INTERFACE_FONT_SIZE_MAX, INTERFACE_FONT_SIZE_MIN, TERMINAL_FONT_SIZE_MAX,
+        TERMINAL_FONT_SIZE_MIN, TEXT_MEASURE_MAX, TEXT_MEASURE_MIN, UiSettings, Workflow,
+        ZOOM_LEVELS,
     },
 };
 
@@ -302,13 +306,40 @@ impl SettingsView {
                     .default_value(DEFAULT_TEXT_MEASURE as f64),
                 )
                 .description(
-                    "Widest the conversation text and composer get, in rem (16 px). Lower is a tighter, easier-to-read column.",
+                    "Widest the conversation text and composer get, in rem (the interface font size). Lower is a tighter, easier-to-read column.",
                 )
             }))
     }
 
-    /// Zoom and the two font families.
+    /// Zoom, the two font families and the font sizes.
     fn appearance_group(&self) -> SettingGroup {
+        let size_item = |title: &'static str,
+                         description: &'static str,
+                         (min, max, default): (f32, f32, f32),
+                         get: fn(&UiSettings) -> f32,
+                         set: fn(&mut UiSettings, f32)| {
+            let read = self.preferences.clone();
+            let write = self.preferences.clone();
+            SettingItem::new(
+                title,
+                SettingField::number_input(
+                    NumberFieldOptions {
+                        min: min as f64,
+                        max: max as f64,
+                        step: 1.,
+                    },
+                    move |cx| get(read.read(cx).ui()) as f64,
+                    move |value, cx| {
+                        let size = (value as f32).round().clamp(min, max);
+                        write.update(cx, |preferences, cx| {
+                            preferences.update_ui(|ui| set(ui, size), cx)
+                        })
+                    },
+                )
+                .default_value(default as f64),
+            )
+            .description(description)
+        };
         let font_item = |title: &'static str,
                          description: &'static str,
                          default_label: &'static str,
@@ -386,6 +417,39 @@ impl SettingsView {
                 "Default monospace",
                 |ui| ui.mono_font.as_deref(),
                 |ui, font| ui.mono_font = font,
+            ))
+            .item(size_item(
+                "Interface font size",
+                "In px at 100% zoom. Spacing and controls grow and shrink with it.",
+                (
+                    INTERFACE_FONT_SIZE_MIN,
+                    INTERFACE_FONT_SIZE_MAX,
+                    DEFAULT_INTERFACE_FONT_SIZE,
+                ),
+                UiSettings::interface_font_size,
+                |ui, size| ui.interface_font_size = size,
+            ))
+            .item(size_item(
+                "Code font size",
+                "In px at 100% zoom. Used for tool output and the file preview.",
+                (
+                    CODE_FONT_SIZE_MIN,
+                    CODE_FONT_SIZE_MAX,
+                    DEFAULT_CODE_FONT_SIZE,
+                ),
+                UiSettings::code_font_size,
+                |ui, size| ui.code_font_size = size,
+            ))
+            .item(size_item(
+                "Terminal font size",
+                "In px at 100% zoom.",
+                (
+                    TERMINAL_FONT_SIZE_MIN,
+                    TERMINAL_FONT_SIZE_MAX,
+                    DEFAULT_TERMINAL_FONT_SIZE,
+                ),
+                UiSettings::terminal_font_size,
+                |ui, size| ui.terminal_font_size = size,
             ))
     }
 

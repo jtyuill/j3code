@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 alacritty_terminal = { version = "0.26", default-features = false }
+base64.workspace = true
 dirs.workspace = true
 gethostname.workspace = true
 # Syntax highlighting for the file pane's preview (JSON comes with

@@ -238,6 +238,58 @@ pub fn read_file(
     })
 }
 
+/// Why [`image_file`] refused a path.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ImageFileError {
+    /// A relative path that climbs out of the workspace root.
+    OutsideRoot,
+    /// Not a raster image the clients render, or larger than an upload.
+    NotImage,
+    /// Nothing (or no regular file) at the resolved path.
+    NotFound(PathBuf),
+}
+
+/// The host image file `requested` names, as `workspace-file` assets see
+/// it: relative to `root` (and resolving inside it), or absolute like
+/// `projects.readFile`. Only GIF, JPEG, PNG and WebP files up to the image
+/// upload limit qualify; returns the path and its MIME type.
+pub fn image_file(root: &str, requested: &str) -> Result<(PathBuf, &'static str), ImageFileError> {
+    let requested = requested.trim();
+    let extension = Path::new(requested)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase);
+    let mime_type = match extension.as_deref() {
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        _ => return Err(ImageFileError::NotImage),
+    };
+    let (target, root) = if Path::new(requested).is_absolute() {
+        (PathBuf::from(requested), None)
+    } else {
+        let relative = workspace_relative(requested)
+            .filter(|relative| !relative.is_empty())
+            .ok_or(ImageFileError::OutsideRoot)?;
+        let root = fs::canonicalize(root).map_err(|_| ImageFileError::NotFound(root.into()))?;
+        (root.join(relative), Some(root))
+    };
+    let resolved = fs::canonicalize(&target).map_err(|_| ImageFileError::NotFound(target))?;
+    if root.is_some_and(|root| !resolved.starts_with(root)) {
+        return Err(ImageFileError::OutsideRoot);
+    }
+    match fs::metadata(&resolved) {
+        Ok(metadata) if metadata.is_file() => {
+            if metadata.len() > crate::attachments::MAX_IMAGE_BYTES {
+                return Err(ImageFileError::NotImage);
+            }
+            Ok((resolved, mime_type))
+        }
+        _ => Err(ImageFileError::NotFound(resolved)),
+    }
+}
+
 /// `path` normalized to `/`-joined components under the workspace root
 /// (empty for the root itself); `None` when it is absolute, climbs out of
 /// the root, or is not UTF-8.

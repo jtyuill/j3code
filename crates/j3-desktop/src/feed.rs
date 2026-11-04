@@ -4,6 +4,7 @@
 //! (`+3 −1`, `12 matches · 3 files`, `2.1s`) and a body (the command and its
 //! output, the diff, the matches) of which a few lines show until expanded.
 
+use j3_core::engine::model::tool_output_images;
 use j3_protocol::t3::orchestration::{
     CommandExecutionItem, DynamicToolItem, FileChangeItem, FileSearchItem, TurnItem, TurnItemKind,
     TurnItemStatus, UserMessageInputIntent, WebSearchItem,
@@ -135,6 +136,8 @@ pub struct ToolView {
     /// Body lines shown while collapsed; 0 shows only the header.
     pub preview: usize,
     pub status: ToolStatus,
+    /// Images in the tool's output (`tool-output-image` indices `0..images`).
+    pub images: usize,
 }
 
 /// First line of `text`, cut to [`SUMMARY_CHARS`] characters.
@@ -282,6 +285,9 @@ pub fn tool_view(item: &TurnItem) -> Option<ToolView> {
         view.description = intent;
         view.prose = true;
     }
+    if let TurnItemKind::DynamicTool(tool) = &item.kind {
+        view.images = output_images(tool);
+    }
     Some(view)
 }
 
@@ -296,6 +302,7 @@ fn base(icon: ToolIcon, title: &str, description: String) -> ToolView {
         body: None,
         preview: 0,
         status: ToolStatus::Done,
+        images: 0,
     }
 }
 
@@ -479,13 +486,28 @@ fn web_search_view(search: &WebSearchItem) -> ToolView {
     view
 }
 
-/// The output text of a dynamic tool, if any.
+/// The output text of a dynamic tool, if any. Output with images is t3's
+/// block list; its text blocks are the text.
 fn output_text(tool: &DynamicToolItem) -> Option<String> {
+    let output = tool.output.as_ref()?.as_ref()?;
+    let text = match output {
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        other => pretty(other),
+    };
+    (!text.trim().is_empty()).then_some(text)
+}
+
+/// How many images a dynamic tool's output shows.
+fn output_images(tool: &DynamicToolItem) -> usize {
     tool.output
         .as_ref()
-        .and_then(|o| o.as_ref())
-        .map(pretty)
-        .filter(|text| !text.trim().is_empty())
+        .and_then(Option::as_ref)
+        .map_or(0, |output| tool_output_images(output).count())
 }
 
 /// Drops the `[PATH#TAG]` header omp's `read` puts above a file.
@@ -512,7 +534,7 @@ fn dynamic_view(tool: &DynamicToolItem) -> ToolView {
                 _ => ToolIcon::Read,
             };
             let mut view = base(icon, "Read", path.to_owned());
-            if let Some(output) = output {
+            if let Some(output) = output.filter(|_| output_images(tool) == 0) {
                 let text = strip_hashline_header(&output).trim_end();
                 view.meta
                     .push(muted(count(text.lines().count(), "line", "lines")));

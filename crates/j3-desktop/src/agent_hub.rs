@@ -695,6 +695,7 @@ impl AgentHub {
                         .py_2()
                         .rounded(theme.radius)
                         .bg(theme.muted)
+                        .text_size(theme.mono_font_size)
                         .font_family(theme.mono_font_family.clone())
                         .child(body),
                 )

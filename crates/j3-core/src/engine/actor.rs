@@ -534,6 +534,31 @@ impl Actor {
                         Err(error) => tracing::debug!(%error, "omp get_subagent_messages"),
                     }
                 }
+                Effect::StoreToolImages(images) => {
+                    for image in images {
+                        let bytes = match base64::engine::general_purpose::STANDARD
+                            .decode(image.data.as_bytes())
+                        {
+                            Ok(bytes) => bytes,
+                            Err(error) => {
+                                tracing::warn!(%error, "decoding a tool output image");
+                                continue;
+                            }
+                        };
+                        let name = format!(
+                            "image.{}",
+                            image.mime_type.strip_prefix("image/").unwrap_or("png")
+                        );
+                        if let Err(error) = self
+                            .config
+                            .attachments
+                            .store_image(&image.attachment_id, &name, &image.mime_type, &bytes)
+                            .await
+                        {
+                            tracing::warn!(%error, "storing a tool output image");
+                        }
+                    }
+                }
             }
         }
         self.expiries.retain(|request_id, _| {
