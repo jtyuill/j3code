@@ -818,11 +818,6 @@ impl ThreadView {
             .or_else(|| thread.map(|t| t.title.clone()))
             .unwrap_or_else(|| "Thread".to_owned())
             .into();
-        let location: SharedString = thread
-            .and_then(|t| shell.project(&t.project_id))
-            .map(|project| format!("{} · {}", env.label(), project.title))
-            .unwrap_or_else(|| env.label().to_string())
-            .into();
         let theme = cx.theme();
         let has_goal = self.state.goal().is_some();
         let terminal_open = self
@@ -844,13 +839,6 @@ impl ThreadView {
                     .font_medium()
                     .text_sm()
                     .child(title),
-            )
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(location),
             )
             .child(div().flex_1())
             .child(

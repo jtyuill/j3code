@@ -1014,8 +1014,9 @@ impl Sidebar {
             ),
         };
         Some(
+            // A solid, bordered button: it sits over the row's title, so a
+            // transparent one would blend into the text under it.
             Button::new(key.element_id("row-action"))
-                .ghost()
                 .xsmall()
                 .icon(icon)
                 .when_some(label, |this, label| this.label(label))
