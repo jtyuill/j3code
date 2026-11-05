@@ -1574,7 +1574,7 @@ async fn stop_interrupts_the_run(cx: &mut TestAppContext) {
     .await;
     app.update(cx, |window, _| assert!(in_sidebar(window, "long task")));
 
-    // A new message starts another run; ⌘. (StopRun) stops it too.
+    // A new message starts another run; the StopRun shortcut stops it too.
     app.click_composer(cx);
     app.update(cx, |window, cx| {
         window.input("again", cx);
@@ -1583,7 +1583,7 @@ async fn stop_interrupts_the_run(cx: &mut TestAppContext) {
     app.until_called(cx, "prompt:again:0").await;
     app.script.emit(json!({"type": "agent_start"}));
     app.until(cx, |window, _| stoppable(window)).await;
-    app.update(cx, |window, cx| window.press("cmd-.", cx));
+    app.update(cx, |window, cx| window.press("secondary-.", cx));
     app.until(cx, |window, _| !stoppable(window)).await;
     assert_eq!(
         app.script
