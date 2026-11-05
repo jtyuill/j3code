@@ -1,5 +1,6 @@
-//! `/` completion for the composer: omp slash commands and skills of the
-//! thread's workspace. Skills are inserted as `/skill:<name>`.
+//! Completion for the composer: omp slash commands and skills of the
+//! thread's workspace (skills are inserted as `/skill:<name>`), and the
+//! models offered by a `^` mention.
 
 use std::collections::HashSet;
 
@@ -9,6 +10,9 @@ use j3_protocol::t3::server::{ServerConfig, ServerProviderSkill, ServerProviderS
 pub enum CompletionKind {
     Command,
     Skill,
+    /// A model for a `^` mention. Accepted through the mention token, not
+    /// [`apply`].
+    Model,
 }
 
 /// One row of the completion menu.

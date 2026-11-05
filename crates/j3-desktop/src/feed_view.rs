@@ -20,10 +20,10 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, Entity, ImageCacheError, ImageSource, InteractiveElement as _, IntoElement,
-    ObjectFit, ParentElement as _, Pixels, SharedString, SharedUri,
-    StatefulInteractiveElement as _, Styled as _, StyledImage as _, TestSupportExt as _,
-    WeakEntity, Window, div, img, px, relative,
+    AnyElement, App, Entity, FontWeight, HighlightStyle, ImageCacheError, ImageSource,
+    InteractiveElement as _, IntoElement, ObjectFit, ParentElement as _, Pixels, SharedString,
+    SharedUri, StatefulInteractiveElement as _, Styled as _, StyledImage as _, StyledText,
+    TestSupportExt as _, WeakEntity, Window, div, img, px, relative,
 };
 use j3_client::{
     ThreadState,
@@ -40,6 +40,7 @@ use serde_json::Value;
 use crate::{
     environment::{Environment, ImageLoad, ImageRef},
     feed::{DiffKind, Tone, ToolBody, ToolIcon, ToolStatus, tool_view},
+    keywords, mention, message_text, models,
     thread_view::ThreadView,
 };
 
@@ -388,7 +389,49 @@ fn user_message(
             attachment_thumbnail(&format!("{id}-{ix}"), attachment, load, cx)
         })
         .collect();
+    let choices = if text.contains('^') {
+        row.environment
+            .read(cx)
+            .state()
+            .config
+            .as_ref()
+            .map(models::model_choices)
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let rich = message_text::rich(text, |selector| {
+        mention::find_choice(&choices, selector).map(mention::display_name)
+    });
     let theme = cx.theme();
+    let mut highlights = Vec::with_capacity(rich.spans.len());
+    for span in &rich.spans {
+        match span.kind {
+            message_text::SpanKind::Keyword(keyword) => {
+                let colors = keywords::colors(keyword, 0.0);
+                let chars = rich.text[span.range.clone()].char_indices();
+                for ((offset, ch), color) in chars.zip(colors) {
+                    let start = span.range.start + offset;
+                    highlights.push((
+                        start..start + ch.len_utf8(),
+                        HighlightStyle {
+                            color: Some(color),
+                            ..Default::default()
+                        },
+                    ));
+                }
+            }
+            message_text::SpanKind::Model => highlights.push((
+                span.range.clone(),
+                HighlightStyle {
+                    color: Some(theme.info),
+                    font_weight: Some(FontWeight::BOLD),
+                    background_color: Some(theme.info.opacity(0.15)),
+                    ..Default::default()
+                },
+            )),
+        }
+    }
     h_flex()
         .w_full()
         .justify_end()
@@ -414,7 +457,11 @@ fn user_message(
                     this.child(h_flex().flex_wrap().gap_2().children(images))
                 })
                 .when(!text.is_empty(), |this| {
-                    this.child(div().whitespace_normal().child(text.to_owned()))
+                    this.child(
+                        div()
+                            .whitespace_normal()
+                            .child(StyledText::new(rich.text).with_highlights(highlights)),
+                    )
                 }),
         )
         .into_any_element()

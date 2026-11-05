@@ -1,10 +1,20 @@
 //! The message composer: multi-line text, pasted images (uploaded as they
-//! are added), one model-and-thinking picker, and `/` completion. It reports a
-//! [`Submission`]; its owner sends it and calls [`Composer::finish`].
+//! are added), one model-and-thinking picker, `/` completion and `^model`
+//! mentions. Magic keywords and accepted or pasted mentions become atomic
+//! inline tokens (the keyword with omp's gradient, the mention as a model
+//! chip) whose text stays in the draft, so [`Submission::text`] is exactly
+//! what was typed. It reports a [`Submission`]; its owner sends it and calls
+//! [`Composer::finish`].
 
-use std::{path::Path, sync::Arc, time::Instant};
+use std::{
+    ops::Range,
+    path::Path,
+    sync::{Arc, LazyLock},
+    time::Instant,
+};
 
 use gpui_kit::assets::IconName as Lucide;
+use gpui_kit::base::input::{InlineToken, InlineTokenContext};
 use gpui_kit::component::{
     ActiveTheme as _, Icon, IconName, IndexPath, Sizable as _,
     button::{Button, ButtonCustomVariant, ButtonVariants as _},
@@ -19,10 +29,11 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     Anchor, AnyElement, App, AppContext as _, ClipboardEntry, ClipboardItem, Context, Entity,
-    EventEmitter, FocusHandle, Focusable, Image, ImageFormat, ImageSource, InteractiveElement as _,
-    IntoElement, KeyDownEvent, MouseButton, ObjectFit, ParentElement as _, Render, SharedString,
-    StatefulInteractiveElement as _, Styled as _, StyledImage as _, Subscription, Task,
-    TestSupportExt as _, WeakEntity, Window, div, img, px, rems,
+    EntityInputHandler as _, EventEmitter, FocusHandle, Focusable, HighlightStyle, Image,
+    ImageFormat, ImageSource, InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton,
+    ObjectFit, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
+    Styled as _, StyledImage as _, StyledText, Subscription, Task, TestSupportExt as _, WeakEntity,
+    Window, div, img, px, rems,
 };
 use j3_client::t3::{chat_attachment::ChatAttachment, model::ModelSelection};
 
@@ -30,7 +41,7 @@ use crate::{
     agent_hub::DoubleTap,
     completion::{self, Catalog, Completion, CompletionKind},
     environment::Environment,
-    logos,
+    keywords, logos, mention,
     models::{self, ModelChoice},
     preferences::Preferences,
     usage::{self, UsagePanel, UsageStore},
@@ -40,6 +51,12 @@ use crate::{
 const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 /// Completion rows shown at once.
 const MAX_COMPLETIONS: usize = 8;
+/// Models a `^` mention lists (the menu scrolls past [`MAX_COMPLETIONS`]).
+const MAX_MODEL_COMPLETIONS: usize = 20;
+
+/// The process-wide origin of the keyword shimmer, so every composer shows
+/// the same phase.
+static SHIMMER_START: LazyLock<Instant> = LazyLock::new(Instant::now);
 
 /// What the composer asks its owner to send.
 #[derive(Debug, Clone, PartialEq)]
@@ -381,6 +398,12 @@ pub struct Composer {
     error: Option<SharedString>,
     /// ← taps in the empty composer.
     left: DoubleTap,
+    /// Set while [`Composer::sync_tokens`] edits the input, so the changes
+    /// it causes do not start another pass.
+    syncing: bool,
+    /// Repaints the input every [`keywords::SHIMMER_FRAME`] while it is
+    /// focused and holds a keyword token; ends by itself afterwards.
+    shimmer: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -460,6 +483,8 @@ impl Composer {
             busy: false,
             error: None,
             left: DoubleTap::default(),
+            syncing: false,
+            shimmer: None,
             _subscriptions: subscriptions,
         };
         composer.sync_config(window, cx);
@@ -514,6 +539,7 @@ impl Composer {
                 self.completions.clear();
                 self.input
                     .update(cx, |input, cx| input.set_value("", window, cx));
+                self.sync_shimmer(window, cx);
             }
             Err(error) => self.error = Some(error.into()),
         }
@@ -533,20 +559,191 @@ impl Composer {
                     let input = input.read(cx);
                     (input.value(), input.cursor())
                 };
-                self.completions = completion::slash_query(&text, cursor)
-                    .map(|query| self.catalog.complete(query))
-                    .unwrap_or_default();
+                self.completions = match completion::slash_query(&text, cursor) {
+                    Some(query) => self.catalog.complete(query),
+                    None => self.model_completions(&text, cursor),
+                };
                 self.completions.truncate(MAX_COMPLETIONS * 4);
                 self.completion_ix = 0;
                 if self.error.take().is_some() || !self.completions.is_empty() {
                     cx.notify();
                 }
                 cx.notify();
+                self.sync_tokens(window, cx);
             }
             // Shift+Enter inserts a newline, yet the textarea still reports it.
             InputEvent::PressEnter { shift: false, .. } => self.submit(window, cx),
-            InputEvent::PressEnter { .. } | InputEvent::Focus | InputEvent::Blur => {}
+            InputEvent::Focus => self.sync_shimmer(window, cx),
+            InputEvent::Blur => {
+                self.sync_shimmer(window, cx);
+                // Repaint the keywords in their static colours.
+                self.input.update(cx, |_, cx| cx.notify());
+            }
+            InputEvent::PressEnter { .. } => {}
         }
+    }
+
+    /// The models a `^` mention being typed at `cursor` offers.
+    fn model_completions(&self, text: &str, cursor: usize) -> Vec<Completion> {
+        let Some((_, query)) = mention::query_at(text, cursor) else {
+            return Vec::new();
+        };
+        mention::rank(&self.choices, &self.favorites, query, MAX_MODEL_COMPLETIONS)
+            .into_iter()
+            .filter_map(|ix| self.choices.get(ix))
+            .map(|choice| Completion {
+                kind: CompletionKind::Model,
+                label: choice.slug().to_owned(),
+                description: Some(mention::display_name(choice)),
+                hint: None,
+            })
+            .collect()
+    }
+
+    /// Keeps the input's tokens in step with its text: a magic keyword that
+    /// is followed by another character (so `orchestrated` never flickers)
+    /// and a `^selector` of a listed model become tokens, and a keyword
+    /// token whose word no longer stands alone is plain text again. Token
+    /// text always equals the text it replaces, so no offset moves and the
+    /// selection is restored after the edits. A second pass over the result
+    /// changes nothing, so the `Change` events the edits emit settle.
+    fn sync_tokens(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.syncing {
+            return;
+        }
+        self.syncing = true;
+        self.rewrite_tokens(window, cx);
+        self.syncing = false;
+        self.sync_shimmer(window, cx);
+    }
+
+    fn rewrite_tokens(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let input = self.input.clone();
+        let (text, tokens, selection, composing) = input.update(cx, |input, cx| {
+            (
+                input.value(),
+                input.tokens().to_vec(),
+                input.selected_range(),
+                input.marked_text_range(window, cx).is_some(),
+            )
+        });
+        // An IME composition owns the text; edit nothing until it commits.
+        if composing {
+            return;
+        }
+        let keywords = keywords::find(&text);
+        let mentions_allowed = mention::allowed(&text);
+
+        let stale = |id: &str, range: &Range<usize>| {
+            if id.starts_with("kw:") {
+                !keywords.iter().any(|found| found.range == *range)
+            } else {
+                id.starts_with("model:") && !mentions_allowed
+            }
+        };
+        let (unwrap, keep): (Vec<_>, Vec<_>) = tokens
+            .iter()
+            .map(|span| span.range())
+            .zip(tokens.iter().map(|span| span.token().id().clone()))
+            .partition(|(range, id)| stale(id, range));
+        let mut occupied: Vec<Range<usize>> = keep.into_iter().map(|(range, _)| range).collect();
+
+        let free = |occupied: &[Range<usize>], range: &Range<usize>| {
+            !occupied
+                .iter()
+                .any(|taken| taken.start < range.end && range.start < taken.end)
+        };
+        let mut wrap: Vec<(Range<usize>, InlineToken)> = Vec::new();
+        for found in &keywords {
+            if found.range.end < text.len() && free(&occupied, &found.range) {
+                let word = &text[found.range.clone()];
+                occupied.push(found.range.clone());
+                wrap.push((
+                    found.range.clone(),
+                    InlineToken::new(format!("kw:{}", found.keyword.word), word),
+                ));
+            }
+        }
+        for mention in mention::mentions(&text) {
+            if mention.range.end < text.len()
+                && free(&occupied, &mention.range)
+                && let Some(choice) = mention::find_choice(&self.choices, mention.selector)
+            {
+                occupied.push(mention.range.clone());
+                wrap.push((
+                    mention.range.clone(),
+                    InlineToken::new(
+                        format!("model:{}", mention.selector),
+                        &text[mention.range.clone()],
+                    )
+                    .with_label(mention::display_name(choice)),
+                ));
+            }
+        }
+        if unwrap.is_empty() && wrap.is_empty() {
+            return;
+        }
+
+        input.update(cx, |input, cx| {
+            for (range, _) in &unwrap {
+                // Identical text, replaced as a plain edit: the edit drops the
+                // token it overlaps.
+                let utf16 = text[..range.start].encode_utf16().count()
+                    ..text[..range.end].encode_utf16().count();
+                input.replace_text_in_range(Some(utf16), &text[range.clone()], window, cx);
+            }
+            for (range, token) in wrap {
+                // Rejected while composing; the next change retries.
+                let _ = input.replace_range_with_token(range, token, window, cx);
+            }
+            if input.selected_range() != selection {
+                input.set_selected_range(selection, cx);
+            }
+        });
+    }
+
+    /// Starts or stops the keyword shimmer: a repaint of the input every
+    /// frame while it is focused and holds a keyword token.
+    fn sync_shimmer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.shimmer_wanted(window, cx) {
+            if let Some(task) = self.shimmer.take() {
+                task.detach();
+            }
+            return;
+        }
+        if self.shimmer.is_some() {
+            return;
+        }
+        self.shimmer = Some(cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(keywords::SHIMMER_FRAME)
+                    .await;
+                let running = this.update_in(cx, |this, window, cx| {
+                    let wanted = this.shimmer_wanted(window, cx);
+                    if wanted {
+                        this.input.update(cx, |_, cx| cx.notify());
+                    } else if let Some(task) = this.shimmer.take() {
+                        // This task: let it end instead of cancelling it.
+                        task.detach();
+                    }
+                    wanted
+                });
+                if !running.unwrap_or(false) {
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// Whether the input is focused and holds a keyword token.
+    fn shimmer_wanted(&self, window: &Window, cx: &App) -> bool {
+        let input = self.input.read(cx);
+        input.focus_handle(cx).is_focused(window)
+            && input
+                .tokens()
+                .iter()
+                .any(|span| span.token().id().starts_with("kw:"))
     }
 
     /// omp's ←← in an empty composer opens the agents hub; any other key
@@ -740,6 +937,10 @@ impl Composer {
         let Some(completion) = self.completions.get(self.completion_ix).cloned() else {
             return;
         };
+        if completion.kind == CompletionKind::Model {
+            self.accept_model(&completion.label, window, cx);
+            return;
+        }
         let text = completion::apply(&self.input.read(cx).value(), &completion);
         let end = text.len();
         self.completions.clear();
@@ -749,6 +950,33 @@ impl Composer {
         });
         // `set_value` does not emit Change, so the menu stays closed.
         self.completions.clear();
+        cx.notify();
+    }
+
+    /// Replaces the `^query` before the cursor with the token of the model
+    /// `slug` and a space, leaving the caret after the space.
+    fn accept_model(&mut self, slug: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.completions.clear();
+        let (text, cursor) = {
+            let input = self.input.read(cx);
+            (input.value(), input.cursor())
+        };
+        if let Some((range, _)) = mention::query_at(&text, cursor)
+            && let Some(choice) = mention::find_choice(&self.choices, slug)
+        {
+            let token = InlineToken::new(format!("model:{slug}"), format!("^{slug}"))
+                .with_label(mention::display_name(choice));
+            let end = range.start + 1 + slug.len();
+            self.input.update(cx, |input, cx| {
+                if input
+                    .replace_range_with_token(range, token, window, cx)
+                    .is_ok()
+                {
+                    input.set_selected_range(end..end, cx);
+                    input.insert(" ", window, cx);
+                }
+            });
+        }
         cx.notify();
     }
 
@@ -855,6 +1083,7 @@ impl Composer {
                         "completion-{}",
                         completion.label
                     )))
+                    .test_support()
                     .gap_2()
                     .px_2()
                     .py_1()
@@ -891,6 +1120,14 @@ impl Composer {
                                 .text_xs()
                                 .text_color(theme.muted_foreground)
                                 .child("skill"),
+                        )
+                    })
+                    .when(completion.kind == CompletionKind::Model, |this| {
+                        this.child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child("model"),
                         )
                     })
                     .on_click(cx.listener(move |this, _, window, cx| {
@@ -1167,6 +1404,7 @@ impl Focusable for Composer {
 impl Render for Composer {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let weak = cx.weak_entity();
+        let focus = self.focus_handle(cx);
         let action = self.send_action(cx);
         let completions = self.render_completions(cx);
         let images = self.render_images(cx);
@@ -1246,6 +1484,9 @@ impl Render for Composer {
                         .appearance(false)
                         .text_sm()
                         .aria_label("Message")
+                        .token(move |ctx, window, cx| {
+                            render_token(ctx, focus.is_focused(window), cx)
+                        })
                         .on_paste(move |item, _, cx| Self::on_paste(&weak, item, cx)),
                 ),
             )
@@ -1287,5 +1528,68 @@ impl Render for Composer {
                             }))
                     }),
             )
+    }
+}
+
+/// What an inline token of the draft renders as: a model chip for a
+/// `^selector`, the keyword's gradient (animated while the input is
+/// `focused`) for a magic keyword.
+fn render_token(ctx: &InlineTokenContext, focused: bool, cx: &App) -> AnyElement {
+    let theme = cx.theme();
+    let token = ctx.token();
+    let id = token.id().clone();
+    let chip = div()
+        .id(id.clone())
+        .test_support()
+        .flex()
+        .items_center()
+        .h(ctx.line_height())
+        .max_w(ctx.available_width())
+        .rounded(theme.radius);
+    if id.starts_with("model:") {
+        let label = token.label().clone();
+        return chip
+            .aria_label(label.clone())
+            .gap_1()
+            .px_1()
+            .text_color(theme.info)
+            .bg(if ctx.is_selected() {
+                theme.selection
+            } else {
+                theme.info.opacity(0.15)
+            })
+            .child(Icon::new(Lucide::Bot).xsmall().flex_none())
+            .child(div().min_w_0().truncate().child(label))
+            .into_any_element();
+    }
+    let word = token.text().clone();
+    let keyword = keywords::KEYWORDS.iter().find(|k| k.word == &*word);
+    let chip = chip
+        .aria_label(word.clone())
+        .when(ctx.is_selected(), |this| this.bg(theme.selection));
+    match keyword {
+        Some(keyword) => {
+            let phase = if focused {
+                keywords::shimmer_phase(SHIMMER_START.elapsed())
+            } else {
+                0.0
+            };
+            let highlights: Vec<_> = word
+                .char_indices()
+                .zip(keywords::colors(keyword, phase))
+                .map(|((start, ch), color)| {
+                    (
+                        start..start + ch.len_utf8(),
+                        HighlightStyle {
+                            color: Some(color),
+                            ..Default::default()
+                        },
+                    )
+                })
+                .collect();
+            chip.child(StyledText::new(word).with_highlights(highlights))
+                .into_any_element()
+        }
+        None => chip.child(word).into_any_element(),
     }
 }

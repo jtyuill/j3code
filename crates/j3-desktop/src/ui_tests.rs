@@ -48,7 +48,9 @@ use j3_core::{
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
-use crate::{actions, local_server::LocalServer, services::Services, workspace::Workspace};
+use crate::{
+    actions, local_server::LocalServer, mention, models, services::Services, workspace::Workspace,
+};
 
 /// The model the fake omp lists (and the tests launch with).
 const MODEL: &str = "opencode-go/glm-5.3-flash";
@@ -1300,6 +1302,139 @@ async fn new_thread_launches_from_the_composer_and_streams_the_reply(cx: &mut Te
     assert_eq!(thread.model_selection.model, MODEL);
     drop(state);
 
+    app.stop(cx);
+}
+
+/// Opens a new thread in a fresh project once the model catalog has loaded,
+/// with the composer focused.
+async fn focused_new_thread_composer(app: &Harness, cx: &mut TestAppContext) {
+    app.project(cx).await;
+    let connection = app.connection.clone();
+    app.until(cx, move |_, _| {
+        connection
+            .state()
+            .borrow()
+            .config
+            .as_ref()
+            .is_some_and(|config| {
+                config
+                    .providers
+                    .iter()
+                    .any(|provider| !provider.models.is_empty())
+            })
+    })
+    .await;
+    app.update(cx, |window, cx| window.click("new-thread", cx));
+    app.until(cx, |window, _| {
+        window
+            .find_all_by_label("Message")
+            .first()
+            .is_some_and(|input| input.focused() == Some(true))
+    })
+    .await;
+}
+
+/// The composer's draft text.
+fn draft(window: &Window) -> String {
+    window
+        .find_by_label("Message")
+        .value()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+#[gpui_kit::test]
+async fn a_caret_mention_completes_to_a_model_chip_and_sends_its_selector(cx: &mut TestAppContext) {
+    let app = Harness::start("mention", cx).await;
+    focused_new_thread_composer(&app, cx).await;
+    let name = {
+        let state = app.connection.state();
+        let state = state.borrow();
+        let config = state.config.as_ref().expect("the model catalog");
+        models::model_choices(config)
+            .iter()
+            .find(|choice| choice.slug() == MODEL)
+            .map(mention::display_name)
+            .expect("the fake omp's model")
+    };
+    let row = format!("completion-{MODEL}");
+    let chip = format!("model:{MODEL}");
+
+    app.update(cx, |window, cx| window.input("Have ^", cx));
+    app.until(cx, |window, _| window.try_find(row.clone()).is_some())
+        .await;
+    app.update(cx, |window, cx| window.press("enter", cx));
+    app.until(cx, |window, _| window.try_find(chip.clone()).is_some())
+        .await;
+    app.update(cx, |window, _| {
+        assert_eq!(draft(window), format!("Have ^{MODEL} "));
+        assert_eq!(label_of(window, &chip).as_deref(), Some(name.as_str()));
+        assert!(window.try_find(row.clone()).is_none());
+    });
+
+    app.update(cx, |window, cx| window.press("enter", cx));
+    app.until_called(cx, &format!("prompt:Have ^{MODEL}:0"))
+        .await;
+    app.stop(cx);
+}
+
+#[gpui_kit::test]
+async fn a_magic_keyword_becomes_a_token_once_a_delimiter_follows_and_stops_when_extended(
+    cx: &mut TestAppContext,
+) {
+    let app = Harness::start("keyword", cx).await;
+    focused_new_thread_composer(&app, cx).await;
+    let keyword_tokens = |window: &Window| window.find_all_by_label("orchestrate").len();
+
+    // At the end of the draft the word stays plain text.
+    app.update(cx, |window, cx| window.input("please orchestrate", cx));
+    app.update(cx, |window, _| {
+        assert_eq!(draft(window), "please orchestrate");
+        assert_eq!(keyword_tokens(window), 0);
+    });
+
+    // Once a character follows it, the word is one token and the text is
+    // untouched.
+    app.update(cx, |window, cx| window.input(" this", cx));
+    app.until(cx, |window, _| keyword_tokens(window) == 1).await;
+    app.update(cx, |window, _| {
+        assert!(window.try_find("kw:orchestrate").is_some());
+        assert_eq!(draft(window), "please orchestrate this");
+    });
+
+    // Typing straight after the word makes it `orchestrated`: plain again.
+    app.update(cx, |window, cx| window.input(" orchestrate ", cx));
+    app.until(cx, |window, _| keyword_tokens(window) == 2).await;
+    app.update(cx, |window, cx| {
+        // Back over the space: the caret sits at the end of the word's token.
+        window.press("left", cx);
+        window.input("d", cx);
+    });
+    app.until(cx, |window, _| {
+        draft(window) == "please orchestrate this orchestrated "
+    })
+    .await;
+    app.until(cx, |window, _| keyword_tokens(window) == 1).await;
+    app.update(cx, |window, _| {
+        assert_eq!(draft(window), "please orchestrate this orchestrated ");
+    });
+    app.stop(cx);
+}
+
+#[gpui_kit::test]
+async fn a_bang_draft_shows_no_model_menu_and_no_model_chip(cx: &mut TestAppContext) {
+    let app = Harness::start("bang", cx).await;
+    focused_new_thread_composer(&app, cx).await;
+    let text = format!("!ls ^{MODEL} ");
+
+    app.update(cx, |window, cx| window.input(&text, cx));
+    app.until(cx, |window, _| draft(window) == text).await;
+    cx.executor().timer(Duration::from_millis(300)).await;
+    app.update(cx, |window, _| {
+        assert_eq!(draft(window), text);
+        assert!(window.try_find(format!("completion-{MODEL}")).is_none());
+        assert!(window.try_find(format!("model:{MODEL}")).is_none());
+    });
     app.stop(cx);
 }
 
