@@ -1299,12 +1299,8 @@ async fn git_status_and_streamed_actions() {
     );
 
     // A commit with a message: its phases stream, then the result.
-    let mut run = connection.run_git_action(
-        &dir,
-        GitStackedAction::Commit,
-        Some("Add notes".into()),
-        None,
-    );
+    let mut run =
+        connection.run_git_action(&dir, GitStackedAction::Commit, Some("Add notes".into()));
     let mut progress = Vec::new();
     let result = loop {
         match run.next().await.expect("an outcome") {
@@ -1331,7 +1327,7 @@ async fn git_status_and_streamed_actions() {
     assert!(!status.has_working_tree_changes && status.working_tree.files.is_empty());
 
     // Pull requests are cut: the action fails with the server's sentence.
-    let mut run = connection.run_git_action(&dir, GitStackedAction::CreatePr, None, None);
+    let mut run = connection.run_git_action(&dir, GitStackedAction::CreatePr, None);
     let outcome = loop {
         if let GitActionUpdate::Finished(outcome) = run.next().await.expect("an outcome") {
             break outcome;

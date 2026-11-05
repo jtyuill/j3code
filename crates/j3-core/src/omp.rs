@@ -21,7 +21,11 @@ use omp_rpc::{
     Client, ClientOptions, Command, Event, ExtensionUiResponse, GetStateCommand, RpcInbound,
     SetAskDialogCommand,
 };
-use tokio::{io::AsyncWriteExt, sync::mpsc, task};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    sync::mpsc,
+    task,
+};
 
 /// Frames from an omp process that are not responses to our own commands.
 pub type OmpEvents = mpsc::UnboundedReceiver<Event>;
@@ -51,17 +55,28 @@ pub enum Error {
     TextTimeout,
     #[error("omp failed ({status}): {stderr}")]
     TextFailed { status: String, stderr: String },
+    #[error("running omp commit: {0}")]
+    CommitSpawn(std::io::Error),
+    #[error("omp commit did not finish within {}s", COMMIT_TIMEOUT.as_secs())]
+    CommitTimeout,
+    #[error("omp commit failed ({status}): {output}")]
+    CommitFailed { status: String, output: String },
 }
 
 /// How long `omp usage` may take; uncached reports query every provider.
 const USAGE_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a one-shot text generation (`omp -p`) may take.
 const TEXT_TIMEOUT: Duration = Duration::from_secs(90);
+/// How long `omp commit` may take: its commit agent, changelog updates and
+/// the repository's commit hooks.
+const COMMIT_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// omp's fast model role.
 pub const SMOL_MODEL: &str = "pi/smol";
-/// omp's smallest model role.
-pub const TINY_MODEL: &str = "pi/tiny";
+/// omp's commit message model role (what `omp commit` asks first).
+pub const COMMIT_MODEL: &str = "pi/commit";
+/// omp's default model role.
+pub const DEFAULT_MODEL: &str = "pi/default";
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -252,6 +267,67 @@ impl OmpLauncher {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
+    /// Runs `omp commit` in `cwd`: omp's own commit pipeline (the `commit`
+    /// model role, then `smol`, then the chat roles; split commits;
+    /// changelog updates) over what is staged. `on_step` gets each step omp
+    /// reports (`● Creating commit...` is `Creating commit...`) as it
+    /// happens. Whether a commit was made is for the caller to read from the
+    /// repository: omp exits 0 with nothing to commit. Uses the launcher's
+    /// environment, not its extra arguments (those are for `--mode rpc`).
+    pub async fn commit(&self, cwd: &Path, mut on_step: impl FnMut(&str)) -> Result<()> {
+        let mut process = tokio::process::Command::new(&self.program);
+        process
+            .current_dir(cwd)
+            .arg("commit")
+            .envs(self.env.iter().map(|(k, v)| (k, v)))
+            .env("NO_COLOR", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            // Not a TTY, so a split plan is not put to a question.
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = process.spawn().map_err(Error::CommitSpawn)?;
+        let stdout = child.stdout.take().expect("stdout is piped");
+        let mut stderr = child.stderr.take().expect("stderr is piped");
+        // Drained alongside stdout so neither pipe can fill up and stall omp.
+        let stderr = tokio::spawn(async move {
+            let mut text = String::new();
+            let _ = stderr.read_to_string(&mut text).await;
+            text
+        });
+        let run = async {
+            let mut lines = BufReader::new(stdout).lines();
+            let mut transcript = String::new();
+            while let Some(line) = lines.next_line().await.map_err(Error::CommitSpawn)? {
+                if let Some(step) = commit_step(&line) {
+                    on_step(step);
+                }
+                transcript.push_str(&line);
+                transcript.push('\n');
+            }
+            let status = child.wait().await.map_err(Error::CommitSpawn)?;
+            Ok::<_, Error>((status, transcript))
+        };
+        let (status, transcript) = tokio::time::timeout(COMMIT_TIMEOUT, run)
+            .await
+            .map_err(|_| Error::CommitTimeout)??;
+        let stderr = stderr.await.unwrap_or_default();
+        if !status.success() {
+            // omp reports a refusing hook or push on stderr; anything else
+            // it had to say went to stdout.
+            let output = match stderr.trim() {
+                "" => transcript.trim(),
+                stderr => stderr,
+            };
+            return Err(Error::CommitFailed {
+                status: status.to_string(),
+                output: output.to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     fn command(&self, cwd: &Path, mode: Persistence<'_>) -> Result<Process> {
         let mut process = Process::new(&self.program);
         process
@@ -292,6 +368,15 @@ enum Persistence<'a> {
     Resume(&'a Path),
     /// `--no-session`: nothing written.
     None,
+}
+
+/// The step of an `omp commit` stdout line: `● Resolving model...` is
+/// `Resolving model...`. The commit agent's closing remarks also start with
+/// `●`, but they do not end in `...`.
+fn commit_step(line: &str) -> Option<&str> {
+    line.strip_prefix("● ")
+        .map(str::trim)
+        .filter(|step| step.ends_with("...") && step.len() > 3)
 }
 
 /// A running omp process bound to one session.

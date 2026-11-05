@@ -81,6 +81,7 @@ Protocol check against a running server (uses real omp and spends tokens):
 - Identity: after start, `get_state` reports `sessionId`/`sessionFile`, which go into the thread index.
 - `ask`/`select`/`confirm`/`input`/`editor` requests become pending thread requests that any connected client can answer. The response is written back as `extension_ui_response`.
 - A run is finished at `session_settled`, not `agent_end`, because background jobs can wake the agent after it yields.
+- Git: the desktop's generated commits run `omp commit` in the project (omp's `commit` model role, changelog updates, split commits); pull request text is a one-shot `omp -p` on `pi/commit`, then `pi/smol`, then `pi/default`.
 
 ## Milestones
 

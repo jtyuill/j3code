@@ -1,9 +1,11 @@
 //! t3's git workflow over the host's `git` and `gh` CLIs (`vcs.refreshStatus`,
 //! `vcs.pull`, `git.runStackedAction`): status, fast-forward pull, and the
-//! commit / push / pull request stacked actions with omp-generated commit
-//! messages and PR text. Credentials, identity and `gh` login are the host
-//! user's own (`~/.gitconfig`, `~/.config/gh`), nothing is configured here.
-//! Pull requests need a GitHub remote; feature branches are not served.
+//! commit / push / pull request stacked actions. Commits without a message
+//! from the client go through `omp commit`, so omp writes them the way its
+//! CLI does; pull request text comes from omp's `commit` model role.
+//! Credentials, identity and `gh` login are the host user's own
+//! (`~/.gitconfig`, `~/.config/gh`), nothing is configured here. Pull
+//! requests need a GitHub remote; feature branches are not served.
 //!
 //! Mirrors t3's `GitManager` (`apps/server/src/git/GitManager.ts`) and
 //! `GitVcsDriverCore` (`apps/server/src/vcs/GitVcsDriverCore.ts`).
@@ -45,10 +47,16 @@ const MAX_COUNTED_FILE_BYTES: u64 = 1024 * 1024;
 const SHORT_SHA_LENGTH: usize = 7;
 /// t3's `TOAST_DESCRIPTION_MAX`.
 const TOAST_DESCRIPTION_MAX: usize = 72;
-/// The system prompt of commit message generation.
-const COMMIT_SYSTEM_PROMPT: &str = "You write concise git commit messages.";
 /// The system prompt of pull request text generation.
 const PR_SYSTEM_PROMPT: &str = "You write GitHub pull request titles and descriptions.";
+/// The models pull request text is asked of, in order: omp's `commit`, `smol`
+/// and `default` roles, the order `omp commit` resolves its own model in. An
+/// unset role makes omp fail at once, which moves on to the next.
+const PR_MODELS: [&str; 3] = [
+    crate::omp::COMMIT_MODEL,
+    crate::omp::SMOL_MODEL,
+    crate::omp::DEFAULT_MODEL,
+];
 /// How long a branch's pull request is remembered between status polls.
 const PR_CACHE_TTL: Duration = Duration::from_secs(60);
 /// `gh` talks to the network; `gh pr create` also runs `git push` hooks.
@@ -622,7 +630,7 @@ async fn run_action(
 
     let commit = if wants_commit {
         progress.set_phase(GitActionProgressPhase::Commit);
-        commit_step(omp, input, branch.as_deref(), progress).await?
+        commit_step(omp, input, progress).await?
     } else {
         GitCommitStep {
             status: GitCommitStepStatus::SkippedNotRequested,
@@ -649,7 +657,7 @@ async fn run_action(
             progress.set_phase(GitActionProgressPhase::Pr);
             // The push moved the branch; read the state it left.
             let current = details(cwd).await?;
-            pr_step(omp, cwd, branch, &current, input.model.as_deref(), progress).await?
+            pr_step(omp, cwd, branch, &current, progress).await?
         }
         _ => GitPrStep {
             status: GitPrStepStatus::SkippedNotRequested,
@@ -684,13 +692,16 @@ async fn run_action(
     Ok(result)
 }
 
-/// t3's `runCommitStep`: stage, resolve the message, commit.
+/// t3's `runCommitStep`: stage, then commit with the client's message, or
+/// through `omp commit`, which writes the message and may split the staged
+/// changes into several commits and update changelogs on the way. The step
+/// reports the last commit made.
 async fn commit_step(
     omp: &OmpLauncher,
     input: &GitRunStackedActionInput,
-    branch: Option<&str>,
     progress: &Progress<'_>,
 ) -> GitResult<GitCommitStep> {
+    const OMP_COMMIT: &str = "OmpCommit.commit";
     let cwd = input.cwd.as_str();
     let git = Git::new(Path::new(cwd), cwd);
     let custom = input
@@ -720,14 +731,13 @@ async fn commit_step(
                 .await?;
         }
     }
-    let staged_summary = git
+    let staged = git
         .run(
             "GitVcsDriver.prepareCommitContext.stagedSummary",
-            &["diff", "--cached", "--name-status"],
+            &["diff", "--cached", "--name-only"],
         )
         .await?;
-    let staged_summary = staged_summary.trim();
-    if staged_summary.is_empty() {
+    if staged.trim().is_empty() {
         return Ok(GitCommitStep {
             status: GitCommitStepStatus::SkippedNoChanges,
             commit_sha: None,
@@ -735,34 +745,46 @@ async fn commit_step(
         });
     }
 
-    let message = match custom {
-        Some(message) => message,
-        None => {
-            let staged_patch = git
-                .run(
-                    "GitVcsDriver.prepareCommitContext.stagedPatch",
-                    &["diff", "--no-ext-diff", "--cached", "--patch", "--minimal"],
-                )
+    let before = git.try_line(&["rev-parse", "--verify", "--quiet", "HEAD"]).await?;
+    match custom {
+        Some(message) => {
+            progress.phase_started(GitActionProgressPhase::Commit, "Committing...");
+            let mut args = vec!["commit", "-m", message.subject.as_str()];
+            if !message.body.is_empty() {
+                args.extend(["-m", message.body.as_str()]);
+            }
+            git.run_with("GitVcsDriver.commit.commit", &args, LONG_GIT_TIMEOUT)
                 .await?;
-            let prompt = commit_message_prompt(branch, staged_summary, &staged_patch);
-            generate_commit_message(omp, &prompt, Path::new(cwd), input.model.as_deref()).await?
         }
-    };
-
-    progress.phase_started(GitActionProgressPhase::Commit, "Committing...");
-    let mut args = vec!["commit", "-m", message.subject.as_str()];
-    if !message.body.is_empty() {
-        args.extend(["-m", message.body.as_str()]);
+        None => omp
+            .commit(Path::new(cwd), |step| {
+                progress.phase_started(GitActionProgressPhase::Commit, step);
+            })
+            .await
+            .map_err(|error| {
+                Box::new(GitManagerServiceError::command(
+                    OMP_COMMIT,
+                    "omp commit",
+                    cwd,
+                    None,
+                    error.to_string(),
+                ))
+            })?,
     }
-    git.run_with("GitVcsDriver.commit.commit", &args, LONG_GIT_TIMEOUT)
+    let head = git
+        .run(
+            "GitVcsDriver.commit.head",
+            &["log", "-1", "--format=%H%x00%s"],
+        )
         .await?;
-    let sha = git
-        .run("GitVcsDriver.commit.revParseHead", &["rev-parse", "HEAD"])
-        .await?;
+    let (sha, subject) = head.trim_end().split_once('\0').unwrap_or((head.trim(), ""));
+    if before.as_deref() == Some(sha) {
+        return Err(manager(OMP_COMMIT, cwd, "omp commit made no commit."));
+    }
     Ok(GitCommitStep {
         status: GitCommitStepStatus::Created,
-        commit_sha: Some(sha.trim().to_owned()),
-        subject: Some(message.subject),
+        commit_sha: Some(sha.to_owned()),
+        subject: Some(subject.to_owned()),
     })
 }
 
@@ -955,14 +977,12 @@ fn forget_pull_request(cwd: &str, branch: &str) {
 }
 
 /// t3's `runPrStep`: the branch's open pull request, or a new one with
-/// omp-written text (`thread_model` as in [`generate_text`]). `branch` is
-/// pushed already.
+/// omp-written text (see [`PR_MODELS`]). `branch` is pushed already.
 async fn pr_step(
     omp: &OmpLauncher,
     cwd: &str,
     branch: &str,
     details: &Details,
-    thread_model: Option<&str>,
     progress: &Progress<'_>,
 ) -> GitResult<GitPrStep> {
     const OPERATION: &str = "runPrStep";
@@ -1058,7 +1078,7 @@ async fn pr_step(
 
     progress.phase_started(GitActionProgressPhase::Pr, "Generating PR content...");
     let prompt = pr_prompt(&base, branch, commits.trim(), stat.trim(), &patch);
-    let generated = generate_pull_request(omp, &prompt, Path::new(cwd), thread_model).await?;
+    let generated = generate_pull_request(omp, &prompt, Path::new(cwd)).await?;
     let title = generated.title;
     let body = generated.body;
 
@@ -1181,10 +1201,9 @@ async fn generate_pull_request(
     omp: &OmpLauncher,
     prompt: &str,
     cwd: &Path,
-    thread_model: Option<&str>,
 ) -> GitResult<PullRequestText> {
     const OPERATION: &str = "generatePullRequestContent";
-    let reply = generate_text(omp, prompt, PR_SYSTEM_PROMPT, cwd, thread_model)
+    let reply = generate_text(omp, prompt, PR_SYSTEM_PROMPT, cwd)
         .await
         .map_err(|error| {
             Box::new(GitManagerServiceError::text_generation(
@@ -1219,10 +1238,7 @@ fn sanitize_pull_request(generated: GeneratedPullRequest) -> PullRequestText {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Commit messages
-// ---------------------------------------------------------------------------
-
+/// A commit message the client typed.
 #[derive(Debug, PartialEq, Eq)]
 struct CommitMessage {
     subject: String,
@@ -1250,80 +1266,17 @@ fn limit_section(value: &str, max_chars: usize) -> String {
     }
 }
 
-/// t3's `buildCommitMessagePrompt` without a branch name request or style
-/// policy.
-fn commit_message_prompt(branch: Option<&str>, staged_summary: &str, staged_patch: &str) -> String {
-    [
-        COMMIT_SYSTEM_PROMPT,
-        "Return a JSON object with keys: subject, body.",
-        "Rules:",
-        "- subject must be imperative, <= 72 chars, and no trailing period",
-        "- body can be empty string or short bullet points",
-        "- capture the primary user-visible or developer-visible change",
-        "",
-        &format!("Branch: {}", branch.unwrap_or("(detached)")),
-        "",
-        "Staged files:",
-        &limit_section(staged_summary, 6_000),
-        "",
-        "Staged patch:",
-        &limit_section(staged_patch, 40_000),
-    ]
-    .join("\n")
-}
-
-#[derive(Deserialize)]
-struct GeneratedCommitMessage {
-    subject: String,
-    #[serde(default)]
-    body: String,
-}
-
-async fn generate_commit_message(
-    omp: &OmpLauncher,
-    prompt: &str,
-    cwd: &Path,
-    thread_model: Option<&str>,
-) -> GitResult<CommitMessage> {
-    const OPERATION: &str = "generateCommitMessage";
-    let reply = generate_text(omp, prompt, COMMIT_SYSTEM_PROMPT, cwd, thread_model)
-        .await
-        .map_err(|error| {
-            Box::new(GitManagerServiceError::text_generation(
-                OPERATION,
-                error.to_string(),
-            ))
-        })?;
-    let generated = parse_generated(&reply).ok_or_else(|| {
-        Box::new(GitManagerServiceError::text_generation(
-            OPERATION,
-            format!(
-                "omp did not return a commit message JSON object: {}",
-                reply.trim()
-            ),
-        ))
-    })?;
-    Ok(sanitize_commit_message(generated))
-}
-
-/// Asks omp's `pi/smol`, then `pi/tiny`, then the thread's own model, and
-/// answers with the first reply. A model that cannot be reached (omp fails
-/// or times out with it) moves on to the next; the last failure is the
-/// error.
+/// Asks each of [`PR_MODELS`] in turn and answers with the first reply. A
+/// model that cannot be reached (omp fails or times out with it) moves on to
+/// the next; the last failure is the error.
 async fn generate_text(
     omp: &OmpLauncher,
     prompt: &str,
     system: &str,
     cwd: &Path,
-    thread_model: Option<&str>,
 ) -> crate::omp::Result<String> {
-    let models = [
-        Some(crate::omp::SMOL_MODEL),
-        Some(crate::omp::TINY_MODEL),
-        thread_model,
-    ];
     let mut last = None;
-    for model in models.into_iter().flatten() {
+    for model in PR_MODELS {
         match omp.generate_text(prompt, system, cwd, model).await {
             Ok(reply) => return Ok(reply),
             Err(error) => {
@@ -1341,25 +1294,6 @@ fn parse_json<T: serde::de::DeserializeOwned>(reply: &str) -> Option<T> {
     let start = reply.find('{')?;
     let end = reply.rfind('}')?;
     serde_json::from_str(reply.get(start..=end)?).ok()
-}
-
-fn parse_generated(reply: &str) -> Option<GeneratedCommitMessage> {
-    parse_json(reply)
-}
-
-/// t3's `sanitizeCommitMessage`.
-fn sanitize_commit_message(generated: GeneratedCommitMessage) -> CommitMessage {
-    let first = generated.subject.trim().lines().next().unwrap_or("").trim();
-    let subject = first.trim_end_matches('.').trim();
-    let subject = if subject.is_empty() {
-        "Update project files".to_owned()
-    } else {
-        take_chars(subject, 72).trim_end().to_owned()
-    };
-    CommitMessage {
-        subject,
-        body: generated.body.trim().to_owned(),
-    }
 }
 
 fn take_chars(value: &str, max_chars: usize) -> &str {
@@ -1502,27 +1436,6 @@ mod tests {
             })
         );
         assert_eq!(parse_custom_commit_message(" \n "), None);
-    }
-
-    #[test]
-    fn generated_messages_are_sanitized() {
-        let generated = parse_generated(
-            "```json\n{\"subject\": \"Add things...\\nmore\", \"body\": \" b \"}\n```",
-        )
-        .unwrap();
-        assert_eq!(
-            sanitize_commit_message(generated),
-            CommitMessage {
-                subject: "Add things".into(),
-                body: "b".into()
-            }
-        );
-        let empty = sanitize_commit_message(GeneratedCommitMessage {
-            subject: "...".into(),
-            body: String::new(),
-        });
-        assert_eq!(empty.subject, "Update project files");
-        assert!(parse_generated("no json").is_none());
     }
 
     #[test]

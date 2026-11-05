@@ -155,15 +155,11 @@ impl GitControl {
                 .is_some_and(|status| status.has_working_tree_changes);
         self.running = Some(first_phase(action, generates).into());
         cx.notify();
-        let env = self.environment.read(cx);
-        let model = env
-            .state()
-            .shell
-            .thread(&self.thread_id)
-            .map(|thread| thread.model_selection.model.clone());
-        let mut run = env
+        let mut run = self
+            .environment
+            .read(cx)
             .connection()
-            .run_git_action(&cwd, action, commit_message, model);
+            .run_git_action(&cwd, action, commit_message);
         cx.spawn_in(window, async move |this, cx| {
             let outcome = loop {
                 match run.next().await {

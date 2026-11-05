@@ -67,11 +67,6 @@ pub struct GitRunStackedActionInput {
     pub feature_branch: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_paths: Option<Vec<String>>,
-    /// j3 extension: the thread's model (`provider/id`), the last model a
-    /// generated commit message or pull request falls back to after omp's
-    /// `pi/smol` and `pi/tiny`. t3 clients leave it out.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
 }
 
 /// One changed file of [`VcsWorkingTree`].

@@ -1,6 +1,6 @@
 //! The git workflow (`vcs.refreshStatus`, `vcs.pull`, `git.runStackedAction`)
 //! against real temporary repositories with a bare remote, and a fake omp
-//! for generated commit messages.
+//! for `omp commit` and pull request text.
 
 use std::{
     os::unix::fs::PermissionsExt,
@@ -94,7 +94,6 @@ fn input(cwd: &Path, action: GitStackedAction, message: Option<&str>) -> GitRunS
         commit_message: message.map(str::to_owned),
         feature_branch: None,
         file_paths: None,
-        model: None,
     }
 }
 
@@ -143,12 +142,16 @@ fn no_omp() -> OmpLauncher {
 
 /// An omp that answers every one-shot prompt with `reply`.
 fn fake_omp(root: &TempDir, reply: &str) -> OmpLauncher {
-    let script = root.0.join("fake-omp");
-    std::fs::write(
-        &script,
-        format!("#!/bin/sh\ncat > /dev/null\ncat <<'EOF'\n{reply}\nEOF\n"),
+    omp_script(
+        root,
+        &format!("cat > /dev/null\ncat <<'EOF'\n{reply}\nEOF\n"),
     )
-    .unwrap();
+}
+
+/// An omp that runs the shell script `body`.
+fn omp_script(root: &TempDir, body: &str) -> OmpLauncher {
+    let script = root.0.join("fake-omp");
+    std::fs::write(&script, format!("#!/bin/sh\n{body}")).unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
     OmpLauncher::new(script)
 }
@@ -633,141 +636,136 @@ async fn gh_failures_surface_with_gh_s_own_message() {
 }
 
 #[tokio::test]
-async fn generated_commit_messages_come_from_omp() {
+async fn generated_commits_are_made_by_omp_commit() {
     let root = TempDir::new();
     let (work, _) = repo(&root);
-    let prompt = root.0.join("prompt.txt");
     let args = root.0.join("args.txt");
-    let script = root.0.join("omp");
-    std::fs::write(
-        &script,
-        format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\ncat > '{}'\n\
-             printf 'Here you go:\\n```json\\n{{\"subject\": \"Add greeting.\", \"body\": \"- say hi\"}}\\n```\\n'\n",
-            args.display(),
-            prompt.display()
+    // What `omp commit` prints and does: step lines, the agent's closing
+    // remark, then a commit of what is staged.
+    let omp = omp_script(
+        &root,
+        &format!(
+            "printf '%s\\n' \"$@\" > '{}'\n\
+             echo '● Resolving model...'\n\
+             echo '  └─ Fake Haiku'\n\
+             echo '● Starting commit agent...'\n\
+             echo '● I proposed a single feat(greet) commit.'\n\
+             echo '● Creating commit...'\n\
+             git commit -q -m 'feat(greet): add greeting' -m '- say hi'\n\
+             echo 'Commit created.'\n",
+            args.display()
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     write(&work, "greet.txt", "hi\n");
+    write(&work, "other.txt", "not selected\n");
+    let mut selected = input(&work, GitStackedAction::Commit, None);
+    selected.file_paths = Some(vec!["greet.txt".into()]);
 
-    let (events, failure) = run(
-        OmpLauncher::new(&script),
-        input(&work, GitStackedAction::Commit, None),
-    )
-    .await;
+    let (events, failure) = run(omp, selected).await;
     assert!(failure.is_none(), "{failure:?}");
     assert_eq!(
         labels(&events),
         [
             "started",
             "Generating commit message...",
-            "Committing...",
+            "Resolving model...",
+            "Starting commit agent...",
+            "Creating commit...",
             "finished"
         ]
     );
+    assert_eq!(std::fs::read_to_string(args).unwrap(), "commit\n");
     let result = finished(&events);
-    assert_eq!(result.commit.subject.as_deref(), Some("Add greeting"));
+    assert_eq!(result.commit.status, GitCommitStepStatus::Created);
     assert_eq!(
-        git(&work, &["log", "-1", "--format=%B"]),
-        "Add greeting\n\n- say hi"
+        result.commit.subject.as_deref(),
+        Some("feat(greet): add greeting")
     );
     let sha = result.commit.commit_sha.unwrap();
+    assert_eq!(sha, git(&work, &["rev-parse", "HEAD"]));
     assert_eq!(result.toast.title, format!("Committed {}", &sha[..7]));
     assert!(matches!(
         result.toast.cta,
         GitToastCta::RunAction { ref label, action } if label == "Push" && action.kind == GitStackedAction::Push
     ));
-
-    let prompt = std::fs::read_to_string(prompt).unwrap();
-    assert!(prompt.starts_with("You write concise git commit messages.\n"));
-    assert!(prompt.contains("Branch: main\n"));
-    assert!(prompt.contains("Staged files:\nA\tgreet.txt\n"));
-    assert!(prompt.contains("+hi"));
-    let args = std::fs::read_to_string(args).unwrap();
-    assert!(args.starts_with("-p\n--no-session\n"));
-    assert!(args.contains("--model\npi/smol\n"));
+    // omp committed what j3 staged: only the selected file.
+    assert_eq!(
+        git(&work, &["show", "--name-only", "--format=", "HEAD"]),
+        "greet.txt"
+    );
+    assert_eq!(git(&work, &["status", "--porcelain"]), "?? other.txt");
 }
 
 #[tokio::test]
-async fn failed_generation_is_a_text_generation_error() {
+async fn omp_commit_failures_are_the_action_s_error() {
     let root = TempDir::new();
     let (work, _) = repo(&root);
-    let script = root.0.join("omp");
-    std::fs::write(
-        &script,
-        "#!/bin/sh\ncat >/dev/null\necho nope >&2\nexit 3\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
     write(&work, "a.txt", "a\n");
+    commit_all(&work, "Initial");
 
-    let (events, failure) = run(
-        OmpLauncher::new(&script),
-        input(&work, GitStackedAction::Commit, None),
-    )
-    .await;
+    // A refusing hook: omp reports it on stderr and exits 1.
+    write(&work, "b.txt", "b\n");
+    let omp = omp_script(
+        &root,
+        "echo '● Creating commit...'\n\
+         printf '✗ Commit failed:\\n    pre-commit: lint failed\\n' >&2\nexit 1\n",
+    );
+    let (events, failure) = run(omp, input(&work, GitStackedAction::Commit, None)).await;
     let failure = failure.unwrap();
     assert!(
-        matches!(failure, GitManagerServiceError::TextGenerationError { ref operation, .. } if operation == "generateCommitMessage"),
+        matches!(failure, GitManagerServiceError::GitCommandError { ref operation, .. } if operation == "OmpCommit.commit"),
+        "{failure:?}"
+    );
+    assert!(
+        failure.message().contains("pre-commit: lint failed"),
         "{failure:?}"
     );
     assert!(matches!(
         events.last().unwrap().progress,
         GitActionProgress::ActionFailed { phase: Some(_), .. }
     ));
+
+    // omp exiting cleanly without a commit is a failure too.
+    let omp = omp_script(&root, "echo 'No changes to commit.' >&2\n");
+    let (_, failure) = run(omp, input(&work, GitStackedAction::Commit, None)).await;
+    let failure = failure.unwrap();
+    assert!(
+        failure.message().contains("omp commit made no commit"),
+        "{failure:?}"
+    );
 }
 
 #[tokio::test]
-async fn generation_falls_back_from_smol_to_tiny_to_the_thread_model() {
+async fn pull_request_text_falls_back_from_commit_to_smol_to_default() {
     let root = TempDir::new();
-    let (work, _) = repo(&root);
-    let tried = root.0.join("tried.txt");
-    let script = root.0.join("omp");
-    // Answers only with the thread's model; records every model asked.
+    let (work, _) = github_repo(&root);
+    git(&work, &["checkout", "-b", "feature"]);
+    write(&work, "f.txt", "f\n");
+    commit_all(&work, "Add f");
     std::fs::write(
-        &script,
-        format!(
-            "#!/bin/sh\ncat >/dev/null\nwhile [ \"$1\" != --model ]; do shift; done\n\
-             echo \"$2\" >> '{}'\n\
-             [ \"$2\" = anthropic/thread-model ] || {{ echo unreachable >&2; exit 1; }}\n\
-             printf '{{\"subject\": \"Add a\"}}'\n",
-            tried.display()
-        ),
+        gh_state(&work, "create.url"),
+        "https://github.com/acme/widgets/pull/12\n",
     )
     .unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-    write(&work, "a.txt", "a\n");
-
-    let mut with_model = input(&work, GitStackedAction::Commit, None);
-    with_model.model = Some("anthropic/thread-model".into());
-    let (_, failure) = run(OmpLauncher::new(&script), with_model).await;
-    assert!(failure.is_none(), "{failure:?}");
-    assert_eq!(git(&work, &["log", "-1", "--format=%s"]), "Add a");
-    assert_eq!(
-        std::fs::read_to_string(&tried).unwrap(),
-        "pi/smol\npi/tiny\nanthropic/thread-model\n"
-    );
-
-    // Without a thread model, a failing tiny is the last word.
-    std::fs::remove_file(&tried).unwrap();
-    write(&work, "b.txt", "b\n");
-    let (_, failure) = run(
-        OmpLauncher::new(&script),
-        input(&work, GitStackedAction::Commit, None),
-    )
-    .await;
-    assert!(
-        matches!(
-            failure,
-            Some(GitManagerServiceError::TextGenerationError { .. })
+    let tried = root.0.join("tried.txt");
+    // Answers only as the default role; records every model asked.
+    let omp = omp_script(
+        &root,
+        &format!(
+            "cat >/dev/null\nwhile [ \"$1\" != --model ]; do shift; done\n\
+             echo \"$2\" >> '{}'\n\
+             [ \"$2\" = pi/default ] || {{ echo \"Model \\\"$2\\\" not found\" >&2; exit 1; }}\n\
+             printf '{{\"title\": \"Add f\", \"body\": \"\"}}'\n",
+            tried.display()
         ),
-        "{failure:?}"
     );
+
+    let (events, failure) = run(omp, input(&work, GitStackedAction::CreatePr, None)).await;
+    assert!(failure.is_none(), "{failure:?}");
+    assert_eq!(finished(&events).pr.title.as_deref(), Some("Add f"));
     assert_eq!(
         std::fs::read_to_string(&tried).unwrap(),
-        "pi/smol\npi/tiny\n"
+        "pi/commit\npi/smol\npi/default\n"
     );
 }
 
