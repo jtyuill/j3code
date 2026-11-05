@@ -467,7 +467,9 @@ impl Composer {
                 this.sync_config(window, cx)
             }),
             cx.observe_in(&preferences, window, |this, _, window, cx| {
-                this.sync_favorites(window, cx)
+                this.sync_favorites(window, cx);
+                // Settings can switch the inline usage windows on or off.
+                cx.notify();
             }),
             // The button shows the cached peak.
             cx.observe(&usage_store, |_, _, cx| cx.notify()),
@@ -1247,11 +1249,12 @@ impl Composer {
 
     /// One button for both the model and its thinking level: it shows the
     /// provider logo, model and level; its menu lists models by provider
-    /// with the levels in the footer.
+    /// with the levels in the footer. The logo names the provider, so the
+    /// label leaves it out.
     fn render_model_picker(&self, cx: &mut Context<Self>) -> AnyElement {
         let choice = self.choice(cx);
         let provider = choice.map(|choice| choice.provider.clone());
-        let name: SharedString = choice.map_or("Model".into(), |c| c.label.text().clone());
+        let name: SharedString = choice.map_or("Model".into(), |c| c.label.section_text().clone());
         let level_label = self
             .level
             .as_ref()
@@ -1299,13 +1302,20 @@ impl Composer {
     }
 
     /// The gauge beside the model: the model provider's highest cached
-    /// usage on this environment; opening it refreshes and lists the limits.
+    /// usage on this environment, or, for a provider whose usage Settings
+    /// shows inline, each window's usage; opening it refreshes and lists
+    /// the limits.
     fn render_usage_button(&self, cx: &mut Context<Self>) -> AnyElement {
         let env = self.environment.read(cx);
         let choice = self.choice(cx);
-        let peak = choice.and_then(|choice| {
+        let label = choice.and_then(|choice| {
             let snapshot = self.usage_store.read(cx).snapshot(env.key())?;
-            usage::peak(snapshot, &choice.provider)
+            if self.preferences.read(cx).ui().shows_usage(&choice.provider) {
+                if let Some(breakdown) = usage::breakdown(snapshot, &choice.provider) {
+                    return Some(breakdown);
+                }
+            }
+            usage::peak(snapshot, &choice.provider).map(|peak| format!("{:.0}%", peak * 100.))
         });
         let tooltip = match choice {
             Some(choice) => format!(
@@ -1324,9 +1334,7 @@ impl Composer {
                     .ghost()
                     .xsmall()
                     .icon(Icon::new(Lucide::Gauge))
-                    .when_some(peak, |this, peak| {
-                        this.label(format!("{:.0}%", peak * 100.))
-                    })
+                    .when_some(label, |this, label| this.label(label))
                     .tooltip(tooltip),
             )
             .on_open_change(move |open, _, cx| {

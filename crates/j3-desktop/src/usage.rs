@@ -194,6 +194,86 @@ pub fn peak(snapshot: &UsageSnapshot, provider: &str) -> Option<f64> {
         .max_by(f64::total_cmp)
 }
 
+/// The windows [`windows`] reports, shortest first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Span {
+    Session,
+    Weekly,
+    Monthly,
+}
+
+impl Span {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Session => "Session",
+            Self::Weekly => "Weekly",
+            Self::Monthly => "Monthly",
+        }
+    }
+
+    /// The window a limit counts in, from its window label (`5 Hour`,
+    /// `7 Day`, `Weekly`, `Monthly`). Longer windows such as 30 days are
+    /// none of them.
+    fn of(limit: &UsageLimit) -> Option<Self> {
+        let label = limit
+            .window
+            .as_ref()
+            .and_then(|window| window.label.as_deref())
+            .unwrap_or(&limit.label)
+            .to_lowercase();
+        if label.contains("5 hour") || label.contains("5h") || label.contains("session") {
+            Some(Self::Session)
+        } else if label.contains("week") || label.contains("7 day") || label.contains("7d") {
+            Some(Self::Weekly)
+        } else if label.contains("month") {
+            Some(Self::Monthly)
+        } else {
+            None
+        }
+    }
+}
+
+/// `provider`'s used fraction per window, shortest first. Each account
+/// counts its first limit of a window (the provider's overall one, before
+/// per-model limits); of several accounts the highest wins.
+pub fn windows(snapshot: &UsageSnapshot, provider: &str) -> Vec<(Span, f64)> {
+    let mut found: BTreeMap<Span, f64> = BTreeMap::new();
+    for report in snapshot
+        .reports
+        .iter()
+        .filter(|report| report.provider == provider)
+    {
+        let mut seen = Vec::new();
+        for limit in &report.limits {
+            let Some(window) = Span::of(limit) else {
+                continue;
+            };
+            if seen.contains(&window) {
+                continue;
+            }
+            seen.push(window);
+            if let Some(fraction) = used_fraction(limit) {
+                let slot = found.entry(window).or_insert(fraction);
+                *slot = slot.max(fraction);
+            }
+        }
+    }
+    found.into_iter().collect()
+}
+
+/// [`windows`] as `Session 12% · Weekly 20%`; `None` when `provider`
+/// reports none.
+pub fn breakdown(snapshot: &UsageSnapshot, provider: &str) -> Option<String> {
+    let windows = windows(snapshot, provider);
+    (!windows.is_empty()).then(|| {
+        windows
+            .iter()
+            .map(|(span, fraction)| format!("{} {:.0}%", span.label(), fraction * 100.))
+            .collect::<Vec<_>>()
+            .join(" · ")
+    })
+}
+
 /// One environment's usage for one provider: the usage button's popover.
 pub struct UsagePanel {
     store: Entity<UsageStore>,
@@ -472,5 +552,45 @@ mod tests {
             remaining(time::Duration::minutes(2 * 1_440 + 4 * 60 + 30)),
             "2d 4h"
         );
+    }
+
+    #[test]
+    fn windows_are_the_providers_overall_limits_by_length() {
+        let limit = |label: &str, window: &str, used: f64| {
+            serde_json::json!({
+                "id": label, "label": label, "window": {"label": window},
+                "amount": {"usedFraction": used},
+            })
+        };
+        let snapshot: UsageSnapshot = serde_json::from_value(serde_json::json!({
+            "generatedAt": 0,
+            "reports": [
+                {"provider": "anthropic", "limits": [
+                    limit("Claude 5 Hour", "5 Hour", 0.12),
+                    limit("Claude 7 Day", "7 Day", 0.2),
+                    limit("Claude 7 Day (Fable)", "7 Day", 0.9),
+                ]},
+                {"provider": "opencode-go", "limits": [
+                    limit("5 Hour limit", "5 Hour", 0.),
+                    limit("Weekly limit", "Weekly", 0.04),
+                    limit("Monthly limit", "Monthly", 0.5),
+                ]},
+                {"provider": "openai-codex", "limits": [limit("30 days", "30 days", 0.01)]},
+            ],
+        }))
+        .unwrap();
+        assert_eq!(
+            windows(&snapshot, "anthropic"),
+            [(Span::Session, 0.12), (Span::Weekly, 0.2)]
+        );
+        assert_eq!(
+            windows(&snapshot, "opencode-go"),
+            [
+                (Span::Session, 0.),
+                (Span::Weekly, 0.04),
+                (Span::Monthly, 0.5)
+            ]
+        );
+        assert!(windows(&snapshot, "openai-codex").is_empty());
     }
 }

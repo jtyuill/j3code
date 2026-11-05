@@ -326,6 +326,46 @@ impl SettingsView {
                 )
                 .description("Typeset LaTeX in messages.")
             }))
+            .group(
+                SettingGroup::new()
+                    .title("Usage")
+                    .item(Self::usage_item(
+                        &preferences,
+                        "anthropic",
+                        "Anthropic",
+                        "Show session and weekly usage beside the model while an Anthropic model is chosen.",
+                    ))
+                    .item(Self::usage_item(
+                        &preferences,
+                        "opencode-go",
+                        "OpenCode Go",
+                        "Show session, weekly and monthly usage beside the model while an OpenCode Go model is chosen.",
+                    )),
+            )
+    }
+
+    /// A switch for showing `provider`'s usage windows in the composer.
+    fn usage_item(
+        preferences: &Entity<Preferences>,
+        provider: &'static str,
+        name: &'static str,
+        description: &'static str,
+    ) -> SettingItem {
+        let read = preferences.clone();
+        let write = preferences.clone();
+        SettingItem::new(
+            name,
+            SettingField::switch(
+                move |cx| read.read(cx).ui().shows_usage(provider),
+                move |value, cx| {
+                    write.update(cx, |preferences, cx| {
+                        preferences.update_ui(|ui| ui.set_shows_usage(provider, value), cx)
+                    })
+                },
+            )
+            .default_value(false),
+        )
+        .description(description)
     }
 
     /// Zoom, the two font families and the font sizes.

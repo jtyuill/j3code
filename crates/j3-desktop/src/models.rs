@@ -58,6 +58,7 @@ pub struct ModelLabel {
     /// `qualifier` without the provider's name.
     detail: Option<SharedString>,
     text: SharedString,
+    section_text: SharedString,
 }
 
 impl ModelLabel {
@@ -69,11 +70,16 @@ impl ModelLabel {
             Some(qualifier) => format!("{name} ({qualifier})").into(),
             None => name.clone(),
         };
+        let section_text = match &detail {
+            Some(detail) => format!("{name} ({detail})").into(),
+            None => name.clone(),
+        };
         Self {
             name,
             qualifier,
             detail,
             text,
+            section_text,
         }
     }
 
@@ -97,6 +103,12 @@ impl ModelLabel {
     /// The label as plain text: `Name (qualifier)`, or just the name.
     pub fn text(&self) -> &SharedString {
         &self.text
+    }
+
+    /// [`Self::text`] without the provider's name, for where the provider's
+    /// logo already shows it: `Name (detail)`, or just the name.
+    pub fn section_text(&self) -> &SharedString {
+        &self.section_text
     }
 }
 

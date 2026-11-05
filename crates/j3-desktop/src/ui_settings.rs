@@ -93,6 +93,10 @@ pub struct UiSettings {
     /// to the top of the model picker in starring order.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub favorite_models: Vec<String>,
+    /// omp provider ids (`anthropic`, `opencode-go`) whose session, weekly
+    /// and monthly usage the composer shows beside the model.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub usage_inline: Vec<String>,
 }
 
 impl Default for UiSettings {
@@ -113,6 +117,7 @@ impl Default for UiSettings {
             code_font_size: DEFAULT_CODE_FONT_SIZE,
             terminal_font_size: DEFAULT_TERMINAL_FONT_SIZE,
             favorite_models: Vec::new(),
+            usage_inline: Vec::new(),
             zoom: 1.,
         }
     }
@@ -201,6 +206,18 @@ impl UiSettings {
             self.favorite_models.retain(|m| m != model);
         } else {
             self.favorite_models.push(model.to_owned());
+        }
+    }
+
+    /// Whether the composer shows `provider`'s usage windows inline.
+    pub fn shows_usage(&self, provider: &str) -> bool {
+        self.usage_inline.iter().any(|p| p == provider)
+    }
+
+    pub fn set_shows_usage(&mut self, provider: &str, show: bool) {
+        self.usage_inline.retain(|p| p != provider);
+        if show {
+            self.usage_inline.push(provider.to_owned());
         }
     }
 }
@@ -310,12 +327,16 @@ mod tests {
             code_font_size: 13.,
             terminal_font_size: 12.,
             favorite_models: Vec::new(),
+            usage_inline: Vec::new(),
             zoom: 1.25,
         };
         ui.set_expanded(Shelf::Settled, true);
         ui.set_expanded(Shelf::Working, true);
         ui.set_expanded(Shelf::Working, false);
         ui.toggle_favorite("a/one");
+        ui.set_shows_usage("anthropic", true);
+        ui.set_shows_usage("opencode-go", true);
+        ui.set_shows_usage("opencode-go", false);
         ui.toggle_favorite("b/two");
         ui.toggle_favorite("b/two");
         let value = serde_json::to_value(&ui).unwrap();
@@ -325,11 +346,12 @@ mod tests {
                 "agentOrder": "attention", "toasts": false, "sounds": true, "mathRendering": false,
                 "expandedShelves": ["settled"], "textMeasure": 42.0, "uiFont": "Inter",
                 "interfaceFontSize": 15.0, "codeFontSize": 13.0, "terminalFontSize": 12.0,
-                "favoriteModels": ["a/one"], "zoom": 1.25})
+                "favoriteModels": ["a/one"], "usageInline": ["anthropic"], "zoom": 1.25})
         );
         assert_eq!(serde_json::from_value::<UiSettings>(value).unwrap(), ui);
         assert!(ui.is_expanded(Shelf::Settled));
         assert!(!ui.is_expanded(Shelf::Working));
         assert!(ui.is_favorite("a/one") && !ui.is_favorite("b/two"));
+        assert!(ui.shows_usage("anthropic") && !ui.shows_usage("opencode-go"));
     }
 }
