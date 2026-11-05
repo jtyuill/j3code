@@ -6,20 +6,21 @@ use std::collections::HashSet;
 
 use j3_protocol::t3::server::{ServerConfig, ServerProviderSkill, ServerProviderSlashCommand};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompletionKind {
     Command,
     Skill,
-    /// A model for a `^` mention. Accepted through the mention token, not
-    /// [`apply`].
-    Model,
+    /// A model for a `^` mention, by slug. Accepted through the mention
+    /// token, not [`apply`].
+    Model(String),
 }
 
 /// One row of the completion menu.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Completion {
     pub kind: CompletionKind,
-    /// What the menu shows and inserts, without the trailing space.
+    /// What the menu shows; commands and skills also insert it, without the
+    /// trailing space.
     pub label: String,
     pub description: Option<String>,
     /// Argument hint shown after the label (commands only).

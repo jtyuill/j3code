@@ -40,7 +40,7 @@ use serde_json::Value;
 use crate::{
     environment::{Environment, ImageLoad, ImageRef},
     feed::{DiffKind, Tone, ToolBody, ToolIcon, ToolStatus, tool_view},
-    keywords, mention, message_text, models,
+    keywords, math, mention, message_text,
     thread_view::ThreadView,
 };
 
@@ -58,6 +58,8 @@ pub struct RowContext {
     pub environment: Entity<Environment>,
     /// The thread the rows belong to, for entities items refer to (subagents).
     pub state: Arc<ThreadState>,
+    /// Typeset TeX math in markdown (the `math_rendering` preference).
+    pub math: bool,
 }
 
 /// Rows of agent activity (tool calls, thinking, plan updates) that read as
@@ -99,12 +101,13 @@ pub fn render_item(
             Some(state) => div()
                 .w_full()
                 .text_sm()
-                .child(
+                .child(math::text_view(
                     TextView::new(state)
                         .selectable(true)
                         .stream_fade(message.streaming)
                         .image_source(markdown_images(&row.environment, &item.thread_id)),
-                )
+                    row.math,
+                ))
                 .into_any_element(),
             None => div()
                 .text_sm()
@@ -389,20 +392,12 @@ fn user_message(
             attachment_thumbnail(&format!("{id}-{ix}"), attachment, load, cx)
         })
         .collect();
-    let choices = if text.contains('^') {
-        row.environment
-            .read(cx)
-            .state()
-            .config
-            .as_ref()
-            .map(models::model_choices)
-            .unwrap_or_default()
-    } else {
-        Vec::new()
+    let rich = {
+        let choices = row.environment.read(cx).models();
+        message_text::rich(text, |selector| {
+            mention::find_choice(choices, selector).map(|choice| choice.label.text().to_string())
+        })
     };
-    let rich = message_text::rich(text, |selector| {
-        mention::find_choice(&choices, selector).map(mention::display_name)
-    });
     let theme = cx.theme();
     let mut highlights = Vec::with_capacity(rich.spans.len());
     for span in &rich.spans {
@@ -646,7 +641,10 @@ fn reasoning_row(id: &str, streaming: bool, row: &RowContext, cx: &App) -> AnyEl
                         .border_color(theme.border)
                         .text_sm()
                         .text_color(theme.muted_foreground)
-                        .child(TextView::new(state).selectable(true)),
+                        .child(math::text_view(
+                            TextView::new(state).selectable(true),
+                            row.math,
+                        )),
                 )
             })
         })
@@ -851,20 +849,30 @@ fn frame(cx: &App) -> gpui_kit::Stateful<gpui_kit::Div> {
         .font_family(theme.mono_font_family.clone())
 }
 
-/// One monospace line: cut with an ellipsis while collapsed, wrapped once
-/// the row is expanded.
-fn mono_line(text: &str, expanded: bool) -> gpui_kit::Div {
+/// One monospace line, coloured by `spans` (plain without any): cut with an
+/// ellipsis while collapsed, wrapped once the row is expanded.
+fn mono_line(text: &str, spans: &crate::syntax::Spans, expanded: bool) -> gpui_kit::Div {
     let text = if text.is_empty() { " " } else { text };
-    div()
-        .min_w_0()
-        .map(|this| {
-            if expanded {
-                this.whitespace_normal()
-            } else {
-                this.truncate()
-            }
-        })
-        .child(text.replace('\t', "    "))
+    let line = div().min_w_0().map(|this| {
+        if expanded {
+            this.whitespace_normal()
+        } else {
+            this.truncate()
+        }
+    });
+    if spans.is_empty() {
+        line.child(text.replace('\t', "    "))
+    } else if text.contains('\t') {
+        let (text, spans) = crate::syntax::expand_tabs(text, spans);
+        line.child(StyledText::new(text).with_highlights(spans))
+    } else {
+        line.child(StyledText::new(text.to_owned()).with_highlights(spans.iter().cloned()))
+    }
+}
+
+/// Line `ix`'s spans in `lines`; none without highlights.
+fn spans(lines: Option<&crate::syntax::Lines>, ix: usize) -> &crate::syntax::Spans {
+    lines.map_or(&[], |lines| lines.line(ix))
 }
 
 /// The thin labelled rule between a frame's sections (`─── Output ───`).
@@ -892,6 +900,7 @@ fn render_body(
     let theme = cx.theme();
     match body {
         ToolBody::Command { command, output } => {
+            let colours = crate::syntax::code(command, "bash", &theme.highlight_theme);
             let command_lines: Vec<&str> = command.lines().collect();
             let shown_command = if expanded {
                 command_lines.len()
@@ -916,7 +925,7 @@ fn render_body(
                                             .text_color(theme.info)
                                             .child(if ix == 0 { "$" } else { " " }),
                                     )
-                                    .child(mono_line(line, expanded))
+                                    .child(mono_line(line, spans(colours.as_deref(), ix), expanded))
                             },
                         ))
                         .when(shown_command < command_lines.len(), |this| {
@@ -938,21 +947,28 @@ fn render_body(
                             } else {
                                 theme.foreground.opacity(0.85)
                             })
-                            .children(tail.iter().map(|line| mono_line(line, expanded))),
+                            .children(tail.iter().map(|line| mono_line(line, &[], expanded))),
                     )
                 })
                 .into_any_element()
         }
-        ToolBody::Diff(diff) => {
+        ToolBody::Diff {
+            text: diff,
+            language,
+        } => {
             let gutter = diff
                 .lines()
                 .filter_map(|line| crate::feed::diff_line(line).number)
                 .map(str::len)
                 .max()
                 .unwrap_or(0);
+            let colours = crate::syntax::diff(diff, language, &theme.highlight_theme, |row| {
+                let line = crate::feed::diff_line(row);
+                (line.kind != DiffKind::Hunk).then_some(line.text)
+            });
             frame(cx)
                 .py_1()
-                .children(diff.lines().take(limit).map(|line| {
+                .children(diff.lines().take(limit).enumerate().map(|(ix, line)| {
                     let line = crate::feed::diff_line(line);
                     let (sign, color, bg) = match line.kind {
                         DiffKind::Added => ("+", theme.success, Some(theme.success.opacity(0.12))),
@@ -973,15 +989,23 @@ fn render_body(
                             )
                         })
                         .child(div().flex_shrink_0().text_color(color).child(sign))
-                        .child(mono_line(line.text, expanded).text_color(match line.kind {
-                            DiffKind::Context => theme.foreground.opacity(0.75),
-                            DiffKind::Hunk => theme.info,
-                            _ => theme.foreground,
-                        }))
+                        .child(
+                            mono_line(line.text, spans(colours.as_deref(), ix), expanded)
+                                .text_color(match line.kind {
+                                    DiffKind::Context => theme.foreground.opacity(0.75),
+                                    DiffKind::Hunk => theme.info,
+                                    _ => theme.foreground,
+                                }),
+                        )
                 }))
                 .into_any_element()
         }
-        ToolBody::Code { text, first_line } => {
+        ToolBody::Code {
+            text,
+            first_line,
+            language,
+        } => {
+            let colours = crate::syntax::code(text, language, &theme.highlight_theme);
             let lines: Vec<&str> = text.lines().collect();
             let gutter = (first_line + lines.len()).to_string().len();
             frame(cx)
@@ -996,7 +1020,7 @@ fn render_body(
                                 .text_color(theme.muted_foreground.opacity(0.7))
                                 .child(format!("{:>gutter$}", first_line + ix)),
                         )
-                        .child(mono_line(line, expanded))
+                        .child(mono_line(line, spans(colours.as_deref(), ix), expanded))
                 }))
                 .into_any_element()
         }
@@ -1016,7 +1040,10 @@ fn render_body(
                                 .text_color(theme.muted_foreground.opacity(0.6))
                                 .child(if last { "└─" } else { "├─" }),
                         )
-                        .child(mono_line(line, expanded).text_color(theme.foreground.opacity(0.85)))
+                        .child(
+                            mono_line(line, &[], expanded)
+                                .text_color(theme.foreground.opacity(0.85)),
+                        )
                 }))
                 .into_any_element()
         }
@@ -1025,6 +1052,7 @@ fn render_body(
             frame(cx)
                 .children(sections.iter().enumerate().map(|(ix, (label, text))| {
                     let lines: Vec<&str> = text.lines().collect();
+                    let colours = crate::syntax::json(text, &theme.highlight_theme);
                     let shown = lines.len().min(budget);
                     budget -= shown;
                     v_flex()
@@ -1039,9 +1067,9 @@ fn render_body(
                                 .px_2()
                                 .py_1()
                                 .text_color(theme.foreground.opacity(0.85))
-                                .children(
-                                    lines[..shown].iter().map(|line| mono_line(line, expanded)),
-                                ),
+                                .children(lines[..shown].iter().enumerate().map(|(ix, line)| {
+                                    mono_line(line, spans(colours.as_deref(), ix), expanded)
+                                })),
                         )
                 }))
                 .into_any_element()

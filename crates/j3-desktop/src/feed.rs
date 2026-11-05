@@ -77,10 +77,18 @@ pub enum Tone {
 pub enum ToolBody {
     /// `$ command`, then its output (bash).
     Command { command: String, output: String },
-    /// A diff: omp's `+12|text` / `-12|text` / ` 12|text` lines, or unified.
-    Diff(String),
-    /// File text, numbered from `first_line`.
-    Code { text: String, first_line: usize },
+    /// A diff: omp's `+12|text` / `-12|text` / ` 12|text` lines, or unified;
+    /// its code coloured as `language`.
+    Diff {
+        text: String,
+        language: &'static str,
+    },
+    /// File text, numbered from `first_line`, coloured as `language`.
+    Code {
+        text: String,
+        first_line: usize,
+        language: &'static str,
+    },
     /// Result lines drawn as a tree (search hits, files, sources).
     List(Vec<String>),
     /// Labelled monospace sections, such as a script and its output.
@@ -92,7 +100,7 @@ impl ToolBody {
     pub fn lines(&self) -> usize {
         match self {
             Self::Command { output, .. } => output.lines().count(),
-            Self::Diff(text) | Self::Code { text, .. } => text.lines().count(),
+            Self::Diff { text, .. } | Self::Code { text, .. } => text.lines().count(),
             Self::List(lines) => lines.len(),
             Self::Sections(sections) => sections.iter().map(|(_, text)| text.lines().count()).sum(),
         }
@@ -100,8 +108,8 @@ impl ToolBody {
 }
 
 /// omp's numbered file text (`12:line` rows, one contiguous range) as code
-/// starting at its first number; `None` for anything else.
-fn numbered(text: &str) -> Option<ToolBody> {
+/// in `language` starting at its first number; `None` for anything else.
+fn numbered(text: &str, language: &'static str) -> Option<ToolBody> {
     let mut first_line = None;
     let mut lines = Vec::new();
     for (ix, row) in text.lines().enumerate() {
@@ -116,7 +124,16 @@ fn numbered(text: &str) -> Option<ToolBody> {
     Some(ToolBody::Code {
         text: lines.join("\n"),
         first_line: first_line?,
+        language,
     })
+}
+
+/// The highlighter language of a read path, which may end in a selector
+/// (`src/main.rs:10-20`, `notes.md:raw`).
+fn read_language(path: &str) -> &'static str {
+    let name = path.rfind('/').map_or(0, |ix| ix + 1);
+    let end = path[name..].find(':').map_or(path.len(), |ix| name + ix);
+    crate::syntax::language(&path[..end])
 }
 
 /// One tool row.
@@ -348,6 +365,7 @@ fn file_change_view(change: &FileChangeItem) -> ToolView {
             view.body = Some(ToolBody::Code {
                 text: content.trim_end().to_owned(),
                 first_line: 1,
+                language: crate::syntax::language(&change.file_name),
             });
             view.preview = 8;
             view
@@ -358,7 +376,10 @@ fn file_change_view(change: &FileChangeItem) -> ToolView {
                 view.meta.push((format!("+{added}"), Tone::Added));
                 view.meta.push((format!("−{removed}"), Tone::Removed));
             }
-            view.body = diff.map(|diff| ToolBody::Diff(diff.trim_end().to_owned()));
+            view.body = diff.map(|diff| ToolBody::Diff {
+                text: diff.trim_end().to_owned(),
+                language: crate::syntax::language(&change.file_name),
+            });
             view.preview = 12;
             view
         }
@@ -397,6 +418,7 @@ fn write_view(path: &str, content: Option<&str>, output: Option<String>) -> Tool
                 view.body = Some(ToolBody::Code {
                     text: content.to_owned(),
                     first_line: 1,
+                    language: crate::syntax::language(path),
                 });
                 view.preview = 8;
             }
@@ -535,11 +557,17 @@ fn dynamic_view(tool: &DynamicToolItem) -> ToolView {
             };
             let mut view = base(icon, "Read", path.to_owned());
             if let Some(output) = output.filter(|_| output_images(tool) == 0) {
+                // Only a file's text is code; pages and agent output are not.
+                let language = if matches!(icon, ToolIcon::Read) {
+                    read_language(path)
+                } else {
+                    "text"
+                };
                 let text = strip_hashline_header(&output).trim_end();
                 view.meta
                     .push(muted(count(text.lines().count(), "line", "lines")));
                 view.body = Some(
-                    numbered(text)
+                    numbered(text, language)
                         .unwrap_or_else(|| ToolBody::Sections(vec![(None, text.to_owned())])),
                 );
             }
@@ -830,7 +858,13 @@ mod tests {
                 ("−1".to_owned(), Tone::Removed)
             ]
         );
-        assert_eq!(edit.body, Some(ToolBody::Diff("+1|x".into())));
+        assert_eq!(
+            edit.body,
+            Some(ToolBody::Diff {
+                text: "+1|x".into(),
+                language: "rust"
+            })
+        );
 
         let write = tool_view(&item(
             "completed",
@@ -885,7 +919,8 @@ mod tests {
             read.body,
             Some(ToolBody::Code {
                 text: "# plan\n".into(),
-                first_line: 7
+                first_line: 7,
+                language: "markdown"
             })
         );
         // Not one numbered range: shown as it is.

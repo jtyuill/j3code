@@ -66,6 +66,8 @@ pub struct UiSettings {
     pub toasts: bool,
     /// Sounds for the same events.
     pub sounds: bool,
+    /// Typeset TeX math (`$…$`, `$$…$$`, `\(…\)`, `\[…\]`) in messages.
+    pub math_rendering: bool,
     /// T3 shelves the user expanded; like t3 web, every shelf starts
     /// collapsed.
     pub expanded_shelves: Vec<Shelf>,
@@ -102,6 +104,7 @@ impl Default for UiSettings {
             agent_order: AgentOrder::default(),
             toasts: true,
             sounds: true,
+            math_rendering: true,
             expanded_shelves: Vec::new(),
             text_measure: DEFAULT_TEXT_MEASURE,
             ui_font: None,
@@ -224,7 +227,7 @@ mod tests {
         assert_eq!(ui.workflow, Workflow::T3);
         assert_eq!(ui.status_indicators, StatusIndicators::Dots);
         assert_eq!(ui.agent_order, AgentOrder::Spaces);
-        assert!(ui.toasts && ui.sounds && ui.working_shelf);
+        assert!(ui.toasts && ui.sounds && ui.working_shelf && ui.math_rendering);
         assert_eq!(ui.text_measure, DEFAULT_TEXT_MEASURE);
         assert_eq!((ui.zoom, ui.ui_font.as_deref()), (1., None));
         assert_eq!(
@@ -298,6 +301,7 @@ mod tests {
             agent_order: AgentOrder::Attention,
             toasts: false,
             sounds: true,
+            math_rendering: false,
             expanded_shelves: Vec::new(),
             text_measure: 42.,
             ui_font: Some("Inter".into()),
@@ -318,7 +322,7 @@ mod tests {
         assert_eq!(
             value,
             json!({"workflow": "herdr", "workingShelf": false, "statusIndicators": "symbols",
-                "agentOrder": "attention", "toasts": false, "sounds": true,
+                "agentOrder": "attention", "toasts": false, "sounds": true, "mathRendering": false,
                 "expandedShelves": ["settled"], "textMeasure": 42.0, "uiFont": "Inter",
                 "interfaceFontSize": 15.0, "codeFontSize": 13.0, "terminalFontSize": 12.0,
                 "favoriteModels": ["a/one"], "zoom": 1.25})

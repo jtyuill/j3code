@@ -1,6 +1,9 @@
 //! Model and thinking-level choices derived from a server's config, the way
 //! t3's `buildModelOptions` does (ios-surface §2.2 M1, "Model picker").
 
+use std::{collections::HashMap, hash::Hash};
+
+use gpui_kit::SharedString;
 use j3_protocol::t3::{
     model::{
         ModelSelection, ProviderOptionDescriptor, ProviderOptionSelection,
@@ -8,6 +11,8 @@ use j3_protocol::t3::{
     },
     server::{ServerConfig, ServerProvider, ServerProviderAuthStatus, ServerProviderModel},
 };
+
+use crate::{logos, mention};
 
 /// The option id omp's thinking level travels under.
 const THINKING: &str = "thinking";
@@ -22,6 +27,8 @@ pub struct ModelChoice {
     /// …): the model's `subProvider`, else the slug's `<provider>/` prefix.
     pub provider: String,
     pub is_default: bool,
+    /// How the UI names it; [`model_choices`] sets it for the whole catalog.
+    pub label: ModelLabel,
 }
 
 impl ModelChoice {
@@ -32,6 +39,149 @@ impl ModelChoice {
     pub fn slug(&self) -> &str {
         &self.key.1
     }
+
+    /// The slug after its first `/` (the provider's own model id), or the
+    /// whole slug.
+    pub fn id(&self) -> &str {
+        let slug = self.slug();
+        slug.split_once('/').map_or(slug, |(_, id)| id)
+    }
+}
+
+/// How a model is shown: its pretty name and, when another listed model
+/// has the same name, what tells them apart. Never the raw slug unless
+/// nothing else does.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelLabel {
+    name: SharedString,
+    qualifier: Option<SharedString>,
+    /// `qualifier` without the provider's name.
+    detail: Option<SharedString>,
+    text: SharedString,
+}
+
+impl ModelLabel {
+    fn new(name: String, provider: Option<&str>, detail: Option<String>) -> Self {
+        let name = SharedString::from(name);
+        let qualifier = qualifier(provider, detail.as_deref()).map(SharedString::from);
+        let detail = detail.map(SharedString::from);
+        let text = match &qualifier {
+            Some(qualifier) => format!("{name} ({qualifier})").into(),
+            None => name.clone(),
+        };
+        Self {
+            name,
+            qualifier,
+            detail,
+            text,
+        }
+    }
+
+    /// The pretty name ([`mention::display_name`]).
+    pub fn name(&self) -> &SharedString {
+        &self.name
+    }
+
+    /// What sets the model apart from others with its name; shown muted
+    /// after the name.
+    pub fn qualifier(&self) -> Option<&SharedString> {
+        self.qualifier.as_ref()
+    }
+
+    /// [`Self::qualifier`] without the provider's name, for a row under its
+    /// provider's header (which already names it).
+    pub fn section_qualifier(&self) -> Option<&SharedString> {
+        self.detail.as_ref()
+    }
+
+    /// The label as plain text: `Name (qualifier)`, or just the name.
+    pub fn text(&self) -> &SharedString {
+        &self.text
+    }
+}
+
+/// Labels for a whole catalog, in `choices` order. Models whose names
+/// collide (trimmed, case-insensitively) are told apart by their provider's
+/// name when the providers differ, and within one provider by the id tokens
+/// (split on `-`, `_`, `.`, `:`, `/`) not every colliding id has. Labels that
+/// still collide fall back to the model id. Unique names stay bare.
+pub fn model_labels(choices: &[ModelChoice]) -> Vec<ModelLabel> {
+    let names: Vec<String> = choices.iter().map(mention::display_name).collect();
+    let keys: Vec<String> = names
+        .iter()
+        .map(|name| name.trim().to_lowercase())
+        .collect();
+    let mut providers: Vec<Option<&str>> = vec![None; choices.len()];
+    let mut details: Vec<Option<String>> = vec![None; choices.len()];
+    for group in collisions(0..choices.len(), |ix| keys[ix].as_str()) {
+        let first = &choices[group[0]].provider;
+        if group.iter().any(|&ix| choices[ix].provider != *first) {
+            for &ix in &group {
+                providers[ix] = Some(logos::provider_name(&choices[ix].provider));
+            }
+        }
+        for same in collisions(group.iter().copied(), |ix| choices[ix].provider.as_str()) {
+            let ids: Vec<&str> = same.iter().map(|&ix| choices[ix].id()).collect();
+            for (&ix, detail) in same.iter().zip(distinct_tokens(&ids)) {
+                details[ix] = detail;
+            }
+        }
+    }
+    let still = collisions(0..choices.len(), |ix| {
+        (
+            keys[ix].as_str(),
+            qualifier(providers[ix], details[ix].as_deref()).map(|q| q.to_lowercase()),
+        )
+    });
+    for ix in still.into_iter().flatten() {
+        details[ix] = Some(choices[ix].id().to_owned());
+    }
+    names
+        .into_iter()
+        .zip(providers)
+        .zip(details)
+        .map(|((name, provider), detail)| ModelLabel::new(name, provider, detail))
+        .collect()
+}
+
+/// Groups of two or more `indices` with equal `key`s.
+fn collisions<K: Eq + Hash>(
+    indices: impl IntoIterator<Item = usize>,
+    key: impl Fn(usize) -> K,
+) -> Vec<Vec<usize>> {
+    let mut groups: HashMap<K, Vec<usize>> = HashMap::new();
+    for ix in indices {
+        groups.entry(key(ix)).or_default().push(ix);
+    }
+    groups
+        .into_values()
+        .filter(|group| group.len() > 1)
+        .collect()
+}
+
+/// For each of `ids`, its tokens that not all `ids` have, space-separated;
+/// `None` when it has none.
+fn distinct_tokens(ids: &[&str]) -> Vec<Option<String>> {
+    fn tokens(id: &str) -> impl Iterator<Item = &str> {
+        id.split(['-', '_', '.', ':', '/'])
+            .filter(|token| !token.is_empty())
+    }
+    let shared = |token: &str| ids.iter().all(|id| tokens(id).any(|t| t == token));
+    ids.iter()
+        .map(|id| {
+            let own: Vec<&str> = tokens(id).filter(|&token| !shared(token)).collect();
+            (!own.is_empty()).then(|| own.join(" "))
+        })
+        .collect()
+}
+
+/// `Provider · detail`, either part alone, or `None`.
+fn qualifier(provider: Option<&str>, detail: Option<&str>) -> Option<String> {
+    match (provider, detail) {
+        (Some(provider), Some(detail)) => Some(format!("{provider} · {detail}")),
+        (Some(provider), None) => Some(provider.to_owned()),
+        (None, detail) => detail.map(str::to_owned),
+    }
 }
 
 fn usable(provider: &ServerProvider) -> bool {
@@ -40,9 +190,9 @@ fn usable(provider: &ServerProvider) -> bool {
         && provider.auth.status != ServerProviderAuthStatus::Unauthenticated
 }
 
-/// Models of every usable provider, in config order.
+/// Models of every usable provider, in config order, labelled.
 pub fn model_choices(config: &ServerConfig) -> Vec<ModelChoice> {
-    config
+    let mut choices: Vec<ModelChoice> = config
         .providers
         .iter()
         .filter(|provider| usable(provider))
@@ -56,9 +206,15 @@ pub fn model_choices(config: &ServerConfig) -> Vec<ModelChoice> {
                     .or_else(|| Some(model.slug.split_once('/')?.0.to_owned()))
                     .unwrap_or_else(|| provider.instance_id.clone()),
                 is_default: model.is_default == Some(true),
+                label: ModelLabel::default(),
             })
         })
-        .collect()
+        .collect();
+    let labels = model_labels(&choices);
+    for (choice, label) in choices.iter_mut().zip(labels) {
+        choice.label = label;
+    }
+    choices
 }
 
 /// `choices` grouped by provider, groups in order of first appearance:
@@ -249,6 +405,118 @@ mod tests {
         assert_eq!(
             serde_json::to_value(model_selection(&choices[0], None)).unwrap(),
             serde_json::json!({"instanceId":"omp","model":"a/one"})
+        );
+    }
+
+    fn named(provider: &str, slug: &str, name: &str) -> ModelChoice {
+        ModelChoice {
+            key: ("omp".into(), slug.into()),
+            name: name.into(),
+            provider: provider.into(),
+            is_default: false,
+            label: ModelLabel::default(),
+        }
+    }
+
+    fn texts(choices: &[ModelChoice]) -> Vec<String> {
+        model_labels(choices)
+            .iter()
+            .map(|label| label.text().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn unique_names_get_no_qualifier() {
+        let choices = [
+            named("anthropic", "anthropic/claude-opus-4-5", "Claude Opus 4.5"),
+            named("openai", "openai/gpt-5", "GPT-5"),
+            named("x", "x/raw-id", " "),
+        ];
+        let labels = model_labels(&choices);
+        assert!(labels.iter().all(|label| label.qualifier().is_none()));
+        assert_eq!(texts(&choices), ["Claude Opus 4.5", "GPT-5", "raw-id"]);
+    }
+
+    #[test]
+    fn cross_provider_collisions_name_the_provider() {
+        let choices = [
+            named("anthropic", "anthropic/claude-opus-4-5", "Claude Opus 4.5"),
+            named(
+                "openrouter",
+                "openrouter/anthropic/claude-opus-4.5",
+                " claude opus 4.5",
+            ),
+            named(
+                "anthropic",
+                "anthropic/claude-opus-4-5-20251101",
+                "Claude Opus 4.5",
+            ),
+        ];
+        assert_eq!(
+            texts(&choices),
+            [
+                "Claude Opus 4.5 (Anthropic)",
+                "claude opus 4.5 (OpenRouter)",
+                "Claude Opus 4.5 (Anthropic · 20251101)",
+            ]
+        );
+        // Under its provider's header a row drops the provider's name.
+        let labels = model_labels(&choices);
+        let sections: Vec<Option<&str>> = labels
+            .iter()
+            .map(|label| label.section_qualifier().map(SharedString::as_str))
+            .collect();
+        assert_eq!(sections, [None, None, Some("20251101")]);
+    }
+
+    #[test]
+    fn same_provider_collisions_add_the_differing_id_tokens() {
+        let choices = [
+            named("anthropic", "anthropic/claude-opus-4-5", "Claude Opus 4.5"),
+            named(
+                "anthropic",
+                "anthropic/claude-opus-4-5-20251101",
+                "Claude Opus 4.5",
+            ),
+        ];
+        let labels = model_labels(&choices);
+        assert_eq!(labels[0].qualifier(), None);
+        assert_eq!(labels[1].name().as_str(), "Claude Opus 4.5");
+        assert_eq!(
+            labels[1].qualifier().map(SharedString::as_str),
+            Some("20251101")
+        );
+        assert_eq!(labels[1].text().as_str(), "Claude Opus 4.5 (20251101)");
+        assert_eq!(labels[1].section_qualifier(), labels[1].qualifier());
+    }
+
+    #[test]
+    fn three_way_collisions_drop_the_tokens_all_ids_share() {
+        let choices = [
+            named("x", "x/gpt-5-codex", "GPT Codex"),
+            named("x", "x/gpt-5-codex-mini", "GPT Codex"),
+            named("x", "x/gpt-5.1-codex-max", "GPT Codex"),
+        ];
+        assert_eq!(
+            texts(&choices),
+            ["GPT Codex", "GPT Codex (mini)", "GPT Codex (1 max)"]
+        );
+    }
+
+    #[test]
+    fn labels_that_still_collide_fall_back_to_the_id() {
+        let choices = [
+            named("google", "google/gemini-2.5-pro-05-06", "Gemini 2.5 Pro"),
+            named("google", "google/gemini-2.5-pro-06-05", "Gemini 2.5 Pro"),
+            named("google", "google/gemini-flash", "Gemini Flash"),
+        ];
+        assert_eq!(
+            texts(&choices),
+            [
+                "Gemini 2.5 Pro (gemini-2.5-pro-05-06)",
+                "Gemini 2.5 Pro (gemini-2.5-pro-06-05)",
+                "Gemini Flash",
+            ]
         );
     }
 }

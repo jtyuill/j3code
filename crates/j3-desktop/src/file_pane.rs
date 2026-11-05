@@ -385,7 +385,7 @@ impl FilePane {
         };
         preview.body = match result {
             Ok(file) => {
-                let language = language(path);
+                let language = crate::syntax::language(path);
                 let truncated = file.truncated.then(|| {
                     format!(
                         "Showing the first {} of {}.",
@@ -797,24 +797,6 @@ impl Render for FilePane {
     }
 }
 
-/// The highlighter language of `path`, from its extension.
-fn language(path: &str) -> &'static str {
-    let name = path.rsplit('/').next().unwrap_or(path);
-    let extension = name.rsplit_once('.').map_or("", |(_, ext)| ext);
-    match extension.to_ascii_lowercase().as_str() {
-        "rs" => "rust",
-        "ts" | "mts" | "cts" => "typescript",
-        "tsx" => "tsx",
-        "js" | "mjs" | "cjs" | "jsx" => "javascript",
-        "json" | "jsonc" => "json",
-        "toml" => "toml",
-        "md" | "markdown" | "mdx" => "markdown",
-        "py" | "pyi" => "python",
-        "sh" | "bash" | "zsh" => "bash",
-        _ => "text",
-    }
-}
-
 /// The icon of a file named `name`.
 fn file_icon(name: &str) -> Lucide {
     let name = name.to_ascii_lowercase();
@@ -864,10 +846,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn languages_icons_and_sizes() {
-        assert_eq!(language("src/main.rs"), "rust");
-        assert_eq!(language("web/App.TSX"), "tsx");
-        assert_eq!(language("Makefile"), "text");
+    fn icons_and_sizes() {
         assert_eq!(file_icon("Cargo.lock"), Lucide::FileLock);
         assert_eq!(file_icon("Cargo.toml"), Lucide::FileCog);
         assert_eq!(file_icon("lib.rs"), Lucide::FileCode);

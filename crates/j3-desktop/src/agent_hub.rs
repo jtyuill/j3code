@@ -7,6 +7,7 @@
 //! x stops the selected subagent, Esc or ←← closes.
 
 use std::{
+    borrow::Cow,
     collections::HashMap,
     sync::Arc,
     time::{Duration, Instant},
@@ -32,7 +33,7 @@ use gpui_kit::{
 use j3_client::{ThreadState, t3::orchestration::Subagent};
 use j3_protocol::j3::TranscriptEntry;
 
-use crate::{environment::Environment, feed_view::subagent_status_label};
+use crate::{environment::Environment, feed_view::subagent_status_label, math, mention};
 
 /// How often the selected transcript is reread while its subagent runs.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -93,6 +94,8 @@ pub struct AgentHub {
     expanded: std::collections::HashSet<String>,
     detail_scroll: ScrollHandle,
     left: DoubleTap,
+    /// Whether markdown typesets TeX math (the `math_rendering` preference).
+    math: bool,
     focus_handle: FocusHandle,
     _poll: Task<()>,
 }
@@ -104,6 +107,7 @@ impl AgentHub {
         environment: Entity<Environment>,
         thread_id: String,
         state: Arc<ThreadState>,
+        math: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -141,6 +145,7 @@ impl AgentHub {
             detail_scroll: ScrollHandle::new(),
             // ←← opened the hub: one more ←← closes it.
             left: DoubleTap::default(),
+            math,
             focus_handle: cx.focus_handle(),
             _poll: poll,
         };
@@ -160,6 +165,24 @@ impl AgentHub {
             .is_none_or(|id| self.state.subagent(id).is_none())
         {
             self.selected = self.roster().first().map(|subagent| subagent.id.clone());
+        }
+        cx.notify();
+    }
+
+    /// Follows the math preference: the transcripts whose markdown the
+    /// delimiter rewrite changes get their text again.
+    pub fn set_math(&mut self, math: bool, cx: &mut Context<Self>) {
+        self.math = math;
+        for transcript in self.transcripts.values() {
+            for (&ix, state) in &transcript.markdown {
+                let Some(text) = transcript.entries.get(ix).and_then(markdown_text) else {
+                    continue;
+                };
+                if let Cow::Owned(normalized) = math::normalize_delimiters(text) {
+                    let source = if math { normalized.as_str() } else { text };
+                    state.update(cx, |state, cx| state.set_text(source, cx));
+                }
+            }
         }
         cx.notify();
     }
@@ -229,12 +252,9 @@ impl AgentHub {
         }
         let grew = !read.entries.is_empty();
         for entry in read.entries {
-            let text = match &entry {
-                TranscriptEntry::User { text } | TranscriptEntry::Assistant { text } => Some(text),
-                _ => None,
-            };
-            if let Some(text) = text {
-                let state = cx.new(|cx| TextViewState::markdown(text, cx));
+            if let Some(text) = markdown_text(&entry) {
+                let source = math::markdown_source(text, self.math);
+                let state = cx.new(|cx| TextViewState::markdown(&source, cx));
                 transcript.markdown.insert(transcript.entries.len(), state);
             }
             transcript.entries.push(entry);
@@ -506,7 +526,14 @@ impl AgentHub {
                             .child(
                                 [
                                     Some(subagent.id.clone()),
-                                    subagent.model.clone(),
+                                    subagent.model.as_deref().map(|model| {
+                                        // The catalog's label when the slug is listed.
+                                        let models = self.environment.read(cx).models();
+                                        mention::find_choice(models, model).map_or_else(
+                                            || model.to_owned(),
+                                            |choice| choice.label.text().to_string(),
+                                        )
+                                    }),
                                     subagent.progress.clone(),
                                 ]
                                 .into_iter()
@@ -576,8 +603,11 @@ impl AgentHub {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = cx.theme();
+        let math = self.math;
         let text_block = |text: &str| match markdown {
-            Some(state) => TextView::new(state).selectable(true).into_any_element(),
+            Some(state) => {
+                math::text_view(TextView::new(state).selectable(true), math).into_any_element()
+            }
             None => div().child(text.to_owned()).into_any_element(),
         };
         match entry {
@@ -756,6 +786,14 @@ fn markdown_less(label: &'static str, text: &str, cx: &App) -> AnyElement {
         )
         .child(text.to_owned())
         .into_any_element()
+}
+
+/// The text of an entry shown as markdown: user and assistant text.
+fn markdown_text(entry: &TranscriptEntry) -> Option<&str> {
+    match entry {
+        TranscriptEntry::User { text } | TranscriptEntry::Assistant { text } => Some(text.as_str()),
+        _ => None,
+    }
 }
 
 impl Focusable for AgentHub {

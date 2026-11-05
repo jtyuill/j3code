@@ -16,21 +16,33 @@ alacritty_terminal = { version = "0.26", default-features = false }
 base64.workspace = true
 dirs.workspace = true
 gethostname.workspace = true
-# Syntax highlighting for the file pane's preview (JSON comes with
-# `tree-sitter`); markdown code blocks in the feed use it too.
+# Syntax highlighting for the file pane's preview, markdown code blocks in
+# the feed and tool output (JSON comes with `tree-sitter`).
 gpui-kit = { workspace = true, features = [
     "tree-sitter-bash",
+    "tree-sitter-c",
+    "tree-sitter-cpp",
+    "tree-sitter-css",
+    "tree-sitter-go",
+    "tree-sitter-html",
+    "tree-sitter-java",
     "tree-sitter-javascript",
     "tree-sitter-markdown",
     "tree-sitter-python",
     "tree-sitter-rust",
+    "tree-sitter-sql",
     "tree-sitter-toml",
     "tree-sitter-tsx",
     "tree-sitter-typescript",
+    "tree-sitter-yaml",
 ] }
 j3-client.workspace = true
 j3-core.workspace = true
 j3-protocol.workspace = true
+ratex-layout.workspace = true
+ratex-parser.workspace = true
+ratex-svg.workspace = true
+ratex-types.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

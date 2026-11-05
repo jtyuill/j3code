@@ -52,6 +52,7 @@ use crate::{
     feed_view::{RowContext, render_item},
     file_pane::{CloseFiles, FilePane},
     git_control::GitControl,
+    math,
     preferences::Preferences,
     terminal_drawer::{self, HideDrawer, TerminalDrawer},
     titlebar,
@@ -92,6 +93,8 @@ pub struct ThreadView {
     scroller: Entity<MessageScrollerState>,
     markdown: HashMap<String, (Entity<TextViewState>, String)>,
     markdown_snapshot: Rc<HashMap<String, Entity<TextViewState>>>,
+    /// Whether markdown typesets TeX math (the `math_rendering` preference).
+    math: bool,
     expanded: Rc<HashSet<String>>,
     composer: Entity<Composer>,
     git: Entity<GitControl>,
@@ -159,7 +162,13 @@ impl ThreadView {
         let subscriptions = vec![
             cx.subscribe_in(&composer, window, Self::on_composer_event),
             cx.observe(&environment, |_, _, cx| cx.notify()),
-            cx.observe(&preferences, |_, _, cx| cx.notify()),
+            cx.observe(&preferences, |this, preferences, cx| {
+                let math = preferences.read(cx).ui().math_rendering;
+                if math != this.math {
+                    this.set_math(math, cx);
+                }
+                cx.notify()
+            }),
         ];
         let terminal = terminal_drawer::existing(&environment, thread_id, cx).map(|drawer| {
             (
@@ -176,6 +185,7 @@ impl ThreadView {
         })
         .detach();
 
+        let math = preferences.read(cx).ui().math_rendering;
         let mut view = Self {
             environment,
             preferences,
@@ -185,6 +195,7 @@ impl ThreadView {
             scroller,
             markdown: HashMap::new(),
             markdown_snapshot: Rc::default(),
+            math,
             expanded: Rc::default(),
             composer,
             git,
@@ -498,40 +509,7 @@ impl ThreadView {
             }
         });
 
-        // Markdown states for assistant text and reasoning, updated in place
-        // so streaming appends instead of re-parsing.
-        let mut live = HashSet::new();
-        for &ix in &visible {
-            let item = &feed[ix].item;
-            let text = match &item.kind {
-                TurnItemKind::AssistantMessage(message) => &message.text,
-                TurnItemKind::Reasoning(reasoning) => &reasoning.text,
-                _ => continue,
-            };
-            live.insert(item.id.clone());
-            match self.markdown.get_mut(&item.id) {
-                Some((entity, last)) if last != text => {
-                    match text.strip_prefix(last.as_str()) {
-                        Some(delta) => entity.update(cx, |state, cx| state.push_str(delta, cx)),
-                        None => entity.update(cx, |state, cx| state.set_text(text, cx)),
-                    }
-                    *last = text.clone();
-                }
-                Some(_) => {}
-                None => {
-                    let entity = cx.new(|cx| TextViewState::markdown(text, cx));
-                    self.markdown
-                        .insert(item.id.clone(), (entity, text.clone()));
-                }
-            }
-        }
-        self.markdown.retain(|id, _| live.contains(id));
-        self.markdown_snapshot = Rc::new(
-            self.markdown
-                .iter()
-                .map(|(id, (entity, _))| (id.clone(), entity.clone()))
-                .collect(),
-        );
+        self.sync_markdown(&state, &visible, cx);
 
         // The first pending question gets the card above the composer.
         let pending = state.pending_user_inputs();
@@ -578,6 +556,60 @@ impl ThreadView {
         }
         self.state = state;
         cx.notify();
+    }
+
+    /// Markdown states for assistant text and reasoning, updated in place
+    /// so streaming appends instead of re-parsing. Each keeps the markdown
+    /// it was last given, the text after [`math::markdown_source`].
+    fn sync_markdown(&mut self, state: &ThreadState, visible: &[usize], cx: &mut Context<Self>) {
+        let feed = state.feed();
+        let mut live = HashSet::new();
+        for &ix in visible {
+            let item = &feed[ix].item;
+            let text = match &item.kind {
+                TurnItemKind::AssistantMessage(message) => &message.text,
+                TurnItemKind::Reasoning(reasoning) => &reasoning.text,
+                _ => continue,
+            };
+            live.insert(item.id.clone());
+            let text = math::markdown_source(text, self.math);
+            match self.markdown.get_mut(&item.id) {
+                Some((entity, last)) if *last != *text => {
+                    match text.strip_prefix(last.as_str()) {
+                        Some(delta) => entity.update(cx, |state, cx| state.push_str(delta, cx)),
+                        None => entity.update(cx, |state, cx| state.set_text(&text, cx)),
+                    }
+                    *last = text.into_owned();
+                }
+                Some(_) => {}
+                None => {
+                    let entity = cx.new(|cx| TextViewState::markdown(&text, cx));
+                    self.markdown
+                        .insert(item.id.clone(), (entity, text.into_owned()));
+                }
+            }
+        }
+        self.markdown.retain(|id, _| live.contains(id));
+        self.markdown_snapshot = Rc::new(
+            self.markdown
+                .iter()
+                .map(|(id, (entity, _))| (id.clone(), entity.clone()))
+                .collect(),
+        );
+    }
+
+    /// Follows the math preference into the shown markdown, the agents hub
+    /// and the rows' heights.
+    fn set_math(&mut self, math: bool, cx: &mut Context<Self>) {
+        self.math = math;
+        let (state, visible) = (self.state.clone(), self.visible.clone());
+        self.sync_markdown(&state, &visible, cx);
+        self.scroller.update(cx, |scroller, cx| {
+            scroller.remeasure_items(0..visible.len(), cx)
+        });
+        if let Some((hub, _)) = &self.hub {
+            hub.update(cx, |hub, cx| hub.set_math(math, cx));
+        }
     }
 
     fn question_card(
@@ -720,12 +752,13 @@ impl ThreadView {
         if self.hub.is_some() || self.state.subagents().is_empty() {
             return;
         }
-        let (environment, thread_id, state) = (
+        let (environment, thread_id, state, math) = (
             self.environment.clone(),
             self.thread_id().to_owned(),
             self.state.clone(),
+            self.math,
         );
-        let hub = cx.new(|cx| AgentHub::new(environment, thread_id, state, window, cx));
+        let hub = cx.new(|cx| AgentHub::new(environment, thread_id, state, math, window, cx));
         let subscription = cx.subscribe_in(&hub, window, |this, _, _: &CloseHub, window, cx| {
             this.hub = None;
             this.focus_composer(window, cx);
@@ -933,6 +966,7 @@ impl ThreadView {
             view: cx.weak_entity(),
             environment: self.environment.clone(),
             state: self.state.clone(),
+            math: self.math,
         });
         MessageScroller::new("feed", self.scroller.clone(), move |ix, window, cx| {
             let feed = state.feed();

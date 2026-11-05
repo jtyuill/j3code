@@ -13,7 +13,11 @@ use j3_client::{
     },
 };
 
-use crate::{local_server::LocalServerStatus, services::Services};
+use crate::{
+    local_server::LocalServerStatus,
+    models::{self, ModelChoice},
+    services::Services,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnvironmentKind {
@@ -125,6 +129,9 @@ pub struct Environment {
     kind: EnvironmentKind,
     connection: Connection,
     state: Arc<ConnectionState>,
+    /// The labelled models `state`'s config offers, rebuilt when its
+    /// providers change.
+    models: Arc<[ModelChoice]>,
     images: HashMap<ImageRef, ImageLoad>,
     _watch: Task<()>,
 }
@@ -157,6 +164,10 @@ impl Environment {
             while states.changed().await.is_ok() {
                 let state = states.borrow_and_update().clone();
                 let updated = this.update(cx, |this, cx| {
+                    let old = this.state.config.as_ref().map(|config| &config.providers);
+                    if old != state.config.as_ref().map(|config| &config.providers) {
+                        this.models = model_catalog(&state);
+                    }
                     this.state = state;
                     cx.notify();
                 });
@@ -170,6 +181,7 @@ impl Environment {
             label: label.into(),
             kind,
             connection,
+            models: model_catalog(&state),
             state,
             images: HashMap::new(),
             _watch: watch,
@@ -194,6 +206,11 @@ impl Environment {
 
     pub fn state(&self) -> &Arc<ConnectionState> {
         &self.state
+    }
+
+    /// The models this server offers, labelled for display.
+    pub fn models(&self) -> &Arc<[ModelChoice]> {
+        &self.models
     }
 
     pub fn is_live(&self) -> bool {
@@ -271,6 +288,16 @@ impl Environment {
         .detach();
         ImageLoad::Loading
     }
+}
+
+/// The labelled model catalog of `state`'s config; empty without one.
+fn model_catalog(state: &ConnectionState) -> Arc<[ModelChoice]> {
+    state
+        .config
+        .as_ref()
+        .map(models::model_choices)
+        .unwrap_or_default()
+        .into()
 }
 
 /// Indices of the entries to show, given each one's server environment id

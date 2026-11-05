@@ -128,16 +128,24 @@ struct PendingImage {
 struct ModelItem {
     choice: ModelChoice,
     favorite: bool,
+    /// Listed under its provider's header, which already names the
+    /// provider; the row's qualifier leaves it out.
+    in_provider_section: bool,
     /// Where the row's star saves the favourite.
     preferences: WeakEntity<Preferences>,
 }
 
 impl ModelItem {
-    /// The whole row: name and id, then the star and the chosen check, so
-    /// the stars line up at the right edge.
+    /// The whole row: the model's label (its qualifier muted), then the
+    /// star and the chosen check, so the stars line up at the right edge.
     fn row(&self, checked: bool, cx: &App) -> gpui_kit::Div {
         let slug = self.choice.slug();
-        let id = slug.split_once('/').map_or(slug, |(_, id)| id);
+        let label = &self.choice.label;
+        let qualifier = if self.in_provider_section {
+            label.section_qualifier()
+        } else {
+            label.qualifier()
+        };
         let theme = cx.theme();
         let (icon, color) = if self.favorite {
             (Lucide::StarFill, theme.warning)
@@ -150,15 +158,15 @@ impl ModelItem {
             .w_full()
             .gap_2()
             .min_w_0()
-            .child(div().flex_none().child(self.choice.name.clone()))
-            .when(id != self.choice.name, |this| {
+            .child(div().flex_none().child(label.name().clone()))
+            .when_some(qualifier.cloned(), |this, qualifier| {
                 this.child(
                     div()
                         .min_w_0()
                         .truncate()
                         .text_xs()
                         .text_color(theme.muted_foreground)
-                        .child(id.to_owned()),
+                        .child(qualifier),
                 )
             })
             .child(div().flex_1())
@@ -199,7 +207,7 @@ impl SearchableListItem for ModelItem {
     type Value = (String, String);
 
     fn title(&self) -> SharedString {
-        self.choice.name.clone().into()
+        self.choice.label.text().clone()
     }
 
     fn render(&self, _: &mut Window, cx: &mut App) -> impl IntoElement {
@@ -231,15 +239,16 @@ impl ModelGroups {
         favorites: &[String],
         preferences: &WeakEntity<Preferences>,
     ) -> Self {
-        let item = |choice: &ModelChoice| ModelItem {
+        let item = |choice: &ModelChoice, in_provider_section: bool| ModelItem {
             choice: choice.clone(),
             favorite: favorites.iter().any(|f| f == choice.slug()),
+            in_provider_section,
             preferences: preferences.clone(),
         };
         let starred: Vec<ModelItem> = favorites
             .iter()
             .filter_map(|slug| choices.iter().find(|c| c.slug() == slug))
-            .map(item)
+            .map(|choice| item(choice, false))
             .collect();
         let groups: Vec<(Option<String>, Vec<ModelItem>)> = (!starred.is_empty())
             .then_some((None, starred))
@@ -248,7 +257,10 @@ impl ModelGroups {
                 models::by_provider(choices)
                     .into_iter()
                     .map(|(provider, rows)| {
-                        let items = rows.into_iter().map(|ix| item(&choices[ix])).collect();
+                        let items = rows
+                            .into_iter()
+                            .map(|ix| item(&choices[ix], true))
+                            .collect();
                         (Some(provider.to_owned()), items)
                     }),
             )
@@ -376,7 +388,8 @@ pub struct Composer {
     input: Entity<TextareaState>,
     images: Vec<PendingImage>,
     next_image: u64,
-    choices: Vec<ModelChoice>,
+    /// The environment's labelled models the picker was last built with.
+    choices: Arc<[ModelChoice]>,
     /// Starred model slugs the picker was last built with.
     favorites: Vec<String>,
     preferences: Entity<Preferences>,
@@ -465,7 +478,7 @@ impl Composer {
             input,
             images: Vec::new(),
             next_image: 0,
-            choices: Vec::new(),
+            choices: Arc::default(),
             favorites: preferences.read(cx).ui().favorite_models.clone(),
             preferences,
             model,
@@ -592,9 +605,9 @@ impl Composer {
             .into_iter()
             .filter_map(|ix| self.choices.get(ix))
             .map(|choice| Completion {
-                kind: CompletionKind::Model,
-                label: choice.slug().to_owned(),
-                description: Some(mention::display_name(choice)),
+                kind: CompletionKind::Model(choice.slug().to_owned()),
+                label: choice.label.text().to_string(),
+                description: None,
                 hint: None,
             })
             .collect()
@@ -676,7 +689,7 @@ impl Composer {
                         format!("model:{}", mention.selector),
                         &text[mention.range.clone()],
                     )
-                    .with_label(mention::display_name(choice)),
+                    .with_label(choice.label.text().clone()),
                 ));
             }
         }
@@ -858,7 +871,7 @@ impl Composer {
         }
         self.catalog = catalog;
 
-        let choices = models::model_choices(config);
+        let choices = self.environment.read(cx).models().clone();
         if choices != self.choices {
             let current = self.selection(cx).or_else(|| self.preferred.clone());
             let initial = models::initial_choice(&choices, current.as_ref());
@@ -937,8 +950,8 @@ impl Composer {
         let Some(completion) = self.completions.get(self.completion_ix).cloned() else {
             return;
         };
-        if completion.kind == CompletionKind::Model {
-            self.accept_model(&completion.label, window, cx);
+        if let CompletionKind::Model(slug) = &completion.kind {
+            self.accept_model(slug, window, cx);
             return;
         }
         let text = completion::apply(&self.input.read(cx).value(), &completion);
@@ -965,7 +978,7 @@ impl Composer {
             && let Some(choice) = mention::find_choice(&self.choices, slug)
         {
             let token = InlineToken::new(format!("model:{slug}"), format!("^{slug}"))
-                .with_label(mention::display_name(choice));
+                .with_label(choice.label.text().clone());
             let end = range.start + 1 + slug.len();
             self.input.update(cx, |input, cx| {
                 if input
@@ -1078,11 +1091,13 @@ impl Composer {
             .take(MAX_COMPLETIONS)
             .map(|(ix, completion)| {
                 let selected = ix == self.completion_ix;
+                // Models show their label; their slug keeps the row's id.
+                let (key, model) = match &completion.kind {
+                    CompletionKind::Model(slug) => (slug, true),
+                    _ => (&completion.label, false),
+                };
                 h_flex()
-                    .id(SharedString::from(format!(
-                        "completion-{}",
-                        completion.label
-                    )))
+                    .id(SharedString::from(format!("completion-{key}")))
                     .test_support()
                     .gap_2()
                     .px_2()
@@ -1097,7 +1112,10 @@ impl Composer {
                     })
                     .child(
                         div()
-                            .font_family(theme.mono_font_family.clone())
+                            .when(model, |this| this.flex_1().min_w_0().truncate())
+                            .when(!model, |this| {
+                                this.font_family(theme.mono_font_family.clone())
+                            })
                             .child(completion.label.clone()),
                     )
                     .when_some(completion.hint.clone(), |this, hint| {
@@ -1122,7 +1140,7 @@ impl Composer {
                                 .child("skill"),
                         )
                     })
-                    .when(completion.kind == CompletionKind::Model, |this| {
+                    .when(model, |this| {
                         this.child(
                             div()
                                 .text_xs()
@@ -1233,7 +1251,7 @@ impl Composer {
     fn render_model_picker(&self, cx: &mut Context<Self>) -> AnyElement {
         let choice = self.choice(cx);
         let provider = choice.map(|choice| choice.provider.clone());
-        let name: SharedString = choice.map_or("Model".into(), |c| c.name.clone().into());
+        let name: SharedString = choice.map_or("Model".into(), |c| c.label.text().clone());
         let level_label = self
             .level
             .as_ref()

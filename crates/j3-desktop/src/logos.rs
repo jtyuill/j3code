@@ -182,7 +182,17 @@ pub fn provider_logo(provider: &str, size: Pixels, cx: &App) -> AnyElement {
             .into_any_element();
     };
     if logo.colored {
-        img(logo.path).size(size).flex_none().into_any_element()
+        // Rasterized for the drawn size: `img(path)` would shrink a 2x
+        // raster of the 64 px artwork on the GPU and alias.
+        let key = logo.path.as_ptr() as u64;
+        img(crate::svg_image::exact(
+            key,
+            logo.bytes,
+            gpui_kit::size(size, size),
+        ))
+        .size(size)
+        .flex_none()
+        .into_any_element()
     } else {
         // `svg` paints the shape as a mask in the current text color.
         div()

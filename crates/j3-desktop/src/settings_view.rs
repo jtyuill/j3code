@@ -308,6 +308,23 @@ impl SettingsView {
                 .description(
                     "Widest the conversation text and composer get, in rem (the interface font size). Lower is a tighter, easier-to-read column.",
                 )
+            })
+            .item({
+                let read = preferences.clone();
+                let write = preferences.clone();
+                SettingItem::new(
+                    "Render math",
+                    SettingField::switch(
+                        move |cx| read.read(cx).ui().math_rendering,
+                        move |value, cx| {
+                            write.update(cx, |preferences, cx| {
+                                preferences.update_ui(|ui| ui.math_rendering = value, cx)
+                            })
+                        },
+                    )
+                    .default_value(true),
+                )
+                .description("Typeset LaTeX in messages.")
             }))
     }
 

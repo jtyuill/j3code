@@ -75,14 +75,11 @@ pub fn query_at(text: &str, cursor: usize) -> Option<(Range<usize>, &str)> {
 }
 
 /// omp's `modelMentionDisplayName`: the trimmed name, else the id after the
-/// first `/` of the slug; `"` removed.
+/// first `/` of the slug; `"` removed. The base of [`crate::models::ModelLabel`],
+/// which is what the UI shows.
 pub fn display_name(choice: &ModelChoice) -> String {
     let name = choice.name.trim();
-    let base = if name.is_empty() {
-        id_of(choice.slug())
-    } else {
-        name
-    };
+    let base = if name.is_empty() { choice.id() } else { name };
     base.replace('"', "")
 }
 
@@ -128,11 +125,6 @@ pub fn rank(
     scored.into_iter().take(limit).map(|(_, _, i)| i).collect()
 }
 
-/// The part of a slug after the first `/`, or the whole slug.
-fn id_of(slug: &str) -> &str {
-    slug.split_once('/').map_or(slug, |(_, id)| id)
-}
-
 /// Lowercased searchable fields of one model.
 struct Fields {
     slug: String,
@@ -144,7 +136,7 @@ impl Fields {
     fn new(choice: &ModelChoice) -> Self {
         Self {
             slug: choice.slug().to_lowercase(),
-            id: id_of(choice.slug()).to_lowercase(),
+            id: choice.id().to_lowercase(),
             name: display_name(choice).to_lowercase(),
         }
     }
@@ -184,6 +176,7 @@ mod tests {
             name: name.into(),
             provider: slug.split('/').next().unwrap_or_default().into(),
             is_default: false,
+            label: Default::default(),
         }
     }
 
