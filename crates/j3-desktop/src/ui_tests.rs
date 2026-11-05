@@ -49,7 +49,8 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use crate::{
-    actions, local_server::LocalServer, mention, models, services::Services, workspace::Workspace,
+    actions, assist::AssistOmp, local_server::LocalServer, mention, models, services::Services,
+    workspace::Workspace,
 };
 
 /// The model the fake omp lists (and the tests launch with).
@@ -325,8 +326,11 @@ fn model_info() -> Value {
         "contextWindow": null, "maxTokens": null})
 }
 
-/// A utility omp (`--no-session`) for the server's model catalog: `ready`,
-/// then one canned response per command.
+/// A utility omp (`--no-session`) for the server's model catalog and the
+/// composer's assist: `ready`, then one canned response per command. It
+/// predicts `tor` after any draft ending in `refac` (`or` after `refact`),
+/// logs prediction feedback to `predict-feedback.log` beside itself, and
+/// dictates "hello" while recording and "hello there" in the end.
 fn fake_omp_script() -> String {
     let model = model_info().to_string();
     format!(
@@ -340,6 +344,26 @@ while IFS= read -r line; do
     *'"type":"get_state"'*) command=get_state; data='{{"sessionId":"utility","model":{model},"thinkingLevel":"low"}}' ;;
     *'"type":"get_available_commands"'*) command=get_available_commands; data='{{"commands":[]}}' ;;
     *'"type":"set_ask_dialog"'*) command=set_ask_dialog; data='{{"enabled":true}}' ;;
+    *'"type":"predict_word_feedback"'*)
+      printf '%s\n' "$line" >> "$(dirname "$0")/predict-feedback.log"
+      command=predict_word_feedback; data='{{}}' ;;
+    *'"type":"predict_word"'*)
+      command=predict_word
+      case "$line" in
+        *'refact"'*) data='{{"suffix":"or"}}' ;;
+        *'refac"'*) data='{{"suffix":"tor"}}' ;;
+        *) data='{{"suffix":null}}' ;;
+      esac ;;
+    *'"type":"dictation_start"'*)
+      capture=$(printf '%s\n' "$line" | sed -n 's/.*"captureId":"\([^"]*\)".*/\1/p')
+      printf '%s\n' "{{\"type\":\"dictation_state\",\"captureId\":\"$capture\",\"state\":\"recording\"}}"
+      printf '{{"type":"response","command":"dictation_start","success":true,"id":"%s"}}\n' "$id"
+      printf '%s\n' "{{\"type\":\"dictation_transcript\",\"captureId\":\"$capture\",\"text\":\"hello\"}}"
+      continue ;;
+    *'"type":"dictation_stop"'*)
+      printf '%s\n' "{{\"type\":\"dictation_state\",\"captureId\":\"$capture\",\"state\":\"transcribing\"}}"
+      printf '%s\n' "{{\"type\":\"dictation_end\",\"captureId\":\"$capture\",\"text\":\"hello there\"}}"
+      command=dictation_stop; data='{{"text":"hello there"}}' ;;
     *) command=unknown; data='{{}}' ;;
   esac
   printf '{{"type":"response","command":"%s","success":true,"id":"%s","data":%s}}\n' "$command" "$id" "$data"
@@ -458,7 +482,9 @@ impl Harness {
         )
         .unwrap();
         let local = Arc::new(LocalServer::from_server(server));
-        let services = Services::new(runtime.handle().clone(), local, Some(config_path));
+        // The composer's word prediction and dictation ask the fake omp too.
+        let assist = AssistOmp::new(OmpLauncher::new(&omp_path), project_dir.clone());
+        let services = Services::new(runtime.handle().clone(), local, assist, Some(config_path));
 
         let (window, _) = cx.update(|cx| {
             gpui_kit::init(cx);
@@ -636,9 +662,12 @@ impl Harness {
     }
 
     fn stop(mut self, cx: &mut TestAppContext) {
-        let local = cx.update(|cx| Arc::clone(Services::global(cx).local()));
+        let (local, assist) = cx.update(|cx| {
+            let services = Services::global(cx);
+            (Arc::clone(services.local()), Arc::clone(services.assist()))
+        });
         let runtime = self.runtime.take().unwrap();
-        runtime.block_on(local.shutdown());
+        runtime.block_on(async { tokio::join!(local.shutdown(), assist.close()) });
         runtime.shutdown_background();
         for dir in [&self.data_dir, &self.project_dir, &self.config_dir] {
             let _ = std::fs::remove_dir_all(dir);
@@ -1418,6 +1447,96 @@ async fn a_magic_keyword_becomes_a_token_once_a_delimiter_follows_and_stops_when
     app.update(cx, |window, _| {
         assert_eq!(draft(window), "please orchestrate this orchestrated ");
     });
+    app.stop(cx);
+}
+
+#[gpui_kit::test]
+async fn the_composer_offers_omps_word_prediction_as_ghost_text(cx: &mut TestAppContext) {
+    let app = Harness::start("predict", cx).await;
+    focused_new_thread_composer(&app, cx).await;
+    let feedback = app.data_dir.join("predict-feedback.log");
+    let feedback = move || std::fs::read_to_string(&feedback).unwrap_or_default();
+    let ghost = |window: &Window| label_of(window, "composer-ghost");
+
+    // omp's suggestion follows the caret; Tab takes it with a space.
+    app.update(cx, |window, cx| window.input("please refac", cx));
+    app.until(cx, |window, _| ghost(window).as_deref() == Some("tor"))
+        .await;
+    app.update(cx, |window, cx| window.press("tab", cx));
+    app.until(cx, |window, _| draft(window) == "please refactor ")
+        .await;
+    app.update(cx, |window, _| assert_eq!(ghost(window), None));
+    let log = feedback.clone();
+    app.until(cx, move |_, _| log().contains(r#""accepted":true"#))
+        .await;
+    assert!(feedback().contains(r#""suggestion":"tor""#));
+
+    // That space is provisional: punctuation takes its place.
+    app.update(cx, |window, cx| window.input(",", cx));
+    app.until(cx, |window, _| draft(window) == "please refactor,")
+        .await;
+
+    // Typing through the suggestion keeps the rest; → takes it without a
+    // space.
+    app.update(cx, |window, cx| window.input(" refac", cx));
+    app.until(cx, |window, _| ghost(window).as_deref() == Some("tor"))
+        .await;
+    app.update(cx, |window, cx| window.input("t", cx));
+    app.update(cx, |window, _| {
+        assert_eq!(ghost(window).as_deref(), Some("or"))
+    });
+    app.update(cx, |window, cx| window.press("right", cx));
+    app.until(cx, |window, _| draft(window) == "please refactor, refactor")
+        .await;
+
+    // Typing past it rejects it.
+    app.update(cx, |window, cx| window.input(" refac", cx));
+    app.until(cx, |window, _| ghost(window).as_deref() == Some("tor"))
+        .await;
+    app.update(cx, |window, cx| window.input("e", cx));
+    app.update(cx, |window, _| assert_eq!(ghost(window), None));
+    let log = feedback.clone();
+    app.until(cx, move |_, _| log().contains(r#""accepted":false"#))
+        .await;
+    app.stop(cx);
+}
+
+#[gpui_kit::test]
+async fn the_microphone_dictates_into_the_draft(cx: &mut TestAppContext) {
+    let app = Harness::start("dictate", cx).await;
+    focused_new_thread_composer(&app, cx).await;
+
+    // The transcript lands at the caret, a space after the draft's word,
+    // and is replaced as it grows.
+    app.update(cx, |window, cx| {
+        assert_eq!(label_of(window, "dictate").as_deref(), Some("Dictate"));
+        window.input("Note:", cx);
+        window.click("dictate", cx);
+    });
+    app.until(cx, |window, _| {
+        label_of(window, "dictate").as_deref() == Some("Stop dictation")
+            && draft(window) == "Note: hello"
+    })
+    .await;
+    // Nothing is sent while the words are still coming.
+    app.update(cx, |window, cx| window.press("enter", cx));
+
+    app.update(cx, |window, cx| window.click("dictate", cx));
+    app.until(cx, |window, _| {
+        label_of(window, "dictate").as_deref() == Some("Dictate")
+            && draft(window) == "Note: hello there"
+    })
+    .await;
+    assert!(
+        !app.script
+            .calls()
+            .iter()
+            .any(|call| call.starts_with("prompt:"))
+    );
+
+    // Then the draft sends as typed.
+    app.update(cx, |window, cx| window.press("enter", cx));
+    app.until_called(cx, "prompt:Note: hello there:0").await;
     app.stop(cx);
 }
 

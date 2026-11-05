@@ -3,8 +3,10 @@
 //! mentions. Magic keywords and accepted or pasted mentions become atomic
 //! inline tokens (the keyword with omp's gradient, the mention as a model
 //! chip) whose text stays in the draft, so [`Submission::text`] is exactly
-//! what was typed. It reports a [`Submission`]; its owner sends it and calls
-//! [`Composer::finish`].
+//! what was typed. omp's word prediction paints the rest of the word at the
+//! caret as ghost text, and the microphone button dictates into the draft
+//! (both from this machine's omp, see [`crate::assist`]). It reports a
+//! [`Submission`]; its owner sends it and calls [`Composer::finish`].
 
 use std::{
     ops::Range,
@@ -16,11 +18,14 @@ use std::{
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::base::input::{InlineToken, InlineTokenContext};
 use gpui_kit::component::{
-    ActiveTheme as _, Icon, IconName, IndexPath, Sizable as _,
+    ActiveTheme as _, Disableable as _, Icon, IconName, IndexPath, Sizable as _,
     button::{Button, ButtonCustomVariant, ButtonVariants as _},
     combobox::{Combobox, ComboboxEvent, ComboboxState},
     h_flex,
-    input::{Enter, Escape, IndentInline, InputEvent, MoveDown, MoveUp, Textarea, TextareaState},
+    input::{
+        Enter, Escape, IndentInline, InputEvent, MoveDown, MoveRight, MoveUp, Textarea,
+        TextareaState,
+    },
     popover::Popover,
     searchable_list::{SearchableListDelegate, SearchableListItem},
     spinner::Spinner,
@@ -28,21 +33,23 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    Anchor, AnyElement, App, AppContext as _, ClipboardEntry, ClipboardItem, Context, Entity,
-    EntityInputHandler as _, EventEmitter, FocusHandle, Focusable, HighlightStyle, Image,
+    Anchor, AnyElement, App, AppContext as _, ClipboardEntry, ClipboardItem, ContentMask, Context,
+    Entity, EntityInputHandler as _, EventEmitter, FocusHandle, Focusable, HighlightStyle, Image,
     ImageFormat, ImageSource, InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton,
     ObjectFit, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
-    Styled as _, StyledImage as _, StyledText, Subscription, Task, TestSupportExt as _, WeakEntity,
-    Window, div, img, px, rems,
+    Styled as _, StyledImage as _, StyledText, Subscription, Task, TestSupportExt as _, TextAlign,
+    TextRun, WeakEntity, Window, canvas, div, img, px, rems,
 };
 use j3_client::t3::{chat_attachment::ChatAttachment, model::ModelSelection};
 
 use crate::{
     agent_hub::DoubleTap,
+    assist::{Assist, AssistEvent, Phase},
     completion::{self, Catalog, Completion, CompletionKind},
     environment::Environment,
     keywords, logos, mention,
     models::{self, ModelChoice},
+    prediction::{self, Follow, Ghost, Provisional},
     preferences::Preferences,
     usage::{self, UsagePanel, UsageStore},
 };
@@ -122,6 +129,24 @@ struct PendingImage {
     name: SharedString,
     image: Arc<Image>,
     upload: Upload,
+}
+
+/// A capture dictating into the draft, and where its words are.
+struct Dictation {
+    capture: String,
+    phase: Phase,
+    /// Byte offset of the transcript in the draft: the caret when the
+    /// capture started.
+    start: usize,
+    /// The transcript as it stands in the draft, its separating space
+    /// included.
+    inserted: String,
+    /// The draft has a word right before `start`, so the transcript starts
+    /// with a space.
+    separate: bool,
+    /// Cleared once the user edits the transcript's text; later updates
+    /// then leave the draft alone.
+    tracking: bool,
 }
 
 #[derive(Clone)]
@@ -417,6 +442,17 @@ pub struct Composer {
     /// Repaints the input every [`keywords::SHIMMER_FRAME`] while it is
     /// focused and holds a keyword token; ends by itself afterwards.
     shimmer: Option<Task<()>>,
+    /// This machine's word prediction and dictation.
+    assist: Entity<Assist>,
+    /// omp's suggestion for the rest of the word at the caret; shown while
+    /// the draft and caret are still the ones it follows.
+    ghost: Option<Ghost>,
+    /// The draft right after a Tab accept, while its space is provisional.
+    provisional: Option<Provisional>,
+    /// The newest prediction request; replacing it drops the older answer.
+    predicting: Option<Task<()>>,
+    /// The capture dictating into this draft.
+    dictation: Option<Dictation>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -445,6 +481,7 @@ impl Composer {
         });
         let usage = cx.new(|cx| UsagePanel::new(environment.clone(), cx));
         let usage_store = UsageStore::global(cx);
+        let assist = Assist::global(cx);
         let subscriptions = vec![
             cx.subscribe_in(&input, window, Self::on_input_event),
             cx.subscribe_in(
@@ -473,6 +510,16 @@ impl Composer {
             }),
             // The button shows the cached peak.
             cx.observe(&usage_store, |_, _, cx| cx.notify()),
+            cx.subscribe_in(&assist, window, Self::on_assist_event),
+            // Another composer's capture holds the microphone.
+            cx.observe(&assist, |_, _, cx| cx.notify()),
+            // A capture never outlives the draft it writes into.
+            cx.on_release(|this, cx| {
+                if this.dictation.is_some() {
+                    this.assist
+                        .update(cx, |assist, cx| assist.stop_dictation(cx));
+                }
+            }),
         ];
         let mut composer = Self {
             environment,
@@ -500,6 +547,11 @@ impl Composer {
             left: DoubleTap::default(),
             syncing: false,
             shimmer: None,
+            assist,
+            ghost: None,
+            provisional: None,
+            predicting: None,
+            dictation: None,
             _subscriptions: subscriptions,
         };
         composer.sync_config(window, cx);
@@ -552,6 +604,9 @@ impl Composer {
                 self.error = None;
                 self.images.clear();
                 self.completions.clear();
+                self.ghost = None;
+                self.provisional = None;
+                self.predicting = None;
                 self.input
                     .update(cx, |input, cx| input.set_value("", window, cx));
                 self.sync_shimmer(window, cx);
@@ -584,11 +639,16 @@ impl Composer {
                     cx.notify();
                 }
                 cx.notify();
+                self.follow_draft(&text, cursor, window, cx);
                 self.sync_tokens(window, cx);
             }
             // Shift+Enter inserts a newline, yet the textarea still reports it.
             InputEvent::PressEnter { shift: false, .. } => self.submit(window, cx),
-            InputEvent::Focus => self.sync_shimmer(window, cx),
+            InputEvent::Focus => {
+                self.sync_shimmer(window, cx);
+                // Start the predictor before the first keystroke needs it.
+                self.assist.read(cx).warm(cx);
+            }
             InputEvent::Blur => {
                 self.sync_shimmer(window, cx);
                 // Repaint the keywords in their static colours.
@@ -596,6 +656,253 @@ impl Composer {
             }
             InputEvent::PressEnter { .. } => {}
         }
+    }
+
+    /// Moves the word prediction along with an edit: settles a provisional
+    /// space, keeps the ghost the user is typing through (or reports the
+    /// one typed past), and asks omp about the new draft.
+    fn follow_draft(
+        &mut self,
+        text: &str,
+        cursor: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(provisional) = self.provisional.take() {
+            if provisional.text == text && provisional.cursor == cursor {
+                // The accept's own change.
+                self.provisional = Some(provisional);
+            } else if let Some((range, replacement)) = provisional.settle(text, cursor) {
+                let utf16 = prediction::utf16_offset(text, range.start)
+                    ..prediction::utf16_offset(text, range.end);
+                // Its change event brings the settled draft back here.
+                self.input.update(cx, |input, cx| {
+                    input.replace_text_in_range(Some(utf16), &replacement, window, cx)
+                });
+                return;
+            }
+        }
+        if let Some(ghost) = self.ghost.take() {
+            match ghost.follow(text, cursor) {
+                Follow::Unchanged => {
+                    self.ghost = Some(ghost);
+                    return;
+                }
+                Follow::TypedThrough(rest) => self.ghost = rest,
+                Follow::Diverged => {
+                    let at = prediction::utf16_offset(&ghost.text, ghost.cursor);
+                    self.assist
+                        .read(cx)
+                        .feedback(ghost.text, at, ghost.suffix, false, cx);
+                }
+                Follow::Unrelated => {}
+            }
+        }
+        self.request_prediction(text, cursor, cx);
+    }
+
+    /// Asks omp for the rest of the word ending at the caret, replacing any
+    /// request still in flight. omp predicts only at the end of a line, and
+    /// never into a selection, a completion menu or a dictation.
+    fn request_prediction(&mut self, text: &str, cursor: usize, cx: &mut Context<Self>) {
+        self.predicting = None;
+        let wanted = self.dictation.is_none()
+            && self.completions.is_empty()
+            && !text.trim().is_empty()
+            && prediction::at_line_end(text, cursor)
+            && self.input.read(cx).selected_range().is_empty();
+        if !wanted {
+            self.ghost = None;
+            return;
+        }
+        let answer = self.assist.read(cx).predict(
+            text.to_owned(),
+            prediction::utf16_offset(text, cursor),
+            cx,
+        );
+        let text = text.to_owned();
+        self.predicting = Some(cx.spawn(async move |this, cx| {
+            let suffix = answer.await;
+            let _ = this.update(cx, |this, cx| {
+                let input = this.input.read(cx);
+                // An answer for a draft that has moved on is no use.
+                if input.cursor() != cursor || *input.value() != *text {
+                    return;
+                }
+                let ghost = suffix.map(|suffix| Ghost {
+                    text,
+                    cursor,
+                    suffix,
+                });
+                if this.ghost != ghost {
+                    this.ghost = ghost;
+                    cx.notify();
+                }
+            });
+        }));
+    }
+
+    /// The ghost to paint: one that still follows the draft and caret, with
+    /// nothing else claiming the spot.
+    fn shown_ghost(&self, cx: &App) -> Option<&Ghost> {
+        let ghost = self.ghost.as_ref()?;
+        if self.dictation.is_some() || !self.completions.is_empty() {
+            return None;
+        }
+        let input = self.input.read(cx);
+        (input.selected_range().is_empty() && ghost.matches(&input.value(), input.cursor()))
+            .then_some(ghost)
+    }
+
+    /// Types the shown ghost: Tab with a provisional space after it, →
+    /// without one. Returns whether there was one to take.
+    fn accept_ghost(&mut self, space: bool, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(ghost) = self.shown_ghost(cx).cloned() else {
+            return false;
+        };
+        self.ghost = None;
+        let at = prediction::utf16_offset(&ghost.text, ghost.cursor);
+        let insert = if space {
+            format!("{} ", ghost.suffix)
+        } else {
+            ghost.suffix.clone()
+        };
+        self.assist
+            .read(cx)
+            .feedback(ghost.text, at, ghost.suffix, true, cx);
+        let (text, cursor) = self.input.update(cx, |input, cx| {
+            input.insert(insert, window, cx);
+            (input.value().to_string(), input.cursor())
+        });
+        self.provisional = space.then_some(Provisional { text, cursor });
+        cx.notify();
+        true
+    }
+
+    /// The microphone button: start dictating at the caret, stop a capture
+    /// that is recording (or cancel one still starting). Nothing while the
+    /// last words are transcribed.
+    fn toggle_dictation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.dictation.as_ref().map(|d| d.phase) {
+            Some(Phase::Transcribing) => {}
+            Some(Phase::Starting | Phase::Recording) => {
+                self.assist
+                    .update(cx, |assist, cx| assist.stop_dictation(cx));
+            }
+            None => {
+                let owner = cx.entity_id();
+                let Some(capture) = self
+                    .assist
+                    .update(cx, |assist, cx| assist.start_dictation(owner, cx))
+                else {
+                    self.error = Some("Another composer is dictating.".into());
+                    cx.notify();
+                    return;
+                };
+                let (start, separate) = {
+                    let input = self.input.read(cx);
+                    let text = input.value();
+                    let start = input.cursor();
+                    let before = text.get(..start).and_then(|head| head.chars().next_back());
+                    (start, before.is_some_and(|c| !c.is_whitespace()))
+                };
+                self.ghost = None;
+                self.provisional = None;
+                self.predicting = None;
+                self.error = None;
+                self.dictation = Some(Dictation {
+                    capture,
+                    phase: Phase::Starting,
+                    start,
+                    inserted: String::new(),
+                    separate,
+                    tracking: true,
+                });
+                // The button took focus; the words land at the caret.
+                self.focus(window, cx);
+                cx.notify();
+            }
+        }
+    }
+
+    fn on_assist_event(
+        &mut self,
+        _: &Entity<Assist>,
+        event: &AssistEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let capture = match event {
+            AssistEvent::Phase { capture, .. }
+            | AssistEvent::Transcript { capture, .. }
+            | AssistEvent::End { capture, .. } => capture,
+        };
+        let Some(dictation) = self.dictation.as_mut().filter(|d| d.capture == *capture) else {
+            return;
+        };
+        match event {
+            AssistEvent::Phase { phase, .. } => {
+                dictation.phase = *phase;
+                cx.notify();
+            }
+            AssistEvent::Transcript { text, .. } => self.write_transcript(text, window, cx),
+            AssistEvent::End { text, error, .. } => {
+                if !text.trim().is_empty() {
+                    self.write_transcript(text, window, cx);
+                }
+                // A start cancelled before the microphone opened heard
+                // nothing, and says nothing.
+                let silent = self
+                    .dictation
+                    .take()
+                    .is_some_and(|d| d.phase != Phase::Starting && d.inserted.is_empty());
+                let note: Option<SharedString> = match error {
+                    Some(error) => Some(format!("Dictation failed: {error}").into()),
+                    None if silent => Some("No speech detected.".into()),
+                    None => None,
+                };
+                // After the change event the transcript's edit queued, which
+                // would clear it.
+                if let Some(note) = note {
+                    cx.defer_in(window, move |this, _, cx| {
+                        this.error = Some(note);
+                        cx.notify();
+                    });
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    /// Puts the capture's transcript so far in place of the previous one.
+    /// Once the user has edited that text, the draft is theirs: later
+    /// transcripts are dropped rather than overwrite it.
+    fn write_transcript(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(dictation) = self.dictation.as_mut().filter(|d| d.tracking) else {
+            return;
+        };
+        let value = self.input.read(cx).value();
+        let end = dictation.start + dictation.inserted.len();
+        if value.get(dictation.start..end) != Some(dictation.inserted.as_str()) {
+            dictation.tracking = false;
+            return;
+        }
+        let text = text.trim();
+        let replacement = match text {
+            "" => String::new(),
+            _ if dictation.separate => format!(" {text}"),
+            _ => text.to_owned(),
+        };
+        if replacement == dictation.inserted {
+            return;
+        }
+        let range = prediction::utf16_offset(&value, dictation.start)
+            ..prediction::utf16_offset(&value, end);
+        dictation.inserted = replacement;
+        let replacement = dictation.inserted.as_str();
+        self.input.update(cx, |input, cx| {
+            input.replace_text_in_range(Some(range), replacement, window, cx)
+        });
     }
 
     /// The models a `^` mention being typed at `cursor` offers.
@@ -795,7 +1102,8 @@ impl Composer {
     }
 
     fn submit(&mut self, _: &mut Window, cx: &mut Context<Self>) {
-        if self.busy {
+        // The transcript is still arriving; send it once it has.
+        if self.busy || self.dictation.is_some() {
             return;
         }
         let text = self.input.read(cx).value().trim().to_owned();
@@ -1345,6 +1653,50 @@ impl Composer {
             .content(move |_, _, _| panel.clone())
             .into_any_element()
     }
+
+    /// The microphone, left of Send: dictates into the draft from this
+    /// machine's microphone. While the model loads it spins (a click
+    /// cancels), while recording it is red (a click stops), and while the
+    /// last words are transcribed it waits.
+    fn render_mic(&self, cx: &mut Context<Self>) -> AnyElement {
+        let elsewhere = self
+            .assist
+            .read(cx)
+            .capture()
+            .is_some_and(|(owner, _)| owner != cx.entity_id());
+        let button = Button::new("dictate").xsmall().rounded(px(999.));
+        let button = match self.dictation.as_ref().map(|d| d.phase) {
+            None => button
+                .ghost()
+                .icon(Icon::new(Lucide::Mic))
+                .accessibility_label("Dictate")
+                .tooltip(if elsewhere {
+                    "Another composer is dictating"
+                } else {
+                    "Dictate"
+                })
+                .disabled(elsewhere),
+            Some(Phase::Starting) => button
+                .ghost()
+                .icon(Spinner::new().xsmall())
+                .accessibility_label("Cancel dictation")
+                .tooltip("Starting the microphone… (click to cancel)"),
+            Some(Phase::Recording) => button
+                .custom(recording_style(cx))
+                .icon(Icon::new(Lucide::Mic))
+                .accessibility_label("Stop dictation")
+                .tooltip("Stop dictation"),
+            Some(Phase::Transcribing) => button
+                .ghost()
+                .icon(Icon::new(Lucide::Mic))
+                .accessibility_label("Transcribing")
+                .tooltip("Transcribing…")
+                .loading(true),
+        };
+        button
+            .on_click(cx.listener(|this, _, window, cx| this.toggle_dictation(window, cx)))
+            .into_any_element()
+    }
 }
 
 /// The model menu's footer: the thinking levels, `level` highlighted.
@@ -1411,6 +1763,77 @@ fn send_style(action: SendAction, ready: bool, cx: &App) -> ButtonCustomVariant 
         .active(color.opacity(1.).blend(theme.foreground.opacity(0.14)))
 }
 
+/// The microphone while it records: the Stop button's red tint.
+fn recording_style(cx: &App) -> ButtonCustomVariant {
+    let theme = cx.theme();
+    let color = theme.danger.opacity(0.18);
+    ButtonCustomVariant::new(cx)
+        .color(color)
+        .foreground(theme.danger)
+        .hover(color.opacity(1.).blend(theme.foreground.opacity(0.08)))
+        .active(color.opacity(1.).blend(theme.foreground.opacity(0.14)))
+}
+
+/// omp's suggestion `suffix` painted dim right after the caret at byte
+/// `cursor`, in the input's own font. It is painted after the input, from
+/// the layout the input just painted, and clipped to the input's text area.
+/// Its accessible label is the suggestion.
+fn render_ghost(
+    input: Entity<TextareaState>,
+    cursor: usize,
+    suffix: SharedString,
+    cx: &App,
+) -> impl IntoElement {
+    let color = cx.theme().muted_foreground.opacity(0.6);
+    let label = suffix.clone();
+    let paint = canvas(
+        |_, _, _| {},
+        move |_, (), window, cx| {
+            let input = input.read(cx);
+            if !input.focus_handle(cx).is_focused(window) {
+                return;
+            }
+            let (Some(caret), Some(clip)) = (
+                input.range_to_bounds(&(cursor..cursor)),
+                input.text_bounds(),
+            ) else {
+                return;
+            };
+            let style = window.text_style();
+            let run = TextRun {
+                len: suffix.len(),
+                font: style.font(),
+                color,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            let font_size = style.font_size.to_pixels(window.rem_size());
+            let line = window
+                .text_system()
+                .shape_line(suffix.clone(), font_size, &[run], None);
+            window.with_content_mask(Some(ContentMask { bounds: clip }), |window| {
+                let _ = line.paint(
+                    caret.origin,
+                    caret.size.height,
+                    TextAlign::Left,
+                    None,
+                    window,
+                    cx,
+                );
+            });
+        },
+    )
+    .size_0();
+    div()
+        .id("composer-ghost")
+        .test_support()
+        .aria_label(label)
+        .absolute()
+        .size_0()
+        .child(paint)
+}
+
 fn format_for_path(path: &Path) -> Option<ImageFormat> {
     match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
         "png" => Some(ImageFormat::Png),
@@ -1436,6 +1859,10 @@ impl Render for Composer {
         let images = self.render_images(cx);
         let model_picker = self.render_model_picker(cx);
         let usage_button = self.render_usage_button(cx);
+        let mic = self.render_mic(cx);
+        let ghost = self
+            .shown_ghost(cx)
+            .map(|ghost| (ghost.cursor, SharedString::from(ghost.suffix.clone())));
         let key = |keys: &str| crate::actions::shortcut(keys, cx);
         let tooltip = match action {
             SendAction::Send => format!("Send ({})", key("enter")),
@@ -1502,19 +1929,41 @@ impl Render for Composer {
                     cx.notify();
                 }))
             })
+            .when(ghost.is_some(), |this| {
+                this.capture_action(cx.listener(|this, _: &IndentInline, window, cx| {
+                    if this.accept_ghost(true, window, cx) {
+                        cx.stop_propagation();
+                    }
+                }))
+                .capture_action(cx.listener(
+                    |this, _: &MoveRight, window, cx| {
+                        if this.accept_ghost(false, window, cx) {
+                            cx.stop_propagation();
+                        }
+                    },
+                ))
+            })
             .children(completions)
             .children(images)
             .child(
-                div().px_1().pt_1().child(
-                    Textarea::new(&self.input)
-                        .appearance(false)
-                        .text_sm()
-                        .aria_label("Message")
-                        .token(move |ctx, window, cx| {
-                            render_token(ctx, focus.is_focused(window), cx)
-                        })
-                        .on_paste(move |item, _, cx| Self::on_paste(&weak, item, cx)),
-                ),
+                // `text_sm` here too, so the ghost is set like the draft.
+                div()
+                    .px_1()
+                    .pt_1()
+                    .text_sm()
+                    .child(
+                        Textarea::new(&self.input)
+                            .appearance(false)
+                            .text_sm()
+                            .aria_label("Message")
+                            .token(move |ctx, window, cx| {
+                                render_token(ctx, focus.is_focused(window), cx)
+                            })
+                            .on_paste(move |item, _, cx| Self::on_paste(&weak, item, cx)),
+                    )
+                    .when_some(ghost, |this, (cursor, suffix)| {
+                        this.child(render_ghost(self.input.clone(), cursor, suffix, cx))
+                    }),
             )
             .when_some(self.error.clone(), |this, error| {
                 this.child(div().px_3().text_xs().text_color(theme.danger).child(error))
@@ -1538,6 +1987,7 @@ impl Render for Composer {
                     .child(model_picker)
                     .child(usage_button)
                     .child(div().flex_1())
+                    .child(mic)
                     .child({
                         let ready = action == SendAction::Stop || self.has_draft(cx);
                         Button::new("send-message")

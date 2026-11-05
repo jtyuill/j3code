@@ -9,6 +9,7 @@ mod agent_hub;
 mod appearance;
 mod archived;
 mod assets;
+mod assist;
 mod attention;
 mod completion;
 mod composer;
@@ -28,6 +29,7 @@ mod mention;
 mod message_text;
 mod models;
 mod new_thread;
+mod prediction;
 mod preferences;
 mod services;
 mod settings_view;
@@ -53,7 +55,8 @@ use gpui_kit::{
 use tracing_subscriber::EnvFilter;
 
 use crate::{
-    assets::AppAssets, local_server::LocalServer, services::Services, workspace::Workspace,
+    assets::AppAssets, assist::AssistOmp, local_server::LocalServer, services::Services,
+    workspace::Workspace,
 };
 
 /// Wayland app id / X11 WM_CLASS; the Linux desktop entry is `<APP_ID>.desktop`.
@@ -78,7 +81,12 @@ fn main() {
     let config_path = environments::config_path()
         .inspect_err(|e| tracing::warn!("{e}"))
         .ok();
-    let services = Services::new(runtime.handle().clone(), local, config_path);
+    let data_dir = dirs::data_dir().map(|dir| dir.join("j3"));
+    let assist = AssistOmp::new(
+        assist::launcher(data_dir.as_deref()),
+        dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")),
+    );
+    let services = Services::new(runtime.handle().clone(), local, assist, config_path);
     let termination = runtime.block_on(termination_signal());
 
     gpui_kit::application()

@@ -1,7 +1,8 @@
 //! The app's icon assets: GPUI Kit's component icons plus the Lucide icons
 //! the app draws beyond them (the thread sidebars' — the same ones t3code's
 //! sidebar shows —, the feed's tool calls, the file pane's file types, the
-//! agents hub, the usage gauge) and the model picker's provider logos.
+//! agents hub, the usage gauge, the dictation microphone) and the model
+//! picker's provider logos.
 
 use std::borrow::Cow;
 
@@ -45,6 +46,7 @@ gpui_kit::assets::icon_assets!(
         Mail,
         MessageCircleQuestionMark,
         MessagesSquare,
+        Mic,
         Pencil,
         Pin,
         PinOff,

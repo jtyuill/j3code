@@ -1,5 +1,5 @@
 //! App-wide services: the tokio runtime that drives networking and the
-//! in-process server, and orderly shutdown.
+//! in-process server, this machine's assist omp, and orderly shutdown.
 
 use std::{
     cell::Cell,
@@ -13,7 +13,7 @@ use gpui_kit::{App, Global};
 use j3_client::Connection;
 use tokio::runtime::Handle;
 
-use crate::local_server::LocalServer;
+use crate::{assist::AssistOmp, local_server::LocalServer};
 
 /// How long quitting waits for the local server to stop its omp sessions.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(8);
@@ -21,6 +21,8 @@ const SHUTDOWN_WAIT: Duration = Duration::from_secs(8);
 pub struct Services {
     runtime: Handle,
     local: Arc<LocalServer>,
+    /// The omp behind the composer's word prediction and dictation.
+    assist: Arc<AssistOmp>,
     /// `desktop.json`; `None` when the system has no config directory.
     config_path: Option<PathBuf>,
     quitting: Rc<Cell<bool>>,
@@ -29,10 +31,16 @@ pub struct Services {
 impl Global for Services {}
 
 impl Services {
-    pub fn new(runtime: Handle, local: Arc<LocalServer>, config_path: Option<PathBuf>) -> Self {
+    pub fn new(
+        runtime: Handle,
+        local: Arc<LocalServer>,
+        assist: Arc<AssistOmp>,
+        config_path: Option<PathBuf>,
+    ) -> Self {
         Self {
             runtime,
             local,
+            assist,
             config_path,
             quitting: Rc::new(Cell::new(false)),
         }
@@ -54,6 +62,10 @@ impl Services {
         &self.local
     }
 
+    pub fn assist(&self) -> &Arc<AssistOmp> {
+        &self.assist
+    }
+
     /// Runs `future` on the tokio runtime and resolves with its output on
     /// any executor (for reqwest and other reactor-bound work).
     pub fn run<F>(&self, future: F) -> impl Future<Output = Option<F::Output>> + use<F>
@@ -68,16 +80,17 @@ impl Services {
         async move { rx.await.ok() }
     }
 
-    /// Closes `connections` and stops the local server, bounded by
-    /// [`SHUTDOWN_WAIT`].
+    /// Closes `connections`, stops the local server and the assist omp,
+    /// bounded by [`SHUTDOWN_WAIT`].
     fn shutdown(&self, connections: Vec<Connection>) -> impl Future<Output = ()> + use<> {
         let local = Arc::clone(&self.local);
+        let assist = Arc::clone(&self.assist);
         let done = self.run(async move {
             let stop = async move {
                 for connection in &connections {
                     connection.close().await;
                 }
-                local.shutdown().await;
+                tokio::join!(local.shutdown(), assist.close());
             };
             if tokio::time::timeout(SHUTDOWN_WAIT, stop).await.is_err() {
                 tracing::warn!("shutdown timed out after {SHUTDOWN_WAIT:?}");
