@@ -39,6 +39,7 @@ cat >"$app/Contents/Info.plist" <<EOF
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSLocalNetworkUsageDescription</key><string>j3 connects to j3 servers on your tailnet and local network.</string>
+  <key>NSMicrophoneUsageDescription</key><string>j3 transcribes your dictation on this Mac.</string>
 </dict>
 </plist>
 EOF

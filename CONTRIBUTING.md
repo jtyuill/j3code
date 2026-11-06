@@ -13,11 +13,11 @@ Thanks for helping with j3code. Bug reports, fixes, and focused features are wel
 ```sh
 git clone git@github.com:jtyuill/j3code.git
 cd j3code
-nix develop        # optional: Rust toolchain and Linux GUI libraries
+nix develop        # optional: Rust toolchain, CMake, Linux GUI and audio libraries
 pnpm install       # only needed for the TypeScript packages and iOS app
 ```
 
-Without Nix you need Rust 1.88+, plus on Linux the libraries installed in [`ci.yml`](.github/workflows/ci.yml). You need `omp` installed to run agents.
+Without Nix you need Rust 1.88+ and CMake, plus on Linux the libraries installed in [`ci.yml`](.github/workflows/ci.yml). You need `omp` installed to run agents.
 
 ## Making changes
 

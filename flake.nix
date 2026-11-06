@@ -25,6 +25,22 @@
           xorg.libxcb
         ];
 
+      # Dictation (j3-desktop): cpal records through ALSA (PipeWire's ALSA plugin on
+      # NixOS); whisper-rs builds whisper.cpp with cmake, its bindings with bindgen,
+      # and its Vulkan backend's shaders with glslc.
+      speechNativeInputs =
+        pkgs: with pkgs; [
+          cmake
+          shaderc
+          rustPlatform.bindgenHook
+        ];
+      speechLibs =
+        pkgs: with pkgs; [
+          alsa-lib
+          vulkan-headers
+          vulkan-loader
+        ];
+
       j3Package =
         pkgs:
         {
@@ -78,8 +94,17 @@
                 pkgs.makeWrapper
                 pkgs.copyDesktopItems
                 pkgs.imagemagick
-              ];
-              buildInputs = linuxGuiLibs pkgs;
+              ]
+              ++ speechNativeInputs pkgs;
+              buildInputs = linuxGuiLibs pkgs ++ speechLibs pkgs;
+              # A portable x86-64-v3 whisper.cpp rather than one tuned to the build machine.
+              env = {
+                GGML_NATIVE = "OFF";
+                GGML_AVX = "ON";
+                GGML_AVX2 = "ON";
+                GGML_FMA = "ON";
+                GGML_F16C = "ON";
+              };
               # Named after the window's app id (APP_ID in crates/j3-desktop/src/main.rs),
               # so the compositor ties the window to this entry and its icon.
               desktopItems = [
@@ -121,12 +146,13 @@
               clippy
               rustfmt
               rust-analyzer
+              cmake
             ];
             RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
           }
           // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
-            nativeBuildInputs = [ pkgs.pkg-config ];
-            buildInputs = linuxGuiLibs pkgs;
+            nativeBuildInputs = [ pkgs.pkg-config ] ++ speechNativeInputs pkgs;
+            buildInputs = linuxGuiLibs pkgs ++ speechLibs pkgs;
             LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath (linuxGuiLibs pkgs);
           }
         );

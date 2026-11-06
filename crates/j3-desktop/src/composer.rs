@@ -4,8 +4,9 @@
 //! inline tokens (the keyword with omp's gradient, the mention as a model
 //! chip) whose text stays in the draft, so [`Submission::text`] is exactly
 //! what was typed. omp's word prediction paints the rest of the word at the
-//! caret as ghost text, and the microphone button dictates into the draft
-//! (both from this machine's omp, see [`crate::assist`]). It reports a
+//! caret as ghost text (from this machine's omp, see [`crate::assist`]), and
+//! the microphone button dictates into the draft (transcribed on this
+//! machine, see [`crate::speech`]). It reports a
 //! [`Submission`]; its owner sends it and calls [`Composer::finish`].
 
 use std::{
@@ -44,13 +45,14 @@ use j3_client::t3::{chat_attachment::ChatAttachment, model::ModelSelection};
 
 use crate::{
     agent_hub::DoubleTap,
-    assist::{Assist, AssistEvent, Phase},
+    assist::Assist,
     completion::{self, Catalog, Completion, CompletionKind},
     environment::Environment,
     keywords, logos, mention,
     models::{self, ModelChoice},
     prediction::{self, Follow, Ghost, Provisional},
     preferences::Preferences,
+    speech::{ModelStatus, Phase, Speech, SpeechEvent},
     usage::{self, UsagePanel, UsageStore},
 };
 
@@ -442,8 +444,10 @@ pub struct Composer {
     /// Repaints the input every [`keywords::SHIMMER_FRAME`] while it is
     /// focused and holds a keyword token; ends by itself afterwards.
     shimmer: Option<Task<()>>,
-    /// This machine's word prediction and dictation.
+    /// This machine's word prediction.
     assist: Entity<Assist>,
+    /// This machine's dictation.
+    speech: Entity<Speech>,
     /// omp's suggestion for the rest of the word at the caret; shown while
     /// the draft and caret are still the ones it follows.
     ghost: Option<Ghost>,
@@ -482,6 +486,7 @@ impl Composer {
         let usage = cx.new(|cx| UsagePanel::new(environment.clone(), cx));
         let usage_store = UsageStore::global(cx);
         let assist = Assist::global(cx);
+        let speech = Speech::global(cx);
         let subscriptions = vec![
             cx.subscribe_in(&input, window, Self::on_input_event),
             cx.subscribe_in(
@@ -510,14 +515,14 @@ impl Composer {
             }),
             // The button shows the cached peak.
             cx.observe(&usage_store, |_, _, cx| cx.notify()),
-            cx.subscribe_in(&assist, window, Self::on_assist_event),
-            // Another composer's capture holds the microphone.
-            cx.observe(&assist, |_, _, cx| cx.notify()),
+            cx.subscribe_in(&speech, window, Self::on_speech_event),
+            // Another composer's capture holds the microphone, and the
+            // model's download progress shows on the button.
+            cx.observe(&speech, |_, _, cx| cx.notify()),
             // A capture never outlives the draft it writes into.
             cx.on_release(|this, cx| {
                 if this.dictation.is_some() {
-                    this.assist
-                        .update(cx, |assist, cx| assist.stop_dictation(cx));
+                    this.speech.update(cx, |speech, cx| speech.stop(cx));
                 }
             }),
         ];
@@ -548,6 +553,7 @@ impl Composer {
             syncing: false,
             shimmer: None,
             assist,
+            speech,
             ghost: None,
             provisional: None,
             predicting: None,
@@ -786,14 +792,14 @@ impl Composer {
         match self.dictation.as_ref().map(|d| d.phase) {
             Some(Phase::Transcribing) => {}
             Some(Phase::Starting | Phase::Recording) => {
-                self.assist
-                    .update(cx, |assist, cx| assist.stop_dictation(cx));
+                self.speech.update(cx, |speech, cx| speech.stop(cx));
             }
             None => {
                 let owner = cx.entity_id();
+                let model = self.preferences.read(cx).ui().dictation_model();
                 let Some(capture) = self
-                    .assist
-                    .update(cx, |assist, cx| assist.start_dictation(owner, cx))
+                    .speech
+                    .update(cx, |speech, cx| speech.start(owner, model, cx))
                 else {
                     self.error = Some("Another composer is dictating.".into());
                     cx.notify();
@@ -825,28 +831,28 @@ impl Composer {
         }
     }
 
-    fn on_assist_event(
+    fn on_speech_event(
         &mut self,
-        _: &Entity<Assist>,
-        event: &AssistEvent,
+        _: &Entity<Speech>,
+        event: &SpeechEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let capture = match event {
-            AssistEvent::Phase { capture, .. }
-            | AssistEvent::Transcript { capture, .. }
-            | AssistEvent::End { capture, .. } => capture,
+            SpeechEvent::Phase { capture, .. }
+            | SpeechEvent::Transcript { capture, .. }
+            | SpeechEvent::End { capture, .. } => capture,
         };
         let Some(dictation) = self.dictation.as_mut().filter(|d| d.capture == *capture) else {
             return;
         };
         match event {
-            AssistEvent::Phase { phase, .. } => {
+            SpeechEvent::Phase { phase, .. } => {
                 dictation.phase = *phase;
                 cx.notify();
             }
-            AssistEvent::Transcript { text, .. } => self.write_transcript(text, window, cx),
-            AssistEvent::End { text, error, .. } => {
+            SpeechEvent::Transcript { text, .. } => self.write_transcript(text, window, cx),
+            SpeechEvent::End { text, error, .. } => {
                 if !text.trim().is_empty() {
                     self.write_transcript(text, window, cx);
                 }
@@ -1655,15 +1661,26 @@ impl Composer {
     }
 
     /// The microphone, left of Send: dictates into the draft from this
-    /// machine's microphone. While the model loads it spins (a click
+    /// machine's microphone. While the microphone opens it spins (a click
     /// cancels), while recording it is red (a click stops), and while the
-    /// last words are transcribed it waits.
+    /// recording is transcribed it waits. Its tooltip follows the speech
+    /// model while it downloads or loads.
     fn render_mic(&self, cx: &mut Context<Self>) -> AnyElement {
-        let elsewhere = self
-            .assist
-            .read(cx)
+        let speech = self.speech.read(cx);
+        let elsewhere = speech
             .capture()
             .is_some_and(|(owner, _)| owner != cx.entity_id());
+        let model = match speech.status() {
+            ModelStatus::Downloading { model, fraction } => Some(format!(
+                "downloading the {} speech model ({:.0}%)",
+                model.label(),
+                fraction * 100.
+            )),
+            ModelStatus::Loading(model) => {
+                Some(format!("loading the {} speech model", model.label()))
+            }
+            ModelStatus::Idle | ModelStatus::Ready(_) | ModelStatus::Failed(_) => None,
+        };
         let button = Button::new("dictate").xsmall().rounded(px(999.));
         let button = match self.dictation.as_ref().map(|d| d.phase) {
             None => button
@@ -1685,12 +1702,18 @@ impl Composer {
                 .custom(recording_style(cx))
                 .icon(Icon::new(Lucide::Mic))
                 .accessibility_label("Stop dictation")
-                .tooltip("Stop dictation"),
+                .tooltip(match model {
+                    Some(model) => format!("Stop dictation · {model}"),
+                    None => "Stop dictation".to_owned(),
+                }),
             Some(Phase::Transcribing) => button
                 .ghost()
                 .icon(Icon::new(Lucide::Mic))
                 .accessibility_label("Transcribing")
-                .tooltip("Transcribing…")
+                .tooltip(match model {
+                    Some(model) => format!("Transcribing · {model}…"),
+                    None => "Transcribing…".to_owned(),
+                })
                 .loading(true),
         };
         button

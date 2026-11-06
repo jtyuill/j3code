@@ -5,6 +5,8 @@
 use j3_client::workflow::{AgentOrder, StatusIndicators};
 use serde::{Deserialize, Serialize};
 
+use crate::speech::models::SpeechModel;
+
 /// Which thread workflow the sidebar follows.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -97,6 +99,10 @@ pub struct UiSettings {
     /// and monthly usage the composer shows beside the model.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub usage_inline: Vec<String>,
+    /// The dictation model's key (`small.en`, `large-v3-turbo`, …); `None`
+    /// is the one recommended for this machine.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dictation_model: Option<String>,
 }
 
 impl Default for UiSettings {
@@ -118,6 +124,7 @@ impl Default for UiSettings {
             terminal_font_size: DEFAULT_TERMINAL_FONT_SIZE,
             favorite_models: Vec::new(),
             usage_inline: Vec::new(),
+            dictation_model: None,
             zoom: 1.,
         }
     }
@@ -126,6 +133,14 @@ impl Default for UiSettings {
 impl UiSettings {
     pub fn is_expanded(&self, shelf: Shelf) -> bool {
         self.expanded_shelves.contains(&shelf)
+    }
+
+    /// The dictation model picked in Settings; `None` (also for a key this
+    /// build does not know) is the one recommended for this machine.
+    pub fn dictation_model(&self) -> Option<SpeechModel> {
+        self.dictation_model
+            .as_deref()
+            .and_then(SpeechModel::from_key)
     }
 
     pub fn set_expanded(&mut self, shelf: Shelf, expanded: bool) {
@@ -328,6 +343,7 @@ mod tests {
             terminal_font_size: 12.,
             favorite_models: Vec::new(),
             usage_inline: Vec::new(),
+            dictation_model: Some("small.en".into()),
             zoom: 1.25,
         };
         ui.set_expanded(Shelf::Settled, true);
@@ -346,7 +362,8 @@ mod tests {
                 "agentOrder": "attention", "toasts": false, "sounds": true, "mathRendering": false,
                 "expandedShelves": ["settled"], "textMeasure": 42.0, "uiFont": "Inter",
                 "interfaceFontSize": 15.0, "codeFontSize": 13.0, "terminalFontSize": 12.0,
-                "favoriteModels": ["a/one"], "usageInline": ["anthropic"], "zoom": 1.25})
+                "favoriteModels": ["a/one"], "usageInline": ["anthropic"],
+                "dictationModel": "small.en", "zoom": 1.25})
         );
         assert_eq!(serde_json::from_value::<UiSettings>(value).unwrap(), ui);
         assert!(ui.is_expanded(Shelf::Settled));

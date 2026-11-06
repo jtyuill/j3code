@@ -34,6 +34,7 @@ mod preferences;
 mod services;
 mod settings_view;
 mod sidebar;
+mod speech;
 mod svg_image;
 mod syntax;
 mod terminal_drawer;
@@ -56,7 +57,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::{
     assets::AppAssets, assist::AssistOmp, local_server::LocalServer, services::Services,
-    workspace::Workspace,
+    speech::SpeechEngine, workspace::Workspace,
 };
 
 /// Wayland app id / X11 WM_CLASS; the Linux desktop entry is `<APP_ID>.desktop`.
@@ -86,7 +87,20 @@ fn main() {
         assist::launcher(data_dir.as_deref()),
         dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")),
     );
-    let services = Services::new(runtime.handle().clone(), local, assist, config_path);
+    let speech = SpeechEngine::local(
+        data_dir
+            .as_deref()
+            .unwrap_or(&std::env::temp_dir().join("j3"))
+            .join("models"),
+        runtime.handle().clone(),
+    );
+    // Probing the GPU takes a moment; Settings and the first dictation then
+    // find it done.
+    let probe = Arc::clone(&speech);
+    std::thread::spawn(move || {
+        tracing::info!("dictation runs on {}", probe.hardware().describe());
+    });
+    let services = Services::new(runtime.handle().clone(), local, assist, speech, config_path);
     let termination = runtime.block_on(termination_signal());
 
     gpui_kit::application()

@@ -49,7 +49,15 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use crate::{
-    actions, assist::AssistOmp, local_server::LocalServer, mention, models, services::Services,
+    actions,
+    assist::AssistOmp,
+    local_server::LocalServer,
+    mention, models,
+    services::Services,
+    speech::{
+        AudioSource, AudioStream, ModelStatus, Pass, Recognizer, SpeechEngine,
+        models::{Hardware, SpeechModel},
+    },
     workspace::Workspace,
 };
 
@@ -327,10 +335,10 @@ fn model_info() -> Value {
 }
 
 /// A utility omp (`--no-session`) for the server's model catalog and the
-/// composer's assist: `ready`, then one canned response per command. It
-/// predicts `tor` after any draft ending in `refac` (`or` after `refact`),
-/// logs prediction feedback to `predict-feedback.log` beside itself, and
-/// dictates "hello" while recording and "hello there" in the end.
+/// composer's word prediction: `ready`, then one canned response per
+/// command. It predicts `tor` after any draft ending in `refac` (`or` after
+/// `refact`) and logs prediction feedback to `predict-feedback.log` beside
+/// itself.
 fn fake_omp_script() -> String {
     let model = model_info().to_string();
     format!(
@@ -354,22 +362,53 @@ while IFS= read -r line; do
         *'refac"'*) data='{{"suffix":"tor"}}' ;;
         *) data='{{"suffix":null}}' ;;
       esac ;;
-    *'"type":"dictation_start"'*)
-      capture=$(printf '%s\n' "$line" | sed -n 's/.*"captureId":"\([^"]*\)".*/\1/p')
-      printf '%s\n' "{{\"type\":\"dictation_state\",\"captureId\":\"$capture\",\"state\":\"recording\"}}"
-      printf '{{"type":"response","command":"dictation_start","success":true,"id":"%s"}}\n' "$id"
-      printf '%s\n' "{{\"type\":\"dictation_transcript\",\"captureId\":\"$capture\",\"text\":\"hello\"}}"
-      continue ;;
-    *'"type":"dictation_stop"'*)
-      printf '%s\n' "{{\"type\":\"dictation_state\",\"captureId\":\"$capture\",\"state\":\"transcribing\"}}"
-      printf '%s\n' "{{\"type\":\"dictation_end\",\"captureId\":\"$capture\",\"text\":\"hello there\"}}"
-      command=dictation_stop; data='{{"text":"hello there"}}' ;;
     *) command=unknown; data='{{}}' ;;
   esac
   printf '{{"type":"response","command":"%s","success":true,"id":"%s","data":%s}}\n' "$command" "$id" "$data"
 done
 "#
     )
+}
+
+/// A microphone that has heard a second of sound the moment it opens.
+struct FakeMicrophone;
+
+struct FakeStream;
+
+impl AudioStream for FakeStream {
+    fn rate(&self) -> u32 {
+        16_000
+    }
+}
+
+impl AudioSource for FakeMicrophone {
+    fn open(&self, sink: Arc<Mutex<Vec<f32>>>) -> Result<Box<dyn AudioStream>, String> {
+        sink.lock()
+            .unwrap()
+            .extend(std::iter::repeat_n(0.1, 16_000));
+        Ok(Box::new(FakeStream))
+    }
+}
+
+/// Hears "hello" while recording and "hello there" in the end.
+struct FakeRecognizer(Hardware);
+
+impl Recognizer for FakeRecognizer {
+    fn hardware(&self) -> &Hardware {
+        &self.0
+    }
+
+    fn prepare(&self, _: SpeechModel, _: &mut dyn FnMut(ModelStatus)) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn transcribe(&self, _: &[f32], pass: Pass) -> Result<String, String> {
+        Ok(match pass {
+            Pass::Partial => "hello",
+            Pass::Final => "hello there",
+        }
+        .to_owned())
+    }
 }
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -482,9 +521,22 @@ impl Harness {
         )
         .unwrap();
         let local = Arc::new(LocalServer::from_server(server));
-        // The composer's word prediction and dictation ask the fake omp too.
+        // The composer's word prediction asks the fake omp too.
         let assist = AssistOmp::new(OmpLauncher::new(&omp_path), project_dir.clone());
-        let services = Services::new(runtime.handle().clone(), local, assist, Some(config_path));
+        let speech = SpeechEngine::new(
+            Box::new(FakeMicrophone),
+            Arc::new(FakeRecognizer(Hardware {
+                gpu: None,
+                threads: 4,
+            })),
+        );
+        let services = Services::new(
+            runtime.handle().clone(),
+            local,
+            assist,
+            speech,
+            Some(config_path),
+        );
 
         let (window, _) = cx.update(|cx| {
             gpui_kit::init(cx);

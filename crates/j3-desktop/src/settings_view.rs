@@ -1,5 +1,6 @@
 //! Settings, as a full-window view: the thread workflow and its options,
-//! appearance (zoom, fonts and font sizes), notifications, environments, projects and archived threads. Preference
+//! appearance (zoom, fonts and font sizes), the dictation model,
+//! notifications, environments, projects and archived threads. Preference
 //! changes apply and save at once; environment and project commands go to
 //! the workspace.
 
@@ -29,6 +30,8 @@ use crate::{
     archived::{ArchivedView, Unarchived},
     environment::{Environment, distinct_environments},
     preferences::Preferences,
+    services::Services,
+    speech::models::SpeechModel,
     titlebar,
     ui_settings::{
         CODE_FONT_SIZE_MAX, CODE_FONT_SIZE_MIN, DEFAULT_CODE_FONT_SIZE,
@@ -195,7 +198,7 @@ impl SettingsView {
             })
     }
 
-    fn general_page(&self) -> SettingPage {
+    fn general_page(&self, cx: &App) -> SettingPage {
         let preferences = self.preferences.clone();
         let segmented_item =
             |title: &'static str,
@@ -326,6 +329,7 @@ impl SettingsView {
                 )
                 .description("Typeset LaTeX in messages.")
             }))
+            .group(self.dictation_group(cx))
             .group(
                 SettingGroup::new()
                     .title("Usage")
@@ -342,6 +346,49 @@ impl SettingsView {
                         "Show session, weekly and monthly usage beside the model while an OpenCode Go model is chosen.",
                     )),
             )
+    }
+
+    /// The dictation model: the one recommended for this machine, or one
+    /// picked by name.
+    fn dictation_group(&self, cx: &App) -> SettingGroup {
+        let engine = Services::global(cx).speech();
+        let hardware = engine.hardware().describe();
+        let options = std::iter::once((
+            SharedString::default(),
+            SharedString::from(format!("Recommended: {}", engine.recommended().title())),
+        ))
+        .chain(
+            SpeechModel::ALL
+                .iter()
+                .map(|model| (model.key().into(), model.title().into())),
+        )
+        .collect();
+        let read = self.preferences.clone();
+        let write = self.preferences.clone();
+        SettingGroup::new().title("Dictation").item(
+            SettingItem::new(
+                "Speech model",
+                SettingField::dropdown(
+                    options,
+                    move |cx| {
+                        read.read(cx)
+                            .ui()
+                            .dictation_model()
+                            .map_or_else(SharedString::default, |model| model.key().into())
+                    },
+                    move |value: SharedString, cx| {
+                        let model = (!value.is_empty()).then(|| value.to_string());
+                        write.update(cx, |preferences, cx| {
+                            preferences.update_ui(|ui| ui.dictation_model = model, cx)
+                        })
+                    },
+                )
+                .default_value(SharedString::default()),
+            )
+            .description(format!(
+                "English, transcribed on this machine by Whisper ({hardware}). A model downloads the first time you dictate with it. Larger models are more accurate and slower.",
+            )),
+        )
     }
 
     /// A switch for showing `provider`'s usage windows in the composer.
@@ -766,7 +813,7 @@ impl Focusable for SettingsView {
 impl Render for SettingsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let pages = [
-            self.general_page(),
+            self.general_page(cx),
             self.notifications_page(),
             self.environments_page(cx),
             self.projects_page(cx),

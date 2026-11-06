@@ -1,5 +1,6 @@
 //! App-wide services: the tokio runtime that drives networking and the
-//! in-process server, this machine's assist omp, and orderly shutdown.
+//! in-process server, this machine's assist omp and dictation engine, and
+//! orderly shutdown.
 
 use std::{
     cell::Cell,
@@ -13,7 +14,7 @@ use gpui_kit::{App, Global};
 use j3_client::Connection;
 use tokio::runtime::Handle;
 
-use crate::{assist::AssistOmp, local_server::LocalServer};
+use crate::{assist::AssistOmp, local_server::LocalServer, speech::SpeechEngine};
 
 /// How long quitting waits for the local server to stop its omp sessions.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(8);
@@ -21,8 +22,10 @@ const SHUTDOWN_WAIT: Duration = Duration::from_secs(8);
 pub struct Services {
     runtime: Handle,
     local: Arc<LocalServer>,
-    /// The omp behind the composer's word prediction and dictation.
+    /// The omp behind the composer's word prediction.
     assist: Arc<AssistOmp>,
+    /// The composer's dictation.
+    speech: Arc<SpeechEngine>,
     /// `desktop.json`; `None` when the system has no config directory.
     config_path: Option<PathBuf>,
     quitting: Rc<Cell<bool>>,
@@ -35,12 +38,14 @@ impl Services {
         runtime: Handle,
         local: Arc<LocalServer>,
         assist: Arc<AssistOmp>,
+        speech: Arc<SpeechEngine>,
         config_path: Option<PathBuf>,
     ) -> Self {
         Self {
             runtime,
             local,
             assist,
+            speech,
             config_path,
             quitting: Rc::new(Cell::new(false)),
         }
@@ -64,6 +69,10 @@ impl Services {
 
     pub fn assist(&self) -> &Arc<AssistOmp> {
         &self.assist
+    }
+
+    pub fn speech(&self) -> &Arc<SpeechEngine> {
+        &self.speech
     }
 
     /// Runs `future` on the tokio runtime and resolves with its output on
