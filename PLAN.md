@@ -52,7 +52,7 @@ flowchart LR
 | Wire protocol | WebSocket using t3code's Effect RPC JSON message format, cut down to the methods the trimmed iOS app calls. Rust types live in `j3-protocol`. We own the protocol; server and iOS change together. |
 | iOS | Trimmed fork of `t3code/apps/mobile`: threads, chat, composer, `ask` dialogs. Removed: Android, Clerk, T3 relay/Connect, push, widgets, share extension, Axiom telemetry, EAS/OTA. Free personal team, bundle id `dev.jacobyuill.j3code`, re-signed every 7 days. |
 | Repo | Monorepo. t3code is imported as a snapshot commit (upstream SHA in `NOTICE`), not as history. No upstream sync. |
-| License | GPL-3.0. t3code's MIT notice is kept in `NOTICE`. omp's MIT `omp-rpc` crate is a git dependency. |
+| License | MIT. t3code's MIT notice is kept in `NOTICE`. omp's MIT `omp-rpc` crate is a git dependency. |
 | Build | Cargo workspace. A Nix flake provides the dev shell and packages for shieldy/revived; the Mac uses rustup. |
 
 ## Layout

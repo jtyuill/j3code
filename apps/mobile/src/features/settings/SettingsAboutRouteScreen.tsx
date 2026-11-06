@@ -49,7 +49,7 @@ function AppSettingsSection() {
         </View>
       </SettingsSection>
       <Text className="px-2 text-sm text-foreground-muted">
-        j3 is a fork of t3code, licensed under the GPL-3.0.
+        j3 is a fork of t3code, licensed under the MIT License.
       </Text>
     </View>
   );

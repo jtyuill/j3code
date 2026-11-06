@@ -30,7 +30,7 @@ const SETTINGS_SEARCH_TERMS = {
   SettingsFollowUp: ["follow-ups", "queue", "steer", "while the agent is running"],
   SettingsArchive: ["archive", "archived", "restore", "unarchive"],
   SettingsLabs: ["legacy", "plan mode"],
-  SettingsAbout: ["version", "license", "gpl", "t3code"],
+  SettingsAbout: ["version", "license", "mit", "t3code"],
 } satisfies Partial<Record<SettingsPageTarget, readonly string[]>>;
 const termsById: ReadonlyMap<string, readonly string[]> = new Map(
   Object.entries(SETTINGS_SEARCH_TERMS),
