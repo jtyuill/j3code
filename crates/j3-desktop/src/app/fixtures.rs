@@ -60,15 +60,21 @@ pub enum Scene {
     Settings,
     /// The herdr workflow's sidebar with [`OPEN_THREAD`] open.
     Herdr,
+    /// [`OPEN_THREAD`] open with its file pane (a fixture tree and preview) and git control.
+    Files,
+    /// [`OPEN_THREAD`] open with its git control's commit dialog.
+    GitCommit,
 }
 
 impl Scene {
-    pub const ALL: [Scene; 5] = [
+    pub const ALL: [Scene; 7] = [
         Scene::Fixtures,
         Scene::Thread,
         Scene::NewThread,
         Scene::Settings,
         Scene::Herdr,
+        Scene::Files,
+        Scene::GitCommit,
     ];
 
     /// The `--scene` name.
@@ -79,6 +85,8 @@ impl Scene {
             Scene::NewThread => "new-thread",
             Scene::Settings => "settings",
             Scene::Herdr => "herdr",
+            Scene::Files => "files",
+            Scene::GitCommit => "git-commit",
         }
     }
 }
@@ -93,6 +101,8 @@ pub const SCENES: &[SceneSetup] = &[
     ("new-thread", |s: &mut J3| start(s, Scene::NewThread)),
     ("settings", |s: &mut J3| start(s, Scene::Settings)),
     ("herdr", |s: &mut J3| start(s, Scene::Herdr)),
+    ("files", |s: &mut J3| start(s, Scene::Files)),
+    ("git-commit", |s: &mut J3| start(s, Scene::GitCommit)),
 ];
 
 /// A scene from the command line: default UI settings (not the user's `desktop.json`), so
@@ -149,12 +159,18 @@ pub fn install(s: &mut J3, scene: Scene) {
     ));
     match scene {
         Scene::Fixtures => {}
-        Scene::Thread | Scene::Herdr => {
+        Scene::Thread | Scene::Herdr | Scene::Files | Scene::GitCommit => {
             let key = open_thread_key();
             if s.subscribe_thread(&key).is_some()
                 && let Some(thread) = s.threads.get_mut(&key)
             {
                 thread.state = Arc::new(thread_state());
+            }
+            if scene == Scene::Files {
+                crate::files::fixtures::install(s, &key);
+            }
+            if matches!(scene, Scene::Files | Scene::GitCommit) {
+                crate::git::fixtures::install(s, &key, scene == Scene::GitCommit);
             }
             s.route.main = Main::Thread(key);
         }
