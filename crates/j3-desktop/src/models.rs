@@ -3,7 +3,6 @@
 
 use std::{collections::HashMap, hash::Hash};
 
-use gpui_kit::SharedString;
 use j3_protocol::t3::{
     model::{
         ModelSelection, ProviderOptionDescriptor, ProviderOptionSelection,
@@ -53,25 +52,23 @@ impl ModelChoice {
 /// nothing else does.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ModelLabel {
-    name: SharedString,
-    qualifier: Option<SharedString>,
+    name: String,
+    qualifier: Option<String>,
     /// `qualifier` without the provider's name.
-    detail: Option<SharedString>,
-    text: SharedString,
-    section_text: SharedString,
+    detail: Option<String>,
+    text: String,
+    section_text: String,
 }
 
 impl ModelLabel {
     fn new(name: String, provider: Option<&str>, detail: Option<String>) -> Self {
-        let name = SharedString::from(name);
-        let qualifier = qualifier(provider, detail.as_deref()).map(SharedString::from);
-        let detail = detail.map(SharedString::from);
+        let qualifier = qualifier(provider, detail.as_deref());
         let text = match &qualifier {
-            Some(qualifier) => format!("{name} ({qualifier})").into(),
+            Some(qualifier) => format!("{name} ({qualifier})"),
             None => name.clone(),
         };
         let section_text = match &detail {
-            Some(detail) => format!("{name} ({detail})").into(),
+            Some(detail) => format!("{name} ({detail})"),
             None => name.clone(),
         };
         Self {
@@ -84,30 +81,30 @@ impl ModelLabel {
     }
 
     /// The pretty name ([`mention::display_name`]).
-    pub fn name(&self) -> &SharedString {
+    pub fn name(&self) -> &str {
         &self.name
     }
 
     /// What sets the model apart from others with its name; shown muted
     /// after the name.
-    pub fn qualifier(&self) -> Option<&SharedString> {
-        self.qualifier.as_ref()
+    pub fn qualifier(&self) -> Option<&str> {
+        self.qualifier.as_deref()
     }
 
     /// [`Self::qualifier`] without the provider's name, for a row under its
     /// provider's header (which already names it).
-    pub fn section_qualifier(&self) -> Option<&SharedString> {
-        self.detail.as_ref()
+    pub fn section_qualifier(&self) -> Option<&str> {
+        self.detail.as_deref()
     }
 
     /// The label as plain text: `Name (qualifier)`, or just the name.
-    pub fn text(&self) -> &SharedString {
+    pub fn text(&self) -> &str {
         &self.text
     }
 
     /// [`Self::text`] without the provider's name, for where the provider's
     /// logo already shows it: `Name (detail)`, or just the name.
-    pub fn section_text(&self) -> &SharedString {
+    pub fn section_text(&self) -> &str {
         &self.section_text
     }
 }
@@ -476,7 +473,7 @@ mod tests {
         let labels = model_labels(&choices);
         let sections: Vec<Option<&str>> = labels
             .iter()
-            .map(|label| label.section_qualifier().map(SharedString::as_str))
+            .map(ModelLabel::section_qualifier)
             .collect();
         assert_eq!(sections, [None, None, Some("20251101")]);
     }
@@ -493,12 +490,9 @@ mod tests {
         ];
         let labels = model_labels(&choices);
         assert_eq!(labels[0].qualifier(), None);
-        assert_eq!(labels[1].name().as_str(), "Claude Opus 4.5");
-        assert_eq!(
-            labels[1].qualifier().map(SharedString::as_str),
-            Some("20251101")
-        );
-        assert_eq!(labels[1].text().as_str(), "Claude Opus 4.5 (20251101)");
+        assert_eq!(labels[1].name(), "Claude Opus 4.5");
+        assert_eq!(labels[1].qualifier(), Some("20251101"));
+        assert_eq!(labels[1].text(), "Claude Opus 4.5 (20251101)");
         assert_eq!(labels[1].section_qualifier(), labels[1].qualifier());
     }
 

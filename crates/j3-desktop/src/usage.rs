@@ -2,77 +2,70 @@
 //! through `j3.getUsage`), shown from the composer's usage button for the
 //! composer's environment and the chosen model's provider.
 //!
-//! [`UsageStore`] is app-wide: the last snapshot of each environment is
-//! cached in `usage.json` next to `desktop.json` and shown as it is. While a
-//! composer shows an environment's usage button, that environment is asked
-//! again once a minute, and opening the button asks at once; until an answer
-//! arrives (and when one fails) the cached snapshot stays on screen.
+//! [`UsageStore`] is app-wide (`J3::usage`): the last snapshot of each
+//! environment is cached in `usage.json` next to `desktop.json` and shown as
+//! it is. While a composer shows an environment's usage button, that
+//! environment is asked again once a minute, and opening the button asks at
+//! once; until an answer arrives (and when one fails) the cached snapshot
+//! stays on screen.
+//!
+//! How a composer uses it:
+//! - While it shows an environment's usage button it holds a watch:
+//!   `J3::watch_usage(env, true, tx)` when the button appears (which also
+//!   asks at once when the cached snapshot is stale) and
+//!   `J3::watch_usage(env, false, tx)` when it goes away; every watch is
+//!   paired with an unwatch.
+//! - Opening the button calls `J3::refresh_usage(env)`.
+//! - The button and its popover read [`UsageStore::snapshot`] (with
+//!   [`peak`], [`breakdown`] and [`windows`] for the provider),
+//!   [`UsageStore::is_pending`] for a spinner, [`UsageStore::error`] for the
+//!   last failure and [`UsageStore::updated_at`] for the snapshot's age.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
     time::Duration,
 };
 
-use gpui_kit::component::{
-    ActiveTheme as _, Sizable as _, StyledExt as _, h_flex, progress::Progress, spinner::Spinner,
-    v_flex,
-};
-use gpui_kit::prelude::FluentBuilder as _;
-use gpui_kit::{
-    AnyElement, App, AppContext as _, Context, Entity, Global, InteractiveElement as _,
-    IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
-    Styled as _, Subscription, Task, TestSupportExt as _, WeakEntity, Window, div, px,
-};
-use j3_protocol::j3::{UsageLimit, UsageReport, UsageSnapshot};
+use j3_protocol::j3::{UsageLimit, UsageSnapshot};
 use time::OffsetDateTime;
 
-use crate::{environment::Environment, feed::age_since, logos, services::Services};
+use crate::app::J3;
 
 const CACHE_FILE: &str = "usage.json";
 /// How often the shown environments' usage is asked for again.
 const POLL_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Every environment's last usage snapshot, shared by the usage buttons.
+#[derive(Default)]
 pub struct UsageStore {
     /// Latest snapshot per environment key.
     cache: BTreeMap<String, UsageSnapshot>,
     /// Environments with a request in flight.
-    pending: HashMap<SharedString, Task<()>>,
+    pending: HashSet<String>,
     /// The last request's failure, per environment.
-    errors: HashMap<SharedString, SharedString>,
+    errors: HashMap<String, String>,
     /// `None` without a config directory: nothing is persisted.
     path: Option<PathBuf>,
-    /// Live usage buttons and their environments; polled while any lives.
-    watched: Vec<(WeakEntity<UsagePanel>, WeakEntity<Environment>)>,
-    /// The polling loop, while anything is watched.
-    poll: Option<Task<()>>,
+    /// Watched environments and how many usage buttons watch each.
+    watched: HashMap<String, usize>,
+    /// When (`Clock::t`) the watched environments are next polled, while
+    /// anything is watched.
+    poll_at: Option<f64>,
 }
 
-struct GlobalUsageStore(Entity<UsageStore>);
-
-impl Global for GlobalUsageStore {}
-
 impl UsageStore {
-    /// The app's store, created (and its cache loaded) on first use.
-    pub fn global(cx: &mut App) -> Entity<UsageStore> {
-        if let Some(store) = cx.try_global::<GlobalUsageStore>() {
-            return store.0.clone();
-        }
-        let path = Services::global(cx)
-            .config_path()
-            .map(|config| config.with_file_name(CACHE_FILE));
+    /// The store with its cache loaded from `usage.json` beside
+    /// `config_path` (`desktop.json`, `Services::config_path`); `None` keeps
+    /// nothing on disk.
+    pub fn load(config_path: Option<PathBuf>) -> Self {
+        let path = config_path.map(|config| config.with_file_name(CACHE_FILE));
         let cache = path.as_deref().map(load).unwrap_or_default();
-        let store = cx.new(|_| Self {
+        Self {
             cache,
-            pending: HashMap::new(),
-            errors: HashMap::new(),
             path,
-            watched: Vec::new(),
-            poll: None,
-        });
-        cx.set_global(GlobalUsageStore(store.clone()));
-        store
+            ..Self::default()
+        }
     }
 
     /// `env`'s cached snapshot.
@@ -80,87 +73,21 @@ impl UsageStore {
         self.cache.get(env)
     }
 
-    /// Asks `env` for a new snapshot, unless a request is in flight; the
-    /// cached snapshot stays until it is replaced.
-    pub fn refresh(&mut self, env: &Entity<Environment>, cx: &mut Context<Self>) {
-        let env = env.read(cx);
-        let key = env.key().clone();
-        if self.pending.contains_key(&key) {
-            return;
-        }
-        let connection = env.connection().clone();
-        let task = cx.spawn({
-            let key = key.clone();
-            async move |this, cx| {
-                let result = connection.usage().await;
-                let _ = this.update(cx, |this, cx| {
-                    this.pending.remove(&key);
-                    match result {
-                        Ok(snapshot) => {
-                            this.errors.remove(&key);
-                            this.cache.insert(key.to_string(), snapshot);
-                            this.save();
-                        }
-                        Err(error) => {
-                            this.errors.insert(key, error.to_string().into());
-                        }
-                    }
-                    cx.notify();
-                });
-            }
-        });
-        self.pending.insert(key, task);
-        cx.notify();
+    /// Whether a request for `env` is in flight.
+    pub fn is_pending(&self, env: &str) -> bool {
+        self.pending.contains(env)
     }
 
-    /// Keeps `env`'s snapshot fresh while `panel` lives: refreshed now if
-    /// stale, then every [`POLL_INTERVAL`].
-    pub fn watch(
-        &mut self,
-        panel: WeakEntity<UsagePanel>,
-        env: &Entity<Environment>,
-        cx: &mut Context<Self>,
-    ) {
-        self.watched.push((panel, env.downgrade()));
-        if self.is_stale(env.read(cx).key(), OffsetDateTime::now_utc()) {
-            self.refresh(env, cx);
-        }
-        if self.poll.is_none() {
-            self.poll = Some(cx.spawn(async move |this, cx| {
-                loop {
-                    cx.background_executor().timer(POLL_INTERVAL).await;
-                    let polling = this.update(cx, |this, cx| this.poll_watched(cx));
-                    if !polling.unwrap_or(false) {
-                        break;
-                    }
-                }
-            }));
-        }
+    /// Why `env`'s last request failed; cleared by the next answer.
+    pub fn error(&self, env: &str) -> Option<&str> {
+        self.errors.get(env).map(String::as_str)
     }
 
-    /// One poll: drops the closed panels and refreshes the environments
-    /// still shown whose snapshot is stale. `false` stops polling (nothing
-    /// is watched any more).
-    fn poll_watched(&mut self, cx: &mut Context<Self>) -> bool {
-        self.watched
-            .retain(|(panel, env)| panel.upgrade().is_some() && env.upgrade().is_some());
-        if self.watched.is_empty() {
-            self.poll = None;
-            return false;
-        }
-        let now = OffsetDateTime::now_utc();
-        let envs: Vec<Entity<Environment>> = self
-            .watched
-            .iter()
-            .filter_map(|(_, env)| env.upgrade())
-            .collect();
-        for env in envs {
-            // `refresh` skips an environment already asked this tick.
-            if self.is_stale(env.read(cx).key(), now) {
-                self.refresh(&env, cx);
-            }
-        }
-        true
+    /// When `env`'s cached snapshot was taken.
+    pub fn updated_at(&self, env: &str) -> Option<OffsetDateTime> {
+        self.cache
+            .get(env)
+            .and_then(|snapshot| unix_ms(snapshot.generated_at))
     }
 
     /// Whether `env`'s snapshot is missing or due for a poll. A little
@@ -172,6 +99,22 @@ impl UsageStore {
             .is_none_or(|at| now - at >= POLL_INTERVAL - Duration::from_secs(5))
     }
 
+    /// Lands the answer to `env`'s request: a snapshot replaces the cached
+    /// one (and is saved), an error keeps it.
+    fn answered(&mut self, env: String, result: Result<UsageSnapshot, String>) {
+        self.pending.remove(&env);
+        match result {
+            Ok(snapshot) => {
+                self.errors.remove(&env);
+                self.cache.insert(env, snapshot);
+                self.save();
+            }
+            Err(error) => {
+                self.errors.insert(env, error);
+            }
+        }
+    }
+
     fn save(&self) {
         let Some(path) = &self.path else {
             return;
@@ -180,6 +123,79 @@ impl UsageStore {
         if let Err(error) = std::fs::write(path, json) {
             tracing::warn!(%error, path = %path.display(), "saving the usage cache");
         }
+    }
+}
+
+impl J3 {
+    /// Asks `env` for a new snapshot, unless a request is in flight; the
+    /// cached snapshot stays until it is replaced.
+    pub fn refresh_usage(&mut self, env: &str) {
+        if self.usage.pending.contains(env) {
+            return;
+        }
+        let Some(environment) = self.envs.get(env) else {
+            return;
+        };
+        let connection = environment.connection().clone();
+        let key = env.to_owned();
+        self.usage.pending.insert(key.clone());
+        self.spawn(async move {
+            let result = connection.usage().await.map_err(|error| error.to_string());
+            move |s: &mut J3, _: &mut rune::Tx| s.usage.answered(key, result)
+        });
+    }
+
+    /// Starts (`watching`) or ends one usage button's watch of `env`. While
+    /// any watch holds, `env`'s snapshot is kept fresh: refreshed now if
+    /// stale, then every [`POLL_INTERVAL`].
+    pub fn watch_usage(&mut self, env: &str, watching: bool, tx: &mut rune::Tx) {
+        if !watching {
+            if let Some(count) = self.usage.watched.get_mut(env) {
+                *count -= 1;
+                if *count == 0 {
+                    self.usage.watched.remove(env);
+                }
+            }
+            return;
+        }
+        *self.usage.watched.entry(env.to_owned()).or_default() += 1;
+        if self.usage.is_stale(env, self.clock.now) {
+            self.refresh_usage(env);
+        }
+        if self.usage.poll_at.is_none() {
+            self.usage.poll_at = Some(self.clock.t + POLL_INTERVAL.as_secs_f64());
+            tx.wake_after(POLL_INTERVAL);
+        }
+    }
+
+    /// One poll when it is due: forgets watched environments that are gone
+    /// and refreshes the watched ones whose snapshot is stale; polling stops
+    /// once nothing is watched. True when a refresh started.
+    pub(crate) fn poll_usage(&mut self, tx: &mut rune::Tx) -> bool {
+        if self.usage.poll_at.is_none_or(|at| self.clock.t < at) {
+            return false;
+        }
+        self.usage
+            .watched
+            .retain(|env, _| self.envs.get(env).is_some());
+        if self.usage.watched.is_empty() {
+            self.usage.poll_at = None;
+            return false;
+        }
+        self.usage.poll_at = Some(self.clock.t + POLL_INTERVAL.as_secs_f64());
+        tx.wake_after(POLL_INTERVAL);
+        let now = self.clock.now;
+        let stale: Vec<String> = self
+            .usage
+            .watched
+            .keys()
+            .filter(|env| !self.usage.pending.contains(*env) && self.usage.is_stale(env, now))
+            .cloned()
+            .collect();
+        for env in &stale {
+            self.refresh_usage(env);
+        }
+        !stale.is_empty()
     }
 }
 
@@ -274,148 +290,17 @@ pub fn breakdown(snapshot: &UsageSnapshot, provider: &str) -> Option<String> {
     })
 }
 
-/// One environment's usage for one provider: the usage button's popover.
-pub struct UsagePanel {
-    store: Entity<UsageStore>,
-    environment: Entity<Environment>,
-    /// omp provider id of the composer's model.
-    provider: Option<String>,
-    _store: Subscription,
-}
-
-impl UsagePanel {
-    pub fn new(environment: Entity<Environment>, cx: &mut Context<Self>) -> Self {
-        let store = UsageStore::global(cx);
-        let panel = cx.weak_entity();
-        store.update(cx, |store, cx| store.watch(panel, &environment, cx));
-        Self {
-            _store: cx.observe(&store, |_, _, cx| cx.notify()),
-            store,
-            environment,
-            provider: None,
-        }
-    }
-
-    pub fn set_provider(&mut self, provider: Option<String>, cx: &mut Context<Self>) {
-        if self.provider != provider {
-            self.provider = provider;
-            cx.notify();
-        }
-    }
-
-    /// Asks the environment for a new snapshot.
-    pub fn refresh(&mut self, cx: &mut Context<Self>) {
-        let environment = self.environment.clone();
-        self.store
-            .update(cx, |store, cx| store.refresh(&environment, cx));
-    }
-
-    fn render_report(
-        &self,
-        env_key: &SharedString,
-        ix: usize,
-        report: &UsageReport,
-        accounts: usize,
-        now: OffsetDateTime,
-        cx: &Context<Self>,
-    ) -> AnyElement {
-        let theme = cx.theme();
-        let account = &report.metadata;
-        let who = [
-            account.email.as_deref().or(account.org_name.as_deref()),
-            account.plan_type.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join(" · ");
-        v_flex()
-            .gap_1()
-            // One account needs no heading; several are told apart by it.
-            .when(accounts > 1 && !who.is_empty(), |this| {
-                this.child(
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(who),
-                )
-            })
-            .children(report.limits.iter().enumerate().map(|(lix, limit)| {
-                let id = format!("usage-{env_key}-{ix}-{lix}");
-                render_limit(id, limit, now, cx)
-            }))
-            .into_any_element()
-    }
-}
-
-fn render_limit(id: String, limit: &UsageLimit, now: OffsetDateTime, cx: &App) -> AnyElement {
-    let theme = cx.theme();
-    let fraction = used_fraction(limit);
-    let color = match fraction {
-        Some(f) if f >= 0.9 => theme.danger,
-        Some(f) if f >= 0.7 => theme.warning,
-        _ => theme.progress_bar,
-    };
-    let resets = limit
-        .window
-        .as_ref()
-        .and_then(|window| window.resets_at)
-        .and_then(unix_ms)
-        .map(|at| format!("resets in {}", remaining(at - now)));
-    v_flex()
-        .id(SharedString::from(id.clone()))
-        .test_support()
-        .gap_0p5()
-        .child(
-            h_flex()
-                .gap_2()
-                .text_xs()
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .child(limit_title(limit)),
-                )
-                .child(
-                    div()
-                        .flex_shrink_0()
-                        .text_color(theme.muted_foreground)
-                        .child(match fraction {
-                            Some(f) => format!("{:.0}%", f * 100.),
-                            None => "—".to_owned(),
-                        }),
-                ),
-        )
-        .child(
-            Progress::new(SharedString::from(format!("{id}-bar")))
-                .xsmall()
-                .color(color)
-                .value(fraction.unwrap_or(0.) as f32 * 100.),
-        )
-        .when_some(resets, |this, resets| {
-            this.child(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(resets),
-            )
-        })
-        .into_any_element()
-}
-
 /// The limit's label, with its window when the label doesn't name it
 /// ("Gemini · Weekly", but just "Claude 5 Hour").
-fn limit_title(limit: &UsageLimit) -> String {
+pub fn limit_title(limit: &UsageLimit) -> String {
     match limit.window.as_ref().and_then(|w| w.label.as_deref()) {
         Some(window) if !limit.label.contains(window) => format!("{} · {window}", limit.label),
         _ => limit.label.clone(),
     }
 }
 
-fn used_fraction(limit: &UsageLimit) -> Option<f64> {
+/// How much of `limit` is used, 0 to 1, when it says.
+pub fn used_fraction(limit: &UsageLimit) -> Option<f64> {
     let amount = &limit.amount;
     amount
         .used_fraction
@@ -425,12 +310,13 @@ fn used_fraction(limit: &UsageLimit) -> Option<f64> {
         })
 }
 
-fn unix_ms(ms: i64) -> Option<OffsetDateTime> {
+/// A protocol timestamp (Unix milliseconds) as a time.
+pub fn unix_ms(ms: i64) -> Option<OffsetDateTime> {
     OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000).ok()
 }
 
 /// A countdown such as `45m`, `3h 12m` or `2d 4h`.
-fn remaining(duration: time::Duration) -> String {
+pub fn remaining(duration: time::Duration) -> String {
     let minutes = duration.whole_minutes().max(0);
     match minutes {
         0..60 => format!("{minutes}m"),
@@ -448,95 +334,6 @@ fn load(path: &Path) -> BTreeMap<String, UsageSnapshot> {
         tracing::warn!(%error, path = %path.display(), "ignoring the usage cache");
         BTreeMap::new()
     })
-}
-
-impl Render for UsagePanel {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let now = OffsetDateTime::now_utc();
-        let env = self.environment.read(cx);
-        let key = env.key().clone();
-        let env_label = env.label().clone();
-        let store = self.store.read(cx);
-        let pending = store.pending.contains_key(&key);
-        let error = store.errors.get(&key).cloned();
-        let snapshot = store.cache.get(key.as_ref());
-        let theme = cx.theme();
-        let provider = self.provider.as_deref().unwrap_or_default();
-        let provider_name = logos::provider_name(provider).to_owned();
-        let status: SharedString = if pending {
-            "Updating…".into()
-        } else if let Some(at) = snapshot.and_then(|s| unix_ms(s.generated_at)) {
-            match age_since(at, now).as_str() {
-                "now" => "updated now".into(),
-                age => format!("updated {age} ago").into(),
-            }
-        } else {
-            SharedString::default()
-        };
-        // Report indices stay those of the whole snapshot, so ids are stable.
-        let reports: Vec<(usize, &UsageReport)> = snapshot
-            .iter()
-            .flat_map(|snapshot| snapshot.reports.iter().enumerate())
-            .filter(|(_, report)| report.provider == provider)
-            .collect();
-        let body = if !reports.is_empty() {
-            v_flex()
-                .gap_2()
-                .children(reports.iter().map(|(ix, report)| {
-                    self.render_report(&key, *ix, report, reports.len(), now, cx)
-                }))
-                .into_any_element()
-        } else if snapshot.is_some() {
-            div()
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .child(format!("No usage limits reported for {provider_name}"))
-                .into_any_element()
-        } else {
-            div().into_any_element()
-        };
-        v_flex()
-            .id("usage-panel")
-            .test_support()
-            .w(px(300.))
-            .max_h(px(480.))
-            .overflow_y_scroll()
-            .gap_2()
-            .child(
-                h_flex()
-                    .gap_1p5()
-                    .child(logos::provider_logo(provider, px(14.), cx))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_sm()
-                            .font_semibold()
-                            .child(provider_name),
-                    )
-                    .when(pending, |this| this.child(Spinner::new().xsmall())),
-            )
-            .child(
-                h_flex()
-                    .gap_2()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(div().flex_1().min_w_0().truncate().child(env_label))
-                    .child(div().flex_shrink_0().child(status)),
-            )
-            .when_some(error, |this, error| {
-                this.child(
-                    div()
-                        .id(SharedString::from(format!("usage-error-{key}")))
-                        .test_support()
-                        .text_xs()
-                        .text_color(theme.danger)
-                        .child(error),
-                )
-            })
-            .child(body)
-    }
 }
 
 #[cfg(test)]

@@ -1,10 +1,11 @@
-//! One environment (j3 server) as a GPUI entity: its connection, the latest
-//! connection state, and the chat images fetched through it.
+//! Environments (spec §2.4): one j3 server each, its connection, the latest connection
+//! state forwarded from its `watch` channel, its model catalog, and the chat images fetched
+//! through it. [`Environments`] keeps them in order, the local environment first, and
+//! [`Environments::distinct`] hides servers reached twice.
 
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use base64::Engine as _;
-use gpui_kit::{App, Context, Entity, Image, ImageFormat, SharedString, Task};
 use j3_client::{
     Connection, ConnectionState, ConnectionStatus,
     t3::{
@@ -12,26 +13,25 @@ use j3_client::{
         chat_attachment::ChatAttachment,
     },
 };
+use rune::Tx;
 
 use crate::{
+    app::J3,
+    images::ImageLoad,
+    inbox::Inbox,
     local_server::LocalServerStatus,
     models::{self, ModelChoice},
     services::Services,
 };
+
+/// Key of the local environment.
+pub const LOCAL_KEY: &str = "local";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnvironmentKind {
     /// The in-process server (or the j3-server already on its port).
     Local(LocalServerStatus),
     Remote,
-}
-
-/// An image being fetched for display.
-#[derive(Clone)]
-pub enum ImageLoad {
-    Loading,
-    Loaded(Arc<Image>),
-    Failed,
 }
 
 /// An image the chat shows, by where its bytes come from.
@@ -124,58 +124,55 @@ impl ImageRef {
 
 pub struct Environment {
     /// Stable identity: `local`, or the remote base URL.
-    key: SharedString,
-    label: SharedString,
+    key: String,
+    label: String,
     kind: EnvironmentKind,
     connection: Connection,
     state: Arc<ConnectionState>,
     /// The labelled models `state`'s config offers, rebuilt when its
     /// providers change.
     models: Arc<[ModelChoice]>,
-    images: HashMap<ImageRef, ImageLoad>,
-    _watch: Task<()>,
-}
-
-/// Key of the local environment.
-pub const LOCAL_KEY: &str = "local";
-
-impl Environment {
-    /// The server's stable `environmentId`, once its descriptor is known.
-    pub fn environment_id(&self) -> Option<&str> {
-        self.state
-            .descriptor
-            .as_ref()
-            .map(|descriptor| descriptor.environment_id.as_str())
-    }
+    /// The task forwarding `connection.state()` into the inbox; stopped on drop.
+    watch: Option<tokio::task::AbortHandle>,
 }
 
 impl Environment {
-    pub fn new(
-        key: impl Into<SharedString>,
-        label: impl Into<SharedString>,
+    /// Opens a connection to `url` and forwards its state changes into `inbox` as
+    /// `J3::environment_changed` updates.
+    pub fn open(
+        key: impl Into<String>,
+        label: impl Into<String>,
         url: &str,
         kind: EnvironmentKind,
-        cx: &mut Context<Self>,
+        services: &Services,
+        inbox: &Inbox,
     ) -> Self {
-        let connection = Connection::open(url, Services::global(cx).runtime().clone());
+        let key = key.into();
+        let connection = Connection::open(url, services.runtime.clone());
+        services.register(&connection);
         let mut states = connection.state();
         let state = states.borrow_and_update().clone();
-        let watch = cx.spawn(async move |this, cx| {
+        let inbox = inbox.clone();
+        let env = key.clone();
+        let watch = services.runtime.spawn(async move {
             while states.changed().await.is_ok() {
                 let state = states.borrow_and_update().clone();
-                let updated = this.update(cx, |this, cx| {
-                    let old = this.state.config.as_ref().map(|config| &config.providers);
-                    if old != state.config.as_ref().map(|config| &config.providers) {
-                        this.models = model_catalog(&state);
-                    }
-                    this.state = state;
-                    cx.notify();
-                });
-                if updated.is_err() {
-                    break;
-                }
+                let env = env.clone();
+                inbox.post(move |s, tx| s.environment_changed(&env, state, tx));
             }
         });
+        Self::with_state(key, label, kind, connection, state, Some(watch.abort_handle()))
+    }
+
+    /// An environment over `connection` whose state the caller sets (tests, fixtures).
+    pub fn with_state(
+        key: impl Into<String>,
+        label: impl Into<String>,
+        kind: EnvironmentKind,
+        connection: Connection,
+        state: Arc<ConnectionState>,
+        watch: Option<tokio::task::AbortHandle>,
+    ) -> Self {
         Self {
             key: key.into(),
             label: label.into(),
@@ -183,17 +180,20 @@ impl Environment {
             connection,
             models: model_catalog(&state),
             state,
-            images: HashMap::new(),
-            _watch: watch,
+            watch,
         }
     }
 
-    pub fn key(&self) -> &SharedString {
+    pub fn key(&self) -> &str {
         &self.key
     }
 
-    pub fn label(&self) -> &SharedString {
+    pub fn label(&self) -> &str {
         &self.label
+    }
+
+    pub fn kind(&self) -> &EnvironmentKind {
+        &self.kind
     }
 
     pub fn is_local(&self) -> bool {
@@ -211,6 +211,14 @@ impl Environment {
     /// The models this server offers, labelled for display.
     pub fn models(&self) -> &Arc<[ModelChoice]> {
         &self.models
+    }
+
+    /// The server's stable `environmentId`, once its descriptor is known.
+    pub fn environment_id(&self) -> Option<&str> {
+        self.state
+            .descriptor
+            .as_ref()
+            .map(|descriptor| descriptor.environment_id.as_str())
     }
 
     pub fn is_live(&self) -> bool {
@@ -251,42 +259,21 @@ impl Environment {
         lines.join("\n")
     }
 
-    /// An image for the chat, fetching it on first use. Notifies when a
-    /// fetch finishes.
-    pub fn image(&mut self, image: &ImageRef, cx: &mut Context<Self>) -> ImageLoad {
-        if let Some(load) = self.images.get(image) {
-            return load.clone();
+    /// Stores a newer state, rebuilding the model catalog when the providers changed.
+    pub fn set_state(&mut self, state: Arc<ConnectionState>) {
+        let old = self.state.config.as_ref().map(|config| &config.providers);
+        if old != state.config.as_ref().map(|config| &config.providers) {
+            self.models = model_catalog(&state);
         }
-        self.images.insert(image.clone(), ImageLoad::Loading);
-        let connection = self.connection.clone();
-        let image = image.clone();
-        let runtime = Services::global(cx).runtime().clone();
-        cx.spawn(async move |this, cx| {
-            let bytes = match (&image, image.resource()) {
-                (ImageRef::Url(url), _) if url.starts_with("data:") => data_url(url),
-                (ImageRef::Url(url), _) => fetch_on(&runtime, url.clone()).await,
-                (_, Some(resource)) => match connection.resource_url(resource).await {
-                    Ok(url) => fetch_on(&runtime, url).await,
-                    Err(e) => {
-                        tracing::debug!("asset url for {image:?}: {e}");
-                        None
-                    }
-                },
-                (_, None) => None,
-            };
-            let load = match bytes.and_then(|bytes| Some((sniff_format(&bytes)?, bytes))) {
-                Some((format, bytes)) => {
-                    ImageLoad::Loaded(Arc::new(Image::from_bytes(format, bytes)))
-                }
-                None => ImageLoad::Failed,
-            };
-            let _ = this.update(cx, |this, cx| {
-                this.images.insert(image, load);
-                cx.notify();
-            });
-        })
-        .detach();
-        ImageLoad::Loading
+        self.state = state;
+    }
+}
+
+impl Drop for Environment {
+    fn drop(&mut self) {
+        if let Some(watch) = self.watch.take() {
+            watch.abort();
+        }
     }
 }
 
@@ -298,6 +285,57 @@ fn model_catalog(state: &ConnectionState) -> Arc<[ModelChoice]> {
         .map(models::model_choices)
         .unwrap_or_default()
         .into()
+}
+
+/// The environments in order: the local one first, then the remotes of `desktop.json`.
+#[derive(Default)]
+pub struct Environments {
+    list: Vec<Environment>,
+}
+
+impl Environments {
+    pub fn iter(&self) -> impl Iterator<Item = &Environment> {
+        self.list.iter()
+    }
+
+    pub fn get(&self, key: &str) -> Option<&Environment> {
+        self.list.iter().find(|env| env.key == key)
+    }
+
+    pub fn get_mut(&mut self, key: &str) -> Option<&mut Environment> {
+        self.list.iter_mut().find(|env| env.key == key)
+    }
+
+    /// The local environment (always first once opened).
+    pub fn local(&self) -> Option<&Environment> {
+        self.list.first().filter(|env| env.is_local())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.list.is_empty()
+    }
+
+    pub fn push(&mut self, env: Environment) {
+        self.list.push(env);
+    }
+
+    pub fn remove(&mut self, key: &str) -> Option<Environment> {
+        let ix = self.list.iter().position(|env| env.key == key)?;
+        Some(self.list.remove(ix))
+    }
+
+    /// The environments without the ones that reach a server already listed
+    /// (e.g. the default `shieldy` remote on shieldy itself). Their config
+    /// entries stay; they reappear if the ids ever differ.
+    pub fn distinct(&self) -> Vec<&Environment> {
+        let ids: Vec<Option<&str>> = self.list.iter().map(Environment::environment_id).collect();
+        distinct(&ids).into_iter().map(|ix| &self.list[ix]).collect()
+    }
+
+    /// Every connection, for shutdown and commands across environments.
+    pub fn connections(&self) -> Vec<Connection> {
+        self.list.iter().map(|env| env.connection.clone()).collect()
+    }
 }
 
 /// Indices of the entries to show, given each one's server environment id
@@ -313,30 +351,125 @@ pub fn distinct(ids: &[Option<&str>]) -> Vec<usize> {
         .collect()
 }
 
-/// `environments` without the ones that reach a server already listed
-/// (e.g. the default `shieldy` remote on shieldy itself). Their config
-/// entries stay; they reappear if the ids ever differ.
-pub fn distinct_environments(
-    environments: &[Entity<Environment>],
-    cx: &App,
-) -> Vec<Entity<Environment>> {
-    let ids: Vec<Option<&str>> = environments
-        .iter()
-        .map(|env| env.read(cx).environment_id())
-        .collect();
-    distinct(&ids)
-        .into_iter()
-        .map(|ix| environments[ix].clone())
-        .collect()
-}
+impl J3 {
+    /// Opens the local environment and every remote of `desktop.json`.
+    pub fn open_environments(&mut self) {
+        let hostname = gethostname::gethostname().to_string_lossy().into_owned();
+        let status = match &self.services.local {
+            Some(local) => local.status().clone(),
+            None => LocalServerStatus::External("headless run; no server started".into()),
+        };
+        let local = Environment::open(
+            LOCAL_KEY,
+            hostname,
+            self.services.local_url(),
+            EnvironmentKind::Local(status),
+            &self.services,
+            &self.inbox,
+        );
+        self.envs.push(local);
+        for remote in self.prefs.remotes().to_vec() {
+            let env = Environment::open(
+                remote.url.clone(),
+                remote.label,
+                &remote.url,
+                EnvironmentKind::Remote,
+                &self.services,
+                &self.inbox,
+            );
+            self.envs.push(env);
+        }
+    }
 
-/// The body of `url`, fetched on the tokio runtime (reqwest needs it).
-async fn fetch_on(runtime: &tokio::runtime::Handle, url: String) -> Option<Vec<u8>> {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    runtime.spawn(async move {
-        let _ = tx.send(fetch(&url).await);
-    });
-    rx.await.ok().flatten()
+    /// Validates, saves and connects a new remote environment.
+    pub fn add_environment(&mut self, label: &str, url: &str) -> Result<(), String> {
+        let remote = self.prefs.add_remote(label, url)?;
+        let env = Environment::open(
+            remote.url.clone(),
+            remote.label,
+            &remote.url,
+            EnvironmentKind::Remote,
+            &self.services,
+            &self.inbox,
+        );
+        self.envs.push(env);
+        Ok(())
+    }
+
+    /// Forgets a remote environment: saves `desktop.json`, leaves anything of it on screen,
+    /// and closes its connection.
+    pub fn remove_environment(&mut self, key: &str, tx: &mut Tx) -> Result<(), String> {
+        self.prefs.remove_remote(key)?;
+        let Some(env) = self.envs.remove(key) else {
+            return Ok(());
+        };
+        self.forget_environment(key, tx);
+        self.images.forget_env(key);
+        self.services.unregister(env.connection());
+        let connection = env.connection().clone();
+        self.services
+            .runtime
+            .spawn(async move { connection.close().await });
+        Ok(())
+    }
+
+    /// A newer state for environment `key`, from its watch-forwarding task.
+    pub fn environment_changed(&mut self, key: &str, state: Arc<ConnectionState>, tx: &mut Tx) {
+        let Some(env) = self.envs.get_mut(key) else {
+            return;
+        };
+        env.set_state(state);
+        self.observe_attention(key, tx);
+    }
+
+    /// The image `image` of environment `env` for a view: the cached load, else `Loading`
+    /// while a fetch is recorded for the next `poll`.
+    pub fn image(&self, env: &str, image: &ImageRef) -> ImageLoad {
+        let key = (env.to_owned(), image.clone());
+        match self.images.get(&key) {
+            Some(load) => load,
+            None => {
+                self.inbox.wake();
+                ImageLoad::Loading
+            }
+        }
+    }
+
+    /// Starts the fetches views recorded since the last poll; true when any started.
+    pub(crate) fn fetch_wanted_images(&mut self) -> bool {
+        let wanted = self.images.take_wanted();
+        let started = !wanted.is_empty();
+        for key in wanted {
+            let (env, image) = key.clone();
+            let Some(connection) = self.envs.get(&env).map(|env| env.connection().clone()) else {
+                self.images.set(key, ImageLoad::Failed);
+                continue;
+            };
+            self.images.set(key.clone(), ImageLoad::Loading);
+            self.spawn(async move {
+                let bytes = match (&image, image.resource()) {
+                    (ImageRef::Url(url), _) if url.starts_with("data:") => data_url(url),
+                    (ImageRef::Url(url), _) => fetch(url).await,
+                    (_, Some(resource)) => match connection.resource_url(resource).await {
+                        Ok(url) => fetch(&url).await,
+                        Err(e) => {
+                            tracing::debug!("asset url for {image:?}: {e}");
+                            None
+                        }
+                    },
+                    (_, None) => None,
+                };
+                move |s: &mut J3, _: &mut Tx| {
+                    let load = match bytes {
+                        Some(bytes) => s.images.decode(bytes),
+                        None => ImageLoad::Failed,
+                    };
+                    s.images.set(key, load);
+                }
+            });
+        }
+        started
+    }
 }
 
 async fn fetch(url: &str) -> Option<Vec<u8>> {
@@ -386,44 +519,10 @@ fn percent_decode(text: &str) -> Vec<u8> {
     out
 }
 
-/// The image format of `bytes`, from their signature.
-fn sniff_format(bytes: &[u8]) -> Option<ImageFormat> {
-    Some(match bytes {
-        [0x89, b'P', b'N', b'G', ..] => ImageFormat::Png,
-        [0xFF, 0xD8, 0xFF, ..] => ImageFormat::Jpeg,
-        [b'G', b'I', b'F', b'8', ..] => ImageFormat::Gif,
-        [
-            b'R',
-            b'I',
-            b'F',
-            b'F',
-            _,
-            _,
-            _,
-            _,
-            b'W',
-            b'E',
-            b'B',
-            b'P',
-            ..,
-        ] => ImageFormat::Webp,
-        [b'B', b'M', ..] => ImageFormat::Bmp,
-        [b'I', b'I', 42, 0, ..] | [b'M', b'M', 0, 42, ..] => ImageFormat::Tiff,
-        _ => {
-            let head = String::from_utf8_lossy(&bytes[..bytes.len().min(512)]);
-            let head = head.trim_start_matches('\u{feff}').trim_start();
-            if head.starts_with("<svg") || (head.starts_with("<?xml") && head.contains("<svg")) {
-                ImageFormat::Svg
-            } else {
-                return None;
-            }
-        }
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::images::{Format, sniff};
 
     #[test]
     fn the_same_server_is_listed_once() {
@@ -458,8 +557,8 @@ mod tests {
             ImageRef::Url(png.trim().into())
         );
         let bytes = data_url(png).unwrap();
-        assert_eq!(sniff_format(&bytes), Some(ImageFormat::Png));
+        assert_eq!(sniff(&bytes), Some(Format::Png));
         let svg = data_url("data:image/svg+xml,%3Csvg%20xmlns='x'/%3E").unwrap();
-        assert_eq!(sniff_format(&svg), Some(ImageFormat::Svg));
+        assert_eq!(sniff(&svg), Some(Format::Svg));
     }
 }

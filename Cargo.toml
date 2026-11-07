@@ -26,7 +26,10 @@ clap = { version = "4", features = ["derive"] }
 dirs = "7"
 futures-util = "0.3"
 gethostname = "1"
-gpui-kit = "=0.8.1"
+# Desktop UI: Rune (pin a `dev` rev; `dev` is never rewritten).
+rune = { git = "https://github.com/anomalyco/rune", rev = "5fd9bfa2ec89e6325d6435d95066336d93369d69" }
+rune-kit = { git = "https://github.com/anomalyco/rune", rev = "5fd9bfa2ec89e6325d6435d95066336d93369d69" }
+rune-theme-opencode = { git = "https://github.com/anomalyco/rune", rev = "5fd9bfa2ec89e6325d6435d95066336d93369d69" }
 ratex-layout = "0.1.15"
 ratex-parser = "0.1.15"
 ratex-svg = { version = "0.1.15", features = ["embed-fonts"] }

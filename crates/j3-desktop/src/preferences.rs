@@ -1,12 +1,12 @@
-//! The loaded `desktop.json` as an entity: remote environments and UI
-//! preferences. Every change is written back at once; views observe the
-//! entity to follow the preferences.
+//! The loaded `desktop.json` (spec §2.5): remote environments and UI preferences. Every
+//! change is written back at once; views read `s.prefs` and re-run after the change.
 
 use std::path::PathBuf;
 
-use gpui_kit::{Context, SharedString};
+use rune::Tx;
 
 use crate::{
+    app::J3,
     environments::{DesktopConfig, RemoteEnvironment},
     ui_settings::UiSettings,
 };
@@ -16,7 +16,7 @@ pub struct Preferences {
     /// `None` when the system has no config directory.
     path: Option<PathBuf>,
     /// Why the file could not be read or the last change not saved.
-    error: Option<SharedString>,
+    error: Option<String>,
 }
 
 impl Preferences {
@@ -41,7 +41,16 @@ impl Preferences {
         Self {
             config,
             path,
-            error: error.map(Into::into),
+            error,
+        }
+    }
+
+    /// Preferences held in memory only (tests, headless fixtures): nothing is read or saved.
+    pub fn in_memory(config: DesktopConfig) -> Self {
+        Self {
+            config,
+            path: None,
+            error: None,
         }
     }
 
@@ -53,49 +62,42 @@ impl Preferences {
         &self.config.environments
     }
 
-    pub fn error(&self) -> Option<&SharedString> {
-        self.error.as_ref()
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
     }
 
-    /// Changes the UI preferences and saves them. A failed save keeps the
-    /// change for this session and reports the error.
-    pub fn update_ui(&mut self, change: impl FnOnce(&mut UiSettings), cx: &mut Context<Self>) {
+    /// Changes the UI preferences and saves them; true when anything changed. A failed save
+    /// keeps the change for this session and reports the error.
+    pub fn update_ui(&mut self, change: impl FnOnce(&mut UiSettings)) -> bool {
         let mut ui = self.config.ui.clone();
         change(&mut ui);
         if ui == self.config.ui {
-            return;
+            return false;
         }
         self.config.ui = ui;
         self.error = self
             .save(&self.config)
             .err()
-            .map(|e| format!("Couldn’t save settings: {e}").into());
-        cx.notify();
+            .map(|e| format!("Couldn’t save settings: {e}"));
+        true
     }
 
     /// Validates, stores and saves a new remote environment.
-    pub fn add_remote(
-        &mut self,
-        label: &str,
-        url: &str,
-        cx: &mut Context<Self>,
-    ) -> Result<RemoteEnvironment, String> {
+    pub fn add_remote(&mut self, label: &str, url: &str) -> Result<RemoteEnvironment, String> {
         let mut config = self.config.clone();
         let remote = config.add(label, url).map_err(|e| e.to_string())?;
         self.save(&config)?;
         self.config = config;
-        cx.notify();
         Ok(remote)
     }
 
     /// Forgets the remote environment with this URL and saves.
-    pub fn remove_remote(&mut self, url: &str, cx: &mut Context<Self>) -> Result<(), String> {
+    pub fn remove_remote(&mut self, url: &str) -> Result<(), String> {
         let mut config = self.config.clone();
         config.remove(url);
         self.save(&config)
             .map_err(|e| format!("Couldn’t save the environments: {e}"))?;
         self.config = config;
-        cx.notify();
         Ok(())
     }
 
@@ -104,5 +106,25 @@ impl Preferences {
             Some(path) => config.save(path).map_err(|e| e.to_string()),
             None => Ok(()),
         }
+    }
+}
+
+impl J3 {
+    /// Changes the UI preferences, saves them, and applies what the window needs at once
+    /// (font families). Every view re-runs after a handler, so sizes, zoom and workflow
+    /// follow by themselves.
+    pub fn update_ui(&mut self, change: impl FnOnce(&mut UiSettings), tx: &mut Tx) {
+        let fonts = crate::theme::families(self.prefs.ui());
+        if self.prefs.update_ui(change) && crate::theme::families(self.prefs.ui()) != fonts {
+            crate::theme::apply_families(self.prefs.ui(), tx);
+        }
+    }
+
+    /// Zooms one level in (`steps` > 0) or out (< 0), or back to 100% (0), and saves it.
+    pub fn zoom(&mut self, steps: i32, tx: &mut Tx) {
+        self.update_ui(
+            |ui| ui.zoom = if steps == 0 { 1.0 } else { ui.zoom_step(steps) },
+            tx,
+        );
     }
 }

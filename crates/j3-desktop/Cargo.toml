@@ -1,11 +1,14 @@
 [package]
 name = "j3-desktop"
-description = "j3 desktop app (GPUI)"
+description = "j3 desktop app (Rune)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+
+[lib]
+path = "src/lib.rs"
 
 [[bin]]
 name = "j3"
@@ -19,26 +22,9 @@ base64.workspace = true
 cpal = "0.18"
 dirs.workspace = true
 gethostname.workspace = true
-# Syntax highlighting for the file pane's preview, markdown code blocks in
-# the feed and tool output (JSON comes with `tree-sitter`).
-gpui-kit = { workspace = true, features = [
-    "tree-sitter-bash",
-    "tree-sitter-c",
-    "tree-sitter-cpp",
-    "tree-sitter-css",
-    "tree-sitter-go",
-    "tree-sitter-html",
-    "tree-sitter-java",
-    "tree-sitter-javascript",
-    "tree-sitter-markdown",
-    "tree-sitter-python",
-    "tree-sitter-rust",
-    "tree-sitter-sql",
-    "tree-sitter-toml",
-    "tree-sitter-tsx",
-    "tree-sitter-typescript",
-    "tree-sitter-yaml",
-] }
+# Decoders Rune's image cache picks up (it enables PNG and JPEG itself): chat images and
+# attachments may be GIF, WebP, BMP or TIFF.
+image = { version = "0.25", default-features = false, features = ["bmp", "gif", "tiff", "webp"] }
 j3-client.workspace = true
 j3-core.workspace = true
 j3-protocol.workspace = true
@@ -48,9 +34,14 @@ ratex-svg.workspace = true
 ratex-types.workspace = true
 # HTTPS for speech model downloads.
 reqwest = { workspace = true, features = ["rustls"] }
+rune.workspace = true
+# Markdown (streaming, GFM tables, syntax-coloured fences) for the feed.
+rune-kit = { workspace = true, features = ["markdown"] }
+rune-theme-opencode.workspace = true
 sha2 = "0.10"
 serde.workspace = true
-serde_json.workspace = true
+# Tool inputs show their keys in the order omp wrote them.
+serde_json = { workspace = true, features = ["preserve_order"] }
 thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true
@@ -64,7 +55,5 @@ whisper-rs = { version = "0.16", features = ["metal"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 whisper-rs = { version = "0.16", features = ["vulkan"] }
 
-
 [dev-dependencies]
 futures-util.workspace = true
-gpui-kit = { workspace = true, features = ["test-support"] }

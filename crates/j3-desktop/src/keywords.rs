@@ -20,7 +20,8 @@
 use std::ops::Range;
 use std::time::Duration;
 
-use gpui_kit::{Hsla, hsla};
+use rune::Color;
+use rune::color::srgb_decode;
 
 /// One magic keyword and the hue span of its gradient, in degrees.
 pub struct Keyword {
@@ -74,13 +75,13 @@ pub fn shimmer_phase(elapsed: Duration) -> f32 {
 
 /// One colour per `char` of `keyword.word`, with the gradient rotated by
 /// `phase` (any finite value; it wraps into `[0, 1)`).
-pub fn colors(keyword: &Keyword, phase: f32) -> Vec<Hsla> {
-    let palette: Vec<Hsla> = (0..STOPS)
+pub fn colors(keyword: &Keyword, phase: f32) -> Vec<Color> {
+    let palette: Vec<Color> = (0..STOPS)
         .map(|i| {
             let hue = (keyword.hue_from
                 + (i as f32 / STOPS as f32) * (keyword.hue_to - keyword.hue_from))
                 % 360.0;
-            hsla(hue / 360.0, 0.90, 0.62, 1.0)
+            hsl(hue / 360.0, 0.90, 0.62)
         })
         .collect();
     let wrapped = ((phase % 1.0) + 1.0) % 1.0;
@@ -91,6 +92,29 @@ pub fn colors(keyword: &Keyword, phase: f32) -> Vec<Hsla> {
             palette[(t * STOPS as f32) as usize % STOPS]
         })
         .collect()
+}
+
+/// The opaque colour of sRGB hue `h` (in turns), saturation `s` and
+/// lightness `l`, in linear light.
+fn hsl(h: f32, s: f32, l: f32) -> Color {
+    let chroma = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let sector = (h * 6.0).rem_euclid(6.0);
+    let x = chroma * (1.0 - (sector % 2.0 - 1.0).abs());
+    let (r, g, b) = match sector as u8 {
+        0 => (chroma, x, 0.0),
+        1 => (x, chroma, 0.0),
+        2 => (0.0, chroma, x),
+        3 => (0.0, x, chroma),
+        4 => (x, 0.0, chroma),
+        _ => (chroma, 0.0, x),
+    };
+    let m = l - chroma / 2.0;
+    Color {
+        r: srgb_decode(r + m),
+        g: srgb_decode(g + m),
+        b: srgb_decode(b + m),
+        a: 1.0,
+    }
 }
 
 /// Standalone-prose keywords in `text`, sorted by `range.start`.
@@ -379,8 +403,19 @@ mod tests {
         find(text).iter().map(|f| f.keyword.word).collect()
     }
 
-    fn hue(c: Hsla) -> f32 {
-        c.h * 360.0
+    /// The HSL hue of `c` in degrees, read back from its sRGB components.
+    fn hue(c: Color) -> f32 {
+        let [r, g, b] = [c.r, c.g, c.b].map(rune::color::srgb_encode);
+        let max = r.max(g).max(b);
+        let delta = max - r.min(g).min(b);
+        let sector = if max == r {
+            ((g - b) / delta).rem_euclid(6.0)
+        } else if max == g {
+            (b - r) / delta + 2.0
+        } else {
+            (r - g) / delta + 4.0
+        };
+        sector * 60.0
     }
 
     #[test]

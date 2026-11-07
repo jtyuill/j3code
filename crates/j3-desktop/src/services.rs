@@ -1,45 +1,46 @@
-//! App-wide services: the tokio runtime that drives networking and the
-//! in-process server, this machine's assist omp and dictation engine, and
-//! orderly shutdown.
+//! App-wide services (spec §2.3): the tokio runtime that drives networking and the
+//! in-process server, this machine's assist omp and dictation engine, and orderly shutdown.
 
 use std::{
-    cell::Cell,
-    path::{Path, PathBuf},
-    rc::Rc,
-    sync::Arc,
+    path::PathBuf,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
-use gpui_kit::{App, Global};
 use j3_client::Connection;
 use tokio::runtime::Handle;
 
 use crate::{assist::AssistOmp, local_server::LocalServer, speech::SpeechEngine};
 
-/// How long quitting waits for the local server to stop its omp sessions.
-const SHUTDOWN_WAIT: Duration = Duration::from_secs(8);
+/// How long quitting waits for the connections, the local server's omp sessions and the
+/// assist omp to stop.
+pub const SHUTDOWN_WAIT: Duration = Duration::from_secs(8);
 
 pub struct Services {
-    runtime: Handle,
-    local: Arc<LocalServer>,
+    pub runtime: Handle,
+    /// The in-process server; `None` in headless runs, which never start one.
+    pub local: Option<Arc<LocalServer>>,
     /// The omp behind the composer's word prediction.
-    assist: Arc<AssistOmp>,
+    pub assist: Arc<AssistOmp>,
     /// The composer's dictation.
-    speech: Arc<SpeechEngine>,
+    pub speech: Arc<SpeechEngine>,
     /// `desktop.json`; `None` when the system has no config directory.
-    config_path: Option<PathBuf>,
-    quitting: Rc<Cell<bool>>,
+    pub config_path: Option<PathBuf>,
+    /// `<data>/j3`; `None` when the system has no data directory.
+    pub data_dir: Option<PathBuf>,
+    /// Every environment's connection, closed on shutdown. Environments register theirs
+    /// when they open and remove it when they are dropped from the list.
+    connections: Mutex<Vec<Connection>>,
 }
-
-impl Global for Services {}
 
 impl Services {
     pub fn new(
         runtime: Handle,
-        local: Arc<LocalServer>,
+        local: Option<Arc<LocalServer>>,
         assist: Arc<AssistOmp>,
         speech: Arc<SpeechEngine>,
         config_path: Option<PathBuf>,
+        data_dir: Option<PathBuf>,
     ) -> Self {
         Self {
             runtime,
@@ -47,91 +48,49 @@ impl Services {
             assist,
             speech,
             config_path,
-            quitting: Rc::new(Cell::new(false)),
+            data_dir,
+            connections: Mutex::new(Vec::new()),
         }
     }
 
-    pub fn global(cx: &App) -> &Self {
-        cx.global::<Self>()
+    /// The local environment's URL: this process's server, or the one already on its port.
+    pub fn local_url(&self) -> &str {
+        crate::local_server::LOCAL_URL
     }
 
-    pub fn runtime(&self) -> &Handle {
-        &self.runtime
+    pub(crate) fn register(&self, connection: &Connection) {
+        self.lock().push(connection.clone());
     }
 
-    pub fn config_path(&self) -> Option<&Path> {
-        self.config_path.as_deref()
+    pub(crate) fn unregister(&self, connection: &Connection) {
+        self.lock().retain(|c| c.http_base() != connection.http_base());
     }
 
-    pub fn local(&self) -> &Arc<LocalServer> {
-        &self.local
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Connection>> {
+        self.connections.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    pub fn assist(&self) -> &Arc<AssistOmp> {
-        &self.assist
-    }
-
-    pub fn speech(&self) -> &Arc<SpeechEngine> {
-        &self.speech
-    }
-
-    /// Runs `future` on the tokio runtime and resolves with its output on
-    /// any executor (for reqwest and other reactor-bound work).
-    pub fn run<F>(&self, future: F) -> impl Future<Output = Option<F::Output>> + use<F>
-    where
-        F: Future + Send + 'static,
-        F::Output: Send + 'static,
-    {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.runtime.spawn(async move {
-            let _ = tx.send(future.await);
-        });
-        async move { rx.await.ok() }
-    }
-
-    /// Closes `connections`, stops the local server and the assist omp,
-    /// bounded by [`SHUTDOWN_WAIT`].
-    fn shutdown(&self, connections: Vec<Connection>) -> impl Future<Output = ()> + use<> {
-        let local = Arc::clone(&self.local);
+    /// Closes every connection, stops the local server and the assist omp, bounded by
+    /// [`SHUTDOWN_WAIT`]. Blocks the calling thread (main, after the window's loop ends).
+    pub fn shutdown(&self) {
+        let connections = std::mem::take(&mut *self.lock());
+        let local = self.local.clone();
         let assist = Arc::clone(&self.assist);
-        let done = self.run(async move {
+        self.runtime.block_on(async move {
             let stop = async move {
                 for connection in &connections {
                     connection.close().await;
                 }
-                tokio::join!(local.shutdown(), assist.close());
+                let local = async {
+                    if let Some(local) = local {
+                        local.shutdown().await;
+                    }
+                };
+                tokio::join!(local, assist.close());
             };
             if tokio::time::timeout(SHUTDOWN_WAIT, stop).await.is_err() {
                 tracing::warn!("shutdown timed out after {SHUTDOWN_WAIT:?}");
             }
         });
-        async move {
-            done.await;
-        }
-    }
-
-    /// Shuts down (see [`Services::shutdown`]) and quits. Repeated calls
-    /// while quitting do nothing.
-    pub fn quit(connections: Vec<Connection>, cx: &mut App) {
-        let services = Self::global(cx);
-        if services.quitting.replace(true) {
-            return;
-        }
-        let done = services.shutdown(connections);
-        cx.spawn(async move |cx| {
-            done.await;
-            cx.update(|cx| cx.quit());
-        })
-        .detach();
-    }
-
-    /// Shuts down and exits the process with `code` right away, without
-    /// relying on the platform event loop (used when no window could be
-    /// opened, where some platforms never return from `run`).
-    pub fn exit(connections: Vec<Connection>, code: i32, cx: &mut App) -> ! {
-        let services = Self::global(cx);
-        services.quitting.set(true);
-        services.runtime.block_on(services.shutdown(connections));
-        std::process::exit(code);
     }
 }

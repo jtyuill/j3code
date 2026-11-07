@@ -1,84 +1,38 @@
 //! `j3`: the j3 desktop app. Talks to its own in-process j3 server (the
 //! local environment) and to remote j3 servers over the t3 wire protocol.
 
-// The server-config fixtures in unit tests are large `json!` literals.
-#![recursion_limit = "256"]
-
-mod actions;
-mod agent_hub;
-mod appearance;
-mod archived;
-mod assets;
-mod assist;
-mod attention;
-mod completion;
-mod composer;
-mod dialogs;
-mod environment;
-mod environments;
-mod feed;
-mod feed_view;
-mod file_pane;
-mod git_control;
-mod goto;
-mod keywords;
-mod local_server;
-mod logos;
-mod math;
-mod mention;
-mod message_text;
-mod models;
-mod new_thread;
-mod prediction;
-mod preferences;
-mod services;
-mod settings_view;
-mod sidebar;
-mod speech;
-mod svg_image;
-mod syntax;
-mod terminal_drawer;
-mod terminal_view;
-mod thread_view;
-mod titlebar;
-mod ui_settings;
-#[cfg(test)]
-mod ui_tests;
-mod usage;
-mod workspace;
-
 use std::{path::PathBuf, sync::Arc};
 
-use gpui_kit::component::Theme;
-use gpui_kit::{
-    App, AppContext as _, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size,
+use j3_desktop::{
+    assist::{self, AssistOmp},
+    environments,
+    local_server::LocalServer,
+    services::Services,
+    speech::SpeechEngine,
 };
 use tracing_subscriber::EnvFilter;
-
-use crate::{
-    assets::AppAssets, assist::AssistOmp, local_server::LocalServer, services::Services,
-    speech::SpeechEngine, workspace::Workspace,
-};
-
-/// Wayland app id / X11 WM_CLASS; the Linux desktop entry is `<APP_ID>.desktop`.
-const APP_ID: &str = "dev.jacobyuill.j3code";
 
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
-
-    // Before the runtime starts and anything spawns `omp` or `tailscale`.
+    // Before any other thread exists (`set_var`) and anything spawns `omp` or `tailscale`.
     extend_path();
-
+    // The GPU device and pipeline build on their own thread while the rest starts.
+    rune::prewarm_gpu();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("j3-tokio")
         .build()
         .expect("the tokio runtime starts");
-    // Starting is fast (SQLite open, bind); doing it before the window means
-    // the local connection's first attempt already finds the server.
-    let local = Arc::new(runtime.block_on(LocalServer::start()));
+    // Headless renders (`--snap`, `--tree`, scripts) never start a server; connections to
+    // the local port then fail quietly. A `--scene` runs on offline fixtures
+    // (`app::fixtures`) and needs no server either.
+    let headless = rune::is_headless();
+    let scene = std::env::args().any(|arg| arg == "--scene");
+    // Starting is fast (SQLite open, bind); doing it before the window means the local
+    // connection's first attempt already finds the server.
+    let local = (!headless && !scene).then(|| Arc::new(runtime.block_on(LocalServer::start())));
     let config_path = environments::config_path()
         .inspect_err(|e| tracing::warn!("{e}"))
         .ok();
@@ -94,91 +48,53 @@ fn main() {
             .join("models"),
         runtime.handle().clone(),
     );
-    // Probing the GPU takes a moment; Settings and the first dictation then
-    // find it done.
-    let probe = Arc::clone(&speech);
-    std::thread::spawn(move || {
-        tracing::info!("dictation runs on {}", probe.hardware().describe());
-    });
-    let services = Services::new(runtime.handle().clone(), local, assist, speech, config_path);
-    let termination = runtime.block_on(termination_signal());
-
-    gpui_kit::application()
-        .with_assets(AppAssets)
-        .run(move |cx: &mut App| {
-            gpui_kit::init(cx);
-            cx.set_global(services);
-            actions::init(cx);
-            // SIGTERM (logout, systemd) and SIGINT take the same orderly path
-            // as ⌘Q, so omp sessions are stopped instead of orphaned.
-            cx.spawn(async move |cx| {
-                if termination.await.is_ok() {
-                    tracing::info!("termination signal received; quitting");
-                    cx.update(actions::quit);
-                }
-            })
-            .detach();
-            open_main_window(cx);
-            cx.activate(true);
+    if !headless {
+        // Probing the GPU takes a moment; Settings and the first dictation then find it done.
+        let probe = Arc::clone(&speech);
+        std::thread::spawn(move || {
+            tracing::info!("dictation runs on {}", probe.hardware().describe());
         });
-    // Never wait on a stuck blocking task (e.g. an omp call) at exit.
-    runtime.shutdown_timeout(std::time::Duration::from_secs(1));
-}
+    }
+    let services = Arc::new(Services::new(
+        runtime.handle().clone(),
+        local,
+        assist,
+        speech,
+        config_path,
+        data_dir,
+    ));
 
-/// Resolves when the process receives SIGTERM or SIGINT. The listeners are
-/// installed before this returns, so no signal is missed while the app boots.
-async fn termination_signal() -> tokio::sync::oneshot::Receiver<()> {
-    use tokio::signal::unix::{SignalKind, signal};
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    let listeners = signal(SignalKind::terminate())
-        .and_then(|term| Ok((term, signal(SignalKind::interrupt())?)));
-    match listeners {
-        Ok((mut term, mut int)) => {
-            tokio::spawn(async move {
-                tokio::select! {
-                    _ = term.recv() => {}
-                    _ = int.recv() => {}
-                }
-                let _ = tx.send(());
-            });
+    let app = j3_desktop::app::app(Arc::clone(&services));
+    // SIGTERM (logout, systemd) and SIGINT take the same orderly path as ⌘Q, so omp
+    // sessions are stopped instead of orphaned.
+    let handle = app.handle();
+    runtime.block_on(async {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate())
+            .and_then(|term| Ok((term, signal(SignalKind::interrupt())?)))
+        {
+            Ok((mut term, mut int)) => {
+                tokio::spawn(async move {
+                    tokio::select! {
+                        _ = term.recv() => {}
+                        _ = int.recv() => {}
+                    }
+                    tracing::info!("termination signal received; quitting");
+                    handle.quit();
+                });
+            }
+            Err(e) => tracing::warn!("signal handlers unavailable: {e}"),
         }
-        Err(e) => tracing::warn!("signal handlers unavailable: {e}"),
-    }
-    rx
-}
-
-fn open_main_window(cx: &mut App) {
-    let options = WindowOptions {
-        window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
-            None,
-            size(px(1280.), px(820.)),
-            cx,
-        ))),
-        window_min_size: Some(size(px(720.), px(480.))),
-        // No titlebar of its own: the system one is hidden and the traffic
-        // lights sit on the panes' header row (see `titlebar`). The workspace
-        // re-centres them when the row's height changes with the zoom.
-        titlebar: Some(TitlebarOptions {
-            title: Some("j3".into()),
-            appears_transparent: true,
-            traffic_light_position: Some(titlebar::traffic_light_position(
-                Theme::global(cx).font_size * titlebar::ROW_HEIGHT,
-            )),
-        }),
-        // Matches the Linux desktop entry (flake.nix) so the launcher icon
-        // and taskbar grouping apply to the window.
-        app_id: Some(APP_ID.into()),
-        ..Default::default()
-    };
-    let opened = gpui_kit::open_window(options, cx, |window, cx| {
-        Theme::sync_system_appearance(Some(window), cx);
-        cx.new(|cx| Workspace::new(window, cx))
     });
-    if let Err(e) = opened {
-        tracing::error!("opening the window failed: {e:#}");
-        let connections = Workspace::global_connections(cx);
-        Services::exit(connections, 1, cx);
+    if let Err(e) = app.try_run() {
+        tracing::error!("opening the window failed: {e}");
+        services.shutdown();
+        std::process::exit(1);
     }
+    // Closes connections, stops the local server's omp sessions and the assist omp
+    // (bounded); then never waits on a stuck blocking task (an omp call) at exit.
+    services.shutdown();
+    runtime.shutdown_timeout(std::time::Duration::from_secs(1));
 }
 
 /// Finder (and launchd) start an app bundle with a minimal `PATH` that
@@ -196,7 +112,7 @@ fn extend_path() {
         return;
     }
     // SAFETY: called at the top of `main`, before the tokio runtime or any
-    // other thread exists, so nothing is reading the environment.
+    // other thread of ours exists, so nothing is reading the environment.
     unsafe { std::env::set_var("PATH", &joined) };
     tracing::info!("PATH extended for omp and tailscale");
 }

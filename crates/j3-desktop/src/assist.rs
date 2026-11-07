@@ -3,7 +3,8 @@
 //! a prediction per keystroke should not cross the network.
 //!
 //! [`AssistOmp`] is that omp process (`omp --mode rpc --no-session`), started
-//! on first use and again after it exits. [`Assist`] is its GPUI face.
+//! on first use and again after it exits. The `J3` methods below are its UI
+//! face: they run it on tokio and post answers back through the inbox.
 
 use std::{
     path::{Path, PathBuf},
@@ -13,13 +14,13 @@ use std::{
     },
 };
 
-use gpui_kit::{App, AppContext as _, Entity, Global};
 use j3_core::omp::{
     OmpLauncher, OmpSession,
     omp_rpc::{PredictWordCommand, PredictWordFeedbackCommand},
 };
+use rune::Tx;
 
-use crate::services::Services;
+use crate::app::J3;
 
 /// The launcher for this machine's assist omp: no tools (and so no MCP
 /// servers), skills, rules, context files or extensions, since it never
@@ -172,70 +173,51 @@ impl AssistOmp {
     }
 }
 
-pub struct Assist {
-    omp: Arc<AssistOmp>,
-}
-
-struct GlobalAssist(Entity<Assist>);
-
-impl Global for GlobalAssist {}
-
-impl Assist {
-    /// The app's assist, created on first use.
-    pub fn global(cx: &mut App) -> Entity<Self> {
-        if let Some(assist) = cx.try_global::<GlobalAssist>() {
-            return assist.0.clone();
-        }
-        let omp = Arc::clone(Services::global(cx).assist());
-        let assist = cx.new(|_| Self { omp });
-        cx.set_global(GlobalAssist(assist.clone()));
-        assist
-    }
-
+impl J3 {
     /// Starts the assist omp now, so the first keystroke already gets a
     /// prediction.
-    pub fn warm(&self, cx: &App) {
-        // Runs on tokio whether or not the result is awaited.
-        drop(Services::global(cx).run(Arc::clone(&self.omp).warm()));
+    pub fn warm_assist(&self) {
+        let omp = Arc::clone(&self.services.assist);
+        self.services.runtime.spawn(omp.warm());
     }
 
-    /// omp's ghost-text suffix for the draft `text` with the caret at
-    /// `cursor` (UTF-16). `None` when omp has none or cannot answer (it
-    /// backs off for a while after failing), so failures never reach the
-    /// user per keystroke.
-    pub fn predict(
+    /// Asks omp for the ghost-text suffix of the draft `text` with the caret
+    /// at `cursor` (UTF-16) and applies `then` with the answer: `None` when
+    /// omp has none or cannot answer (it backs off for a while after
+    /// failing), so failures never reach the user per keystroke.
+    pub fn predict_word(
         &self,
         text: String,
         cursor: usize,
-        cx: &App,
-    ) -> impl Future<Output = Option<String>> + use<> {
-        let answer = Services::global(cx).run(Arc::clone(&self.omp).predict(text, cursor));
-        async move {
-            match answer.await? {
+        then: impl FnOnce(&mut J3, Option<String>, &mut Tx) + Send + 'static,
+    ) {
+        let omp = Arc::clone(&self.services.assist);
+        self.spawn(async move {
+            let suffix = match omp.predict(text, cursor).await {
                 Ok(suffix) => suffix.filter(|suffix| !suffix.is_empty()),
                 Err(e) => {
                     tracing::debug!("predict_word: {e}");
                     None
                 }
-            }
-        }
+            };
+            move |s: &mut J3, tx: &mut Tx| then(s, suffix, tx)
+        });
     }
 
     /// Tells omp's predictor whether the suggestion shown after `cursor`
     /// (UTF-16) in `text` was taken or typed past; it learns from both.
-    pub fn feedback(
+    pub fn predict_word_feedback(
         &self,
         text: String,
         cursor: usize,
         suggestion: String,
         accepted: bool,
-        cx: &App,
     ) {
-        let omp = Arc::clone(&self.omp);
-        drop(Services::global(cx).run(async move {
+        let omp = Arc::clone(&self.services.assist);
+        self.services.runtime.spawn(async move {
             if let Err(e) = omp.feedback(text, cursor, suggestion, accepted).await {
                 tracing::debug!("predict_word_feedback: {e}");
             }
-        }));
+        });
     }
 }

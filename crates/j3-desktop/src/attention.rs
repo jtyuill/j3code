@@ -9,7 +9,6 @@ use std::{
     path::PathBuf,
 };
 
-use gpui_kit::SharedString;
 use j3_client::{
     ShellState,
     workflow::{AgentNotification, AgentStatus, agent_notification, agent_status, is_listed},
@@ -19,7 +18,7 @@ use tokio::runtime::Handle;
 /// One alert to show.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Alert {
-    pub env: SharedString,
+    pub env: String,
     pub thread_id: String,
     pub title: String,
     pub kind: AgentNotification,
@@ -50,32 +49,32 @@ impl Alert {
 /// The last status seen of every thread, per environment.
 #[derive(Default)]
 pub struct AttentionMonitor {
-    statuses: HashMap<(SharedString, String), AgentStatus>,
-    /// Environments whose shell has been seen loaded: their first statuses
-    /// are a baseline, not changes.
-    primed: HashSet<SharedString>,
+    /// Thread statuses by environment, then thread id. An environment is
+    /// present once its shell has been seen loaded: its first statuses are a
+    /// baseline, not changes.
+    statuses: HashMap<String, HashMap<String, AgentStatus>>,
 }
 
 impl AttentionMonitor {
     /// Records `env`'s statuses and returns the alerts their changes raise.
     /// `open` is the open thread of this environment, if any.
-    pub fn observe(
-        &mut self,
-        env: &SharedString,
-        shell: &ShellState,
-        open: Option<&str>,
-    ) -> Vec<Alert> {
+    pub fn observe(&mut self, env: &str, shell: &ShellState, open: Option<&str>) -> Vec<Alert> {
         if !shell.loaded {
             return Vec::new();
         }
-        let baseline = self.primed.insert(env.clone());
+        let baseline = !self.statuses.contains_key(env);
+        if baseline {
+            self.statuses.insert(env.to_owned(), HashMap::new());
+        }
+        let Some(statuses) = self.statuses.get_mut(env) else {
+            return Vec::new();
+        };
         let mut alerts = Vec::new();
         let mut seen = HashSet::new();
         for thread in shell.threads.iter().filter(|thread| is_listed(thread)) {
             let next = agent_status(thread);
-            let key = (env.clone(), thread.id.clone());
             seen.insert(thread.id.as_str());
-            let previous = self.statuses.insert(key, next);
+            let previous = statuses.insert(thread.id.clone(), next);
             if baseline {
                 continue;
             }
@@ -84,22 +83,20 @@ impl AttentionMonitor {
             let previous = previous.unwrap_or(AgentStatus::Unknown);
             if let Some(kind) = agent_notification(previous, next, watching) {
                 alerts.push(Alert {
-                    env: env.clone(),
+                    env: env.to_owned(),
                     thread_id: thread.id.clone(),
                     title: thread.title.clone(),
                     kind,
                 });
             }
         }
-        self.statuses
-            .retain(|(e, id), _| e != env || seen.contains(id.as_str()));
+        statuses.retain(|id, _| seen.contains(id.as_str()));
         alerts
     }
 
     /// Forgets a removed environment.
     pub fn forget(&mut self, env: &str) {
-        self.statuses.retain(|(e, _), _| e != env);
-        self.primed.remove(env);
+        self.statuses.remove(env);
     }
 }
 
@@ -158,11 +155,12 @@ impl Sound {
 
     /// Plays the sound on `runtime` without waiting for it. No player (or no
     /// audio device) stays silent.
-    pub fn play(self, runtime: &Handle) {
+    pub fn play(&self, runtime: &Handle) {
+        let sound = *self;
         runtime.spawn(async move {
-            let path = match tokio::task::spawn_blocking(move || self.file()).await {
+            let path = match tokio::task::spawn_blocking(move || sound.file()).await {
                 Ok(Ok(path)) => path,
-                Ok(Err(e)) => return tracing::debug!("writing the {} sound: {e}", self.name()),
+                Ok(Err(e)) => return tracing::debug!("writing the {} sound: {e}", sound.name()),
                 Err(e) => return tracing::debug!("{e}"),
             };
             for program in Self::players() {

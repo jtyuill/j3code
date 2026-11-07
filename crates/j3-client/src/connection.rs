@@ -324,6 +324,31 @@ impl Connection {
         }
     }
 
+    /// A connection that never connects, for offline fixtures: no supervisor runs, its
+    /// state stays the default, every call fails at once with [`Error::Closed`] and thread
+    /// handles stay `Loading`.
+    pub fn offline(http_base: impl Into<String>, runtime: tokio::runtime::Handle) -> Self {
+        let http_base = http_base.into();
+        let shared = Arc::new(Shared {
+            base: reqwest::Url::parse(&http_base).map_err(|e| e.to_string()),
+            http_base,
+            runtime,
+            http: reqwest::Client::new(),
+            state: watch::Sender::new(Arc::new(ConnectionState::default())),
+            session: watch::Sender::new(SessionSlot::Closed),
+        });
+        // Nothing receives commands: subscriptions and closes are dropped.
+        let (commands, _) = mpsc::unbounded_channel();
+        Self {
+            inner: Arc::new(Inner {
+                shared,
+                commands,
+                threads: Mutex::new(HashMap::new()),
+                generations: AtomicU64::new(0),
+            }),
+        }
+    }
+
     pub fn http_base(&self) -> &str {
         &self.inner.shared.http_base
     }
@@ -1297,5 +1322,22 @@ mod tests {
         let title = title_from_prompt(&long, &[]);
         assert!(title.ends_with("..."));
         assert!(title.chars().count() <= 72);
+    }
+
+    #[test]
+    fn an_offline_connection_fails_calls_at_once() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a test runtime");
+        let connection = Connection::offline("http://fixture.invalid:3780", runtime.handle().clone());
+        let thread = connection.thread("t");
+        let result = runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(1), connection.visit("t")).await
+        });
+        assert!(matches!(result, Ok(Err(Error::Closed))));
+        assert_eq!(thread.state().borrow().sync, crate::ThreadSync::Loading);
+        assert_eq!(connection.state().borrow().status, crate::ConnectionStatus::Connecting);
+        runtime.block_on(connection.close());
     }
 }
