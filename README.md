@@ -27,7 +27,7 @@ Forked from [t3code](https://github.com/pingdotgg/t3code). See [PLAN.md](PLAN.md
 - [`omp`](https://github.com/can1357/oh-my-pi) installed and logged in on every machine that runs agents
 - Rust 1.88+ and CMake (the desktop builds whisper.cpp for dictation)
 - Linux desktop builds: `pkg-config`, `glslc`, and the GUI and audio libraries listed in [`ci.yml`](.github/workflows/ci.yml)
-- Optional: Nix (`nix develop` provides the toolchain and libraries), Node 26 + pnpm for the TypeScript packages
+- Optional: Nix (`nix develop`, or direnv via `.envrc`, provides the toolchain, the mold linker and libraries), Node 26 + pnpm for the TypeScript packages
 
 ## Build and run
 

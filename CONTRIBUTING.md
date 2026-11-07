@@ -13,7 +13,8 @@ Thanks for helping with j3code. Bug reports, fixes, and focused features are wel
 ```sh
 git clone git@github.com:jtyuill/j3code.git
 cd j3code
-nix develop        # optional: Rust toolchain, CMake, Linux GUI and audio libraries
+nix develop        # optional: Rust toolchain, CMake, mold, Linux GUI and audio libraries
+                   # (with direnv, `direnv allow` loads it on every `cd` instead)
 pnpm install       # only needed for the TypeScript packages and iOS app
 ```
 
