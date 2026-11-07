@@ -282,6 +282,7 @@ fn pickers(s: &J3, ui: &mut Ui) -> El {
         .w_full()
         .gap(8.0)
         .center_y()
+        .justify_center()
         .child(label("Environment"))
         .child(environment)
         .child(label("Project"))
