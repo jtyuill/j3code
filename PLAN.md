@@ -3,7 +3,7 @@
 j3code is a personal take on [t3code](https://github.com/pingdotgg/t3code): a GUI for running coding agents on your machines and driving them from desktop and phone. It differs from t3code in three ways:
 
 - **One harness.** [Oh My Pi](https://github.com/can1357/oh-my-pi) (`omp`) is the only agent. No provider abstraction.
-- **Native desktop.** The desktop client is Rust + GPUI (Zed's UI framework), not Electron.
+- **Native desktop.** The desktop client is Rust + [Rune](https://github.com/anomalyco/rune) (a GPU-rendered native UI framework), not Electron. It was first built on GPUI (Zed's UI framework) and rewritten on Rune.
 - **Rust server.** The server is a Rust library embedded in the desktop app and also shipped headless (`j3-server`). The iOS app is a trimmed fork of t3code's Expo app, kept wire-compatible with the server.
 
 ## Machines
@@ -39,9 +39,9 @@ flowchart LR
 
 | Area | Decision |
 |---|---|
-| Desktop toolkit | GPUI, macOS arm64 + Linux x86_64. |
+| Desktop toolkit | [Rune](https://github.com/anomalyco/rune) with rune-kit and its OpenCode theme (pinned `dev` rev), macOS arm64 + Linux x86_64. Replaced GPUI. |
 | Desktop v1 scope | Environments (local + remote), project list, thread sidebar, streaming chat with markdown (TeX math typeset with RaTeX: `$…$`, `$$…$$`, `\(…\)`, `\[…\]`; Pandoc's dollar rule keeps prices as prose; a "Render math" setting turns it off), composer (multiline text, pasted images, omp slash commands/skills, `^model` mentions as atomic chips, omp's magic keywords glowing like the TUI draws them, omp's native word prediction as ghost text after the caret — Tab takes the word with a provisional space, → without one, as in omp's editor — and a microphone button left of Send for on-device dictation into the draft), model + thinking picker (with starred favourites; models show their display names, never raw ids, and names that collide get a provider or id-token qualifier), queue/steer/stop (one send button: send, queue or stop; messages sent into a run queue, and the queue panel steers them), omp `ask` dialogs, todos, goals, subagent visibility. Tool calls are drawn the way omp's TUI draws them (per-tool icon and title, framed command/diff/match previews that expand in place, code syntax-coloured by file type, commands as bash, JSON input as JSON); images a tool returns show under its row. Markdown images load from the web, `data:` URLs, or as files on the thread's host. Magic keywords (`ultrathink`, `orchestrate`, `workflowz`, `jevify`) and `^provider/model` mentions need no server support: the composer text goes to omp verbatim and omp adds its hidden notices and expands mentions itself; the desktop only draws them (gradient words, model chips in the composer and in sent messages). No diffs in v1. Git control (commit, push, pull, GitHub pull requests through the host's `gh`) followed, then a per-thread terminal drawer (t3's, ⌃\`) and a file pane (the project's tree and a read-only file preview, ⌘⇧E), both running on the thread's host. Alert sounds are j3's own and play only while the window is in the background. Colored SVGs (provider logos, formulas) are rasterized at their exact device-pixel size, since GPUI's `img()` downsamples a 2x raster without mipmaps and aliases on 1x displays. |
-| Server | Rust. `j3-core` is the server library; `j3-server` is the headless binary. No GPUI dependency on the server side. |
+| Server | Rust. `j3-core` is the server library; `j3-server` is the headless binary. No UI dependency on the server side. |
 | Server scope | Projects, threads, and omp orchestration. One small remote directory listing endpoint, so clients can add a project on a remote host. For the terminal drawer and file pane: PTY shells per thread (`terminal.*`) and project file listing and reading (`projects.listEntries`, `projects.readFile`). |
 | Persistence | omp's session `.jsonl` stays the source of truth for the conversation. j3's SQLite stores the project/thread index (thread id → omp session file, project, title, status), settings, and the t3-shaped thread projections the iOS client decodes, together with a monotonic event `sequence` that survives restarts (`docs/protocol/ios-surface.md`). No event log or replay: projections are updated in place from omp events. |
 | Live turns | Turns keep running with no client attached. Clients that reconnect get a projection snapshot followed by sequenced deltas. |
@@ -62,8 +62,8 @@ crates/
   j3-protocol/      client⇄server wire: Effect RPC envelopes (`effect_rpc`) + t3 contract types (`t3`)
   j3-core/          server library: omp driver, engine (thread actors, omp→t3 mapping), SQLite store, hub, HTTP/WS
   j3-server/        headless binary (`j3-server serve [--tailscale]`), port 3780 (t3code keeps 3773)
-  j3-client/        protocol client: connection supervisor, typed calls, shell/thread state reducers (GPUI-agnostic)
-  j3-desktop/       GPUI Kit desktop app (binary `j3`); embeds j3-core as the local environment
+  j3-client/        protocol client: connection supervisor, typed calls, shell/thread state reducers (UI-agnostic)
+  j3-desktop/       Rune desktop app (binary `j3`); embeds j3-core as the local environment
 packages/contracts/ t3code's Effect Schema contracts (unchanged copy); used by the conformance client and later the iOS app
 tests/conformance/  Node client that drives a j3 server like t3's client-runtime and decodes everything with the contracts
 apps/mobile/        trimmed Expo fork of t3code/apps/mobile                [M5]

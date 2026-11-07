@@ -3,7 +3,7 @@
 A native desktop and mobile client for running [Oh My Pi](https://github.com/can1357/oh-my-pi) (`omp`) coding agents on your own machines.
 
 - **One agent.** `omp` is the only harness. Threads are ordinary omp sessions, so `omp --resume` sees them.
-- **Native desktop.** Rust + [GPUI](https://www.gpui.rs/), not Electron. macOS (arm64) and Linux (x86_64).
+- **Native desktop.** Rust + [Rune](https://github.com/anomalyco/rune), not Electron. macOS (arm64) and Linux (x86_64).
 - **Rust server.** `j3-core` is embedded in the desktop app and also ships headless as `j3-server`.
 - **iOS client.** A trimmed Expo app that talks to the same server.
 
@@ -17,7 +17,7 @@ Forked from [t3code](https://github.com/pingdotgg/t3code). See [PLAN.md](PLAN.md
 | `crates/j3-core` | Server library: omp driver, thread engine, SQLite store, HTTP/WebSocket |
 | `crates/j3-server` | Headless server binary |
 | `crates/j3-client` | Protocol client and state reducers (UI-agnostic) |
-| `crates/j3-desktop` | GPUI desktop app (binary `j3`) |
+| `crates/j3-desktop` | Rune desktop app (binary `j3`) |
 | `apps/mobile` | iOS app |
 | `packages/`, `tests/conformance` | Shared TypeScript packages and a protocol conformance client |
 | `contrib/` | systemd unit, macOS app bundler |

@@ -21,16 +21,18 @@
       ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
 
-      # GPUI on Linux: X11/Wayland windowing, xkbcommon keymaps, fontconfig/freetype
-      # text, Vulkan rendering (loaded at runtime).
+      # Rune on Linux: winit's Wayland/X11 windowing (xkbcommon keymaps; the X11 libraries it
+      # opens at runtime) and wgpu's Vulkan rendering (loaded at runtime). Text needs no system
+      # library; Rune asks `fc-match` for the monospace family.
       linuxGuiLibs =
         pkgs: with pkgs; [
-          fontconfig
-          freetype
           libxkbcommon
           vulkan-loader
           wayland
           xorg.libX11
+          xorg.libXcursor
+          xorg.libXi
+          xorg.libXrandr
           xorg.libxcb
         ];
 
@@ -163,7 +165,8 @@
               '';
               postFixup = ''
                 wrapProgram $out/bin/j3 \
-                  --prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath (linuxGuiLibs pkgs)}
+                  --prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath (linuxGuiLibs pkgs)} \
+                  --suffix PATH : ${pkgs.lib.makeBinPath [ pkgs.fontconfig ]}
               '';
               meta.mainProgram = "j3";
             };
