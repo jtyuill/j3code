@@ -146,3 +146,47 @@ fn the_feed_keeps_following_the_reply_after_a_wheel_scroll_at_the_bottom() {
         );
     }
 }
+
+#[test]
+fn an_expanded_row_is_forgotten_once_its_item_leaves_the_feed() {
+    let mut app = scene();
+    let key = open_thread_key();
+    let id = item_id(&app, |kind| {
+        matches!(kind, TurnItemKind::CommandExecution(_))
+    });
+    let other = item_id(&app, |kind| matches!(kind, TurnItemKind::Reasoning(_)));
+    let (k, i, o) = (key.clone(), id.clone(), other.clone());
+    app.rt.update(move |s, _| {
+        s.toggle_feed_row(&k, &i);
+        s.toggle_feed_row(&k, &o);
+    });
+    app.settle(10);
+
+    let mut state = thread_state();
+    state
+        .projection
+        .as_mut()
+        .unwrap()
+        .visible_turn_items
+        .retain(|projected| projected.item.id != id);
+    let next = Arc::new(state);
+    let k = key.clone();
+    app.rt.update(move |s, tx| s.thread_changed(&k, next, tx));
+    app.settle(10);
+    let feed = &app.rt.state.threads[&key].feed;
+    assert!(
+        !feed.is_expanded(&id),
+        "a row that left the feed is forgotten"
+    );
+    assert!(
+        feed.is_expanded(&other),
+        "rows still in the feed stay expanded"
+    );
+
+    // Coming back, it starts collapsed.
+    let next = Arc::new(thread_state());
+    let k = key.clone();
+    app.rt.update(move |s, tx| s.thread_changed(&k, next, tx));
+    app.settle(10);
+    assert!(!app.rt.state.threads[&key].feed.is_expanded(&id));
+}
