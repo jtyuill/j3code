@@ -147,3 +147,35 @@ fn archived_threads_list_and_ask_before_deleting() {
     assert!(deleting, "Delete… asks first");
     assert!(app.rt.find("dialog-confirm").is_some());
 }
+
+#[test]
+fn an_environment_added_while_archived_shows_loads_its_archive() {
+    use std::sync::Arc;
+
+    use crate::{
+        archived::Listing,
+        environment::{Environment, EnvironmentKind},
+    };
+
+    let mut app = TestApp::with_scene(Scene::SettingsArchived);
+    app.frame();
+    let url = "http://revived:3780";
+    let runtime = app.tokio.handle().clone();
+    app.rt.update(move |s, _| {
+        s.envs.push(Environment::with_state(
+            url,
+            "revived",
+            EnvironmentKind::Remote,
+            j3_client::Connection::offline(url, runtime),
+            Arc::new(j3_client::ConnectionState::default()),
+            None,
+        ));
+    });
+    app.settle(60);
+    let archive = app.rt.state.settings.archived.get(url);
+    assert!(
+        archive.is_some_and(|a| !matches!(a.listing, Listing::Loading)),
+        "the new environment's archive was asked for and answered"
+    );
+    assert!(app.rt.find(&format!("archived-{url}")).is_some());
+}

@@ -99,18 +99,31 @@ impl J3 {
     pub fn show_settings_page(&mut self, page: Page, _: &mut Tx) {
         self.settings.page = page;
         self.settings.zoom_open = false;
-        if page == Page::Archived {
-            let missing: Vec<String> = self
-                .envs
-                .distinct()
-                .into_iter()
-                .map(|env| env.key().to_owned())
-                .filter(|key| self.settings.archived.get(key).is_none())
-                .collect();
-            for env in missing {
-                self.load_archived(&env);
-            }
+        self.load_missing_archives();
+    }
+
+    /// While the Archived page shows: loads the archive of any environment listed without
+    /// one (added, or reached for the first time, while the page is open). True when a load
+    /// started.
+    pub(crate) fn poll_settings(&mut self, _: &mut Tx) -> bool {
+        self.load_missing_archives()
+    }
+
+    fn load_missing_archives(&mut self) -> bool {
+        if !self.route.settings || self.settings.page != Page::Archived {
+            return false;
         }
+        let missing: Vec<String> = self
+            .envs
+            .distinct()
+            .into_iter()
+            .map(|env| env.key().to_owned())
+            .filter(|key| self.settings.archived.get(key).is_none())
+            .collect();
+        for env in &missing {
+            self.load_archived(env);
+        }
+        !missing.is_empty()
     }
 
     /// Leaves Settings (nothing when it isn't open); the sidebar takes focus.

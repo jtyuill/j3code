@@ -28,6 +28,7 @@ pub mod local_server;
 pub mod logos;
 pub mod math;
 pub mod mention;
+pub mod menus;
 pub mod message_text;
 pub mod models;
 pub mod new_thread;

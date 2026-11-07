@@ -134,3 +134,44 @@ fn the_project_name_follows_the_folder_until_edited() {
         "j3code"
     );
 }
+
+#[test]
+fn a_closed_add_project_dialogs_replies_reach_nothing() {
+    let mut app = TestApp::with_scene(Scene::Fixtures);
+    app.frame();
+    let local = crate::environment::LOCAL_KEY.to_owned();
+    // Create on the first picker (offline, so it fails), then cancel and open a second one
+    // before the reply lands.
+    let first = local.clone();
+    app.rt.update(move |s, tx| {
+        s.open_dialog(Dialog::add_project(first, true), tx);
+        s.confirm_dialog(tx);
+        s.close_dialog();
+    });
+    let second = local.clone();
+    app.rt
+        .update(move |s, tx| s.open_dialog(Dialog::add_project(second, true), tx));
+    let revision = |app: &TestApp| match &app.rt.state.dialogs.open {
+        Some(Dialog::AddProject(picker)) => (picker.id, picker.revision, picker.creating),
+        _ => panic!("the second picker is open"),
+    };
+    let (id, browse, creating) = revision(&app);
+    assert!(
+        id > 1 && browse > id,
+        "ids and browses come from one app-wide counter"
+    );
+    assert!(!creating);
+    app.settle(60);
+    match &app.rt.state.dialogs.open {
+        Some(Dialog::AddProject(picker)) => {
+            assert_eq!(picker.id, id);
+            assert!(!picker.creating);
+            assert_eq!(
+                picker.error, None,
+                "the first picker's failure isn't shown here"
+            );
+        }
+        _ => panic!("the second picker stays open"),
+    }
+    assert_eq!(app.rt.state.route.main, crate::app::Main::Empty);
+}

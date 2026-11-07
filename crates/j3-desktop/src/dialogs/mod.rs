@@ -131,9 +131,18 @@ pub struct DialogState {
     pub open: Option<Dialog>,
     /// What a field accessor edits when the dialog it named has closed meanwhile.
     scratch: TextEdit,
+    /// Numbers dialog openings and their requests app-wide, so a late reply can tell whether
+    /// it is still the one asked for.
+    serial: u64,
 }
 
 impl DialogState {
+    /// A number no earlier call returned.
+    pub fn next_serial(&mut self) -> u64 {
+        self.serial += 1;
+        self.serial
+    }
+
     pub fn is_goto(&self) -> bool {
         matches!(self.open, Some(Dialog::Goto))
     }
