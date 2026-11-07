@@ -1,10 +1,19 @@
 {
   description = "j3code: native desktop + server for the omp coding agent";
 
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    # Crane builds the dependencies as their own derivation, so a code change
+    # recompiles only the workspace crates.
+    crane.url = "github:ipetkov/crane";
+  };
 
   outputs =
-    { self, nixpkgs }:
+    {
+      self,
+      nixpkgs,
+      crane,
+    }:
     let
       systems = [
         "x86_64-linux"
@@ -41,14 +50,19 @@
           vulkan-loader
         ];
 
+      # `build` is the environment both derivations compile in: it must match
+      # exactly, or cargo rebuilds the dependencies whose build scripts watch it.
+      # `install` applies to the final package only.
       j3Package =
         pkgs:
         {
           pname,
-          extra ? { },
+          build ? { },
+          install ? { },
         }:
-        pkgs.rustPlatform.buildRustPackage (
-          {
+        let
+          craneLib = crane.mkLib pkgs;
+          common = {
             inherit pname;
             version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
             src = pkgs.lib.fileset.toSource {
@@ -59,20 +73,50 @@
                 ./crates
               ];
             };
-            cargoLock = {
-              lockFile = ./Cargo.lock;
-              # omp-rpc is a git dependency pinned by rev in Cargo.toml.
-              allowBuiltinFetchGit = true;
-            };
-            cargoBuildFlags = [
-              "-p"
-              pname
-            ];
+            cargoExtraArgs = "--locked -p ${pname}";
             # Tests run in the dev shell; the live omp test needs credentials anyway.
             doCheck = false;
           }
-          // extra
+          // build;
+        in
+        craneLib.buildPackage (
+          common
+          // {
+            cargoArtifacts = craneLib.buildDepsOnly (
+              common
+              // {
+                # Only the release build is reused; skip crane's extra `cargo check`.
+                cargoCheckCommand = "true";
+              }
+            );
+          }
+          // install
         );
+
+      desktopBuild = pkgs: {
+        nativeBuildInputs = [
+          pkgs.pkg-config
+          pkgs.makeWrapper
+          pkgs.copyDesktopItems
+          pkgs.imagemagick
+        ]
+        ++ speechNativeInputs pkgs;
+        buildInputs = linuxGuiLibs pkgs ++ speechLibs pkgs;
+        # A portable x86-64-v3 whisper.cpp rather than one tuned to the build machine.
+        env = {
+          GGML_NATIVE = "OFF";
+          GGML_AVX = "ON";
+          GGML_AVX2 = "ON";
+          GGML_FMA = "ON";
+          GGML_F16C = "ON";
+        };
+        # bindgenHook copies NIX_CFLAGS_COMPILE into BINDGEN_EXTRA_CLANG_ARGS, including
+        # the per-derivation -frandom-seed; whisper-rs-sys watches that variable, so the
+        # seed would rebuild whisper.cpp in the final package. It doesn't affect bindings.
+        preBuild = ''
+          export BINDGEN_EXTRA_CLANG_ARGS=$(sed 's/-frandom-seed=[^ ]*//g' <<< "$BINDGEN_EXTRA_CLANG_ARGS")
+        '';
+      };
     in
     {
       packages = forAllSystems (
@@ -80,7 +124,7 @@
         {
           j3-server = j3Package pkgs {
             pname = "j3-server";
-            extra.meta.mainProgram = "j3-server";
+            install.meta.mainProgram = "j3-server";
           };
           default = self.packages.${pkgs.stdenv.hostPlatform.system}.j3-server;
         }
@@ -88,23 +132,11 @@
         // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
           j3-desktop = j3Package pkgs {
             pname = "j3-desktop";
-            extra = {
-              nativeBuildInputs = [
-                pkgs.pkg-config
-                pkgs.makeWrapper
-                pkgs.copyDesktopItems
-                pkgs.imagemagick
-              ]
-              ++ speechNativeInputs pkgs;
-              buildInputs = linuxGuiLibs pkgs ++ speechLibs pkgs;
-              # A portable x86-64-v3 whisper.cpp rather than one tuned to the build machine.
-              env = {
-                GGML_NATIVE = "OFF";
-                GGML_AVX = "ON";
-                GGML_AVX2 = "ON";
-                GGML_FMA = "ON";
-                GGML_F16C = "ON";
-                # The source set has no .git; build.rs reads the commit from here.
+            build = desktopBuild pkgs;
+            install = {
+              # The source set has no .git; build.rs reads the commit from here. Only
+              # the final package sees it, so a new commit leaves the dependencies cached.
+              env = (desktopBuild pkgs).env // {
                 J3_GIT_COMMIT = self.shortRev or self.dirtyShortRev or "unknown";
               };
               # Named after the window's app id (APP_ID in crates/j3-desktop/src/main.rs),
@@ -140,24 +172,32 @@
       );
 
       devShells = forAllSystems (pkgs: {
-        default = pkgs.mkShell (
-          {
-            packages = with pkgs; [
-              cargo
-              rustc
-              clippy
-              rustfmt
-              rust-analyzer
-              cmake
-            ];
-            RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
-          }
-          // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
-            nativeBuildInputs = [ pkgs.pkg-config ] ++ speechNativeInputs pkgs;
-            buildInputs = linuxGuiLibs pkgs ++ speechLibs pkgs;
-            LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath (linuxGuiLibs pkgs);
-          }
-        );
+        # mold links the desktop binary in a second or two; GNU ld takes ~20.
+        default =
+          (
+            if pkgs.stdenv.hostPlatform.isLinux then
+              pkgs.mkShell.override { stdenv = pkgs.stdenvAdapters.useMoldLinker pkgs.stdenv; }
+            else
+              pkgs.mkShell
+          )
+            (
+              {
+                packages = with pkgs; [
+                  cargo
+                  rustc
+                  clippy
+                  rustfmt
+                  rust-analyzer
+                  cmake
+                ];
+                RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
+              }
+              // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+                nativeBuildInputs = [ pkgs.pkg-config ] ++ speechNativeInputs pkgs;
+                buildInputs = linuxGuiLibs pkgs ++ speechLibs pkgs;
+                LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath (linuxGuiLibs pkgs);
+              }
+            );
       });
 
       formatter = forAllSystems (pkgs: pkgs.nixfmt-rfc-style);
