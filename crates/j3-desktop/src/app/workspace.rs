@@ -155,7 +155,7 @@ impl J3 {
     }
 
     /// Environment `key` was removed: nothing of it stays on screen.
-    pub(crate) fn forget_environment(&mut self, key: &str, _: &mut Tx) {
+    pub(crate) fn forget_environment(&mut self, key: &str, tx: &mut Tx) {
         let showing = match &self.route.main {
             Main::Thread(open) => open.env == key,
             Main::NewThread => self.new_thread.env == key,
@@ -170,6 +170,7 @@ impl J3 {
         self.files.retain(|thread, _| thread.env != key);
         self.git.retain(|thread, _| thread.env != key);
         self.hubs.retain(|thread, _| thread.env != key);
+        self.prune_composers(tx);
     }
 
     /// Raises attention toasts and, while the window is in the background, sounds for

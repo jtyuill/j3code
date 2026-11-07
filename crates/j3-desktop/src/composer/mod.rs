@@ -152,13 +152,15 @@ impl J3 {
         self.composers.entry(key.clone()).or_default()
     }
 
-    /// The main pane's composer (its thread's, or the new-thread surface's), also while
-    /// Settings or the agents hub covers it.
+    /// The main pane's composer (its thread's, or the new-thread surface's when it has a
+    /// project), also while Settings or the agents hub covers it.
     pub fn main_composer_key(&self) -> Option<ComposerKey> {
         match &self.route.main {
             Main::Thread(thread) => Some(ComposerKey::Thread(thread.clone())),
-            Main::NewThread => Some(self.new_thread.composer_key()),
-            Main::Empty => None,
+            Main::NewThread if self.new_thread.project.is_some() => {
+                Some(self.new_thread.composer_key())
+            }
+            Main::NewThread | Main::Empty => None,
         }
     }
 
@@ -269,22 +271,34 @@ impl J3 {
         catalog
     }
 
-    /// Asks the server for the workspace's commands once, when it has none yet.
+    /// Asks the server for the workspace's commands once, when it has none yet: as soon as
+    /// the environment is live (polled while the composer is the main one).
     fn request_workspace(&mut self, key: &ComposerKey) {
-        if self.composer(key).workspace_requested {
+        if self
+            .composers
+            .get(key)
+            .is_some_and(|c| c.workspace_requested)
+            || !self.envs.get(key.env()).is_some_and(|env| env.is_live())
+        {
             return;
         }
-        let catalog = self.composer_catalog(key);
         let target = self.composer_target(key);
-        let Some(env) = target.env.filter(|env| env.is_live()) else {
+        let Some(env) = target.env else {
             return;
         };
-        if catalog.has_workspace {
+        let state = env.state();
+        let Some(config) = state.config.as_ref() else {
+            return;
+        };
+        let cwd = target.cwd;
+        let known = cwd.is_empty()
+            || state.workspaces.contains_key(&cwd)
+            || Catalog::for_workspace(config, &cwd).has_workspace;
+        let connection = env.connection().clone();
+        self.composer(key).workspace_requested = true;
+        if known {
             return;
         }
-        let connection = env.connection().clone();
-        let cwd = target.cwd;
-        self.composer(key).workspace_requested = true;
         self.services.runtime.spawn(async move {
             if let Err(e) = connection.refresh_workspace(&cwd).await {
                 tracing::warn!("loading commands for {cwd}: {e}");
@@ -336,7 +350,9 @@ impl J3 {
         composer.completions.clear();
         match key {
             ComposerKey::Thread(thread) => self.send_to_thread(thread.clone(), submission),
-            ComposerKey::NewThread { .. } => self.launch_new_thread(submission, tx),
+            ComposerKey::NewThread { env, project } => {
+                self.launch_new_thread(key.clone(), env.clone(), project.clone(), submission, tx)
+            }
         }
     }
 
@@ -390,6 +406,52 @@ impl J3 {
         }
     }
 
+    /// Drops the composers whose environment, thread or project is gone (never the main
+    /// one, nor one still sending), releasing their images, usage watches and microphone.
+    /// Runs when an environment changes or goes.
+    pub(crate) fn prune_composers(&mut self, tx: &mut Tx) {
+        let main = self.main_composer_key();
+        let gone: Vec<ComposerKey> = self
+            .composers
+            .iter()
+            .filter(|(key, c)| Some(*key) != main.as_ref() && !c.busy && self.composer_gone(key))
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in gone {
+            let Some(composer) = self.composers.remove(&key) else {
+                continue;
+            };
+            if let Some(env) = composer.usage_watch {
+                self.watch_usage(&env, false, tx);
+            }
+            if self
+                .speech
+                .capture()
+                .is_some_and(|(owner, _)| *owner == key)
+            {
+                self.cancel_dictation(tx);
+            }
+        }
+    }
+
+    /// Whether `key`'s environment is gone, or its thread or project is no longer listed by
+    /// its (live, so up-to-date) environment.
+    fn composer_gone(&self, key: &ComposerKey) -> bool {
+        let Some(env) = self.envs.get(key.env()) else {
+            return true;
+        };
+        if !env.is_live() {
+            return false;
+        }
+        let shell = &env.state().shell;
+        match key {
+            ComposerKey::Thread(thread) => shell.thread(&thread.thread_id).is_none(),
+            ComposerKey::NewThread { project, .. } => project
+                .as_deref()
+                .is_none_or(|project| shell.project(project).is_none()),
+        }
+    }
+
     /// Per frame: the main composer's focus (warming the predictor, the keyword shimmer),
     /// its usage watch, and the microphone, released when its composer leaves the screen.
     /// True when a shimmer frame or a focus change needs a redraw.
@@ -433,9 +495,9 @@ impl J3 {
             if focused {
                 // The first keystroke already gets a prediction.
                 self.warm_assist();
-                self.request_workspace(&key);
             }
         }
+        self.request_workspace(&key);
         let composer = self.composer(&key);
         if focused && draft::shows_keyword(&composer.edit) {
             if composer.shimmer_at.is_none_or(|at| now >= at) {

@@ -420,6 +420,7 @@ impl J3 {
         };
         env.set_state(state);
         self.observe_attention(key, tx);
+        self.prune_composers(tx);
     }
 
     /// The image `image` of environment `env` for a view: the cached load, else `Loading`

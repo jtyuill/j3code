@@ -19,8 +19,15 @@ use crate::{
 pub(super) struct PickerState {
     pub open: bool,
     pub search: TextEdit,
-    /// The highlighted row's `(instance, slug)`.
-    pub active: Option<(String, String)>,
+    /// The highlighted row: its index among the shown rows (a starred model shows twice,
+    /// under Favorites and under its provider, and only one of them is highlighted).
+    pub active: Option<usize>,
+}
+
+/// A shown row: its model and its element key.
+struct Row {
+    model: (String, String),
+    key: String,
 }
 
 /// One shown section: `None` is Favorites, else the provider; rows index the choices.
@@ -73,12 +80,18 @@ fn sections(choices: &[ModelChoice], favorites: &[String], query: &str) -> Vec<S
 
 impl J3 {
     fn toggle_picker(&mut self, key: &ComposerKey, tx: &mut Tx) {
-        let current = self.composer_choice(key).map(|c| c.key.clone());
+        let open = !self.composer(key).picker.open;
         let picker = &mut self.composer(key).picker;
-        picker.open = !picker.open;
+        picker.open = open;
         picker.search.clear();
-        picker.search.focused = picker.open;
-        picker.active = current;
+        picker.search.focused = open;
+        let current = self.composer_choice(key).map(|c| c.key.clone());
+        let rows = self.picker_rows(key);
+        let active = current.and_then(|current| rows.iter().position(|r| r.model == current));
+        self.composer(key).picker.active = active;
+        if let Some(row) = active.map(|i| &rows[i]) {
+            tx.scroll_into_view(row.key.clone());
+        }
         tx.instant();
     }
 
@@ -100,8 +113,8 @@ impl J3 {
         self.composer(key).level = Some(level);
     }
 
-    /// The rows shown now, in order, as `(instance, slug)`.
-    fn picker_rows(&self, key: &ComposerKey) -> Vec<(String, String)> {
+    /// The rows shown now, in order.
+    fn picker_rows(&self, key: &ComposerKey) -> Vec<Row> {
         let Some(env) = self.envs.get(key.env()) else {
             return Vec::new();
         };
@@ -112,7 +125,12 @@ impl J3 {
             .map_or("", |c| c.picker.search.text.as_str());
         sections(choices, &self.prefs.ui().favorite_models, query)
             .iter()
-            .flat_map(|section| section.rows.iter().map(|&ix| choices[ix].key.clone()))
+            .flat_map(|section| {
+                section.rows.iter().map(|&ix| Row {
+                    model: choices[ix].key.clone(),
+                    key: row_key(&choices[ix], section.provider.is_some()),
+                })
+            })
             .collect()
     }
 
@@ -122,22 +140,15 @@ impl J3 {
             return false;
         }
         let rows = self.picker_rows(key);
-        let picker = &mut self.composer(key).picker;
-        let at = picker
-            .active
-            .as_ref()
-            .and_then(|a| rows.iter().position(|r| r == a));
+        let at = self.composer(key).picker.active.filter(|&i| i < rows.len());
         let delta: isize = match ev.key {
             Key::Escape => {
                 self.close_picker(key);
                 return true;
             }
             Key::Enter => {
-                if let Some(model) = at
-                    .or((!rows.is_empty()).then_some(0))
-                    .map(|i| rows[i].clone())
-                {
-                    self.choose_model(key, model);
+                if let Some(row) = at.or((!rows.is_empty()).then_some(0)).map(|i| &rows[i]) {
+                    self.choose_model(key, row.model.clone());
                 }
                 return true;
             }
@@ -148,17 +159,28 @@ impl J3 {
         if !rows.is_empty() {
             let next = match at {
                 Some(at) => (at as isize + delta).rem_euclid(rows.len() as isize) as usize,
-                None => 0,
+                None if delta > 0 => 0,
+                None => rows.len() - 1,
             };
-            picker.active = Some(rows[next].clone());
-            tx.scroll_into_view(row_key(&rows[next]));
+            self.composer(key).picker.active = Some(next);
+            tx.scroll_into_view(rows[next].key.clone());
         }
         true
     }
+
+    /// The search changed: the first match is highlighted.
+    fn picker_searched(&mut self, key: &ComposerKey) {
+        self.composer(key).picker.active = Some(0);
+    }
 }
 
-fn row_key(model: &(String, String)) -> String {
-    format!("model-{}-{}", model.0, model.1)
+/// A row's element key: under Favorites or under its provider.
+fn row_key(choice: &ModelChoice, in_provider_section: bool) -> String {
+    if in_provider_section {
+        format!("model-{}-{}", choice.key.0, choice.key.1)
+    } else {
+        format!("model-favorite-{}", choice.slug())
+    }
 }
 
 /// The trigger, and the menu in the layer while it is open.
@@ -223,7 +245,7 @@ fn menu(s: &J3, ui: &mut Ui, key: &ComposerKey) {
     let picker = &composer.picker;
     let shown = sections(choices, favorites, &picker.search.text);
 
-    let (edit_key, key_key) = (key.clone(), key.clone());
+    let (edit_key, key_key, change_key) = (key.clone(), key.clone(), key.clone());
     let search = TextInput::new(&picker.search)
         .plain()
         .leading_icon(k.glyph.search)
@@ -233,10 +255,12 @@ fn menu(s: &J3, ui: &mut Ui, key: &ComposerKey) {
         .label("Search models")
         .on_edit(move |s: &mut J3| &mut s.composer(&edit_key).picker.search)
         .on_key(move |s: &mut J3, ev, tx| s.picker_key(&key_key, ev, tx))
+        .on_change(move |s: &mut J3, _| s.picker_searched(&change_key))
         .build(k)
         .key("model-search");
 
     let mut list = col().key("model-rows").w_full().padding(4.0);
+    let mut shown_ix = 0;
     if shown.is_empty() {
         list = list.child(
             row().h(28.0).px(8.0).center_y().child(
@@ -275,8 +299,9 @@ fn menu(s: &J3, ui: &mut Ui, key: &ComposerKey) {
                 section.provider.is_some(),
                 favorites.iter().any(|f| f == choice.slug()),
                 current.as_ref() == Some(&choice.key),
-                picker.active.as_ref() == Some(&choice.key),
+                picker.active == Some(shown_ix),
             ));
+            shown_ix += 1;
         }
     }
 
@@ -356,11 +381,7 @@ fn model_row(
             s.update_ui(move |ui| ui.toggle_favorite(&slug), tx);
         });
     let mut item = row()
-        .key(if in_provider_section {
-            row_key(&choice.key)
-        } else {
-            format!("model-favorite-{slug}")
-        })
+        .key(row_key(choice, in_provider_section))
         .role("option")
         .label(label.text())
         .checked(checked)

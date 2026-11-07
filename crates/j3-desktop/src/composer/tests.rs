@@ -439,3 +439,173 @@ fn transcripts_land_at_the_caret_and_the_draft_sends_only_after_dictation() {
         Some("No speech detected.")
     );
 }
+
+fn tap(app: &mut TestApp, element: &str) {
+    let (x, y) = app
+        .rt
+        .find(element)
+        .unwrap_or_else(|| panic!("{element} shows"));
+    app.rt.pointer_down(x, y);
+    app.rt.pointer_up(x, y);
+    app.frame();
+}
+
+/// The picker rows drawn highlighted.
+fn highlighted(app: &TestApp) -> Vec<String> {
+    app.rt
+        .elements()
+        .into_iter()
+        .filter(|e| {
+            e.role == "option"
+                && e.key.as_deref().is_some_and(|k| k.starts_with("model-"))
+                && e.fill != rune::Color::TRANSPARENT
+        })
+        .filter_map(|e| e.key)
+        .collect()
+}
+
+#[test]
+fn arrow_keys_walk_every_picker_row_once_with_a_starred_model() {
+    let (mut app, key) = focused(Scene::NewThread);
+    let sonnet = "anthropic/claude-sonnet-4-5";
+    let haiku = "anthropic/claude-haiku-4-5";
+    app.rt
+        .update(|s, tx| s.update_ui(|ui| ui.toggle_favorite("anthropic/claude-sonnet-4-5"), tx));
+    tap(&mut app, "model-picker");
+    // Favorites: Sonnet; Anthropic: Opus (chosen), Sonnet, Haiku; then OpenAI.
+    let active = |app: &TestApp| app.rt.state.composers[&key].picker.active;
+    assert_eq!(active(&app), Some(1), "the chosen model is highlighted");
+    app.settle(30);
+    assert_eq!(highlighted(&app), [format!("model-omp-{OPUS}")]);
+    press(&mut app, Key::Down, Mods::default());
+    assert_eq!(active(&app), Some(2));
+    app.settle(30);
+    assert_eq!(
+        highlighted(&app),
+        [format!("model-omp-{sonnet}")],
+        "one copy only"
+    );
+    press(&mut app, Key::Down, Mods::default());
+    assert_eq!(
+        active(&app),
+        Some(3),
+        "past the starred model's second copy"
+    );
+    press(&mut app, Key::Down, Mods::default());
+    assert_eq!(active(&app), Some(4), "on into the next provider");
+    press(&mut app, Key::Up, Mods::default());
+    press(&mut app, Key::Enter, Mods::default());
+    assert_eq!(
+        app.rt
+            .state
+            .composer_choice(&key)
+            .map(|c| c.slug().to_owned())
+            .as_deref(),
+        Some(haiku)
+    );
+
+    // Searching highlights the first match; Enter takes it.
+    tap(&mut app, "model-picker");
+    typed(&mut app, "sonnet");
+    assert_eq!(active(&app), Some(0));
+    press(&mut app, Key::Enter, Mods::default());
+    assert_eq!(
+        app.rt
+            .state
+            .composer_choice(&key)
+            .map(|c| c.slug().to_owned())
+            .as_deref(),
+        Some(sonnet)
+    );
+}
+
+/// Environment `env`'s state with status `status`.
+fn set_status(app: &mut TestApp, env: &str, status: j3_client::ConnectionStatus) {
+    let env = env.to_owned();
+    app.rt.update(move |s, tx| {
+        let mut state = (**s.envs.get(&env).unwrap().state()).clone();
+        state.status = status;
+        s.environment_changed(&env, std::sync::Arc::new(state), tx);
+    });
+    app.frame();
+}
+
+#[test]
+fn workspace_commands_are_asked_for_once_the_environment_is_live() {
+    use j3_client::ConnectionStatus;
+    let (mut app, key) = focused(Scene::NewThread);
+    let env = key.env().to_owned();
+    let requested = |app: &TestApp| app.rt.state.composers[&key].workspace_requested;
+    set_status(&mut app, &env, ConnectionStatus::Connecting);
+    app.rt.update(|s, _| {
+        s.composer(&new_thread_key()).workspace_requested = false;
+    });
+    app.frame();
+    app.frame();
+    assert!(!requested(&app), "nothing to ask while connecting");
+    // Still focused, no focus change: the poll asks once the environment is live.
+    set_status(&mut app, &env, ConnectionStatus::Live);
+    app.frame();
+    assert!(requested(&app));
+}
+
+#[test]
+fn a_new_thread_without_a_project_has_no_composer() {
+    let (mut app, _) = focused(Scene::NewThread);
+    // The environment lists no projects (any more).
+    app.rt.update(|s, tx| {
+        let env = crate::environment::LOCAL_KEY;
+        let mut state = (**s.envs.get(env).unwrap().state()).clone();
+        state.shell.projects.clear();
+        s.environment_changed(env, std::sync::Arc::new(state), tx);
+    });
+    app.settle(10);
+    assert_eq!(app.rt.state.new_thread.project, None);
+    app.rt.update(|s, tx| s.focus_composer(tx));
+    app.settle(10);
+    let s = &app.rt.state;
+    assert_eq!(s.main_composer_key(), None);
+    let projectless = ComposerKey::NewThread {
+        env: crate::environment::LOCAL_KEY.to_owned(),
+        project: None,
+    };
+    assert!(!s.composers.contains_key(&projectless));
+    assert!(
+        s.composers.values().all(|c| c.usage_watch.is_none()),
+        "no usage watch for a composer nobody sees"
+    );
+}
+
+#[test]
+fn composers_of_threads_that_are_gone_are_dropped() {
+    use j3_client::ConnectionStatus;
+    let (mut app, open) = focused(Scene::Thread);
+    let env = open.env().to_owned();
+    let gone = ComposerKey::Thread(crate::sidebar::ThreadKey::new(env.clone(), "thr-gone"));
+    let image_key = gone.clone();
+    app.rt.update(move |s, _| {
+        s.composer(&image_key).edit.replace_text("draft");
+        s.add_composer_image(&image_key, PNG.to_vec(), None);
+    });
+    set_status(&mut app, &env, ConnectionStatus::Live);
+    let s = &app.rt.state;
+    assert!(
+        !s.composers.contains_key(&gone),
+        "an unlisted thread's draft goes"
+    );
+    assert!(s.composers.contains_key(&open), "the open thread's stays");
+
+    // A removed environment takes its composers with it.
+    let shieldy = crate::app::fixtures::SHIELDY_URL;
+    let other = ComposerKey::NewThread {
+        env: shieldy.to_owned(),
+        project: None,
+    };
+    let made = other.clone();
+    app.rt.update(move |s, _| {
+        s.composer(&made);
+    });
+    app.rt
+        .update(move |s, tx| s.remove_environment(shieldy, tx).unwrap());
+    assert!(!app.rt.state.composers.contains_key(&other));
+}
