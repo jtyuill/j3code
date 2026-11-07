@@ -73,10 +73,12 @@ pub enum Scene {
     AddProject,
     /// The Custom snooze dialog for [`OPEN_THREAD`].
     CustomSnooze,
+    /// [`OPEN_THREAD`] open with its agents hub showing.
+    Hub,
 }
 
 impl Scene {
-    pub const ALL: [Scene; 9] = [
+    pub const ALL: [Scene; 10] = [
         Scene::Fixtures,
         Scene::Thread,
         Scene::NewThread,
@@ -86,6 +88,7 @@ impl Scene {
         Scene::SettingsArchived,
         Scene::AddProject,
         Scene::CustomSnooze,
+        Scene::Hub,
     ];
 
     /// The `--scene` name.
@@ -100,6 +103,7 @@ impl Scene {
             Scene::SettingsArchived => "settings-archived",
             Scene::AddProject => "add-project",
             Scene::CustomSnooze => "custom-snooze",
+            Scene::Hub => "hub",
         }
     }
 }
@@ -118,6 +122,7 @@ pub const SCENES: &[SceneSetup] = &[
     ("settings-archived", |s: &mut J3| start(s, Scene::SettingsArchived)),
     ("add-project", |s: &mut J3| start(s, Scene::AddProject)),
     ("custom-snooze", |s: &mut J3| start(s, Scene::CustomSnooze)),
+    ("hub", |s: &mut J3| start(s, Scene::Hub)),
 ];
 
 /// A scene from the command line: default UI settings (not the user's `desktop.json`), so
@@ -174,7 +179,7 @@ pub fn install(s: &mut J3, scene: Scene) {
     ));
     match scene {
         Scene::Fixtures => {}
-        Scene::Thread | Scene::Herdr | Scene::CustomSnooze => {
+        Scene::Thread | Scene::Herdr | Scene::CustomSnooze | Scene::Hub => {
             let key = open_thread_key();
             if s.subscribe_thread(&key).is_some()
                 && let Some(thread) = s.threads.get_mut(&key)
@@ -183,7 +188,11 @@ pub fn install(s: &mut J3, scene: Scene) {
             }
             s.route.main = Main::Thread(key.clone());
             if scene == Scene::CustomSnooze {
-                s.dialogs.open = Some(Dialog::custom_snooze(key));
+                s.dialogs.open = Some(Dialog::custom_snooze(key.clone()));
+            }
+            if scene == Scene::Hub {
+                let hub = s.hubs.entry(key).or_default();
+                hub.open = true;
             }
         }
         Scene::NewThread => {

@@ -148,6 +148,11 @@ fn fixture_scenes_render_offline() {
                 assert!(s.dialogs.open.is_some());
                 assert!(app.rt.find("dialog-confirm").is_some());
             }
+            Scene::Hub => {
+                assert_eq!(s.route.main, Main::Thread(open.clone()));
+                assert!(app.rt.find("agent-hub").is_some());
+                assert!(app.rt.find("composer").is_none());
+            }
         }
     }
 }
