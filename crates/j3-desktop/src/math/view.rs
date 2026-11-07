@@ -66,7 +66,7 @@ pub struct Doc {
 enum Built {
     Markdown {
         source: String,
-        images: Rc<HashMap<String, Image>>,
+        images: Rc<HashMap<String, (Image, f32)>>,
     },
     Paragraph {
         source: String,
@@ -91,16 +91,20 @@ pub fn doc(s: &J3, env: &str, thread_id: &str, text: &str, look: Look) -> Doc {
                 for src in image_sources(&parse_cached(source)) {
                     let image = match parse_src(&src) {
                         Some(index) => formulas.get(index).and_then(|formula| {
-                            s.math.borrow_mut().image(
+                            let image = s.math.borrow_mut().image(
                                 s.images.cache(),
                                 formula,
                                 look.ink,
                                 look.k.ty.body.size,
                                 look.scale,
-                            )
+                            )?;
+                            Some((image, look.scale))
                         }),
                         None => match s.image(env, &ImageRef::markdown(&src, thread_id)) {
-                            ImageLoad::Loaded(image) => Some(image),
+                            ImageLoad::Loaded(image) => {
+                                let density = s.images.density(&image);
+                                Some((image, density))
+                            }
                             ImageLoad::Loading => {
                                 1u8.hash(&mut hasher);
                                 None
@@ -111,13 +115,13 @@ pub fn doc(s: &J3, env: &str, thread_id: &str, text: &str, look: Look) -> Doc {
                             }
                         },
                     };
-                    if let Some(image) = image {
+                    if let Some((image, density)) = image {
                         let ready = image.is_ready();
                         (image.id(), ready).hash(&mut hasher);
                         if !ready {
                             doc.wait.push(image.clone());
                         }
-                        images.insert(src, image);
+                        images.insert(src, (image, density));
                     }
                 }
                 doc.parts.push(Built::Markdown {
@@ -276,24 +280,25 @@ fn gap(before: &Block, next: &Block) -> f32 {
 }
 
 /// `source` through rune-kit's `Markdown`, its images (display formulas among them) from
-/// `images`.
-fn markdown(source: &str, images: Rc<HashMap<String, Image>>, look: Look) -> El {
+/// `images`, each with the device pixels per point it draws at for its natural size.
+fn markdown(source: &str, images: Rc<HashMap<String, (Image, f32)>>, look: Look) -> El {
     let mut style = rune_kit::MarkdownStyle::from_kit(look.k);
     if look.ink != look.k.c.text_base {
         style = style.text(look.ink);
     }
-    let scale = look.scale;
     let width = look.width;
+    let densities = images.clone();
     Markdown::new(source)
         .style(style)
         .streaming(look.streaming)
         .selectable(true)
-        .images(move |src| images.get(src).cloned())
+        .images(move |src| images.get(src).map(|(image, _)| image.clone()))
         .image_frame(move |picture, frame| {
-            if parse_src(frame.src).is_none() {
-                return picture;
+            let density = densities.get(frame.src).map_or(1.0, |(_, d)| *d);
+            if parse_src(frame.src).is_some() {
+                return display_formula(frame.alt, frame.image, density, width).unwrap_or(picture);
             }
-            display_formula(frame.alt, frame.image, scale, width).unwrap_or(picture)
+            natural_size(frame.alt, frame.image, density).unwrap_or(picture)
         })
         .on_link_tx(|_: &mut J3, url, tx| {
             if let Err(e) = tx.open_url(url) {
@@ -303,11 +308,11 @@ fn markdown(source: &str, images: Rc<HashMap<String, Image>>, look: Look) -> El 
         .build(look.k)
 }
 
-/// A display formula rasterized at `scale`: drawn at its size in points, centred in the
-/// column, scrolling sideways when wider than `width`.
-fn display_formula(tex: &str, image: &Image, scale: f32, width: f32) -> Option<El> {
+/// A display formula rasterized at `density` pixels per point: drawn at its size in points,
+/// centred in the column, scrolling sideways when wider than `width`.
+fn display_formula(tex: &str, image: &Image, density: f32, width: f32) -> Option<El> {
     let [w, h] = image.size()?;
-    let (w, h) = (w as f32 / scale, h as f32 / scale);
+    let (w, h) = (w as f32 / density, h as f32 / density);
     let formula = el()
         .role("image")
         .label(tex.to_owned())
@@ -318,6 +323,18 @@ fn display_formula(tex: &str, image: &Image, scale: f32, width: f32) -> Option<E
     } else {
         rune::row().w_full().scroll_x().child(formula)
     })
+}
+
+/// A markdown picture rasterized at `density` pixels per point, drawn at its natural size
+/// in points up to the column's width, as `Markdown` means to draw one.
+fn natural_size(alt: &str, image: &Image, density: f32) -> Option<El> {
+    let [w, h] = image.size()?;
+    let picture = crate::images::fitted(image, w as f32 / density, h as f32 / density, 4.0);
+    Some(
+        picture
+            .role("image")
+            .label(if alt.is_empty() { "Image preview" } else { alt }),
+    )
 }
 
 /// A top-level paragraph holding formulas: `source` (markdown, each formula a placeholder)

@@ -186,24 +186,23 @@ fn output_image(s: &J3, cx: &Ctx, item: &TurnItem, index: u64) -> El {
         item_id: item.id.clone(),
         index,
     };
-    let frame = el()
-        .key(format!("tool-image-{}-{index}", item.id))
-        .role("image")
-        .radius(k.radius.md)
-        .clip_rounded(k.radius.md)
-        .border(0.5, k.c.border_base)
-        .center();
+    let decorate = |frame: El| {
+        frame
+            .key(format!("tool-image-{}-{index}", item.id))
+            .role("image")
+            .radius(k.radius.md)
+            .clip_rounded(k.radius.md)
+            .border(0.5, k.c.border_base)
+    };
+    let frame = decorate(el()).center();
     match s.image(&cx.key.env, &image) {
         ImageLoad::Loaded(image) => match image.size().filter(|_| image.is_ready()) {
             Some([w, h]) if w > 0 && h > 0 => {
-                let (w, h) = (w as f32, h as f32);
+                let density = s.images.density(&image);
+                let (w, h) = (w as f32 / density, h as f32 / density);
                 let fit = (MAX_OUTPUT_IMAGE_HEIGHT / h).min(1.0);
-                frame
+                decorate(crate::images::fitted(&image, w * fit, h * fit, 0.0))
                     .label("Tool output image")
-                    .w_full()
-                    .max_w(w * fit)
-                    .aspect_ratio(w / h)
-                    .pixels(image.pixels())
             }
             _ => {
                 cx.wait(&image);
