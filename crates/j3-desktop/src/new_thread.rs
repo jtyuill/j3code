@@ -1,20 +1,31 @@
 //! The new-thread surface (spec §8.1): environment and project, a composer, and launching
 //! the thread with its first message; the launched thread opens with its composer focused.
+//!
+//! The Environment select lists distinct environments only; the Project picker is
+//! searchable and disabled while the environment has none, when the composer's place says
+//! how to add one. A composer (and its draft) belongs to one environment and project.
 
-use rune::{Cx, El, Tx, col, text};
+use rune::{Cx, El, Tx, col, row, text};
+use rune_kit::{Combobox, ComboboxOption, ComboboxState, Select, SelectAppearance};
 
 use crate::{
+    actions::{Action, shortcut_label},
     app::{J3, Main, Ui},
     composer::ComposerKey,
     environment::LOCAL_KEY,
     sidebar::ThreadKey,
 };
 
-/// Where the next thread starts.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Where the next thread starts, and the pickers choosing it.
+#[derive(Debug, Clone)]
 pub struct NewThreadState {
     pub env: String,
     pub project: Option<String>,
+    /// The Environment listbox is open.
+    pub env_open: bool,
+    pub project_picker: ComboboxState,
+    /// `project` has been listed by its environment (so its absence means it went away).
+    pub project_seen: bool,
 }
 
 impl Default for NewThreadState {
@@ -22,6 +33,9 @@ impl Default for NewThreadState {
         Self {
             env: LOCAL_KEY.to_owned(),
             project: None,
+            env_open: false,
+            project_picker: ComboboxState::default(),
+            project_seen: false,
         }
     }
 }
@@ -40,15 +54,76 @@ impl J3 {
     /// when `None`) with its composer focused.
     pub fn new_thread(&mut self, env: String, project: Option<String>, tx: &mut Tx) {
         self.close_settings(tx);
-        let project = project.or_else(|| {
-            self.envs
-                .get(&env)
-                .and_then(|e| e.state().shell.projects.first())
-                .map(|p| p.id.clone())
-        });
-        self.new_thread = NewThreadState { env, project };
+        self.new_thread.env = env;
+        self.new_thread.project = project;
+        self.new_thread.project_seen = false;
+        self.new_thread.env_open = false;
+        self.new_thread.project_picker.close();
+        self.sync_new_thread_project();
         self.route.main = Main::NewThread;
         self.focus_composer(tx);
+    }
+
+    /// Starts the next thread on environment `env` instead, on its first project.
+    pub fn choose_new_thread_env(&mut self, env: String, tx: &mut Tx) {
+        self.new_thread.env_open = false;
+        if self.new_thread.env == env {
+            return;
+        }
+        self.new_thread.env = env;
+        self.new_thread.project = None;
+        self.new_thread.project_seen = false;
+        self.sync_new_thread_project();
+        self.focus_composer(tx);
+    }
+
+    /// Starts the next thread in project `project_id` of the chosen environment.
+    pub fn choose_new_thread_project(&mut self, project_id: String, tx: &mut Tx) {
+        if self.new_thread.project.as_deref() == Some(project_id.as_str()) {
+            return;
+        }
+        self.new_thread.project = Some(project_id);
+        self.focus_composer(tx);
+    }
+
+    /// Keeps the chosen project one the environment has: its first one when there is no
+    /// choice or the chosen project went away. A chosen project not listed yet (just
+    /// created) is waited for. True when the choice changed.
+    fn sync_new_thread_project(&mut self) -> bool {
+        let target = &mut self.new_thread;
+        let Some(env) = self.envs.get(&target.env) else {
+            return false;
+        };
+        let projects = &env.state().shell.projects;
+        if let Some(id) = &target.project {
+            if projects.iter().any(|p| &p.id == id) {
+                target.project_seen = true;
+                return false;
+            }
+            if !target.project_seen {
+                return false;
+            }
+        }
+        let first = projects.first().map(|p| p.id.clone());
+        target.project_seen = first.is_some();
+        if first == target.project {
+            return false;
+        }
+        target.project = first;
+        true
+    }
+
+    /// While the new-thread surface shows: follows its environment's projects as they load
+    /// or change (a new first project takes the composer's focus).
+    pub(crate) fn poll_new_thread(&mut self, tx: &mut Tx) -> bool {
+        if self.route.main != Main::NewThread || !self.sync_new_thread_project() {
+            return false;
+        }
+        if self.new_thread.project.is_some() && !self.route.settings && self.dialogs.open.is_none()
+        {
+            self.focus_composer(tx);
+        }
+        true
     }
 
     /// Launches a thread on the chosen project with the composer's submission (its text,
@@ -90,21 +165,28 @@ impl J3 {
     }
 }
 
-/// The new-thread surface: where it starts, then the composer.
+/// The new-thread surface: where it starts, then the composer (or how to add a project).
 pub fn view(s: &J3, cx: &mut Cx<J3>, ui: &mut Ui) -> El {
+    let target = &s.new_thread;
+    let pickers = pickers(s, ui);
     let k = ui.k;
-    let target = s.new_thread.clone();
-    let env = s.envs.get(&target.env);
-    let place = match (env, &target.project) {
-        (Some(env), Some(project)) => {
-            let title = env
-                .state()
-                .shell
-                .project(project)
-                .map_or(project.as_str(), |p| p.title.as_str());
-            format!("{title} · {}", env.label())
-        }
-        _ => "Add a project to this environment to start a thread".to_owned(),
+    let body = match &target.project {
+        Some(_) => crate::composer::view(s, cx, ui, &target.composer_key()),
+        None => row()
+            .key("new-thread-empty")
+            .w_full()
+            .padding(16.0)
+            .radius(12.0)
+            .border(1.0, k.c.border_base)
+            .child(
+                text(format!(
+                    "Add a project to this environment to start a thread ({}).",
+                    shortcut_label(Action::AddProject)
+                ))
+                .font(k.ty.text_small)
+                .color(k.c.text_muted)
+                .wrap(),
+            ),
     };
     col()
         .key("new-thread-view")
@@ -121,12 +203,86 @@ pub fn view(s: &J3, cx: &mut Cx<J3>, ui: &mut Ui) -> El {
                 .px(16.0)
                 .pt(16.0)
                 .pb(12.0)
-                .child(
-                    text(place)
-                        .key("new-thread-target")
-                        .font(k.ty.text_small)
-                        .color(k.c.text_muted),
-                )
-                .child(crate::composer::view(s, cx, ui, &target.composer_key())),
+                .child(pickers)
+                .child(body),
         )
+}
+
+/// "Environment" (distinct environments) and "Project" (searchable; disabled when the
+/// environment has none).
+fn pickers(s: &J3, ui: &mut Ui) -> El {
+    let k = ui.k;
+    let target = &s.new_thread;
+    let envs = s.envs.distinct();
+    let labels: Vec<&str> = envs.iter().map(|env| env.label()).collect();
+    let current = s.envs.get(&target.env).map(|env| env.label());
+    let environment = Select::new("new-thread-environment", &labels)
+        .appearance(SelectAppearance::Field)
+        .width(ui.m.rems(12.0))
+        .label("Environment")
+        .current(current)
+        .open(target.env_open)
+        .on_toggle(|s: &mut J3| s.new_thread.env_open = !s.new_thread.env_open)
+        .on_close(|s: &mut J3| s.new_thread.env_open = false)
+        .on_choose(|s: &mut J3, label: &str, tx: &mut Tx| {
+            let chosen = s
+                .envs
+                .distinct()
+                .into_iter()
+                .find(|env| env.label() == label)
+                .map(|env| env.key().to_owned());
+            match chosen {
+                Some(env) => s.choose_new_thread_env(env, tx),
+                None => s.new_thread.env_open = false,
+            }
+        })
+        .build(k, ui.layer);
+    let projects: Vec<ComboboxOption> = s
+        .envs
+        .get(&target.env)
+        .map(|env| {
+            env.state()
+                .shell
+                .projects
+                .iter()
+                .map(|project| {
+                    let mut option = ComboboxOption::new(&project.id, &project.title);
+                    option.detail = project.workspace_root.clone();
+                    option
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let project = Combobox::new(
+        "new-thread-project",
+        &target.project_picker,
+        &projects,
+        project_picker,
+    )
+    .label("Project")
+    .current(target.project.as_deref())
+    .placeholder("No projects")
+    .search_placeholder("Search projects")
+    .width(ui.m.rems(16.0))
+    .disabled(projects.is_empty())
+    .on_choose(|s: &mut J3, id: &str, tx: &mut Tx| s.choose_new_thread_project(id.to_owned(), tx))
+    .build(k, ui.layer);
+    let label = |line: &str| {
+        text(line.to_owned())
+            .font(k.ty.text_xsmall)
+            .color(k.c.text_muted)
+    };
+    row()
+        .key("new-thread-target")
+        .w_full()
+        .gap(8.0)
+        .center_y()
+        .child(label("Environment"))
+        .child(environment)
+        .child(label("Project"))
+        .child(project)
+}
+
+fn project_picker(s: &mut J3) -> &mut ComboboxState {
+    &mut s.new_thread.project_picker
 }

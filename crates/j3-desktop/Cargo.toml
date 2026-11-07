@@ -21,6 +21,8 @@ base64.workspace = true
 # speech recognition built from whisper.cpp; the GPU backend is per target.
 cpal = "0.18"
 dirs.workspace = true
+# Settings' font pickers list the installed families (already built for ratex's fonts).
+fontdb = "0.23"
 gethostname.workspace = true
 # Decoders Rune's image cache picks up (it enables PNG and JPEG itself): chat images and
 # attachments may be GIF, WebP, BMP or TIFF.

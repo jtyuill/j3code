@@ -7,6 +7,7 @@
 
 pub mod actions;
 pub mod app;
+pub mod archived;
 pub mod assist;
 pub mod attention;
 pub mod completion;
