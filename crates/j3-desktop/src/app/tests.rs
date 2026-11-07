@@ -119,13 +119,17 @@ fn fixture_scenes_render_offline() {
                 assert!(app.rt.find(&open.element_id("thread")).is_some());
                 assert!(app.rt.find("empty").is_some());
             }
-            Scene::Thread | Scene::Herdr => {
+            Scene::Thread | Scene::Herdr | Scene::Terminal => {
                 assert_eq!(s.route.main, Main::Thread(open.clone()));
                 assert!(s.threads[&open].state.projection.is_some());
                 assert!(app.rt.find("feed").is_some());
                 assert_eq!(
                     s.prefs.ui().workflow == Workflow::Herdr,
                     scene == Scene::Herdr
+                );
+                assert_eq!(
+                    app.rt.find("terminal-drawer").is_some(),
+                    scene == Scene::Terminal
                 );
             }
             Scene::NewThread => {

@@ -60,15 +60,18 @@ pub enum Scene {
     Settings,
     /// The herdr workflow's sidebar with [`OPEN_THREAD`] open.
     Herdr,
+    /// [`OPEN_THREAD`] open with its terminal drawer showing a coloured shell session.
+    Terminal,
 }
 
 impl Scene {
-    pub const ALL: [Scene; 5] = [
+    pub const ALL: [Scene; 6] = [
         Scene::Fixtures,
         Scene::Thread,
         Scene::NewThread,
         Scene::Settings,
         Scene::Herdr,
+        Scene::Terminal,
     ];
 
     /// The `--scene` name.
@@ -79,6 +82,7 @@ impl Scene {
             Scene::NewThread => "new-thread",
             Scene::Settings => "settings",
             Scene::Herdr => "herdr",
+            Scene::Terminal => "terminal",
         }
     }
 }
@@ -93,6 +97,7 @@ pub const SCENES: &[SceneSetup] = &[
     ("new-thread", |s: &mut J3| start(s, Scene::NewThread)),
     ("settings", |s: &mut J3| start(s, Scene::Settings)),
     ("herdr", |s: &mut J3| start(s, Scene::Herdr)),
+    ("terminal", |s: &mut J3| start(s, Scene::Terminal)),
 ];
 
 /// A scene from the command line: default UI settings (not the user's `desktop.json`), so
@@ -149,12 +154,15 @@ pub fn install(s: &mut J3, scene: Scene) {
     ));
     match scene {
         Scene::Fixtures => {}
-        Scene::Thread | Scene::Herdr => {
+        Scene::Thread | Scene::Herdr | Scene::Terminal => {
             let key = open_thread_key();
             if s.subscribe_thread(&key).is_some()
                 && let Some(thread) = s.threads.get_mut(&key)
             {
                 thread.state = Arc::new(thread_state());
+            }
+            if scene == Scene::Terminal {
+                crate::terminal::fixture::install(s, &key);
             }
             s.route.main = Main::Thread(key);
         }
