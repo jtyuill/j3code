@@ -177,3 +177,55 @@ fn the_hub_opens_only_with_subagents() {
     assert!(!is_open(&app));
     assert!(app.rt.find("composer").is_some());
 }
+
+#[test]
+fn a_held_left_key_does_not_close_the_hub() {
+    let mut app = hub_app();
+    app.key(press(Key::Left));
+    for _ in 0..3 {
+        app.frame();
+    }
+    // The key's repeats arrive past the 40 ms floor, but a held key is no second tap.
+    app.rt.repeat_key(press(Key::Left));
+    app.frame();
+    assert!(is_open(&app));
+}
+
+#[test]
+fn a_reset_transcript_shows_its_new_text() {
+    use j3_protocol::j3::{SubagentTranscript, TranscriptEntry};
+
+    let mut app = hub_app();
+    let key = open_thread_key();
+    let read = |from: u64, next: u64, reset: bool, text: &str| {
+        let key = key.clone();
+        let entries = vec![TranscriptEntry::Assistant {
+            text: text.to_owned(),
+        }];
+        move |s: &mut J3, tx: &mut rune::Tx| {
+            let transcript = SubagentTranscript {
+                next_byte: next,
+                reset,
+                more: false,
+                entries,
+            };
+            s.hub_read(&key, "sa-bench", from, Ok(transcript), tx);
+        }
+    };
+    let shows = |app: &TestApp, text: &str| {
+        app.rt
+            .elements()
+            .into_iter()
+            .any(|e| e.text.as_deref() == Some(text))
+    };
+    app.rt.update(read(0, 10, false, "first answer"));
+    app.frame();
+    assert!(shows(&app, "first answer"));
+    app.rt.update(read(10, 8, true, "rewritten answer"));
+    app.frame();
+    assert!(
+        shows(&app, "rewritten answer"),
+        "the same index draws its new text"
+    );
+    assert!(!shows(&app, "first answer"));
+}

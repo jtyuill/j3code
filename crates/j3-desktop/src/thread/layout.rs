@@ -45,14 +45,15 @@ pub fn view(s: &J3, cx: &mut Cx<J3>, ui: &mut Ui, key: &ThreadKey) -> El {
         .h_full()
         .child(chat);
     if !hub_open && s.terminals.get(key).is_some_and(|drawer| drawer.open) {
-        let room = cx.layout("thread-main").map(|rect| rect[3] / zoom);
+        // `Cx::layout` reads unzoomed layout points already.
+        let room = cx.layout("thread-main").map(|rect| rect[3]);
         main = main
             .child(drawer_grip(key, zoom, room))
             .child(crate::terminal::view(s, cx, ui, key));
     }
     let mut body = row().key("thread").w_full().h_full().min_h(0.0).child(main);
     if s.files.get(key).is_some_and(|pane| pane.open) {
-        let room = cx.layout("thread").map(|rect| rect[2] / zoom);
+        let room = cx.layout("thread").map(|rect| rect[2]);
         body = body
             .child(files_grip(key, ui.m, room))
             .child(crate::files::view(s, cx, ui, key));
