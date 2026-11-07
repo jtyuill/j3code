@@ -9,6 +9,9 @@ use crate::{
     sidebar::ThreadKey,
 };
 
+mod double_tap;
+pub use double_tap::{DoubleTap, tap_time};
+
 /// One thread's hub.
 #[derive(Default)]
 pub struct AgentHub {

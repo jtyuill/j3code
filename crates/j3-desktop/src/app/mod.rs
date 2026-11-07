@@ -268,6 +268,7 @@ pub fn poll(s: &mut J3, t: f64, tx: &mut Tx) -> bool {
     changed |= s.poll_speech(tx);
     changed |= s.poll_usage(tx);
     changed |= s.toasts.poll(s.clock.t, tx);
+    changed |= s.poll_composer(tx);
     changed |= s.poll_sidebar(tx);
     changed
 }
