@@ -181,12 +181,15 @@ fn fits_cell(c: char, font: TextStyle, width: f32) -> bool {
     })
 }
 
-/// The cursor as the view draws it.
-pub struct Cursor {
-    /// Viewport cell: column, line.
-    pub at: (usize, usize),
-    /// An overlay for a non-block (or unfocused) cursor.
-    pub overlay: Option<El>,
+/// Terminal `t`'s cursor cell (column, line) and shape, when it shows on screen.
+pub fn cursor_at(t: &Terminal) -> Option<(usize, usize, CursorShape)> {
+    let content = t.screen.term().renderable_content();
+    let shape = content.cursor.shape;
+    (content.mode.contains(TermMode::SHOW_CURSOR) && shape != CursorShape::Hidden)
+        .then(|| point_to_viewport(content.display_offset, content.cursor.point))
+        .flatten()
+        .filter(|p| p.line < usize::from(t.screen.size().rows))
+        .map(|p| (p.column.0, p.line, shape))
 }
 
 /// Where the cursor is and how it draws.
@@ -209,21 +212,16 @@ fn model(
 ) -> (Vec<Row>, Option<CursorCell>) {
     let term = t.screen.term();
     let rows = usize::from(t.screen.size().rows);
+    let mut cursor = cursor_at(t).map(|(column, line, shape)| CursorCell {
+        column,
+        line,
+        cells: 1,
+        shape,
+    });
     let content = term.renderable_content();
     let colors = content.colors;
     let offset = content.display_offset;
-    let shape = content.cursor.shape;
-    let mut cursor = (content.mode.contains(TermMode::SHOW_CURSOR) && shape != CursorShape::Hidden)
-        .then(|| point_to_viewport(offset, content.cursor.point))
-        .flatten()
-        .filter(|p| p.line < rows)
-        .map(|p| CursorCell {
-            column: p.column.0,
-            line: p.line,
-            cells: 1,
-            shape,
-        });
-    let block = focused && shape == CursorShape::Block;
+    let block = focused && cursor.is_some_and(|c| c.shape == CursorShape::Block);
     let mut models: Vec<Row> = (0..rows).map(|_| Row::default()).collect();
     let selection = content.selection;
     for indexed in content.display_iter {
@@ -296,13 +294,31 @@ fn model(
     (models, cursor)
 }
 
-/// Terminal `t`'s rows (each memoised under `terminal-row-{id}-{line}`) and cursor.
-pub fn grid(
+/// Terminal `t`'s grid layer: its rows (each memoised under `terminal-row-{id}-{line}`) and
+/// a non-block cursor, built again only when the screen, focus, colours or cell size changed.
+pub fn grid(t: &Terminal, palette: &Palette, cell: CellMetrics, focused: bool) -> El {
+    let mut hasher = DefaultHasher::new();
+    let metrics = (
+        cell.width.to_bits(),
+        cell.height.to_bits(),
+        cell.font.size.to_bits(),
+    );
+    (t.screen.revision(), focused, palette, metrics).hash(&mut hasher);
+    rune::memo::memo_with_hash(format!("terminal-grid-{}", t.id), hasher.finish(), || {
+        let (rows, cursor) = grid_parts(t, palette, cell, focused);
+        el().key(format!("terminal-screen-{}", t.id))
+            .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+            .children(rows)
+            .children(cursor)
+    })
+}
+
+fn grid_parts(
     t: &Terminal,
     palette: &Palette,
     cell: CellMetrics,
     focused: bool,
-) -> (Vec<El>, Option<Cursor>) {
+) -> (Vec<El>, Option<El>) {
     let cols = usize::from(t.screen.size().cols);
     let (models, cursor) = model(t, palette, cell, focused);
     let fallback = palette.foreground;
@@ -325,12 +341,12 @@ pub fn grid(
             )
         })
         .collect();
-    let cursor = cursor.map(|c| {
+    let overlay = cursor.and_then(|c| {
         let x = PADDING + c.column as f32 * cell.width;
         let y = PADDING + c.line as f32 * cell.height;
         let width = c.cells as f32 * cell.width;
         let mark = || el().key(format!("terminal-cursor-{}", t.id));
-        let overlay = match c.shape {
+        match c.shape {
             CursorShape::Block if focused => None,
             CursorShape::Beam if focused => Some(
                 mark()
@@ -350,13 +366,9 @@ pub fn grid(
                     .size(width, cell.height)
                     .border(1.0, palette.cursor),
             ),
-        };
-        Cursor {
-            at: (c.column, c.line),
-            overlay,
         }
     });
-    (elements, cursor)
+    (elements, overlay)
 }
 
 #[cfg(test)]

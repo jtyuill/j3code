@@ -63,6 +63,11 @@ pub struct Screen {
     parser: Processor,
     listener: Listener,
     size: GridSize,
+    /// Bumped by every change to what the screen shows (output, size, selection, scroll),
+    /// so a view can skip regridding an unchanged screen.
+    revision: u64,
+    /// [`Screen::text`] at a revision.
+    text: RefCell<Option<(u64, String)>>,
 }
 
 impl Screen {
@@ -73,6 +78,8 @@ impl Screen {
             parser: Processor::new(),
             listener,
             size,
+            revision: 0,
+            text: RefCell::new(None),
         }
     }
 
@@ -88,10 +95,20 @@ impl Screen {
         *self.term.mode()
     }
 
+    /// Which state of the screen this is: it changes whenever what it shows may have.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    fn changed(&mut self) {
+        self.revision += 1;
+    }
+
     /// A blank screen of the same size (`terminal.clear`).
     pub fn clear(&mut self) {
         self.term = Term::new(Config::default(), &self.size, self.listener.clone());
         self.parser = Processor::new();
+        self.changed();
     }
 
     /// A fresh screen replaying `history`. Requests in old output were answered long ago, so
@@ -106,6 +123,7 @@ impl Screen {
     /// Feeds program output; returns what the program asked of the terminal.
     pub fn feed(&mut self, data: &[u8]) -> Vec<TermEvent> {
         self.parser.advance(&mut self.term, data);
+        self.changed();
         self.listener.0.borrow_mut().drain(..).collect()
     }
 
@@ -116,11 +134,25 @@ impl Screen {
         }
         self.size = size;
         self.term.resize(size);
+        self.changed();
         true
     }
 
-    /// The visible screen as text, one line per row, trailing blanks trimmed.
+    /// The visible screen as text, one line per row, trailing blanks trimmed. Kept until the
+    /// screen changes.
     pub fn text(&self) -> String {
+        let mut cache = self.text.borrow_mut();
+        match &*cache {
+            Some((revision, text)) if *revision == self.revision => text.clone(),
+            _ => {
+                let text = self.read_text();
+                *cache = Some((self.revision, text.clone()));
+                text
+            }
+        }
+    }
+
+    fn read_text(&self) -> String {
         let mut text = String::new();
         let mut row = String::new();
         let mut line = None;
@@ -164,6 +196,7 @@ impl Screen {
         };
         let point = self.point(column, line);
         self.term.selection = Some(Selection::new(kind, point, side));
+        self.changed();
     }
 
     /// Moves the selection's end to viewport cell (`column`, `line`).
@@ -171,6 +204,7 @@ impl Screen {
         let point = self.point(column, line);
         if let Some(selection) = self.term.selection.as_mut() {
             selection.update(point, side);
+            self.changed();
         }
     }
 
@@ -183,11 +217,14 @@ impl Screen {
             .is_some_and(Selection::is_empty)
         {
             self.term.selection = None;
+            self.changed();
         }
     }
 
     pub fn clear_selection(&mut self) {
-        self.term.selection = None;
+        if self.term.selection.take().is_some() {
+            self.changed();
+        }
     }
 
     /// The selected text, if any.
@@ -200,11 +237,15 @@ impl Screen {
     /// Scrolls the display `lines` into the scrollback (negative: back down).
     pub fn scroll(&mut self, lines: i32) {
         self.term.scroll_display(Scroll::Delta(lines));
+        self.changed();
     }
 
     /// Back to the live screen.
     pub fn scroll_to_bottom(&mut self) {
-        self.term.scroll_display(Scroll::Bottom);
+        if self.term.grid().display_offset() != 0 {
+            self.term.scroll_display(Scroll::Bottom);
+            self.changed();
+        }
     }
 }
 
@@ -317,6 +358,35 @@ mod tests {
         assert_eq!(s.text(), "a\nb");
         s.scroll_to_bottom();
         assert_eq!(s.text(), "c\nd");
+    }
+
+    #[test]
+    fn changes_bump_the_revision_and_reads_do_not() {
+        let mut s = screen(10, 2);
+        let mut last = s.revision();
+        let mut bumped = |s: &Screen| {
+            let now = s.revision();
+            let changed = now != last;
+            last = now;
+            changed
+        };
+        s.feed(b"one two");
+        assert!(bumped(&s));
+        let _ = (s.text(), s.selected_text(), s.mode());
+        assert!(!bumped(&s));
+        s.select(0, 0, Side::Left, 2);
+        assert!(bumped(&s));
+        s.clear_selection();
+        assert!(bumped(&s));
+        s.clear_selection();
+        assert!(!bumped(&s));
+        assert!(s.resize(GridSize { cols: 12, rows: 2 }));
+        assert!(bumped(&s));
+        s.scroll_to_bottom();
+        assert!(!bumped(&s), "already at the bottom");
+        // The text follows the change.
+        s.feed(b"!");
+        assert_eq!(s.text(), "one two!");
     }
 
     #[test]

@@ -24,7 +24,7 @@ const LIGHT: [u32; 16] = [
 ];
 
 /// The colours a frame of the terminal draws with.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Hash)]
 pub struct Palette {
     ansi: [Color; 16],
     pub foreground: Color,

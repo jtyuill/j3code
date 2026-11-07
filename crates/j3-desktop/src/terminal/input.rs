@@ -143,7 +143,7 @@ impl J3 {
         let Some(terminal) = self.terminal_mut(key, id) else {
             return false;
         };
-        terminal.scroll_rest += ev.dy;
+        terminal.scroll_rest += wheel_points(ev, line);
         let lines = (terminal.scroll_rest / line) as i32;
         if lines == 0 {
             return true;
@@ -162,5 +162,46 @@ impl J3 {
             terminal.screen.scroll(lines);
         }
         true
+    }
+}
+
+/// Points Rune reports for one notch of a mouse wheel (a line delta).
+const WHEEL_NOTCH: f32 = 40.0;
+
+/// `ev`'s vertical movement in points of the terminal: a notched wheel moves one terminal
+/// line per notch (Rune reports a notch as [`WHEEL_NOTCH`] points), a trackpad moves by its
+/// points. With Shift, Rune turns a plain wheel horizontal off macOS; it still scrolls.
+fn wheel_points(ev: &WheelEvent, line: f32) -> f32 {
+    let delta = if ev.dy == 0.0 && ev.mods.shift {
+        ev.dx
+    } else {
+        ev.dy
+    };
+    if ev.precise {
+        delta
+    } else {
+        delta / WHEEL_NOTCH * line
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rune::Mods;
+
+    use super::*;
+
+    #[test]
+    fn a_wheel_notch_is_one_line_and_a_trackpad_moves_by_points() {
+        assert_eq!(wheel_points(&WheelEvent::new(0.0, 40.0), 19.0), 19.0);
+        assert_eq!(wheel_points(&WheelEvent::new(0.0, -120.0), 19.0), -57.0);
+        assert_eq!(
+            wheel_points(&WheelEvent::new(0.0, 7.0).precise(true), 19.0),
+            7.0
+        );
+        let shifted = WheelEvent::new(40.0, 0.0).mods(Mods {
+            shift: true,
+            ..Mods::default()
+        });
+        assert_eq!(wheel_points(&shifted, 19.0), 19.0);
     }
 }

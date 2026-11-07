@@ -3,9 +3,7 @@
 //! the cursor, and the focus field at the cursor that also shows an input method's
 //! composition there, underlined.
 
-use rune::{
-    Color, Cursor, Cx, Drag, El, Tx, col, edit_access, el, row, spacer, text, text_input,
-};
+use rune::{Color, Cursor, Cx, Drag, El, Tx, col, edit_access, el, row, spacer, text, text_input};
 use rune_kit::{Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit};
 
 use super::{CellMetrics, Drawer, MAX_HEIGHT, MIN_HEIGHT, PADDING, Palette, Terminal, render};
@@ -185,8 +183,8 @@ fn terminal_view(
     focused: bool,
 ) -> El {
     let id = terminal.id.clone();
-    let (rows, cursor) = render::grid(terminal, palette, cell, focused);
-    let (column, line) = cursor.as_ref().map_or((0, 0), |c| c.at);
+    let grid = render::grid(terminal, palette, cell, focused);
+    let (column, line) = render::cursor_at(terminal).map_or((0, 0), |(c, l, _)| (c, l));
     let composing = terminal.edit.preedit.is_some();
     let cols = usize::from(terminal.screen.size().cols);
     let field_width = if composing {
@@ -246,7 +244,6 @@ fn terminal_view(
         })
         .on_drag(move |s: &mut J3, d: &mut Drag, _: &mut Tx| s.terminal_drag(&drag.0, &drag.1, d))
         .on_wheel(move |s: &mut J3, ev, _| s.terminal_wheel(&wheel.0, &wheel.1, &ev))
-        .children(rows)
-        .children(cursor.and_then(|c| c.overlay))
+        .child(grid)
         .child(field)
 }
