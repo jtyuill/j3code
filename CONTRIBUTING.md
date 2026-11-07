@@ -36,6 +36,15 @@ Without Nix you need Rust 1.88+ and CMake, plus on Linux the libraries installed
 
    Tests that spend tokens or need a live `omp` are `#[ignore]`d. Run them only when you change that code.
 5. If you change the wire protocol, update `docs/protocol` and the TypeScript contracts in the same pull request. The server and iOS app change together.
+6. If you change the desktop's UI, look at it headlessly. The binary renders offline fixture scenes (Rune's agent tooling) without a server or a window:
+
+   ```sh
+   cargo build -p j3-desktop
+   target/debug/j3 --list-scenes
+   target/debug/j3 --snap /tmp/thread.png --scene thread --size 1280x820 [--theme light]
+   ```
+
+   The scenes and their data live in `crates/j3-desktop/src/app/fixtures.rs`.
 
 ## Commit messages
 
