@@ -109,7 +109,7 @@ fn roster_column(k: &Kit, key: &ThreadKey, hub: &AgentHub, state: &j3_client::Th
 fn roster_row(k: &Kit, key: &ThreadKey, hub: &AgentHub, subagent: &Subagent) -> El {
     let selected = hub.selected.as_deref() == Some(subagent.id.as_str());
     let title = subagent_title(subagent);
-    let status = status_label(subagent.status);
+    let status = crate::feed::subagent_status_label(subagent.status);
     let secondary = if selected {
         k.c.text_base
     } else {
@@ -501,20 +501,6 @@ pub fn subagent_title(subagent: &Subagent) -> String {
         .clone()
         .filter(|title| !title.trim().is_empty())
         .unwrap_or_else(|| crate::feed::one_line(&subagent.prompt))
-}
-
-/// A subagent's status as the feed and the hub say it.
-pub fn status_label(status: SubagentStatus) -> &'static str {
-    match status {
-        SubagentStatus::Idle => "Idle",
-        SubagentStatus::Pending => "Starting",
-        SubagentStatus::Running => "Running",
-        SubagentStatus::Waiting => "Waiting",
-        SubagentStatus::Completed => "Done",
-        SubagentStatus::Failed => "Failed",
-        SubagentStatus::Cancelled => "Stopped",
-        SubagentStatus::Interrupted => "Interrupted",
-    }
 }
 
 /// The status glyph: running, done, failed, stopped or idle.

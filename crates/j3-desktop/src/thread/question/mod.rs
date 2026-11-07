@@ -282,7 +282,7 @@ impl Questionnaire {
         if self.is_last() {
             self.submit()
         } else {
-            self.next()
+            self.advance()
         }
     }
 
@@ -295,7 +295,7 @@ impl Questionnaire {
         Step::Moved
     }
 
-    pub fn next(&mut self) -> Step {
+    pub fn advance(&mut self) -> Step {
         self.confirm_at = None;
         if !self.items[self.current].validate() || self.is_last() {
             return Step::Stay;
@@ -451,7 +451,7 @@ impl J3 {
         };
         let step = match nav {
             Nav::Previous => form.previous(),
-            Nav::Next => form.next(),
+            Nav::Next => form.advance(),
             Nav::Skip => form.skip(),
             Nav::Submit => form.submit(),
             Nav::Confirm => form.confirm_current(),
@@ -604,7 +604,7 @@ mod tests {
             choice_question("two", &["x", "y"], true, false),
         ];
         let mut form = Questionnaire::new(&questions).unwrap();
-        assert_eq!(form.next(), Step::Stay);
+        assert_eq!(form.advance(), Step::Stay);
         assert_eq!(form.items[0].problem, Some(Problem::Required));
         // A first pick waits a moment, then confirms; the error clears with the answer.
         assert_eq!(form.choose(0, "a", 1.0), Step::Stay);
@@ -651,7 +651,7 @@ mod tests {
         optional.required = Some(false);
         let questions = [optional, choice_question("last", &["z"], false, false)];
         let mut form = Questionnaire::new(&questions).unwrap();
-        assert_eq!(form.next(), Step::Stay);
+        assert_eq!(form.advance(), Step::Stay);
         assert_eq!(form.items[0].problem, Some(Problem::Unanswered));
         assert_eq!(form.skip(), Step::Moved);
         assert_eq!(

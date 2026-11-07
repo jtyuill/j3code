@@ -241,21 +241,11 @@ impl J3 {
         else {
             return;
         };
-        let (Some(run_id), Some(connection)) =
-            (subagent.run_id.clone(), self.thread_connection(key))
-        else {
+        let Some(run_id) = subagent.run_id.clone() else {
             return;
         };
-        let (thread_id, subagent_id) = (key.thread_id.clone(), subagent.id.clone());
-        self.run_command(
-            "stop the subagent",
-            async move {
-                connection
-                    .stop_subagent(&thread_id, &run_id, &subagent_id)
-                    .await
-            },
-            |_, _, _| {},
-        );
+        let subagent_id = subagent.id.clone();
+        self.stop_subagent(key, &run_id, &subagent_id);
     }
 
     /// A key for the open thread's hub while nothing has focus (the window's `on_key`):

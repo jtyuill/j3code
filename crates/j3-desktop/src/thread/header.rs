@@ -85,20 +85,23 @@ pub fn toolbar(s: &J3, cx: &mut Cx<J3>, ui: &mut Ui, key: &ThreadKey) -> Toolbar
         .trailing(actions)
 }
 
+/// What a thread action menu item runs.
+type MenuRun = Box<dyn Fn(&mut J3, &ThreadKey, &mut Tx)>;
+
 /// The Ellipsis button and its menu.
 fn actions_menu(s: &J3, ui: &mut Ui, key: &ThreadKey) -> rune::El {
     let k = ui.k;
     let thread = s.threads.get(key);
     let open = thread.is_some_and(|thread| thread.chrome.actions_open);
     let has_goal = thread.is_some_and(|thread| thread.state.goal().is_some());
-    let item = |label: &str, run: Box<dyn Fn(&mut J3, &ThreadKey, &mut Tx)>| {
+    let item = |label: &str, run: MenuRun| {
         let key = key.clone();
         MenuItem::new(label).on_select_tx(move |s: &mut J3, tx: &mut Tx| {
             s.set_thread_actions(&key, false);
             run(s, &key, tx);
         })
     };
-    let dispatch = |action: Action| -> Box<dyn Fn(&mut J3, &ThreadKey, &mut Tx)> {
+    let dispatch = |action: Action| -> MenuRun {
         Box::new(move |s: &mut J3, _: &ThreadKey, tx: &mut Tx| s.dispatch(action, tx))
     };
     let (toggle_key, close_key) = (key.clone(), key.clone());

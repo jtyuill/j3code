@@ -285,8 +285,10 @@ mod tests {
 
     #[test]
     fn the_measure_stays_in_range() {
-        let mut ui = UiSettings::default();
-        ui.text_measure = 10.;
+        let mut ui = UiSettings {
+            text_measure: 10.,
+            ..Default::default()
+        };
         assert_eq!(ui.measure(), TEXT_MEASURE_MIN);
         ui.text_measure = 200.;
         assert_eq!(ui.measure(), TEXT_MEASURE_MAX);

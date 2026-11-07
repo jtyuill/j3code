@@ -192,12 +192,15 @@ enum Part {
     },
 }
 
+/// Split texts by `(text hash, math on)`.
+type PartsCache = HashMap<(u64, bool), Rc<Vec<Part>>>;
+
 /// `text` prepared and split, cached by text: a mounted message is drawn every commit, and a
 /// streaming one grows, so the newest few hundred texts are kept.
 fn parts(text: &str, math: bool) -> Rc<Vec<Part>> {
     const KEEP: usize = 256;
     thread_local! {
-        static CACHE: RefCell<[HashMap<(u64, bool), Rc<Vec<Part>>>; 2]> = RefCell::default();
+        static CACHE: RefCell<[PartsCache; 2]> = RefCell::default();
     }
     let mut hasher = DefaultHasher::new();
     text.hash(&mut hasher);
