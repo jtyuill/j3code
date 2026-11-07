@@ -17,6 +17,7 @@ pub mod environments;
 pub mod feed;
 pub mod files;
 pub mod git;
+pub mod goto;
 pub mod hub;
 pub mod icons;
 pub mod images;

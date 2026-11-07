@@ -245,7 +245,7 @@ impl J3 {
                 }
             }
             Action::SettleThread => self.settle_open_thread(tx),
-            Action::GotoAgent => self.open_dialog(crate::dialogs::Dialog::goto(), tx),
+            Action::GotoAgent => self.open_goto(tx),
             Action::FocusComposer => self.focus_composer(tx),
             Action::FocusSidebar => {
                 self.close_settings(tx);
@@ -284,7 +284,7 @@ impl J3 {
             KeyContext::GotoPicker
         } else if focused.is_some_and(crate::terminal::owns_focus) {
             KeyContext::Terminal
-        } else if focused.is_some_and(crate::sidebar::owns_focus) {
+        } else if self.sidebar_owns_keys(focused) {
             KeyContext::Sidebar
         } else {
             KeyContext::Workspace
