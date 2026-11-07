@@ -32,7 +32,11 @@ pub struct ProjectPicker {
     /// The user typed a name: the folder no longer names the project.
     pub title_edited: bool,
     pub listing: Listing,
-    /// Bumped by every browse; replies for an older one are dropped.
+    /// Which opening of the dialog this is (from `DialogState::next_serial`): a create that
+    /// finishes after this picker closed must not act on another one.
+    pub id: u64,
+    /// The browse whose reply the listing waits for (from `DialogState::next_serial`, so a
+    /// closed picker's reply never matches a later one); older replies are dropped.
     pub revision: u64,
     pub creating: bool,
     pub error: Option<String>,
@@ -50,6 +54,7 @@ impl ProjectPicker {
             title: TextEdit::new(""),
             title_edited: false,
             listing: Listing::Loading,
+            id: 0,
             revision: 0,
             creating: false,
             error: None,
@@ -87,9 +92,11 @@ impl J3 {
             .filter(|env| env.is_live())
             .map(|env| env.key().to_owned())
             .collect();
+        let id = self.dialogs.next_serial();
         let Some(picker) = self.picker() else {
             return;
         };
+        picker.id = id;
         if !live.contains(&picker.env)
             && let Some(first) = live.into_iter().next()
         {
@@ -145,11 +152,11 @@ impl J3 {
             return;
         };
         let connection = self.envs.get(&env).map(|e| e.connection().clone());
+        let revision = self.dialogs.next_serial();
         let Some(picker) = self.picker() else {
             return;
         };
-        picker.revision += 1;
-        let revision = picker.revision;
+        picker.revision = revision;
         let Some(connection) = connection else {
             picker.listing = Listing::Failed("That device isn’t configured any more.".into());
             return;
@@ -196,6 +203,7 @@ impl J3 {
         };
         let env = picker.env.clone();
         let then_new_thread = picker.then_new_thread;
+        let id = picker.id;
         let Some(connection) = self.envs.get(&env).map(|e| e.connection().clone()) else {
             return;
         };
@@ -207,21 +215,21 @@ impl J3 {
         self.spawn(async move {
             let result = connection.create_project(&title, &path).await;
             move |s: &mut J3, tx: &mut Tx| {
-                let still_open = s.picker().is_some();
+                // Cancelled, or another dialog took its place: the project exists, but
+                // nothing on screen asked for what comes next any more.
+                let Some(picker) = s.picker().filter(|picker| picker.id == id) else {
+                    return;
+                };
                 match result {
                     Ok(project) => {
-                        if still_open {
-                            s.close_dialog();
-                        }
+                        s.close_dialog();
                         if then_new_thread {
                             s.new_thread(env, Some(project.id), tx);
                         }
                     }
                     Err(e) => {
-                        if let Some(picker) = s.picker() {
-                            picker.creating = false;
-                            picker.error = Some(e.to_string());
-                        }
+                        picker.creating = false;
+                        picker.error = Some(e.to_string());
                     }
                 }
             }

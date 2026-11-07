@@ -272,6 +272,7 @@ pub fn poll(s: &mut J3, t: f64, tx: &mut Tx) -> bool {
     changed |= s.poll_sidebar(tx);
     changed |= s.poll_feed();
     changed |= s.poll_new_thread(tx);
+    changed |= s.poll_settings(tx);
     changed |= s.poll_thread(tx);
     changed |= s.poll_git(tx);
     changed |= s.poll_terminals(tx);
@@ -325,7 +326,7 @@ pub fn app(services: Arc<Services>) -> rune::App<J3> {
         scenes: fixtures::SCENES,
         ..AppSpec::new("j3", (1280.0, 820.0), init, view)
     };
-    rune::App::new(spec)
+    let app = rune::App::new(spec)
         // macOS: the panes' title bar band is the titlebar; the traffic lights sit in its
         // middle (rune-kit's shell band is 48 points tall).
         .chrome(Chrome {
@@ -334,5 +335,6 @@ pub fn app(services: Arc<Services>) -> rune::App<J3> {
             drag_regions: true,
         })
         .on_focus(on_focus)
-        .on_close(on_close)
+        .on_close(on_close);
+    crate::menus::install(app)
 }
