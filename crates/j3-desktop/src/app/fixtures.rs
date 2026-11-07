@@ -79,10 +79,12 @@ pub enum Scene {
     Files,
     /// [`OPEN_THREAD`] open with its git control's commit dialog.
     GitCommit,
+    /// [`OPEN_THREAD`] open with its terminal drawer showing a coloured shell session.
+    Terminal,
 }
 
 impl Scene {
-    pub const ALL: [Scene; 12] = [
+    pub const ALL: [Scene; 13] = [
         Scene::Fixtures,
         Scene::Thread,
         Scene::NewThread,
@@ -95,6 +97,7 @@ impl Scene {
         Scene::Hub,
         Scene::Files,
         Scene::GitCommit,
+        Scene::Terminal,
     ];
 
     /// The `--scene` name.
@@ -112,6 +115,7 @@ impl Scene {
             Scene::Hub => "hub",
             Scene::Files => "files",
             Scene::GitCommit => "git-commit",
+            Scene::Terminal => "terminal",
         }
     }
 }
@@ -133,6 +137,7 @@ pub const SCENES: &[SceneSetup] = &[
     ("hub", |s: &mut J3| start(s, Scene::Hub)),
     ("files", |s: &mut J3| start(s, Scene::Files)),
     ("git-commit", |s: &mut J3| start(s, Scene::GitCommit)),
+    ("terminal", |s: &mut J3| start(s, Scene::Terminal)),
 ];
 
 /// A scene from the command line: default UI settings (not the user's `desktop.json`), so
@@ -194,7 +199,8 @@ pub fn install(s: &mut J3, scene: Scene) {
         | Scene::CustomSnooze
         | Scene::Hub
         | Scene::Files
-        | Scene::GitCommit => {
+        | Scene::GitCommit
+        | Scene::Terminal => {
             let key = open_thread_key();
             if s.subscribe_thread(&key).is_some()
                 && let Some(thread) = s.threads.get_mut(&key)
@@ -206,6 +212,9 @@ pub fn install(s: &mut J3, scene: Scene) {
             }
             if matches!(scene, Scene::Files | Scene::GitCommit) {
                 crate::git::fixtures::install(s, &key, scene == Scene::GitCommit);
+            }
+            if scene == Scene::Terminal {
+                crate::terminal::fixture::install(s, &key);
             }
             s.route.main = Main::Thread(key.clone());
             if scene == Scene::CustomSnooze {
