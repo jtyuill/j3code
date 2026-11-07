@@ -179,3 +179,128 @@ impl Sound {
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use j3_client::ConnectionState;
+    use serde_json::{Value, json};
+
+    use crate::{
+        app::{
+            Main,
+            fixtures::{self, Scene, ago, local_state, open_thread_key},
+            testing::TestApp,
+        },
+        environment::LOCAL_KEY,
+        sidebar::ThreadKey,
+        toasts::ToastKind,
+        ui_settings::UiSettings,
+    };
+
+    /// `state` with thread `id`'s fields patched.
+    fn patched(mut state: ConnectionState, id: &str, patch: Value) -> ConnectionState {
+        let thread = state
+            .shell
+            .threads
+            .iter_mut()
+            .find(|thread| thread.id == id)
+            .expect("a fixture thread");
+        let mut value = serde_json::to_value(&*thread).expect("a thread serializes");
+        if let (Some(value), Value::Object(patch)) = (value.as_object_mut(), patch) {
+            value.extend(patch);
+        }
+        *thread = serde_json::from_value(value).expect("the patched thread decodes");
+        state
+    }
+
+    fn finished() -> Value {
+        json!({"status": "completed", "activeRunId": null, "activityRunStatus": null,
+               "activityRunStartedAt": null, "pendingRuntimeRequest": null,
+               "latestRunCompletedAt": ago(0), "lastVisitedAt": ago(30)})
+    }
+
+    fn app() -> TestApp {
+        // No sounds: tests never play audio.
+        let mut app = TestApp::with_ui(UiSettings {
+            sounds: false,
+            ..UiSettings::default()
+        });
+        fixtures::install(&mut app.rt.state, Scene::Thread);
+        app.frame();
+        app
+    }
+
+    fn observe(app: &mut TestApp, state: ConnectionState) {
+        app.rt.update(move |s, tx| s.environment_changed(LOCAL_KEY, Arc::new(state), tx));
+        app.frame();
+    }
+
+    fn toasts(app: &TestApp) -> Vec<(ToastKind, String)> {
+        app.rt
+            .state
+            .toasts
+            .iter()
+            .map(|(_, toast)| (toast.kind, toast.title.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn changes_after_the_baseline_raise_toasts_that_open_their_thread() {
+        let mut app = app();
+        observe(&mut app, local_state());
+        assert!(toasts(&app).is_empty(), "the first observation is a baseline");
+
+        let blocked = patched(local_state(), "thr-sidebar-dnd", json!({
+            "status": "failed", "activeRunId": null, "activityRunStatus": null,
+            "latestRunCompletedAt": ago(0), "lastError": "boom"
+        }));
+        let state = patched(blocked, "thr-scroll", finished());
+        observe(&mut app, state.clone());
+        assert_eq!(
+            toasts(&app),
+            [
+                (ToastKind::Warning, "Sidebar drag and drop between shelves needs attention".to_owned()),
+                (ToastKind::Success, "Momentum scrolling stutters at 120 Hz finished".to_owned()),
+            ]
+        );
+
+        let key = ThreadKey::new(LOCAL_KEY, "thr-scroll");
+        let (x, y) = app.rt.find(&key.element_id("attention")).expect("the toast is drawn");
+        app.rt.pointer_move(x, y);
+        app.rt.pointer_down(x, y);
+        app.rt.pointer_up(x, y);
+        app.frame();
+        assert_eq!(app.rt.state.route.main, Main::Thread(key));
+
+        // Toasts off: the next change raises none.
+        app.rt.update(|s, tx| s.update_ui(|ui| ui.toasts = false, tx));
+        observe(&mut app, patched(state, "thr-math", json!({"status": "failed"})));
+        assert_eq!(toasts(&app).len(), 1, "only the earlier toast is left");
+    }
+
+    #[test]
+    fn the_open_thread_finishing_is_on_screen() {
+        let mut app = app();
+        observe(&mut app, local_state());
+        let open = open_thread_key();
+        // Watched while the window is active: no alert at all.
+        observe(&mut app, patched(local_state(), &open.thread_id, finished()));
+        assert!(toasts(&app).is_empty());
+
+        // In the background the finish alerts (a sound, when on) but needs no toast.
+        let mut app = self::app();
+        observe(&mut app, local_state());
+        app.rt.state.window_active = false;
+        observe(&mut app, patched(local_state(), &open.thread_id, finished()));
+        assert!(toasts(&app).is_empty());
+        // A question on it still raises one.
+        let asking = patched(local_state(), &open.thread_id, json!({"status": "waiting"}));
+        observe(&mut app, asking);
+        assert_eq!(
+            toasts(&app),
+            [(ToastKind::Warning, "Port the feed renderer to Rune needs attention".to_owned())]
+        );
+    }
+}

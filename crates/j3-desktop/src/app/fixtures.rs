@@ -15,6 +15,8 @@ use j3_client::{
     WorkspaceCommands,
     t3::{
         self,
+        filesystem::FilesystemBrowseEntry,
+        methods::ArchivedShellSnapshot,
         orchestration::{ThreadProjection, ThreadShell},
         project::ProjectShell,
         server::{ServerConfig, ServerProviderSkill, ServerProviderSlashCommand},
@@ -26,6 +28,8 @@ use time::{Duration, OffsetDateTime, macros::datetime};
 
 use super::{Clock, J3, Main};
 use crate::{
+    archived::Listing,
+    dialogs::{Dialog, FolderListing},
     environment::{Environment, EnvironmentKind, Environments, LOCAL_KEY},
     environments::{DesktopConfig, RemoteEnvironment},
     local_server::LocalServerStatus,
@@ -60,15 +64,24 @@ pub enum Scene {
     Settings,
     /// The herdr workflow's sidebar with [`OPEN_THREAD`] open.
     Herdr,
+    /// Settings on Archived threads, with the local archive loaded (shieldy's empty).
+    SettingsArchived,
+    /// The Add project dialog over the sidebar, listing `~/repos/` on the local device.
+    AddProject,
+    /// The Custom snooze dialog for [`OPEN_THREAD`].
+    CustomSnooze,
 }
 
 impl Scene {
-    pub const ALL: [Scene; 5] = [
+    pub const ALL: [Scene; 8] = [
         Scene::Fixtures,
         Scene::Thread,
         Scene::NewThread,
         Scene::Settings,
         Scene::Herdr,
+        Scene::SettingsArchived,
+        Scene::AddProject,
+        Scene::CustomSnooze,
     ];
 
     /// The `--scene` name.
@@ -79,6 +92,9 @@ impl Scene {
             Scene::NewThread => "new-thread",
             Scene::Settings => "settings",
             Scene::Herdr => "herdr",
+            Scene::SettingsArchived => "settings-archived",
+            Scene::AddProject => "add-project",
+            Scene::CustomSnooze => "custom-snooze",
         }
     }
 }
@@ -93,6 +109,9 @@ pub const SCENES: &[SceneSetup] = &[
     ("new-thread", |s: &mut J3| start(s, Scene::NewThread)),
     ("settings", |s: &mut J3| start(s, Scene::Settings)),
     ("herdr", |s: &mut J3| start(s, Scene::Herdr)),
+    ("settings-archived", |s: &mut J3| start(s, Scene::SettingsArchived)),
+    ("add-project", |s: &mut J3| start(s, Scene::AddProject)),
+    ("custom-snooze", |s: &mut J3| start(s, Scene::CustomSnooze)),
 ];
 
 /// A scene from the command line: default UI settings (not the user's `desktop.json`), so
@@ -149,27 +168,83 @@ pub fn install(s: &mut J3, scene: Scene) {
     ));
     match scene {
         Scene::Fixtures => {}
-        Scene::Thread | Scene::Herdr => {
+        Scene::Thread | Scene::Herdr | Scene::CustomSnooze => {
             let key = open_thread_key();
             if s.subscribe_thread(&key).is_some()
                 && let Some(thread) = s.threads.get_mut(&key)
             {
                 thread.state = Arc::new(thread_state());
             }
-            s.route.main = Main::Thread(key);
+            s.route.main = Main::Thread(key.clone());
+            if scene == Scene::CustomSnooze {
+                s.dialogs.open = Some(Dialog::custom_snooze(key));
+            }
         }
         Scene::NewThread => {
             s.new_thread = NewThreadState {
                 env: LOCAL_KEY.to_owned(),
                 project: Some(J3CODE_PROJECT.to_owned()),
+                ..NewThreadState::default()
             };
             s.route.main = Main::NewThread;
         }
         Scene::Settings => {
             s.settings.page = Page::General;
             s.route.settings = true;
+            s.load_fonts();
         }
+        Scene::SettingsArchived => {
+            s.settings.page = Page::Archived;
+            s.settings.archived.set(LOCAL_KEY, Listing::Loaded(archived_snapshot()));
+            let empty = ArchivedShellSnapshot {
+                threads: Vec::new(),
+                projects: Vec::new(),
+                ..archived_snapshot()
+            };
+            s.settings.archived.set(SHIELDY_URL, Listing::Loaded(empty));
+            s.route.settings = true;
+        }
+        Scene::AddProject => s.dialogs.open = Some(add_project_dialog()),
     }
+}
+
+/// Three archived local threads, not in archive order.
+pub fn archived_snapshot() -> ArchivedShellSnapshot {
+    let archived = |minutes: i64| json!({"archivedAt": ago(minutes)});
+    ArchivedShellSnapshot {
+        schema_version: 1,
+        snapshot_sequence: 1,
+        projects: local_state().shell.projects,
+        threads: vec![
+            row("thr-archived-week", J3CODE_PROJECT, "Try GPUI's text system for the feed",
+                60 * 24 * 9, archived(60 * 24 * 7)),
+            row("thr-archived-old", "prj-rune", "Sketch the settings layout",
+                60 * 24 * 40, archived(60 * 24 * 30)),
+            row("thr-archived-recent", J3CODE_PROJECT, "Profile the sidebar's drag reordering",
+                60 * 5, archived(90)),
+        ],
+    }
+}
+
+/// The Add project dialog on the local device with `~/repos/` listed.
+fn add_project_dialog() -> Dialog {
+    let mut dialog = Dialog::add_project(LOCAL_KEY.to_owned(), true);
+    if let Dialog::AddProject(picker) = &mut dialog {
+        picker.path.replace_text("~/repos/");
+        picker.path.set_caret(picker.path.text.len());
+        picker.title.replace_text("repos");
+        let entry = |name: &str| FilesystemBrowseEntry {
+            name: name.to_owned(),
+            full_path: format!("/home/jacob/repos/{name}"),
+        };
+        picker.listing = FolderListing::Loaded {
+            parent: "/home/jacob/repos/".into(),
+            entries: ["dotfiles", "herdr", "j3code", "j3code-wt", "omp", "rune", "t3code"]
+                .map(entry)
+                .into(),
+        };
+    }
+    dialog
 }
 
 // ---------------------------------------------------------------------------

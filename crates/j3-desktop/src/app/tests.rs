@@ -136,6 +136,14 @@ fn fixture_scenes_render_offline() {
                 assert!(s.route.settings);
                 assert!(app.rt.find("close-settings").is_some());
             }
+            Scene::SettingsArchived => {
+                assert!(s.route.settings);
+                assert!(app.rt.find("archived-thr-archived-recent").is_some());
+            }
+            Scene::AddProject | Scene::CustomSnooze => {
+                assert!(s.dialogs.open.is_some());
+                assert!(app.rt.find("dialog-confirm").is_some());
+            }
         }
     }
 }

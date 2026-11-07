@@ -2,10 +2,19 @@
 //! Environments, Projects and Archived threads; every change is saved at once through
 //! `J3::update_ui`. Escape and ⌘, leave it (`Action::CloseSettings`, `Action::OpenSettings`).
 
-use rune::{Cx, El, Tx, col, row, text};
-use rune_kit::{Button, ButtonVariant, Switch, shell::Page as ShellPage};
+pub mod controls;
+mod general;
+mod pages;
 
-use crate::app::{J3, Ui};
+use std::sync::Arc;
+
+use rune::{Cx, El, ScrollSpec, Tx, col, row, text};
+use rune_kit::{Button, ButtonVariant, ComboboxState, shell::Page as ShellPage};
+
+use crate::{
+    app::{J3, Ui},
+    archived::Archives,
+};
 
 /// One settings page, in sidebar order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -49,58 +58,169 @@ impl Page {
     }
 }
 
-#[derive(Debug, Default)]
+/// The installed font families, for the font pickers.
+#[derive(Debug, Clone, Default)]
+pub enum Fonts {
+    #[default]
+    Unknown,
+    Loading,
+    Loaded(Arc<[String]>),
+}
+
+#[derive(Default)]
 pub struct SettingsState {
     pub page: Page,
+    /// The zoom listbox is open.
+    pub zoom_open: bool,
+    pub ui_font: ComboboxState,
+    pub mono_font: ComboboxState,
+    pub speech_model: ComboboxState,
+    pub fonts: Fonts,
+    /// Each environment's archived threads, loaded when Settings opens.
+    pub archived: Archives,
 }
 
 impl J3 {
-    /// Opens Settings on `page`.
-    pub fn open_settings(&mut self, page: Page, _: &mut Tx) {
-        self.settings.page = page;
+    /// Opens Settings on `page`; each opening loads the archives afresh.
+    pub fn open_settings(&mut self, page: Page, tx: &mut Tx) {
+        self.settings.archived.clear();
+        self.settings.zoom_open = false;
+        self.settings.ui_font.close();
+        self.settings.mono_font.close();
+        self.settings.speech_model.close();
         self.route.settings = true;
+        if matches!(self.settings.fonts, Fonts::Unknown) {
+            self.load_fonts();
+        }
+        self.show_settings_page(page, tx);
     }
 
-    /// Leaves Settings (nothing when it isn't open).
-    pub fn close_settings(&mut self, _: &mut Tx) {
-        self.route.settings = false;
+    /// Shows `page` of the open Settings.
+    pub fn show_settings_page(&mut self, page: Page, _: &mut Tx) {
+        self.settings.page = page;
+        self.settings.zoom_open = false;
+        if page == Page::Archived {
+            let missing: Vec<String> = self
+                .envs
+                .distinct()
+                .into_iter()
+                .map(|env| env.key().to_owned())
+                .filter(|key| self.settings.archived.get(key).is_none())
+                .collect();
+            for env in missing {
+                self.load_archived(&env);
+            }
+        }
     }
+
+    /// Leaves Settings (nothing when it isn't open); the sidebar takes focus.
+    pub fn close_settings(&mut self, tx: &mut Tx) {
+        if !self.route.settings {
+            return;
+        }
+        self.route.settings = false;
+        self.settings.zoom_open = false;
+        self.focus_sidebar(tx);
+    }
+
+    /// Lists the installed font families off the UI thread (once Settings opens).
+    pub fn load_fonts(&mut self) {
+        self.settings.fonts = Fonts::Loading;
+        self.spawn_blocking(|| {
+            let families = installed_families();
+            move |s: &mut J3, _: &mut Tx| s.settings.fonts = Fonts::Loaded(families.into())
+        });
+    }
+}
+
+/// Every installed font family, sorted, without hidden (`.`-prefixed) system families.
+fn installed_families() -> Vec<String> {
+    let mut db = fontdb::Database::new();
+    db.load_system_fonts();
+    let mut families: Vec<String> = db
+        .faces()
+        .flat_map(|face| face.families.iter().map(|(name, _)| name.clone()))
+        .filter(|name| !name.is_empty() && !name.starts_with('.'))
+        .collect();
+    families.sort_by_key(|name| name.to_lowercase());
+    families.dedup();
+    families
 }
 
 /// The Settings page: its tabs, then the chosen page.
 pub fn view(s: &J3, cx: &mut Cx<J3>, ui: &mut Ui) -> El {
     let k = ui.k;
     let done = Button::new("Done")
-        .variant(ButtonVariant::Neutral)
+        .variant(ButtonVariant::Outline)
         .on_press_tx(|s: &mut J3, tx: &mut Tx| s.close_settings(tx))
         .build(k)
         .key("close-settings");
-    let mut tabs = col().key("settings-pages").w(200.0).gap(2.0).pt(16.0).px(8.0);
+    let mut tabs = col()
+        .key("settings-pages")
+        .role("tablist")
+        .label("Settings pages")
+        .w(200.0)
+        .gap(2.0)
+        .pt(16.0)
+        .px(8.0);
     for page in Page::ALL {
-        let variant = if s.settings.page == page {
-            ButtonVariant::Neutral
+        let on = s.settings.page == page;
+        let mut tab = row()
+            .key(page.key())
+            .role("tab")
+            .label(page.title())
+            .focusable(true)
+            .focus_selected(on)
+            .focus_ring(2.0, 1.0, k.c.border_focus)
+            .w_full()
+            .h(30.0)
+            .px(10.0)
+            .center_y()
+            .radius(6.0)
+            .child(
+                text(page.title())
+                    .font(if on {
+                        k.ty.text_small_medium
+                    } else {
+                        k.ty.text_small
+                    })
+                    .color(if on { k.c.text_base } else { k.c.text_muted })
+                    .a11y_hidden(),
+            )
+            .on_press_tx(move |s: &mut J3, tx: &mut Tx| s.show_settings_page(page, tx));
+        tab = if on {
+            tab.fill(k.c.layer_02)
         } else {
-            ButtonVariant::Ghost
+            tab.hover(k.c.hover)
         };
-        tabs = tabs.child(
-            Button::new(page.title())
-                .variant(variant)
-                .on_press(move |s: &mut J3| s.settings.page = page)
-                .build(k)
-                .key(page.key()),
-        );
+        tabs = tabs.child(tab);
     }
     let body = match s.settings.page {
-        Page::Notifications => notifications(s, ui),
-        Page::Environments => environments(s, ui),
-        page => col().child(text(page.title()).font(k.ty.body_medium).color(k.c.text_base)),
+        Page::General => general::view(s, ui),
+        Page::Notifications => pages::notifications(s, ui),
+        Page::Environments => pages::environments(s, ui),
+        Page::Projects => pages::projects(s, ui),
+        Page::Archived => pages::archived(s, ui),
     };
-    let content = row()
-        .key("settings")
+    let page = col()
+        .key("settings-page")
         .w_full()
-        .h_full()
-        .child(tabs)
-        .child(col().key("settings-page").grow(1.0).min_w(0.0).padding(24.0).gap(16.0).child(body));
+        .max_w(720.0)
+        .self_center()
+        .padding(24.0)
+        .gap(24.0)
+        .child(body);
+    let content = row().key("settings").w_full().h_full().child(tabs).child(
+        col()
+            .key("settings-scroll")
+            .grow(1.0)
+            .min_w(0.0)
+            .min_h(0.0)
+            .scroll(ScrollSpec {
+                stick_bottom: false,
+            })
+            .child(page),
+    );
     ShellPage::new(content)
         .title("Settings")
         .trailing(done)
@@ -108,62 +228,5 @@ pub fn view(s: &J3, cx: &mut Cx<J3>, ui: &mut Ui) -> El {
         .build(k)
 }
 
-fn notifications(s: &J3, ui: &Ui) -> El {
-    let k = ui.k;
-    let ui_settings = s.prefs.ui();
-    col()
-        .gap(16.0)
-        .child(
-            Switch::new(ui_settings.toasts)
-                .label("Toasts")
-                .description(
-                    "When a thread needs an answer or a thread you aren’t viewing finishes.",
-                )
-                .on_toggle_tx(|s: &mut J3, tx: &mut Tx| s.update_ui(|ui| ui.toasts = !ui.toasts, tx))
-                .build(k)
-                .key("toasts"),
-        )
-        .child(
-            Switch::new(ui_settings.sounds)
-                .label("Sounds")
-                .description(
-                    "When a thread needs an answer or a thread you aren’t viewing finishes.",
-                )
-                .on_toggle_tx(|s: &mut J3, tx: &mut Tx| s.update_ui(|ui| ui.sounds = !ui.sounds, tx))
-                .build(k)
-                .key("sounds"),
-        )
-}
-
-fn environments(s: &J3, ui: &Ui) -> El {
-    let k = ui.k;
-    let mut list = col().key("environments").gap(12.0);
-    for env in s.envs.iter() {
-        let status = env.status_label().unwrap_or("Connected");
-        let detail = if env.is_local() {
-            "This computer".to_owned()
-        } else {
-            env.connection().http_base().to_owned()
-        };
-        list = list.child(
-            row()
-                .key(format!("environment-{}", env.key()))
-                .w_full()
-                .gap(12.0)
-                .center_y()
-                .child(
-                    col()
-                        .grow(1.0)
-                        .child(text(env.label()).font(k.ty.text_small_medium).color(k.c.text_base))
-                        .child(text(detail).font(k.ty.text_xsmall).color(k.c.text_muted)),
-                )
-                .child(
-                    text(status)
-                        .font(k.ty.text_xsmall)
-                        .color(k.c.text_muted)
-                        .help(env.status_detail()),
-                ),
-        );
-    }
-    list
-}
+#[cfg(test)]
+mod tests;

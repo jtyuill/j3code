@@ -6,8 +6,14 @@
 //! To add a dialog: a variant here (with its state), a constructor, its arm in [`view`], and
 //! a `J3` command that opens it with `s.open_dialog(..)`.
 
+mod project;
+mod snooze;
+
 use rune::{Cx, El, TextEdit, Tx, col, row, spacer, text};
 use rune_kit::{Button, ButtonVariant, Kit, TextInput};
+
+pub use project::{Listing as FolderListing, ProjectPicker, title_from_path};
+pub use snooze::{Schedule as SnoozeSchedule, SnoozeForm};
 
 use crate::{
     app::{J3, Ui},
@@ -18,9 +24,9 @@ use crate::{
 /// The open dialog and its form state. At most one exists, so variant sizes don't matter.
 #[allow(clippy::large_enum_variant)]
 pub enum Dialog {
-    /// Add a project on `env` (any live environment can be chosen); a new thread opens in it
-    /// afterwards when `then_new_thread`.
-    AddProject { env: String, then_new_thread: bool },
+    /// Add a project on a live environment through a folder browser; a new thread opens in
+    /// it afterwards when the picker's `then_new_thread`.
+    AddProject(ProjectPicker),
     /// Name + "Host or URL" for a remote environment.
     AddEnvironment {
         label: TextEdit,
@@ -29,8 +35,12 @@ pub enum Dialog {
     },
     /// Rename a thread; empty titles are refused.
     RenameThread { key: ThreadKey, title: TextEdit },
-    /// Confirm deleting a thread.
-    DeleteThread { key: ThreadKey, title: String },
+    /// Confirm deleting a thread (`archived`: from Settings' archive, which reloads after).
+    DeleteThread {
+        key: ThreadKey,
+        title: String,
+        archived: bool,
+    },
     /// Confirm forgetting a remote environment.
     RemoveEnvironment { key: String, label: String },
     /// Confirm removing a project with no threads.
@@ -40,17 +50,14 @@ pub enum Dialog {
         title: String,
     },
     /// Snooze a thread until a chosen time.
-    CustomSnooze { key: ThreadKey },
+    CustomSnooze(SnoozeForm),
     /// Go to any agent across environments.
     Goto,
 }
 
 impl Dialog {
     pub fn add_project(env: String, then_new_thread: bool) -> Self {
-        Self::AddProject {
-            env,
-            then_new_thread,
-        }
+        Self::AddProject(ProjectPicker::new(env, then_new_thread))
     }
 
     pub fn add_environment() -> Self {
@@ -67,14 +74,26 @@ impl Dialog {
         let title = s.thread_title(&key);
         let mut edit = TextEdit::new(title.clone());
         edit.focused = true;
-        edit.anchor = 0;
-        edit.focus = title.len();
+        edit.set_selection(0, title.len());
         Self::RenameThread { key, title: edit }
     }
 
     pub fn delete_thread(s: &J3, key: ThreadKey) -> Self {
         let title = s.thread_title(&key);
-        Self::DeleteThread { key, title }
+        Self::DeleteThread {
+            key,
+            title,
+            archived: false,
+        }
+    }
+
+    /// Deleting an archived thread (titled `title`) from Settings.
+    pub fn delete_archived(key: ThreadKey, title: String) -> Self {
+        Self::DeleteThread {
+            key,
+            title,
+            archived: true,
+        }
     }
 
     pub fn remove_environment(s: &J3, key: String) -> Self {
@@ -86,7 +105,7 @@ impl Dialog {
     }
 
     pub fn custom_snooze(key: ThreadKey) -> Self {
-        Self::CustomSnooze { key }
+        Self::CustomSnooze(SnoozeForm::new(key))
     }
 
     pub fn goto() -> Self {
@@ -100,6 +119,11 @@ pub enum Field {
     Label,
     Url,
     Title,
+    Path,
+    ProjectTitle,
+    SnoozeAmount,
+    SnoozeDate,
+    SnoozeTime,
 }
 
 #[derive(Default)]
@@ -120,6 +144,11 @@ impl DialogState {
             (Some(Dialog::AddEnvironment { label, .. }), Field::Label) => label,
             (Some(Dialog::AddEnvironment { url, .. }), Field::Url) => url,
             (Some(Dialog::RenameThread { title, .. }), Field::Title) => title,
+            (Some(Dialog::AddProject(picker)), Field::Path) => &mut picker.path,
+            (Some(Dialog::AddProject(picker)), Field::ProjectTitle) => &mut picker.title,
+            (Some(Dialog::CustomSnooze(form)), Field::SnoozeAmount) => &mut form.amount,
+            (Some(Dialog::CustomSnooze(form)), Field::SnoozeDate) => &mut form.date,
+            (Some(Dialog::CustomSnooze(form)), Field::SnoozeTime) => &mut form.time,
             _ => &mut self.scratch,
         }
     }
@@ -128,15 +157,25 @@ impl DialogState {
 impl J3 {
     /// Opens `dialog`, replacing any open one.
     pub fn open_dialog(&mut self, dialog: Dialog, _: &mut Tx) {
+        let picker = matches!(dialog, Dialog::AddProject(_));
         self.dialogs.open = Some(dialog);
+        if picker {
+            self.project_picker_opened();
+        }
     }
 
     pub fn close_dialog(&mut self) {
         self.dialogs.open = None;
     }
 
-    /// The open dialog's primary action.
+    /// The open dialog's primary action. A refused form stays open with its reason.
     pub fn confirm_dialog(&mut self, tx: &mut Tx) {
+        match &self.dialogs.open {
+            Some(Dialog::AddProject(_)) => return self.create_project(),
+            Some(Dialog::CustomSnooze(_)) => return self.confirm_snooze(),
+            Some(Dialog::Goto) | None => return,
+            Some(_) => {}
+        }
         let Some(dialog) = self.dialogs.open.take() else {
             return;
         };
@@ -146,6 +185,11 @@ impl J3 {
                     self.dialogs.open = Some(Dialog::RenameThread { key, title });
                 }
             }
+            Dialog::DeleteThread {
+                key,
+                archived: true,
+                ..
+            } => self.delete_archived(key),
             Dialog::DeleteThread { key, .. } => self.delete_thread(key),
             Dialog::AddEnvironment { label, url, .. } => {
                 if let Err(error) = self.add_environment(&label.text, &url.text) {
@@ -164,7 +208,7 @@ impl J3 {
             Dialog::RemoveProject {
                 env, project_id, ..
             } => self.remove_project(&env, project_id),
-            dialog @ (Dialog::AddProject { .. } | Dialog::CustomSnooze { .. } | Dialog::Goto) => {
+            dialog @ (Dialog::AddProject(_) | Dialog::CustomSnooze(_) | Dialog::Goto) => {
                 self.dialogs.open = Some(dialog);
             }
         }
@@ -206,8 +250,8 @@ impl J3 {
     }
 }
 
-/// Cancel and the primary action.
-fn footer(k: &Kit, confirm: &str, danger: bool) -> El {
+/// Cancel and the primary action (disabled while `busy`).
+fn footer(k: &Kit, confirm: &str, danger: bool, busy: bool) -> El {
     row()
         .key("dialog-footer")
         .w_full()
@@ -216,7 +260,7 @@ fn footer(k: &Kit, confirm: &str, danger: bool) -> El {
         .child(spacer())
         .child(
             Button::new("Cancel")
-                .variant(ButtonVariant::Ghost)
+                .variant(ButtonVariant::Outline)
                 .on_press(|s: &mut J3| s.close_dialog())
                 .build(k)
                 .key("dialog-cancel"),
@@ -228,19 +272,58 @@ fn footer(k: &Kit, confirm: &str, danger: bool) -> El {
                 } else {
                     ButtonVariant::Contrast
                 })
+                .disabled(busy)
                 .on_press_tx(|s: &mut J3, tx: &mut Tx| s.confirm_dialog(tx))
                 .build(k)
                 .key("dialog-confirm"),
         )
 }
 
-fn input(edit: &TextEdit, field: Field, placeholder: &str, k: &Kit) -> El {
-    TextInput::new(edit)
-        .placeholder(placeholder)
-        .label(placeholder)
-        .on_edit(move |s: &mut J3| s.dialogs.field(field))
-        .on_submit(|s: &mut J3, tx: &mut Tx| s.confirm_dialog(tx))
-        .build(k)
+/// A labelled one-line field of the open dialog.
+fn labelled(
+    k: &Kit,
+    title: &str,
+    edit: &TextEdit,
+    field: Field,
+    placeholder: &str,
+    key: &str,
+) -> El {
+    col()
+        .w_full()
+        .gap(6.0)
+        .child(
+            text(title.to_owned())
+                .font(k.ty.text_small_medium)
+                .color(k.c.text_base),
+        )
+        .child(
+            TextInput::new(edit)
+                .width(None)
+                .placeholder(placeholder)
+                .label(title)
+                .on_edit(move |s: &mut J3| s.dialogs.field(field))
+                .on_submit(|s: &mut J3, tx: &mut Tx| s.confirm_dialog(tx))
+                .build(k)
+                .key(key.to_owned()),
+        )
+}
+
+/// A form body over the footer.
+fn form(body: El, footer: El) -> El {
+    col()
+        .w_full()
+        .child(col().w_full().px(16.0).child(body))
+        .child(footer)
+}
+
+fn error_line(k: &Kit, error: &Option<String>) -> Option<El> {
+    error.as_ref().map(|error| {
+        text(error.clone())
+            .key("dialog-error")
+            .font(k.ty.text_xsmall)
+            .color(Status::of(k).danger)
+            .wrap()
+    })
 }
 
 /// Draws the open dialog into the overlay layer.
@@ -256,75 +339,98 @@ pub fn view(s: &J3, _cx: &mut Cx<J3>, ui: &mut Ui) {
                 "rename-thread",
                 "Rename thread".into(),
                 None,
-                col()
-                    .px(16.0)
-                    .child(input(title, Field::Title, "Title", k))
-                    .child(footer(k, "Rename", false)),
+                form(
+                    TextInput::new(title)
+                        .width(None)
+                        .placeholder("Title")
+                        .label("Title")
+                        .on_edit(|s: &mut J3| s.dialogs.field(Field::Title))
+                        .on_submit(|s: &mut J3, tx: &mut Tx| s.confirm_dialog(tx))
+                        .build(k)
+                        .key("rename-title"),
+                    footer(k, "Rename", false, false),
+                ),
                 400.0,
             ),
             Dialog::DeleteThread { title, .. } => (
                 "delete-thread",
                 format!("Delete “{title}”?"),
-                Some("The conversation is removed from j3. omp’s session file stays on disk.".into()),
-                footer(k, "Delete", true),
+                Some(
+                    "The conversation is removed from j3. omp’s session file stays on disk.".into(),
+                ),
+                footer(k, "Delete", true, false),
                 400.0,
             ),
             Dialog::RemoveEnvironment { label, .. } => (
                 "remove-environment",
                 format!("Remove “{label}”?"),
                 Some("Its threads stay on that server.".into()),
-                footer(k, "Remove", true),
+                footer(k, "Remove", true, false),
                 400.0,
             ),
             Dialog::RemoveProject { title, .. } => (
                 "remove-project",
                 format!("Remove “{title}”?"),
                 Some("Files on disk aren’t deleted.".into()),
-                footer(k, "Remove", true),
+                footer(k, "Remove", true, false),
                 400.0,
             ),
             Dialog::AddEnvironment { label, url, error } => {
-                let mut form = col()
-                    .px(16.0)
-                    .gap(8.0)
-                    .child(input(label, Field::Label, "Name", k))
-                    .child(input(url, Field::Url, "revived or http://revived:3780", k))
+                let mut fields = col()
+                    .w_full()
+                    .gap(12.0)
+                    .child(labelled(
+                        k,
+                        "Name",
+                        label,
+                        Field::Label,
+                        "revived",
+                        "environment-label",
+                    ))
                     .child(
-                        text("Port 3780 is used when none is given.")
-                            .font(k.ty.text_xsmall)
-                            .color(k.c.text_muted),
+                        col()
+                            .w_full()
+                            .gap(6.0)
+                            .child(labelled(
+                                k,
+                                "Host or URL",
+                                url,
+                                Field::Url,
+                                "revived or http://revived:3780",
+                                "environment-url",
+                            ))
+                            .child(
+                                text("Port 3780 is used when none is given.")
+                                    .font(k.ty.text_xsmall)
+                                    .color(k.c.text_muted),
+                            ),
                     );
-                if let Some(error) = error {
-                    form = form.child(
-                        text(error.clone())
-                            .key("dialog-error")
-                            .font(k.ty.text_xsmall)
-                            .color(Status::of(k).danger),
-                    );
+                if let Some(error) = error_line(k, error) {
+                    fields = fields.child(error);
                 }
                 (
                     "add-environment",
                     "Add environment".into(),
                     None,
-                    col().child(form).child(footer(k, "Add", false)),
+                    form(fields, footer(k, "Add", false, false)),
                     400.0,
                 )
             }
-            Dialog::AddProject { env, .. } => {
-                let label = s.envs.get(env).map_or(env.as_str(), |e| e.label());
-                (
-                    "add-project",
-                    "Add project".into(),
-                    Some(format!("On {label}")),
-                    footer(k, "Add Project", false),
-                    544.0,
-                )
-            }
-            Dialog::CustomSnooze { .. } => (
+            Dialog::AddProject(picker) => (
+                "add-project",
+                "Add project".into(),
+                None,
+                form(
+                    project::body(s, k, picker),
+                    footer(k, "Add Project", false, picker.creating),
+                ),
+                544.0,
+            ),
+            Dialog::CustomSnooze(snooze) => (
                 "custom-snooze",
                 "Custom snooze".into(),
                 None,
-                footer(k, "Snooze", false),
+                form(snooze::body(k, snooze), footer(k, "Snooze", false, false)),
                 400.0,
             ),
             Dialog::Goto => (
@@ -346,3 +452,6 @@ pub fn view(s: &J3, _cx: &mut Cx<J3>, ui: &mut Ui) {
     }
     panel.build(k, ui.layer);
 }
+
+#[cfg(test)]
+mod tests;
