@@ -32,6 +32,13 @@ pub struct SpaceRow {
     pub target: Option<ThreadKey>,
 }
 
+impl SpaceRow {
+    /// The row's element key: `space-{env}-{project}`.
+    pub fn element_id(&self) -> String {
+        format!("space-{}-{}", self.project.env, self.project.project_id)
+    }
+}
+
 /// One thread.
 #[derive(Debug, Clone)]
 pub struct AgentRow {
@@ -279,10 +286,7 @@ fn space_row(space: &SpaceRow, indicators: StatusIndicators, k: &Kit) -> El {
             None => s.new_thread_in(Some(project.clone()), tx),
         })
         .build(k)
-        .key(format!(
-            "space-{}-{}",
-            space.project.env, space.project.project_id
-        ))
+        .key(space.element_id())
         .label(format!("{}, {}", space.title, space.status.label()))
 }
 

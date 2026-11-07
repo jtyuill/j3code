@@ -191,7 +191,7 @@ pub fn view(s: &J3, cx: &mut Cx<J3>, ui: &mut Ui) -> El {
     if let Some(m) = &s.sidebar.row_menu
         && let Some(r) = rows.row(&m.key)
     {
-        root = root.child(menu::build(r, m, c.now, ui.m.zoom, k, ui.layer));
+        root = root.child(menu::build(r, m, c.now, k, ui.layer));
     }
     if let Some(drag) = &s.sidebar.drag {
         ui.layer.push(dnd::preview(drag, ui.m.zoom, k));
