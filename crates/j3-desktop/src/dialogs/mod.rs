@@ -327,7 +327,7 @@ fn error_line(k: &Kit, error: &Option<String>) -> Option<El> {
 }
 
 /// Draws the open dialog into the overlay layer.
-pub fn view(s: &J3, _cx: &mut Cx<J3>, ui: &mut Ui) {
+pub fn view(s: &J3, cx: &mut Cx<J3>, ui: &mut Ui) {
     let Some(dialog) = &s.dialogs.open else {
         return;
     };
@@ -437,7 +437,7 @@ pub fn view(s: &J3, _cx: &mut Cx<J3>, ui: &mut Ui) {
                 "goto",
                 "Go to agent".into(),
                 None,
-                col(),
+                crate::goto::body(s, cx, ui),
                 576.0,
             ),
         };

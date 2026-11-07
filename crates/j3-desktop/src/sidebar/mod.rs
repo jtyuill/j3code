@@ -1,24 +1,47 @@
 //! The thread sidebar (spec §4): its shared shell — thread and project keys, thread
-//! commands, navigation order, the sidebar pane's state — and its view. The T3 and herdr
-//! workflows (§4.2, §4.3) render their rows here.
+//! commands, navigation order, the clock, the sidebar pane's state — and its view, in the
+//! workflow the preferences choose:
+//!
+//! - **T3** ([`t3`], [`t3_view`]): t3code's settle workflow. One list across environments:
+//!   Pinned and Active at the top; the Working, Snoozed and Settled shelves anchored at the
+//!   bottom.
+//! - **herdr** ([`herdr`]): herdr's agent workflow. Spaces (projects) with their rolled-up
+//!   attention, then every agent (thread) with its state.
 //!
 //! Navigation (`J3::thread_order`, `adjacent`, `J3::nth_thread`) drives ⌘⇧] / ⌘⇧[ / ⌘1…⌘9
-//! / ↓↑; thread mutations go through `J3::apply_thread_commands`.
+//! / ↓↑ over the visible rows; thread mutations go through `J3::apply_thread_commands`.
 
-use std::time::Duration;
+mod dnd;
+mod herdr;
+mod menu;
+mod t3;
+mod t3_view;
+#[cfg(test)]
+mod tests;
 
-use j3_client::workflow::is_listed;
-use rune::{Cx, El, Tx, col, text};
-use rune_kit::{
-    IconButton, IconButtonVariant, PaneState,
-    shell::{Sidebar, SidebarRow},
+use std::{
+    collections::HashMap,
+    hash::{DefaultHasher, Hash, Hasher},
+    sync::Arc,
+    time::Duration,
 };
+
+use j3_client::ConnectionState;
+use rune::{Cx, El, Tx};
+use rune_kit::PaneState;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
+pub use dnd::DragState;
+pub use herdr::{AgentRow, HerdrRows, SpaceRow, display_title, glyph, status_color};
+pub use menu::{RowMenu, Submenu};
+pub use t3::{SETTLED_INITIAL_COUNT, SETTLED_PAGE_COUNT, T3Row, T3Rows};
+pub use t3_view::status_look;
+
 use crate::{
-    actions::{Action, shortcut_label},
-    app::{J3, Main, Ui},
-    icons,
+    actions::{Action, KeyContext},
+    app::{J3, Ui},
+    goto::GotoState,
+    ui_settings::{Shelf, Workflow},
 };
 
 /// One thread, across environments.
@@ -64,14 +87,41 @@ pub enum ThreadCommand {
     AutoSettle(bool),
 }
 
+/// One distinct environment's latest state, for building rows.
+pub struct EnvSnapshot<'a> {
+    pub key: &'a str,
+    pub label: &'a str,
+    pub state: &'a ConnectionState,
+}
+
 /// The sidebar's own state.
 pub struct SidebarState {
     /// The sidebar pane's width and open state (17 rem, 12.5–30 rem).
     pub pane: PaneState,
     /// T3's project filter (`None`: all projects).
     pub project_filter: Option<ProjectKey>,
-    /// When time-dependent rows next change (`clock.t` seconds); `None` until the first poll.
+    /// Settled rows shown (t3's paged tail).
+    pub settled_shown: usize,
+    /// When time-dependent rows next change (`clock.t` seconds); `None` while nothing on
+    /// screen depends on the time.
     pub tick_at: Option<f64>,
+    /// What the clock was last armed for (environments, settings, filter, open thread).
+    armed_for: Option<u64>,
+    /// The project filter's dropdown is open.
+    pub filter_menu: bool,
+    /// The open row context menu.
+    pub row_menu: Option<RowMenu>,
+    /// The row being dragged.
+    pub drag: Option<DragState>,
+    /// Where each drop target was last drawn, in window points.
+    pub drop_rects: HashMap<String, [f32; 4]>,
+    /// ⌘0 gave the sidebar the keyboard (until another control takes focus).
+    pub keyboard: bool,
+    /// The goto picker's search, filter and selection.
+    pub goto: GotoState,
+    /// Every thread command sent, for tests (fixture connections are offline).
+    #[cfg(test)]
+    pub sent: Vec<(ThreadKey, ThreadCommand)>,
 }
 
 impl Default for SidebarState {
@@ -79,7 +129,17 @@ impl Default for SidebarState {
         Self {
             pane: PaneState::new(272.0).range(200.0, 480.0),
             project_filter: None,
+            settled_shown: SETTLED_INITIAL_COUNT,
             tick_at: None,
+            armed_for: None,
+            filter_menu: false,
+            row_menu: None,
+            drag: None,
+            drop_rects: HashMap::new(),
+            keyboard: false,
+            goto: GotoState::default(),
+            #[cfg(test)]
+            sent: Vec::new(),
         }
     }
 }
@@ -94,12 +154,18 @@ impl SidebarState {
 /// Whether the focused element `key` belongs to the sidebar (its rows and list), so ↑/↓ move
 /// through threads there.
 pub fn owns_focus(key: &str) -> bool {
-    key.starts_with("thread-") || key.starts_with("sidebar")
+    ["thread-", "agent-", "space-", "sidebar"]
+        .iter()
+        .any(|prefix| key.starts_with(prefix))
 }
 
 /// The thread after (`delta` > 0) or before `current` in `order`, wrapping; from the ends
 /// when nothing (or something not listed) is open.
-pub fn adjacent<'k>(order: &'k [ThreadKey], current: Option<&ThreadKey>, delta: isize) -> Option<&'k ThreadKey> {
+pub fn adjacent<'k>(
+    order: &'k [ThreadKey],
+    current: Option<&ThreadKey>,
+    delta: isize,
+) -> Option<&'k ThreadKey> {
     if order.is_empty() {
         return None;
     }
@@ -123,44 +189,99 @@ pub fn until_next_minute(now: OffsetDateTime) -> Duration {
 }
 
 impl J3 {
-    /// The visible threads in display order, for keyboard navigation: every listed thread
-    /// of the distinct environments (within the project filter), newest first.
-    pub fn thread_order(&self) -> Vec<ThreadKey> {
-        let filter = self.sidebar.project_filter.as_ref();
-        let mut rows: Vec<(&str, ThreadKey)> = self
-            .envs
+    /// The distinct environments' latest states.
+    pub fn env_snapshots(&self) -> Vec<EnvSnapshot<'_>> {
+        self.envs
             .distinct()
             .into_iter()
-            .flat_map(|env| {
-                let key = env.key();
-                env.state()
-                    .shell
-                    .threads
-                    .iter()
-                    .filter(|thread| is_listed(thread))
-                    .filter(move |thread| {
-                        filter.is_none_or(|f| f.env == key && f.project_id == thread.project_id)
-                    })
-                    .map(move |thread| (thread.updated_at.as_str(), ThreadKey::new(key, &thread.id)))
+            .map(|env| EnvSnapshot {
+                key: env.key(),
+                label: env.label(),
+                state: env.state(),
             })
-            .collect();
-        rows.sort_by(|a, b| b.0.cmp(a.0));
-        rows.into_iter().map(|(_, key)| key).collect()
+            .collect()
+    }
+
+    /// T3 mode's rows now.
+    pub fn t3_rows(&self) -> T3Rows {
+        T3Rows::build(
+            &self.env_snapshots(),
+            self.prefs.ui(),
+            self.sidebar.project_filter.as_ref(),
+            self.open_thread_key().as_ref(),
+            self.sidebar.settled_shown,
+            self.clock.now,
+        )
+    }
+
+    /// herdr mode's rows now, in the agent order Settings chose.
+    pub fn herdr_rows(&self) -> HerdrRows {
+        let ui = self.prefs.ui();
+        HerdrRows::build(&self.env_snapshots(), ui.status_indicators, ui.agent_order)
+    }
+
+    /// The visible threads in display order, for keyboard navigation.
+    pub fn thread_order(&self) -> Vec<ThreadKey> {
+        match self.prefs.ui().workflow {
+            Workflow::T3 => self.t3_rows().order(),
+            Workflow::Herdr => self.herdr_rows().order(),
+        }
     }
 
     /// The sidebar's `n`th visible thread (1-based).
     pub fn nth_thread(&self, n: usize) -> Option<ThreadKey> {
-        n.checked_sub(1).and_then(|ix| self.thread_order().into_iter().nth(ix))
+        n.checked_sub(1)
+            .and_then(|ix| self.thread_order().into_iter().nth(ix))
     }
 
-    /// Moves keyboard focus to the sidebar's list.
-    pub fn focus_sidebar(&mut self, _: &mut Tx) {
+    /// Gives the sidebar the keyboard: ↑/↓ then move through its threads.
+    pub fn focus_sidebar(&mut self, tx: &mut Tx) {
         self.sidebar.pane.set_open(true);
+        self.sidebar.keyboard = true;
+        tx.blur();
+    }
+
+    /// Whether keys arriving with `focused` focused belong to the sidebar.
+    pub fn sidebar_owns_keys(&self, focused: Option<&str>) -> bool {
+        match focused {
+            Some(key) => owns_focus(key),
+            None => self.sidebar.keyboard,
+        }
+    }
+
+    /// A new thread in `project`, or where "new thread" goes (the filter, the open thread's
+    /// project, the local environment).
+    pub fn new_thread_in(&mut self, project: Option<ProjectKey>, tx: &mut Tx) {
+        match project {
+            Some(project) => self.new_thread(project.env, Some(project.project_id), tx),
+            None => self.dispatch(Action::NewThread, tx),
+        }
+    }
+
+    /// Shows `filter`'s threads only (`None`: every project's).
+    pub fn set_project_filter(&mut self, filter: Option<ProjectKey>) {
+        self.sidebar.project_filter = filter;
+    }
+
+    /// Folds or unfolds `shelf` (saved in `ui.expandedShelves`); Settled pages from the
+    /// start again.
+    pub fn toggle_shelf(&mut self, shelf: Shelf, tx: &mut Tx) {
+        if shelf == Shelf::Settled {
+            self.sidebar.settled_shown = SETTLED_INITIAL_COUNT;
+        }
+        self.update_ui(|ui| ui.set_expanded(shelf, !ui.is_expanded(shelf)), tx);
+    }
+
+    /// The next page of settled rows.
+    pub fn show_more_settled(&mut self) {
+        self.sidebar.settled_shown += SETTLED_PAGE_COUNT;
     }
 
     /// Runs thread commands in order on their servers, stopping at the first failure (a later
     /// command can depend on an earlier one, e.g. un-settle before reorder).
     pub fn apply_thread_commands(&mut self, commands: Vec<(ThreadKey, ThreadCommand)>) {
+        #[cfg(test)]
+        self.sidebar.sent.extend(commands.iter().cloned());
         let commands: Vec<_> = commands
             .into_iter()
             .filter_map(|(key, command)| {
@@ -183,8 +304,12 @@ impl J3 {
                         ThreadCommand::Wake => connection.unsnooze(id).await,
                         ThreadCommand::Pin(key) => connection.pin(id, key.as_deref()).await,
                         ThreadCommand::Unpin => connection.unpin(id).await,
-                        ThreadCommand::ReorderPinned(key) => connection.reorder_pinned(id, &key).await,
-                        ThreadCommand::ReorderActive(key) => connection.reorder_active(id, &key).await,
+                        ThreadCommand::ReorderPinned(key) => {
+                            connection.reorder_pinned(id, &key).await
+                        }
+                        ThreadCommand::ReorderActive(key) => {
+                            connection.reorder_active(id, &key).await
+                        }
                         ThreadCommand::MarkUnread => connection.mark_unread(id).await,
                         ThreadCommand::AutoSettle(enabled) => {
                             connection.set_auto_settle(id, enabled).await
@@ -197,97 +322,74 @@ impl J3 {
         );
     }
 
-    /// The sidebar's clock: time-dependent rows (ages, snooze wakes) re-render on the
-    /// minute. True when the minute turned.
+    /// What the sidebar's rows depend on besides the time: the environments' states, the
+    /// workflow settings, the filter, the paging and the open thread.
+    fn sidebar_inputs(&self) -> u64 {
+        let mut h = DefaultHasher::new();
+        for env in self.envs.distinct() {
+            env.key().hash(&mut h);
+            (Arc::as_ptr(env.state()) as usize).hash(&mut h);
+        }
+        let ui = self.prefs.ui();
+        (ui.workflow == Workflow::T3, ui.working_shelf).hash(&mut h);
+        ui.expanded_shelves.hash(&mut h);
+        self.sidebar.project_filter.hash(&mut h);
+        self.sidebar.settled_shown.hash(&mut h);
+        self.open_thread_key().hash(&mut h);
+        h.finish()
+    }
+
+    /// The sidebar's clock: time-dependent rows (working timers every second, ages on the
+    /// minute, snoozes when they wake) re-render on time. True when that time came. Also
+    /// drops a project filter whose project is gone, and the sidebar's keyboard once another
+    /// control has focus.
     pub(crate) fn poll_sidebar(&mut self, tx: &mut Tx) -> bool {
+        if tx.focused().is_some_and(|key| !owns_focus(key)) {
+            self.sidebar.keyboard = false;
+        }
         let t = self.clock.t;
         let due = self.sidebar.tick_at.is_some_and(|at| t >= at);
-        if due || self.sidebar.tick_at.is_none() {
-            let wait = until_next_minute(self.clock.now);
-            self.sidebar.tick_at = Some(t + wait.as_secs_f64());
+        let inputs = self.sidebar_inputs();
+        if !due && self.sidebar.armed_for == Some(inputs) {
+            return false;
+        }
+        self.sidebar.armed_for = Some(inputs);
+        if let Some(filter) = &self.sidebar.project_filter {
+            let gone = !self.env_snapshots().iter().any(|env| {
+                env.key == filter.env
+                    && (!env.state.shell.loaded
+                        || env.state.shell.project(&filter.project_id).is_some())
+            });
+            if gone {
+                self.sidebar.project_filter = None;
+            }
+        }
+        let wait = match self.prefs.ui().workflow {
+            Workflow::T3 => Some(self.t3_rows().next_tick(self.clock.now)),
+            Workflow::Herdr => None,
+        };
+        self.sidebar.tick_at = wait.map(|wait| t + wait.as_secs_f64());
+        if let Some(wait) = wait {
             tx.wake_after(wait);
         }
         due
     }
 }
 
-/// The sidebar pane's content.
-pub fn view(s: &J3, _cx: &mut Cx<J3>, ui: &mut Ui) -> El {
-    let k = ui.k;
-    let open = match &s.route.main {
-        Main::Thread(key) => Some(key),
-        _ => None,
+/// The sidebar pane's content in the chosen workflow. ↑/↓ on a focused row move to the
+/// previous / next thread, wrapping, as everywhere the sidebar has the keyboard.
+pub fn view(s: &J3, cx: &mut Cx<J3>, ui: &mut Ui) -> El {
+    let body = match s.prefs.ui().workflow {
+        Workflow::T3 => t3_view::view(s, cx, ui),
+        Workflow::Herdr => herdr::view(s, ui),
     };
-    let new_thread = IconButton::new(&icons::SQUARE_PEN)
-        .variant(IconButtonVariant::GhostMuted)
-        .label("New thread")
-        .help(format!("New thread ({})", shortcut_label(Action::NewThread)))
-        .on_press_tx(|s: &mut J3, tx: &mut Tx| s.dispatch(Action::NewThread, tx))
-        .build(k)
-        .key("new-thread");
-    let mut sidebar = Sidebar::new().label("Threads").header(new_thread);
-    let order = s.thread_order();
-    if order.is_empty() {
-        let connecting = s.envs.iter().all(|env| !env.state().shell.loaded);
-        let note = if connecting { "Connecting…" } else { "No threads yet" };
-        sidebar = sidebar.child(
-            col()
-                .key("sidebar-empty")
-                .w_full()
-                .py(12.0)
-                .child(text(note).font(k.ty.text_small).color(k.c.text_muted)),
-        );
-    }
-    for key in order {
-        let title = s
-            .envs
-            .get(&key.env)
-            .and_then(|env| env.state().shell.thread(&key.thread_id))
-            .map_or_else(String::new, |thread| thread.title.clone());
-        let row_key = key.element_id("thread");
-        let selected = open == Some(&key);
-        sidebar = sidebar.child(
-            SidebarRow::new(title)
-                .selected(selected)
-                .on_select(move |s: &mut J3, tx: &mut Tx| s.open_thread(key.clone(), tx))
-                .build(k)
-                .key(row_key),
-        );
-    }
-    sidebar.build(k)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn adjacent_wraps_and_starts_at_the_ends() {
-        let order: Vec<ThreadKey> = ["a", "b", "c"]
-            .into_iter()
-            .map(|id| ThreadKey::new("local", id))
-            .collect();
-        let key = |id: &str| ThreadKey::new("local", id);
-        assert_eq!(adjacent(&order, Some(&key("a")), 1), Some(&key("b")));
-        assert_eq!(adjacent(&order, Some(&key("c")), 1), Some(&key("a")));
-        assert_eq!(adjacent(&order, Some(&key("a")), -1), Some(&key("c")));
-        assert_eq!(adjacent(&order, None, 1), Some(&key("a")));
-        assert_eq!(adjacent(&order, None, -1), Some(&key("c")));
-        assert_eq!(adjacent(&order, Some(&key("x")), 1), Some(&key("a")));
-        assert_eq!(adjacent(&[], None, 1), None);
-    }
-
-    #[test]
-    fn element_ids_are_namespaced_per_environment() {
-        assert_ne!(
-            ThreadKey::new("local", "t1").element_id("thread"),
-            ThreadKey::new("http://x:1", "t1").element_id("thread")
-        );
-    }
-
-    #[test]
-    fn the_clock_ticks_on_the_minute() {
-        let now = OffsetDateTime::parse("2026-11-01T12:00:45.250Z", &Rfc3339).unwrap();
-        assert_eq!(until_next_minute(now), Duration::from_millis(14_750));
-    }
+    body.on_key(|s: &mut J3, ev, tx: &mut Tx| {
+        match crate::actions::action_for(ev, KeyContext::Sidebar, tx) {
+            Some(action @ (Action::NextThread | Action::PreviousThread)) => {
+                s.dispatch(action, tx);
+                true
+            }
+            _ => false,
+        }
+    })
 }

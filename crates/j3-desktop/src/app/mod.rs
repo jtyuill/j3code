@@ -287,6 +287,9 @@ pub fn on_key(s: &mut J3, ev: &KeyEvent, tx: &mut Tx) -> bool {
         return true;
     }
     let context = s.key_context(tx);
+    if context == crate::actions::KeyContext::GotoPicker && crate::goto::on_key(s, ev, tx) {
+        return true;
+    }
     match crate::actions::action_for(ev, context, tx) {
         Some(action) => {
             s.dispatch(action, tx);
