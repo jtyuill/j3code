@@ -1163,17 +1163,23 @@ const VERSION_LABEL: &str = concat!(
     env!("J3_GIT_COMMIT")
 );
 
-/// The build stamp in the window's bottom-right corner: small and faded so it
-/// reads as chrome, not content. It has no handlers, so clicks fall through.
-fn version_watermark(cx: &App) -> impl IntoElement {
-    div()
-        .id("version-watermark")
+/// The build stamp: a thin status strip under the content with the label at
+/// its right end. It takes its own row, so it never covers the settings pages
+/// or the composer.
+fn version_bar(cx: &App) -> impl IntoElement {
+    let theme = cx.theme();
+    h_flex()
+        .id("version-bar")
         .test_support()
-        .absolute()
-        .bottom_1()
-        .right_2()
+        .flex_shrink_0()
+        .justify_end()
+        .items_center()
+        .px_3()
+        .py_0p5()
+        .border_t_1()
+        .border_color(theme.border)
         .text_xs()
-        .text_color(cx.theme().muted_foreground.opacity(0.55))
+        .text_color(theme.muted_foreground)
         .child(VERSION_LABEL)
 }
 
@@ -1212,7 +1218,7 @@ impl Render for Workspace {
             .text_color(cx.theme().foreground)
             .child(titlebar)
             .child(div().flex_1().min_h_0().child(content))
-            .child(version_watermark(cx))
+            .child(version_bar(cx))
             .when(cfg!(target_os = "macos"), |this| {
                 this.on_mouse_down(MouseButton::Left, titlebar::double_click)
             })
