@@ -261,6 +261,6 @@ fn send_button(s: &J3, ui: &Ui, key: &ComposerKey, running: bool) -> El {
                     s.stop_run(thread);
                 }
             }
-            SendAction::Send | SendAction::Queue => s.submit_composer(&press, tx),
+            SendAction::Send | SendAction::Queue => s.send_halting_dictation(&press, tx),
         })
 }

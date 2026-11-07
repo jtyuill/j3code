@@ -83,7 +83,7 @@ impl J3 {
 
     /// What the capture `owner` started reports: its phase, its transcript so far, its end
     /// ("Dictation failed: …", or "No speech detected." for a capture that heard nothing).
-    pub fn on_speech_event(&mut self, event: SpeechEvent, _: &mut Tx) {
+    pub fn on_speech_event(&mut self, event: SpeechEvent, tx: &mut Tx) {
         let owner = match &event {
             SpeechEvent::Phase { owner, .. }
             | SpeechEvent::Transcript { owner, .. }
@@ -95,6 +95,7 @@ impl J3 {
         let Some(dictation) = composer.dictation.as_mut() else {
             return;
         };
+        let mut send = false;
         match event {
             SpeechEvent::Phase { phase, .. } => dictation.phase = phase,
             SpeechEvent::Transcript { text, .. } => write_transcript(composer, &text),
@@ -108,12 +109,34 @@ impl J3 {
                     .dictation
                     .take()
                     .is_some_and(|d| d.phase != Phase::Starting && d.inserted.is_empty());
+                send = std::mem::take(&mut composer.send_after_dictation) && error.is_none();
                 composer.error = match error {
                     Some(error) => Some(format!("Dictation failed: {error}")),
                     None if silent => Some("No speech detected.".to_owned()),
                     None => None,
                 };
             }
+        }
+        // Send was pressed mid-dictation: the capture is over and its words are in.
+        if send {
+            self.submit_composer(&owner, tx);
+        }
+    }
+
+    /// The Send/Queue button: sends the draft. While this composer dictates, halts the
+    /// capture first and sends once its last words have landed.
+    pub(super) fn send_halting_dictation(&mut self, key: &ComposerKey, tx: &mut Tx) {
+        let composer = self.composer(key);
+        let Some(dictation) = composer.dictation.as_ref() else {
+            return self.submit_composer(key, tx);
+        };
+        if composer.busy {
+            return;
+        }
+        let transcribing = dictation.phase == Phase::Transcribing;
+        composer.send_after_dictation = true;
+        if !transcribing {
+            self.stop_dictation(tx);
         }
     }
 }

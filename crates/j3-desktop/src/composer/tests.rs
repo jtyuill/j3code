@@ -440,6 +440,37 @@ fn transcripts_land_at_the_caret_and_the_draft_sends_only_after_dictation() {
     );
 }
 
+#[test]
+fn send_during_dictation_waits_for_the_last_words_then_sends() {
+    let (mut app, key) = focused(Scene::NewThread);
+    typed(&mut app, "Note:");
+    let start = key.clone();
+    app.rt.update(move |s, _| {
+        let composer = s.composer(&start);
+        let mut dictation = super::mic::Dictation::at(&composer.edit);
+        dictation.phase = Phase::Recording;
+        composer.dictation = Some(dictation);
+    });
+    tap(&mut app, "send-message");
+    // Pressed mid-dictation: nothing sent yet, the send waits for the capture's end.
+    assert!(!app.rt.state.composers[&key].busy);
+    let end = key.clone();
+    app.rt.update(move |s, tx| {
+        s.on_speech_event(
+            SpeechEvent::End {
+                owner: end,
+                text: "last words".into(),
+                error: None,
+            },
+            tx,
+        )
+    });
+    app.frame();
+    let composer = &app.rt.state.composers[&key];
+    assert!(composer.dictation.is_none() && !composer.send_after_dictation);
+    assert!(composer.busy, "the draft with the last words was sent");
+}
+
 fn tap(app: &mut TestApp, element: &str) {
     let (x, y) = app
         .rt

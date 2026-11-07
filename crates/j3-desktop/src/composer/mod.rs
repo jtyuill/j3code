@@ -115,6 +115,8 @@ pub struct ComposerState {
     predicting: usize,
     /// The capture dictating into this draft.
     dictation: Option<Dictation>,
+    /// Send was pressed while dictating: the draft sends when the capture ends.
+    send_after_dictation: bool,
     /// ← taps in the empty draft.
     left: DoubleTap,
     /// The field's focus as the last poll saw it.
