@@ -5,10 +5,12 @@
 //! `J3::open_thread` subscribes (once per thread; the state stays while the app runs, so a
 //! reopened thread renders at once), routes the main pane to it and marks it visited.
 
+pub mod feed;
+
 use std::sync::Arc;
 
-use j3_client::{ThreadHandle, ThreadState, ThreadSync, t3::orchestration::TurnItemKind};
-use rune::{Cx, El, ScrollSpec, Tx, col, el, row, text};
+use j3_client::{ThreadHandle, ThreadState};
+use rune::{Cx, El, Tx, col, row};
 use rune_kit::shell::Toolbar;
 
 use crate::{
@@ -23,6 +25,8 @@ pub struct ThreadUi {
     pub handle: ThreadHandle,
     /// The latest state from the subscription.
     pub state: Arc<ThreadState>,
+    /// The feed's own UI state.
+    pub feed: feed::FeedUi,
     /// The task forwarding `handle.state()` into the inbox; stopped on drop.
     watch: tokio::task::AbortHandle,
 }
@@ -75,6 +79,7 @@ impl J3 {
                 ThreadUi {
                     handle,
                     state,
+                    feed: feed::FeedUi::default(),
                     watch: watch.abort_handle(),
                 },
             );
@@ -130,25 +135,7 @@ pub fn toolbar(s: &J3, cx: &mut Cx<J3>, ui: &mut Ui, key: &ThreadKey) -> Toolbar
 
 /// The open thread: its messages, then the composer.
 pub fn view(s: &J3, cx: &mut Cx<J3>, ui: &mut Ui, key: &ThreadKey) -> El {
-    let k = ui.k;
-    let note = |message: String| {
-        el().key("feed-note")
-            .w_full()
-            .grow(1.0)
-            .center()
-            .child(text(message).font(k.ty.text_small).color(k.c.text_muted))
-    };
-    let feed = match s.threads.get(key).map(|thread| &thread.state) {
-        None => note("Loading…".into()),
-        Some(state) => match &state.sync {
-            ThreadSync::Deleted => note("This thread was deleted.".into()),
-            ThreadSync::Failed(e) if state.projection.is_none() => {
-                note(format!("Couldn’t load the thread: {e}"))
-            }
-            _ if state.projection.is_none() => note("Loading…".into()),
-            _ => messages(state, ui),
-        },
-    };
+    let feed = feed::view(s, cx, ui, key);
     let hub_open = s.hubs.get(key).is_some_and(|hub| hub.open);
     let chat = if hub_open {
         crate::hub::view(s, cx, ui, key).grow(1.0).min_h(0.0)
@@ -183,70 +170,4 @@ pub fn view(s: &J3, cx: &mut Cx<J3>, ui: &mut Ui, key: &ThreadKey) -> El {
                 .child(drawer),
         )
         .child(files)
-}
-
-/// User and assistant messages as plain text, in a list that follows its end.
-fn messages(state: &ThreadState, ui: &Ui) -> El {
-    let k = ui.k;
-    let rows: Vec<El> = state
-        .feed()
-        .iter()
-        .filter(|projected| !crate::feed::is_hidden(&projected.item))
-        .filter_map(|projected| {
-            let item = &projected.item;
-            let (text_of, user) = match &item.kind {
-                TurnItemKind::UserMessage(message) => (message.text.clone(), true),
-                TurnItemKind::AssistantMessage(message) => (message.text.clone(), false),
-                _ => return None,
-            };
-            let body = text(text_of.clone())
-                .font(k.ty.body)
-                .color(k.c.text_base)
-                .wrap()
-                .selectable(true)
-                .selection_color(k.selection());
-            let bubble = if user {
-                row().w_full().justify_end().child(
-                    el().max_w(ui.m.measure * 0.8)
-                        .padding(12.0)
-                        .radius(k.radius.lg)
-                        .fill(k.c.layer_02)
-                        .child(body),
-                )
-            } else {
-                row().w_full().child(body)
-            };
-            Some(
-                el().key(format!("feed-{}", item.id))
-                    .w_full()
-                    .px(16.0)
-                    .pt(24.0)
-                    .label(text_of)
-                    .child(bubble),
-            )
-        })
-        .collect();
-    if rows.is_empty() {
-        return el()
-            .key("feed")
-            .w_full()
-            .grow(1.0)
-            .center()
-            .child(text("No messages yet.").font(k.ty.text_small).color(k.c.text_muted));
-    }
-    col()
-        .key("feed")
-        .w_full()
-        .grow(1.0)
-        .min_h(0.0)
-        .scroll(ScrollSpec { stick_bottom: true })
-        .child(
-            col()
-                .key("feed-rows")
-                .w_full()
-                .max_w(ui.m.measure)
-                .self_center()
-                .pb(16.0)
-                .children(rows),
-        )
 }
