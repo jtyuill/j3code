@@ -116,7 +116,9 @@ impl J3 {
         id: u64,
         result: Result<ChatAttachment, String>,
     ) {
-        let composer = self.composer(key);
+        let Some(composer) = self.composers.get_mut(key) else {
+            return;
+        };
         if let Some(image) = composer.images.iter_mut().find(|image| image.id == id) {
             image.upload = match result {
                 Ok(attachment) => Upload::Done(attachment),
@@ -176,6 +178,10 @@ impl J3 {
                 })
                 .collect();
             move |s: &mut J3, tx: &mut Tx| {
+                // The draft may have gone while the files were read.
+                if !s.composers.contains_key(&key) {
+                    return;
+                }
                 for (bytes, name) in read {
                     s.add_composer_image(&key, bytes, name);
                 }

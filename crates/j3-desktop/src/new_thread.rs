@@ -126,12 +126,17 @@ impl J3 {
         true
     }
 
-    /// Launches a thread on the chosen project with the composer's submission (its text,
-    /// uploaded images and model) as the first message, then opens it.
-    pub fn launch_new_thread(&mut self, submission: crate::composer::Submission, _: &mut Tx) {
-        let key = self.new_thread.composer_key();
-        let env = self.new_thread.env.clone();
-        let Some(project) = self.new_thread.project.clone() else {
+    /// Launches a thread on `project` of `env` with the submission of composer `key` (its
+    /// text, uploaded images and model) as the first message, then opens it.
+    pub fn launch_new_thread(
+        &mut self,
+        key: ComposerKey,
+        env: String,
+        project: Option<String>,
+        submission: crate::composer::Submission,
+        _: &mut Tx,
+    ) {
+        let Some(project) = project else {
             self.finish_composer(
                 &key,
                 Err("Add a project to this environment to start a thread.".into()),
@@ -143,7 +148,6 @@ impl J3 {
             return;
         };
         let connection = environment.connection().clone();
-        self.composer(&key).busy = true;
         self.spawn(async move {
             let result = connection
                 .launch(

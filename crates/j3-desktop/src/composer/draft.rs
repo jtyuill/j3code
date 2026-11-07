@@ -234,10 +234,11 @@ impl J3 {
         let key = key.clone();
         let at = prediction::utf16_offset(&text, cursor);
         self.predict_word(text.clone(), at, move |s, suffix, tx| {
-            let composer = s.composer(&key);
-            composer.predicting -= 1;
-            s.prediction_answered(&key, text, cursor, suffix);
-            tx.instant();
+            if let Some(composer) = s.composers.get_mut(&key) {
+                composer.predicting -= 1;
+                s.prediction_answered(&key, text, cursor, suffix);
+                tx.instant();
+            }
         });
     }
 
@@ -250,7 +251,9 @@ impl J3 {
         cursor: usize,
         suffix: Option<String>,
     ) {
-        let composer = self.composer(key);
+        let Some(composer) = self.composers.get_mut(key) else {
+            return;
+        };
         if composer.edit.focus != cursor || composer.edit.text != text {
             return;
         }

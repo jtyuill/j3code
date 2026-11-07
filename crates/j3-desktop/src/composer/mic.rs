@@ -89,7 +89,9 @@ impl J3 {
             | SpeechEvent::Transcript { owner, .. }
             | SpeechEvent::End { owner, .. } => owner.clone(),
         };
-        let composer = self.composer(&owner);
+        let Some(composer) = self.composers.get_mut(&owner) else {
+            return;
+        };
         let Some(dictation) = composer.dictation.as_mut() else {
             return;
         };
