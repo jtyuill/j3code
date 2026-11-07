@@ -24,6 +24,8 @@ use j3_client::SendMode;
 use j3_client::t3::{chat_attachment::ChatAttachment, model::ModelSelection};
 use rune::{TextEdit, Tx};
 
+#[cfg(test)]
+pub(crate) use draft::keyword_tokens;
 pub use draft::plain_text;
 pub use view::view;
 

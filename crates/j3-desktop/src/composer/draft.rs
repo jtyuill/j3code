@@ -50,7 +50,7 @@ fn overlaps(taken: &[Range<usize>], range: &Range<usize>) -> bool {
 /// The magic keywords drawn with their gradient: standalone prose occurrences that a
 /// character follows (so `orchestrate` doesn't flicker while it is the last word), outside
 /// the chips.
-pub(super) fn keyword_tokens(edit: &TextEdit) -> Vec<keywords::Found> {
+pub(crate) fn keyword_tokens(edit: &TextEdit) -> Vec<keywords::Found> {
     let text = &edit.text;
     let pills = pill_ranges(edit);
     keywords::find(text)

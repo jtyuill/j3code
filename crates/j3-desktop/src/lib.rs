@@ -43,4 +43,6 @@ pub mod theme;
 pub mod thread;
 pub mod toasts;
 pub mod ui_settings;
+#[cfg(test)]
+mod ui_tests;
 pub mod usage;

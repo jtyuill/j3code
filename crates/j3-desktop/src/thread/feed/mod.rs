@@ -317,7 +317,7 @@ fn build_row(s: &J3, key: &ThreadKey, visible: &[usize], i: usize, dark: bool, s
         key,
         state: &thread.state,
         feed: &thread.feed,
-        width: m.measure - 32.0,
+        width: m.measure,
         scale,
         math: s.prefs.ui().math_rendering,
     };
@@ -333,7 +333,12 @@ fn build_row(s: &J3, key: &ThreadKey, visible: &[usize], i: usize, dark: bool, s
         _ => None,
     };
     let frame = move |content: El| {
-        let inner = el().w_full().max_w(m.measure).px(16.0).child(content);
+        // The measure is the text's width; the side padding sits outside it.
+        let inner = el()
+            .w_full()
+            .max_w(m.measure + 32.0)
+            .px(16.0)
+            .child(content);
         let row = col()
             .w_full()
             .items_center()
@@ -357,7 +362,8 @@ fn build_row(s: &J3, key: &ThreadKey, visible: &[usize], i: usize, dark: bool, s
         (m.measure.to_bits(), scale.to_bits()),
         cx.math,
     );
-    let id = format!("feed-row-{}", item.id);
+    // Item ids repeat across threads (`ti_1`…): the thread is part of the row's identity.
+    let id = key.element_id(&format!("feed-row-{}", item.id));
     // Markdown resolves its images first: their states version the row.
     match &item.kind {
         TurnItemKind::AssistantMessage(message) => {

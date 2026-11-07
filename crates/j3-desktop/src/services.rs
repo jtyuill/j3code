@@ -55,7 +55,9 @@ impl Services {
 
     /// The local environment's URL: this process's server, or the one already on its port.
     pub fn local_url(&self) -> &str {
-        crate::local_server::LOCAL_URL
+        self.local
+            .as_deref()
+            .map_or(crate::local_server::LOCAL_URL, |local| local.url())
     }
 
     pub(crate) fn register(&self, connection: &Connection) {
