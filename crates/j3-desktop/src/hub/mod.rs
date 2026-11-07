@@ -275,7 +275,8 @@ impl J3 {
             return false;
         };
         if ev.key == Key::Left {
-            if hub.left.tap(now) {
+            // A held key's repeats are no taps (as the composer's ←←).
+            if !tx.key_repeat() && hub.left.tap(now) {
                 self.close_hub(key, tx);
             }
             return true;

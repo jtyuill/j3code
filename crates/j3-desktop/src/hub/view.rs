@@ -2,6 +2,8 @@
 //! header with Stop, then the transcript: the assignment, assistant markdown, thinking,
 //! tool calls and results that expand on click, and errors.
 
+use std::hash::{DefaultHasher, Hash, Hasher};
+
 use j3_client::t3::orchestration::{Subagent, SubagentStatus};
 use j3_protocol::j3::TranscriptEntry;
 use rune::{
@@ -309,11 +311,11 @@ fn entry_view(
                     .font(k.ty.text_xsmall)
                     .color(k.c.text_muted),
             )
-            .child(markdown(s, ui, &id, body)),
+            .child(markdown(s, ui, key, &id, body)),
         TranscriptEntry::Assistant { text: body } => col()
             .key(format!("hub-entry-{id}"))
             .w_full()
-            .child(markdown(s, ui, &id, body)),
+            .child(markdown(s, ui, key, &id, body)),
         TranscriptEntry::Thinking { text: body } => text(body)
             .key(format!("hub-entry-{id}"))
             .font(TextStyle {
@@ -437,9 +439,9 @@ fn tool_row(
 }
 
 /// User and assistant text as markdown, with TeX math typeset when the setting is on.
-/// Entries never change once read, so a memo keeps all but those with formulas (whose
-/// images load later).
-fn markdown(s: &J3, ui: &Ui, id: &str, source: &str) -> El {
+/// A memo keyed by thread and entry, versioned by the source (a reset transcript reuses
+/// indices), keeps all but entries with formulas (whose images load later).
+fn markdown(s: &J3, ui: &Ui, key: &ThreadKey, id: &str, source: &str) -> El {
     let k = ui.k;
     let math_on = s.prefs.ui().math_rendering;
     let build = || {
@@ -471,9 +473,17 @@ fn markdown(s: &J3, ui: &Ui, id: &str, source: &str) -> El {
     if may_have_math {
         return build();
     }
+    let mut hasher = DefaultHasher::new();
+    source.hash(&mut hasher);
     memo(
-        format!("hub-md-{id}"),
-        (math_on, k.dark, ui.m.rem.to_bits(), ui.m.code.to_bits()),
+        format!("hub-md-{}-{}-{id}", key.env, key.thread_id),
+        (
+            hasher.finish(),
+            math_on,
+            k.dark,
+            ui.m.rem.to_bits(),
+            ui.m.code.to_bits(),
+        ),
         build,
     )
 }

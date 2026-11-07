@@ -145,11 +145,13 @@ impl J3 {
         true
     }
 
-    /// After a thread leaves the list, show nothing in its place.
+    /// After a thread leaves the list (archived or deleted), show nothing in its place and
+    /// drop what was kept for it.
     pub fn leave_thread(&mut self, key: &ThreadKey) {
         if self.open_thread_key().as_ref() == Some(key) {
             self.route.main = Main::Empty;
         }
+        self.forget_thread(key);
     }
 
     /// Environment `key` was removed: nothing of it stays on screen.

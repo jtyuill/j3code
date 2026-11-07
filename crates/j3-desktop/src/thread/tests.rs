@@ -338,3 +338,69 @@ fn the_question_card_walks_the_questions_and_answers() {
     click(&mut app, "dismiss-question");
     until_failed(&mut app, "dismiss the question");
 }
+
+#[test]
+fn only_the_open_thread_stays_subscribed_and_a_recent_one_reopens_at_once() {
+    let mut app = thread_app();
+    let first = open_thread_key();
+    let other = crate::sidebar::ThreadKey::new("local", "thr-dictation");
+    let open = other.clone();
+    app.rt.update(move |s: &mut J3, tx| s.open_thread(open, tx));
+    app.frame();
+    let threads = &app.rt.state.threads;
+    assert!(threads[&other].is_subscribed());
+    assert!(
+        !threads[&first].is_subscribed(),
+        "leaving a thread ends its subscription"
+    );
+    assert!(
+        threads[&first].state.projection.is_some(),
+        "its last state stays cached"
+    );
+
+    // Reopening draws the cached feed and cards at once, subscribed again.
+    let back = first.clone();
+    app.rt.update(move |s: &mut J3, tx| s.open_thread(back, tx));
+    app.frame();
+    assert!(app.rt.state.threads[&first].is_subscribed());
+    assert!(!app.rt.state.threads[&other].is_subscribed());
+    assert!(app.rt.find("question-card").is_some() && app.rt.find("goal").is_some());
+
+    // Only the most recent stay cached.
+    let ids = [
+        "thr-sidebar-dnd",
+        "thr-release",
+        "thr-math",
+        "thr-zoom",
+        "thr-notarize",
+        "thr-scroll",
+        "thr-tokens",
+        "thr-layout",
+        "thr-dictation",
+        "thr-sidebar-dnd",
+    ];
+    for id in ids {
+        let key = crate::sidebar::ThreadKey::new("local", id);
+        app.rt.update(move |s: &mut J3, tx| s.open_thread(key, tx));
+        app.frame();
+    }
+    let threads = &app.rt.state.threads;
+    assert_eq!(threads.len(), super::RECENT_THREADS + 1);
+    assert_eq!(threads.values().filter(|t| t.is_subscribed()).count(), 1);
+    assert!(
+        !threads.contains_key(&first),
+        "the least recently open thread went"
+    );
+}
+
+#[test]
+fn an_archived_thread_is_forgotten() {
+    let mut app = thread_app();
+    let key = open_thread_key();
+    let left = key.clone();
+    app.rt.update(move |s: &mut J3, _| s.leave_thread(&left));
+    app.frame();
+    assert!(app.rt.find("thread-title").is_none());
+    assert!(!app.rt.state.threads.contains_key(&key));
+    assert!(!app.rt.state.hubs.contains_key(&key));
+}
