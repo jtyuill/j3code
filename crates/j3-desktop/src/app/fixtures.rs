@@ -75,10 +75,14 @@ pub enum Scene {
     CustomSnooze,
     /// [`OPEN_THREAD`] open with its agents hub showing.
     Hub,
+    /// [`OPEN_THREAD`] open with its file pane (a fixture tree and preview) and git control.
+    Files,
+    /// [`OPEN_THREAD`] open with its git control's commit dialog.
+    GitCommit,
 }
 
 impl Scene {
-    pub const ALL: [Scene; 10] = [
+    pub const ALL: [Scene; 12] = [
         Scene::Fixtures,
         Scene::Thread,
         Scene::NewThread,
@@ -89,6 +93,8 @@ impl Scene {
         Scene::AddProject,
         Scene::CustomSnooze,
         Scene::Hub,
+        Scene::Files,
+        Scene::GitCommit,
     ];
 
     /// The `--scene` name.
@@ -104,6 +110,8 @@ impl Scene {
             Scene::AddProject => "add-project",
             Scene::CustomSnooze => "custom-snooze",
             Scene::Hub => "hub",
+            Scene::Files => "files",
+            Scene::GitCommit => "git-commit",
         }
     }
 }
@@ -123,6 +131,8 @@ pub const SCENES: &[SceneSetup] = &[
     ("add-project", |s: &mut J3| start(s, Scene::AddProject)),
     ("custom-snooze", |s: &mut J3| start(s, Scene::CustomSnooze)),
     ("hub", |s: &mut J3| start(s, Scene::Hub)),
+    ("files", |s: &mut J3| start(s, Scene::Files)),
+    ("git-commit", |s: &mut J3| start(s, Scene::GitCommit)),
 ];
 
 /// A scene from the command line: default UI settings (not the user's `desktop.json`), so
@@ -179,12 +189,23 @@ pub fn install(s: &mut J3, scene: Scene) {
     ));
     match scene {
         Scene::Fixtures => {}
-        Scene::Thread | Scene::Herdr | Scene::CustomSnooze | Scene::Hub => {
+        Scene::Thread
+        | Scene::Herdr
+        | Scene::CustomSnooze
+        | Scene::Hub
+        | Scene::Files
+        | Scene::GitCommit => {
             let key = open_thread_key();
             if s.subscribe_thread(&key).is_some()
                 && let Some(thread) = s.threads.get_mut(&key)
             {
                 thread.state = Arc::new(thread_state());
+            }
+            if scene == Scene::Files {
+                crate::files::fixtures::install(s, &key);
+            }
+            if matches!(scene, Scene::Files | Scene::GitCommit) {
+                crate::git::fixtures::install(s, &key, scene == Scene::GitCommit);
             }
             s.route.main = Main::Thread(key.clone());
             if scene == Scene::CustomSnooze {

@@ -273,6 +273,7 @@ pub fn poll(s: &mut J3, t: f64, tx: &mut Tx) -> bool {
     changed |= s.poll_feed();
     changed |= s.poll_new_thread(tx);
     changed |= s.poll_thread(tx);
+    changed |= s.poll_git(tx);
     changed
 }
 
