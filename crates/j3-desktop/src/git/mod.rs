@@ -2,7 +2,8 @@
 //! project's repository status, a quick action button with a menu (Commit…, Push, Pull, and on
 //! GitHub Create PR / View PR), the commit dialog, and outcome toasts. It follows the open
 //! thread's project root and rereads the status when the root changes, when the thread's run
-//! ends and every 30 s. Hidden unless a status loaded and the project is a repository.
+//! ends and every 30 s. Hidden unless a status loaded and the project is a repository, or
+//! an action is running.
 //!
 //! An action runs on tokio and outlives the control: leaving the thread does not interrupt a
 //! commit; its phases label the button and its outcome is a toast.
@@ -40,7 +41,7 @@ const POLL_INTERVAL: f64 = 30.0;
 pub struct GitControl {
     /// The thread's project directory, once the shell knows it.
     cwd: Option<String>,
-    /// The latest status of `cwd`; `None` until read, or when it could not be.
+    /// The latest status read of `cwd`; `None` until one succeeds. A failed read keeps it.
     pub status: Option<VcsStatusResult>,
     /// The running action's current phase ("Committing..."); the control is busy while set.
     running: Option<String>,
@@ -170,10 +171,14 @@ impl J3 {
                     return;
                 };
                 git.refreshing = false;
-                if git.cwd.as_deref() == Some(cwd.as_str()) {
-                    git.status = result
-                        .inspect_err(|e| tracing::debug!("git status of {cwd}: {e}"))
-                        .ok();
+                // A failed read keeps the last good status: one missed poll (a busy
+                // repository mid-commit, say) must not hide the control.
+                match result {
+                    Ok(status) if git.cwd.as_deref() == Some(cwd.as_str()) => {
+                        git.status = Some(status);
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::debug!("git status of {cwd}: {e}"),
                 }
                 if std::mem::take(&mut git.refresh_again) {
                     s.refresh_git(&key);

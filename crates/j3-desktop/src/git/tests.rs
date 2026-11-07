@@ -175,7 +175,7 @@ fn a_commit_runs_labelled_by_its_phase_and_reports_its_failure() {
 }
 
 #[test]
-fn the_end_of_a_run_rereads_the_status() {
+fn the_end_of_a_run_rereads_the_status_and_a_failed_read_keeps_the_last() {
     let mut app = TestApp::with_scene(Scene::Files);
     app.settle(10);
     let key = open_thread_key();
@@ -184,7 +184,7 @@ fn the_end_of_a_run_rereads_the_status() {
         "the fixture thread is mid-run"
     );
     assert!(app.rt.find("git-quick-action").is_some());
-    // The run ends: the poll sees it and rereads, which fails offline, so the control hides.
+    // The run ends: the next poll rereads the status.
     let ended = key.clone();
     app.rt.update(move |s, _| {
         let thread = s.threads.get_mut(&ended).unwrap();
@@ -196,7 +196,37 @@ fn the_end_of_a_run_rereads_the_status() {
         }
         thread.state = Arc::new(state);
     });
-    until(&mut app, |app| app.rt.state.git[&key].status.is_none());
+    app.frame();
     assert!(!app.rt.state.git[&key].run_active);
+    assert!(app.rt.state.git[&key].refreshing, "a read is in flight");
+    // Offline the read fails; the last good status stays and so does the control.
+    until(&mut app, |app| !app.rt.state.git[&key].refreshing);
+    assert_eq!(app.rt.state.git[&key].status, Some(fixtures::status()));
+    assert_eq!(
+        label(&app, "git-quick-action").as_deref(),
+        Some("Commit, push & PR")
+    );
+}
+
+#[test]
+fn a_running_action_keeps_the_control_without_a_status() {
+    let mut app = TestApp::with_scene(Scene::Files);
+    app.settle(10);
+    let key = open_thread_key();
+    let busy = key.clone();
+    app.rt.update(move |s, _| {
+        let git = s.git.get_mut(&busy).unwrap();
+        git.status = None;
+        git.running = Some("Pushing...".to_owned());
+    });
+    app.frame();
+    assert_eq!(
+        label(&app, "git-quick-action").as_deref(),
+        Some("Pushing...")
+    );
+    let idle = key.clone();
+    app.rt
+        .update(move |s, _| s.git.get_mut(&idle).unwrap().running = None);
+    app.frame();
     assert!(app.rt.find("git-quick-action").is_none());
 }

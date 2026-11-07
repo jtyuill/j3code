@@ -19,19 +19,20 @@ use crate::{
 };
 
 /// `key`'s git control in the thread header (content-sized); empty until a repository
-/// status is known.
+/// status is known, but kept while an action runs so its phase stays on screen.
 pub fn view(s: &J3, _cx: &mut Cx<J3>, ui: &mut Ui, key: &ThreadKey) -> El {
     let control = row().key("git-control").gap(2.0).center_y();
     let Some(git) = s.git.get(key) else {
         return control;
     };
-    let Some(status) = git.status.as_ref().filter(|status| status.is_repo) else {
-        return control;
-    };
-    let k = ui.k;
+    let status = git.status.as_ref().filter(|status| status.is_repo);
     let busy = git.busy();
-    let quick = git::quick_action(Some(status), busy);
-    let menu = git::menu(Some(status), busy);
+    if status.is_none() && !busy {
+        return control;
+    }
+    let k = ui.k;
+    let quick = git::quick_action(status, busy);
+    let menu = git::menu(status, busy);
     let label = git
         .running
         .clone()
