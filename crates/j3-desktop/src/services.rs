@@ -65,7 +65,8 @@ impl Services {
     }
 
     pub(crate) fn unregister(&self, connection: &Connection) {
-        self.lock().retain(|c| c.http_base() != connection.http_base());
+        self.lock()
+            .retain(|c| c.http_base() != connection.http_base());
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Connection>> {

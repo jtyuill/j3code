@@ -76,7 +76,11 @@ impl Toast {
         self
     }
 
-    pub fn action(mut self, label: impl Into<String>, f: impl Fn(&mut J3, &mut Tx) + 'static) -> Self {
+    pub fn action(
+        mut self,
+        label: impl Into<String>,
+        f: impl Fn(&mut J3, &mut Tx) + 'static,
+    ) -> Self {
         self.action = Some((label.into(), Rc::new(f)));
         self
     }
@@ -110,7 +114,8 @@ impl Toasts {
     /// Shows `toast`, replacing one with the same key; returns its id.
     pub fn push(&mut self, toast: Toast) -> u64 {
         if let Some(key) = &toast.key {
-            self.list.retain(|entry| entry.toast.key.as_ref() != Some(key));
+            self.list
+                .retain(|entry| entry.toast.key.as_ref() != Some(key));
         }
         self.next += 1;
         self.list.push(Entry {
@@ -138,7 +143,12 @@ impl Toasts {
     }
 
     /// An attention toast for `thread`: a click opens it; one per thread.
-    pub fn push_thread(&mut self, kind: ToastKind, message: impl Into<String>, thread: ThreadKey) -> u64 {
+    pub fn push_thread(
+        &mut self,
+        kind: ToastKind,
+        message: impl Into<String>,
+        thread: ThreadKey,
+    ) -> u64 {
         self.push(Toast::new(kind, message).thread(thread))
     }
 
@@ -154,7 +164,8 @@ impl Toasts {
     /// Times new toasts and hides expired ones; true when the list changed.
     pub(crate) fn poll(&mut self, t: f64, tx: &mut Tx) -> bool {
         let before = self.list.len();
-        self.list.retain(|entry| entry.expires.is_none_or(|at| at > t));
+        self.list
+            .retain(|entry| entry.expires.is_none_or(|at| at > t));
         for entry in &mut self.list {
             if entry.expires.is_none() {
                 entry.expires = Some(t + SHOWN_FOR);

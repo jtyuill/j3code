@@ -233,7 +233,8 @@ mod tests {
     }
 
     fn observe(app: &mut TestApp, state: ConnectionState) {
-        app.rt.update(move |s, tx| s.environment_changed(LOCAL_KEY, Arc::new(state), tx));
+        app.rt
+            .update(move |s, tx| s.environment_changed(LOCAL_KEY, Arc::new(state), tx));
         app.frame();
     }
 
@@ -250,24 +251,40 @@ mod tests {
     fn changes_after_the_baseline_raise_toasts_that_open_their_thread() {
         let mut app = app();
         observe(&mut app, local_state());
-        assert!(toasts(&app).is_empty(), "the first observation is a baseline");
+        assert!(
+            toasts(&app).is_empty(),
+            "the first observation is a baseline"
+        );
 
-        let blocked = patched(local_state(), "thr-sidebar-dnd", json!({
-            "status": "failed", "activeRunId": null, "activityRunStatus": null,
-            "latestRunCompletedAt": ago(0), "lastError": "boom"
-        }));
+        let blocked = patched(
+            local_state(),
+            "thr-sidebar-dnd",
+            json!({
+                "status": "failed", "activeRunId": null, "activityRunStatus": null,
+                "latestRunCompletedAt": ago(0), "lastError": "boom"
+            }),
+        );
         let state = patched(blocked, "thr-scroll", finished());
         observe(&mut app, state.clone());
         assert_eq!(
             toasts(&app),
             [
-                (ToastKind::Warning, "Sidebar drag and drop between shelves needs attention".to_owned()),
-                (ToastKind::Success, "Momentum scrolling stutters at 120 Hz finished".to_owned()),
+                (
+                    ToastKind::Warning,
+                    "Sidebar drag and drop between shelves needs attention".to_owned()
+                ),
+                (
+                    ToastKind::Success,
+                    "Momentum scrolling stutters at 120 Hz finished".to_owned()
+                ),
             ]
         );
 
         let key = ThreadKey::new(LOCAL_KEY, "thr-scroll");
-        let (x, y) = app.rt.find(&key.element_id("attention")).expect("the toast is drawn");
+        let (x, y) = app
+            .rt
+            .find(&key.element_id("attention"))
+            .expect("the toast is drawn");
         app.rt.pointer_move(x, y);
         app.rt.pointer_down(x, y);
         app.rt.pointer_up(x, y);
@@ -275,8 +292,12 @@ mod tests {
         assert_eq!(app.rt.state.route.main, Main::Thread(key));
 
         // Toasts off: the next change raises none.
-        app.rt.update(|s, tx| s.update_ui(|ui| ui.toasts = false, tx));
-        observe(&mut app, patched(state, "thr-math", json!({"status": "failed"})));
+        app.rt
+            .update(|s, tx| s.update_ui(|ui| ui.toasts = false, tx));
+        observe(
+            &mut app,
+            patched(state, "thr-math", json!({"status": "failed"})),
+        );
         assert_eq!(toasts(&app).len(), 1, "only the earlier toast is left");
     }
 
@@ -286,21 +307,30 @@ mod tests {
         observe(&mut app, local_state());
         let open = open_thread_key();
         // Watched while the window is active: no alert at all.
-        observe(&mut app, patched(local_state(), &open.thread_id, finished()));
+        observe(
+            &mut app,
+            patched(local_state(), &open.thread_id, finished()),
+        );
         assert!(toasts(&app).is_empty());
 
         // In the background the finish alerts (a sound, when on) but needs no toast.
         let mut app = self::app();
         observe(&mut app, local_state());
         app.rt.state.window_active = false;
-        observe(&mut app, patched(local_state(), &open.thread_id, finished()));
+        observe(
+            &mut app,
+            patched(local_state(), &open.thread_id, finished()),
+        );
         assert!(toasts(&app).is_empty());
         // A question on it still raises one.
         let asking = patched(local_state(), &open.thread_id, json!({"status": "waiting"}));
         observe(&mut app, asking);
         assert_eq!(
             toasts(&app),
-            [(ToastKind::Warning, "Port the feed renderer to Rune needs attention".to_owned())]
+            [(
+                ToastKind::Warning,
+                "Port the feed renderer to Rune needs attention".to_owned()
+            )]
         );
     }
 }

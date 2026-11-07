@@ -131,7 +131,9 @@ pub const SCENES: &[SceneSetup] = &[
     ("settings", |s: &mut J3| start(s, Scene::Settings)),
     ("herdr", |s: &mut J3| start(s, Scene::Herdr)),
     ("composer", |s: &mut J3| start(s, Scene::Composer)),
-    ("settings-archived", |s: &mut J3| start(s, Scene::SettingsArchived)),
+    ("settings-archived", |s: &mut J3| {
+        start(s, Scene::SettingsArchived)
+    }),
     ("add-project", |s: &mut J3| start(s, Scene::AddProject)),
     ("custom-snooze", |s: &mut J3| start(s, Scene::CustomSnooze)),
     ("hub", |s: &mut J3| start(s, Scene::Hub)),
@@ -244,7 +246,9 @@ pub fn install(s: &mut J3, scene: Scene) {
         }
         Scene::SettingsArchived => {
             s.settings.page = Page::Archived;
-            s.settings.archived.set(LOCAL_KEY, Listing::Loaded(archived_snapshot()));
+            s.settings
+                .archived
+                .set(LOCAL_KEY, Listing::Loaded(archived_snapshot()));
             let empty = ArchivedShellSnapshot {
                 threads: Vec::new(),
                 projects: Vec::new(),
@@ -265,12 +269,27 @@ pub fn archived_snapshot() -> ArchivedShellSnapshot {
         snapshot_sequence: 1,
         projects: local_state().shell.projects,
         threads: vec![
-            row("thr-archived-week", J3CODE_PROJECT, "Try GPUI's text system for the feed",
-                60 * 24 * 9, archived(60 * 24 * 7)),
-            row("thr-archived-old", "prj-rune", "Sketch the settings layout",
-                60 * 24 * 40, archived(60 * 24 * 30)),
-            row("thr-archived-recent", J3CODE_PROJECT, "Profile the sidebar's drag reordering",
-                60 * 5, archived(90)),
+            row(
+                "thr-archived-week",
+                J3CODE_PROJECT,
+                "Try GPUI's text system for the feed",
+                60 * 24 * 9,
+                archived(60 * 24 * 7),
+            ),
+            row(
+                "thr-archived-old",
+                "prj-rune",
+                "Sketch the settings layout",
+                60 * 24 * 40,
+                archived(60 * 24 * 30),
+            ),
+            row(
+                "thr-archived-recent",
+                J3CODE_PROJECT,
+                "Profile the sidebar's drag reordering",
+                60 * 5,
+                archived(90),
+            ),
         ],
     }
 }
@@ -288,9 +307,17 @@ fn add_project_dialog() -> Dialog {
         };
         picker.listing = FolderListing::Loaded {
             parent: "/home/jacob/repos/".into(),
-            entries: ["dotfiles", "herdr", "j3code", "j3code-wt", "omp", "rune", "t3code"]
-                .map(entry)
-                .into(),
+            entries: [
+                "dotfiles",
+                "herdr",
+                "j3code",
+                "j3code-wt",
+                "omp",
+                "rune",
+                "t3code",
+            ]
+            .map(entry)
+            .into(),
         };
     }
     dialog
@@ -333,7 +360,12 @@ fn patched(mut base: Value, patch: Value) -> Value {
 /// The local environment: a live server with the `j3code` and `rune` projects.
 pub fn local_state() -> ConnectionState {
     let projects = vec![
-        project(J3CODE_PROJECT, "j3code", "/home/jacob/repos/j3code", 60 * 24 * 40),
+        project(
+            J3CODE_PROJECT,
+            "j3code",
+            "/home/jacob/repos/j3code",
+            60 * 24 * 40,
+        ),
         project("prj-rune", "rune", "/home/jacob/repos/rune", 60 * 24 * 90),
     ];
     connection_state("env-workstation", LOCAL_LABEL, projects, local_threads())
@@ -430,15 +462,39 @@ fn model(slug: &str, name: &str, capabilities: Value) -> Value {
 pub fn server_config(environment_id: &str, label: &str) -> ServerConfig {
     let levels = ["low", "medium", "high"];
     let openai_levels = ["minimal", "low", "medium", "high"];
-    let mut opus = model("anthropic/claude-opus-4-5", "Claude Opus 4.5", thinking(&levels, "high"));
+    let mut opus = model(
+        "anthropic/claude-opus-4-5",
+        "Claude Opus 4.5",
+        thinking(&levels, "high"),
+    );
     opus["isDefault"] = json!(true);
     let models = json!([
         opus,
-        model("anthropic/claude-sonnet-4-5", "Claude Sonnet 4.5", thinking(&levels, "medium")),
-        model("anthropic/claude-haiku-4-5", "Claude Haiku 4.5", json!({"optionDescriptors": []})),
-        model("openai/gpt-5.1", "GPT-5.1", thinking(&openai_levels, "medium")),
-        model("openai/gpt-5.1-codex", "GPT-5.1 Codex", thinking(&openai_levels, "high")),
-        model("openai/gpt-5-mini", "GPT-5 mini", json!({"optionDescriptors": []})),
+        model(
+            "anthropic/claude-sonnet-4-5",
+            "Claude Sonnet 4.5",
+            thinking(&levels, "medium")
+        ),
+        model(
+            "anthropic/claude-haiku-4-5",
+            "Claude Haiku 4.5",
+            json!({"optionDescriptors": []})
+        ),
+        model(
+            "openai/gpt-5.1",
+            "GPT-5.1",
+            thinking(&openai_levels, "medium")
+        ),
+        model(
+            "openai/gpt-5.1-codex",
+            "GPT-5.1 Codex",
+            thinking(&openai_levels, "high")
+        ),
+        model(
+            "openai/gpt-5-mini",
+            "GPT-5 mini",
+            json!({"optionDescriptors": []})
+        ),
     ]);
     decode(
         "server config",
@@ -564,61 +620,125 @@ fn local_threads() -> Vec<ThreadShell> {
     let rune = "prj-rune";
     vec![
         // Waiting on the user's answer, with a queued message and a goal (the open thread).
-        row(OPEN_THREAD, j3, "Port the feed renderer to Rune", 55, json!({
-            "status": "waiting", "latestRunId": "run-3", "activeRunId": "run-3",
-            "activeProviderThreadId": "pt-feed",
-            "activityRunStatus": "waiting", "activityRunStartedAt": ago(6),
-            "latestRunRequestedAt": ago(6), "latestRunStartedAt": ago(6),
-            "latestRunCompletedAt": null, "latestUserMessageAt": ago(1),
-            "pendingRuntimeRequest": {"id": "req-anchor", "kind": "user_input",
-                                      "createdAt": ago(2), "blocking": true},
-            "latestVisibleMessage": {"id": "msg-3", "role": "user",
-                                     "text": "Keep the anchor, and orchestrate a bench run on both displays.",
-                                     "updatedAt": ago(6)},
-            "goal": goal(),
-            "itemCount": 27, "visibleItemCount": 25,
-            "updatedAt": ago(2), "lastVisitedAt": ago(2)
-        })),
+        row(
+            OPEN_THREAD,
+            j3,
+            "Port the feed renderer to Rune",
+            55,
+            json!({
+                "status": "waiting", "latestRunId": "run-3", "activeRunId": "run-3",
+                "activeProviderThreadId": "pt-feed",
+                "activityRunStatus": "waiting", "activityRunStartedAt": ago(6),
+                "latestRunRequestedAt": ago(6), "latestRunStartedAt": ago(6),
+                "latestRunCompletedAt": null, "latestUserMessageAt": ago(1),
+                "pendingRuntimeRequest": {"id": "req-anchor", "kind": "user_input",
+                                          "createdAt": ago(2), "blocking": true},
+                "latestVisibleMessage": {"id": "msg-3", "role": "user",
+                                         "text": "Keep the anchor, and orchestrate a bench run on both displays.",
+                                         "updatedAt": ago(6)},
+                "goal": goal(),
+                "itemCount": 27, "visibleItemCount": 25,
+                "updatedAt": ago(2), "lastVisitedAt": ago(2)
+            }),
+        ),
         // Working.
-        row("thr-sidebar-dnd", j3, "Sidebar drag and drop between shelves", 48,
-            patched(running("thr-sidebar-dnd", 4), json!({"modelSelection": codex(),
-                                                          "branch": "sidebar-dnd"}))),
+        row(
+            "thr-sidebar-dnd",
+            j3,
+            "Sidebar drag and drop between shelves",
+            48,
+            patched(
+                running("thr-sidebar-dnd", 4),
+                json!({"modelSelection": codex(),
+                                                          "branch": "sidebar-dnd"}),
+            ),
+        ),
         // Failed, not seen since.
-        row("thr-dictation", j3, "Dictation drops the first word", 95, json!({
-            "status": "failed", "latestRunCompletedAt": ago(9),
-            "lastError": "omp exited unexpectedly (exit code 1)",
-            "lastErrorClass": "provider_error",
-            "updatedAt": ago(9), "lastVisitedAt": ago(30)
-        })),
+        row(
+            "thr-dictation",
+            j3,
+            "Dictation drops the first word",
+            95,
+            json!({
+                "status": "failed", "latestRunCompletedAt": ago(9),
+                "lastError": "omp exited unexpectedly (exit code 1)",
+                "lastErrorClass": "provider_error",
+                "updatedAt": ago(9), "lastVisitedAt": ago(30)
+            }),
+        ),
         // Pinned, finished and seen.
-        row("thr-release", j3, "Release checklist for 0.9", 60 * 24 * 3, json!({
-            "pinnedAt": ago(60 * 24 * 3), "pinOrderKey": "a0",
-            "latestRunCompletedAt": ago(180), "updatedAt": ago(180), "lastVisitedAt": ago(170)
-        })),
+        row(
+            "thr-release",
+            j3,
+            "Release checklist for 0.9",
+            60 * 24 * 3,
+            json!({
+                "pinnedAt": ago(60 * 24 * 3), "pinOrderKey": "a0",
+                "latestRunCompletedAt": ago(180), "updatedAt": ago(180), "lastVisitedAt": ago(170)
+            }),
+        ),
         // Finished and unread.
-        row("thr-math", j3, "Typeset display math in markdown", 70, json!({
-            "latestRunCompletedAt": ago(12), "updatedAt": ago(12), "lastVisitedAt": ago(40)
-        })),
+        row(
+            "thr-math",
+            j3,
+            "Typeset display math in markdown",
+            70,
+            json!({
+                "latestRunCompletedAt": ago(12), "updatedAt": ago(12), "lastVisitedAt": ago(40)
+            }),
+        ),
         // Settled.
-        row("thr-zoom", j3, "Zoom shortcuts on Linux", 60 * 24 * 2 + 30, json!({
-            "settledOverride": "settled", "settledAt": ago(60 * 24 * 2)
-        })),
+        row(
+            "thr-zoom",
+            j3,
+            "Zoom shortcuts on Linux",
+            60 * 24 * 2 + 30,
+            json!({
+                "settledOverride": "settled", "settledAt": ago(60 * 24 * 2)
+            }),
+        ),
         // Snoozed for three hours.
-        row("thr-notarize", j3, "Follow up on the notarization ticket", 75, json!({
-            "snoozedUntil": from_now(180), "snoozedAt": ago(60)
-        })),
+        row(
+            "thr-notarize",
+            j3,
+            "Follow up on the notarization ticket",
+            75,
+            json!({
+                "snoozedUntil": from_now(180), "snoozedAt": ago(60)
+            }),
+        ),
         // Working, on GPT-5.1 Codex.
-        row("thr-scroll", rune, "Momentum scrolling stutters at 120 Hz", 40,
-            patched(running("thr-scroll", 15), json!({"modelSelection": codex()}))),
+        row(
+            "thr-scroll",
+            rune,
+            "Momentum scrolling stutters at 120 Hz",
+            40,
+            patched(
+                running("thr-scroll", 15),
+                json!({"modelSelection": codex()}),
+            ),
+        ),
         // Finished a day ago and seen.
-        row("thr-tokens", rune, "Theme tokens from the opencode kit", 60 * 26, json!({})),
+        row(
+            "thr-tokens",
+            rune,
+            "Theme tokens from the opencode kit",
+            60 * 26,
+            json!({}),
+        ),
         // Stopped by a usage limit.
-        row("thr-layout", rune, "Refactor the flex layout pass", 130, json!({
-            "status": "failed", "latestRunCompletedAt": ago(20),
-            "lastError": "You have reached your usage limit.",
-            "lastErrorClass": "usage_limit", "usageLimitResetAt": from_now(120),
-            "updatedAt": ago(20), "lastVisitedAt": ago(18)
-        })),
+        row(
+            "thr-layout",
+            rune,
+            "Refactor the flex layout pass",
+            130,
+            json!({
+                "status": "failed", "latestRunCompletedAt": ago(20),
+                "lastError": "You have reached your usage limit.",
+                "lastErrorClass": "usage_limit", "usageLimitResetAt": from_now(120),
+                "updatedAt": ago(20), "lastVisitedAt": ago(18)
+            }),
+        ),
     ]
 }
 
@@ -626,30 +746,59 @@ fn shieldy_threads() -> Vec<ThreadShell> {
     let infra = "prj-infra";
     vec![
         // Working.
-        row("thr-backup", infra, "Nightly backup restore drill", 30,
-            running("thr-backup", 22)),
+        row(
+            "thr-backup",
+            infra,
+            "Nightly backup restore drill",
+            30,
+            running("thr-backup", 22),
+        ),
         // Waiting on an approval.
-        row("thr-acl", infra, "Tailscale ACL for the new runners", 35, json!({
-            "status": "waiting", "activeRunId": "run-thr-acl",
-            "activityRunStatus": "waiting", "activityRunStartedAt": ago(8),
-            "latestRunCompletedAt": null,
-            "pendingRuntimeRequest": {"id": "req-acl", "kind": "command",
-                                      "createdAt": ago(5), "blocking": true},
-            "updatedAt": ago(5), "lastVisitedAt": ago(8)
-        })),
+        row(
+            "thr-acl",
+            infra,
+            "Tailscale ACL for the new runners",
+            35,
+            json!({
+                "status": "waiting", "activeRunId": "run-thr-acl",
+                "activityRunStatus": "waiting", "activityRunStartedAt": ago(8),
+                "latestRunCompletedAt": null,
+                "pendingRuntimeRequest": {"id": "req-acl", "kind": "command",
+                                          "createdAt": ago(5), "blocking": true},
+                "updatedAt": ago(5), "lastVisitedAt": ago(8)
+            }),
+        ),
         // Finished and unread.
-        row("thr-caddy", infra, "Caddy TLS renewal failing", 50, json!({
-            "modelSelection": selection("openai/gpt-5.1", Some("medium")),
-            "latestRunCompletedAt": ago(25), "updatedAt": ago(25), "lastVisitedAt": ago(45)
-        })),
+        row(
+            "thr-caddy",
+            infra,
+            "Caddy TLS renewal failing",
+            50,
+            json!({
+                "modelSelection": selection("openai/gpt-5.1", Some("medium")),
+                "latestRunCompletedAt": ago(25), "updatedAt": ago(25), "lastVisitedAt": ago(45)
+            }),
+        ),
         // Settled.
-        row("thr-grafana", infra, "Grafana dashboard for omp latency", 60 * 24 * 5, json!({
-            "settledOverride": "settled", "settledAt": ago(60 * 24 * 4)
-        })),
+        row(
+            "thr-grafana",
+            infra,
+            "Grafana dashboard for omp latency",
+            60 * 24 * 5,
+            json!({
+                "settledOverride": "settled", "settledAt": ago(60 * 24 * 4)
+            }),
+        ),
         // Snoozed until tomorrow morning.
-        row("thr-disk", infra, "Disk pressure alerts on shieldy", 200, json!({
-            "snoozedUntil": from_now(16 * 60 + 30), "snoozedAt": ago(150)
-        })),
+        row(
+            "thr-disk",
+            infra,
+            "Disk pressure alerts on shieldy",
+            200,
+            json!({
+                "snoozedUntil": from_now(16 * 60 + 30), "snoozedAt": ago(150)
+            }),
+        ),
     ]
 }
 
@@ -710,7 +859,14 @@ pub fn thread_state() -> ThreadState {
 
 /// One feed item of the open thread: `(run, status, minutes ago, seconds long, title,
 /// type-specific body)`.
-type FeedItem = (&'static str, &'static str, i64, i64, Option<&'static str>, Value);
+type FeedItem = (
+    &'static str,
+    &'static str,
+    i64,
+    i64,
+    Option<&'static str>,
+    Value,
+);
 
 /// The open thread's feed items, in order.
 fn feed_items() -> Vec<FeedItem> {
@@ -718,172 +874,361 @@ fn feed_items() -> Vec<FeedItem> {
                        "mimeType": "image/png", "sizeBytes": 184_320});
     vec![
         // Run 1: the investigation, completed.
-        ("run-1", "completed", 52, 0, None, json!({
-            "type": "user_message", "createdBy": "user", "creationSource": "web",
-            "messageId": "msg-1", "inputIntent": "turn_start",
-            "text": "Use ^anthropic/claude-opus-4-5 and ultrathink this: why does the feed jump while a long reply streams in? Screenshot attached.",
-            "attachments": [image]
-        })),
-        ("run-1", "completed", 52, 18, None, json!({
-            "type": "reasoning", "streaming": false,
-            "text": "The jump lines up with each streamed chunk. The virtual list keeps its scroll offset fixed, but the rows **above** the viewport are remeasured when the reply grows, so the content under the viewport shifts.\n\nCheck where `remeasure_items` runs and whether the anchor is the first or last visible row."
-        })),
-        ("run-1", "completed", 51, 1, Some("Finding where rows are remeasured"), json!({
-            "type": "file_search", "pattern": "remeasure",
-            "results": [
-                {"fileName": "crates/j3-desktop/src/thread/mod.rs", "line": 142, "preview": "        self.remeasure(&changed);"},
-                {"fileName": "crates/j3-desktop/src/thread/mod.rs", "line": 188, "preview": "    fn remeasure(&mut self, rows: &[usize]) {"},
-                {"fileName": "crates/j3-desktop/src/feed.rs", "line": 61, "preview": "/// Rows whose item changed are remeasured; the rest keep their height."}
-            ]
-        })),
-        ("run-1", "completed", 50, 1, Some("Reading the thread view"), json!({
-            "type": "dynamic_tool", "toolName": "read",
-            "input": {"path": "crates/j3-desktop/src/thread/mod.rs:125-131"},
-            "output": "[crates/j3-desktop/src/thread/mod.rs#6163]\n125:pub fn view(s: &J3, cx: &mut Cx<J3>, ui: &mut Ui, key: &ThreadKey) -> El {\n126:    let k = ui.k;\n127:    let note = |message: String| {\n128:        el().key(\"feed-note\")\n129:            .w_full()\n130:            .grow(1.0)\n131:            .center()"
-        })),
-        ("run-1", "completed", 49, 3, Some("Searching for scroll anchoring"), json!({
-            "type": "web_search", "patterns": ["virtual list scroll anchoring streaming content"],
-            "results": [
-                {"title": "CSS Scroll Anchoring", "url": "https://drafts.csswg.org/css-scroll-anchoring/",
-                 "snippet": "Scroll anchoring aims to keep the visible content stable when content above it changes size."},
-                {"title": "Building a chat list that does not jump", "url": "https://blog.example.dev/chat-scroll",
-                 "snippet": "Anchor to the last fully visible message and correct the offset after layout."},
-                {"title": "Virtualized lists and dynamic heights", "url": "https://github.com/anomalyco/rune/discussions/412",
-                 "snippet": "Measure once, then correct by the delta of rows above the viewport."}
-            ]
-        })),
-        ("run-1", "failed", 48, 4, None, json!({
-            "type": "error",
-            "failure": {"class": "provider_error", "message": "overloaded_error: Overloaded",
-                        "code": "529", "retryable": true},
-            "retry": {"attempt": 2, "maxAttempts": 5, "retryDelayMs": 4_000}
-        })),
-        ("run-1", "completed", 46, 38, Some("Running the feed tests"), json!({
-            "type": "command_execution", "input": "cargo test -p j3-desktop feed",
-            "output": "   Compiling j3-desktop v0.9.0 (/home/jacob/repos/j3code/crates/j3-desktop)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 31.84s\n     Running unittests src/lib.rs (target/debug/deps/j3_desktop-5c1f0e2a9b7d4e31)\n\nrunning 14 tests\ntest feed::tests::ages_are_compact ... ok\ntest feed::tests::diff_lines_split_omp_and_unified_forms ... ok\ntest feed::tests::dynamic_tools_get_their_omp_titles ... ok\ntest feed::tests::edits_writes_and_searches_read_like_omp ... ok\n\ntest result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 212 filtered out; finished in 0.04s\n",
-            "exitCode": 0
-        })),
-        ("run-1", "completed", 45, 24, Some("Linting with clippy"), json!({
-            "type": "command_execution", "input": "cargo clippy -p j3-desktop --all-targets -- -D warnings",
-            "output": "    Checking j3-desktop v0.9.0 (/home/jacob/repos/j3code/crates/j3-desktop)\nerror: unused variable: `delta`\n  --> crates/j3-desktop/src/thread/anchor.rs:18:9\n   |\n18 |     let delta = after - before;\n   |         ^^^^^ help: if this is intentional, prefix it with an underscore: `_delta`\n   |\n   = note: `-D unused-variables` implied by `-D warnings`\n\nerror: could not compile `j3-desktop` (lib) due to 1 previous error\n",
-            "exitCode": 101, "outputIndicatesFailure": true
-        })),
-        ("run-1", "completed", 43, 1, None, json!({
-            "type": "file_change", "fileName": "crates/j3-desktop/src/thread/mod.rs",
-            "additions": 6, "deletions": 2,
-            "diffStr": "@@ -139,8 +139,12 @@\n 139|        let changed = self.changed_rows(&state);\n-140|        self.remeasure(&changed);\n-141|        self.scroll.keep_offset();\n+140|        let anchor = self.scroll.last_visible();\n+141|        let before = self.scroll.offset_of(anchor);\n+142|        self.remeasure(&changed);\n+143|        let after = self.scroll.offset_of(anchor);\n+144|        self.scroll.shift(anchor::hold(&anchor, before, after));\n+145|        self.scroll.settle();\n 146|    }"
-        })),
-        ("run-1", "completed", 42, 1, None, json!({
-            "type": "dynamic_tool", "toolName": "write",
-            "input": {"path": "crates/j3-desktop/src/thread/anchor.rs",
-                      "content": "//! Keeps the feed still while rows above the viewport change height.\n\n/// The row the viewport is pinned to and its offset from the top.\npub struct Anchor {\n    pub row: usize,\n    pub offset: f32,\n}\n\n/// Keeps `anchor` at the same screen offset across a relayout.\npub fn hold(anchor: &Anchor, before: f32, after: f32) -> f32 {\n    let drift = after - before;\n    anchor.offset - drift\n}\n"},
-            "output": "Wrote crates/j3-desktop/src/thread/anchor.rs (13 lines)"
-        })),
-        ("run-1", "completed", 41, 1, None, json!({
-            "type": "dynamic_tool", "toolName": "edit",
-            "input": {"path": "crates/j3-desktop/src/thread/mod.rs",
-                      "input": "[crates/j3-desktop/src/thread/mod.rs#6163]\nPUT <8:\n+mod anchor;\n+"},
-            "output": "Applied 1 edit to crates/j3-desktop/src/thread/mod.rs"
-        })),
-        ("run-1", "completed", 40, 2, None, json!({
-            "type": "dynamic_tool", "toolName": "eval",
-            "input": {"language": "py", "title": "Comparing frame times",
-                      "code": "before = [6.9, 6.7, 6.8]\nafter = [2.2, 2.0, 2.1]\nprint(f\"{sum(before)/3:.1f} ms -> {sum(after)/3:.1f} ms\")"},
-            "output": "6.8 ms -> 2.1 ms"
-        })),
-        ("run-1", "completed", 39, 0, None, json!({
-            "type": "todo_list", "planId": "plan-feed",
-            "explanation": "Fix the jump, then guard it with a bench.",
-            "steps": todo_steps()
-        })),
-        ("run-1", "completed", 38, 2, None, json!({
-            "type": "dynamic_tool", "toolName": "task",
-            "input": {"agent": "task", "tasks": [
-                {"name": "AuditScroll", "task": "Find every place the feed changes its scroll offset"},
-                {"name": "BenchFeed", "task": "Measure frame time while a 4,000-line reply streams"}
-            ]},
-            "output": "Started 2 agents: AuditScroll, BenchFeed"
-        })),
-        ("run-1", "completed", 37, 140, None, json!({
-            "type": "subagent", "subagentId": "sa-audit", "origin": "provider_native",
-            "driver": "pi", "providerInstanceId": "omp", "childThreadId": null,
-            "prompt": "Find every place the feed changes its scroll offset and list them with file:line.",
-            "progress": "Checked 9 call sites",
-            "result": "Three writers: `thread/mod.rs:144` (anchor shift), `thread/mod.rs:201` (jump to bottom on send) and `rune_kit::MessageScroller::follow`. Only the first runs while streaming."
-        })),
-        ("run-1", "completed", 34, 2, None, json!({
-            "type": "dynamic_tool", "toolName": "mcp__github__search_issues",
-            "input": {"query": "scroll jump is:open repo:anomalyco/rune"},
-            "output": "#412 Virtualized lists and dynamic heights (open)\n#398 MessageScroller jumps when a row above grows (open)"
-        })),
-        ("run-1", "completed", 31, 25, None, json!({
-            "type": "assistant_message", "messageId": "msg-1a", "text": ANSWER, "streaming": false
-        })),
+        (
+            "run-1",
+            "completed",
+            52,
+            0,
+            None,
+            json!({
+                "type": "user_message", "createdBy": "user", "creationSource": "web",
+                "messageId": "msg-1", "inputIntent": "turn_start",
+                "text": "Use ^anthropic/claude-opus-4-5 and ultrathink this: why does the feed jump while a long reply streams in? Screenshot attached.",
+                "attachments": [image]
+            }),
+        ),
+        (
+            "run-1",
+            "completed",
+            52,
+            18,
+            None,
+            json!({
+                "type": "reasoning", "streaming": false,
+                "text": "The jump lines up with each streamed chunk. The virtual list keeps its scroll offset fixed, but the rows **above** the viewport are remeasured when the reply grows, so the content under the viewport shifts.\n\nCheck where `remeasure_items` runs and whether the anchor is the first or last visible row."
+            }),
+        ),
+        (
+            "run-1",
+            "completed",
+            51,
+            1,
+            Some("Finding where rows are remeasured"),
+            json!({
+                "type": "file_search", "pattern": "remeasure",
+                "results": [
+                    {"fileName": "crates/j3-desktop/src/thread/mod.rs", "line": 142, "preview": "        self.remeasure(&changed);"},
+                    {"fileName": "crates/j3-desktop/src/thread/mod.rs", "line": 188, "preview": "    fn remeasure(&mut self, rows: &[usize]) {"},
+                    {"fileName": "crates/j3-desktop/src/feed.rs", "line": 61, "preview": "/// Rows whose item changed are remeasured; the rest keep their height."}
+                ]
+            }),
+        ),
+        (
+            "run-1",
+            "completed",
+            50,
+            1,
+            Some("Reading the thread view"),
+            json!({
+                "type": "dynamic_tool", "toolName": "read",
+                "input": {"path": "crates/j3-desktop/src/thread/mod.rs:125-131"},
+                "output": "[crates/j3-desktop/src/thread/mod.rs#6163]\n125:pub fn view(s: &J3, cx: &mut Cx<J3>, ui: &mut Ui, key: &ThreadKey) -> El {\n126:    let k = ui.k;\n127:    let note = |message: String| {\n128:        el().key(\"feed-note\")\n129:            .w_full()\n130:            .grow(1.0)\n131:            .center()"
+            }),
+        ),
+        (
+            "run-1",
+            "completed",
+            49,
+            3,
+            Some("Searching for scroll anchoring"),
+            json!({
+                "type": "web_search", "patterns": ["virtual list scroll anchoring streaming content"],
+                "results": [
+                    {"title": "CSS Scroll Anchoring", "url": "https://drafts.csswg.org/css-scroll-anchoring/",
+                     "snippet": "Scroll anchoring aims to keep the visible content stable when content above it changes size."},
+                    {"title": "Building a chat list that does not jump", "url": "https://blog.example.dev/chat-scroll",
+                     "snippet": "Anchor to the last fully visible message and correct the offset after layout."},
+                    {"title": "Virtualized lists and dynamic heights", "url": "https://github.com/anomalyco/rune/discussions/412",
+                     "snippet": "Measure once, then correct by the delta of rows above the viewport."}
+                ]
+            }),
+        ),
+        (
+            "run-1",
+            "failed",
+            48,
+            4,
+            None,
+            json!({
+                "type": "error",
+                "failure": {"class": "provider_error", "message": "overloaded_error: Overloaded",
+                            "code": "529", "retryable": true},
+                "retry": {"attempt": 2, "maxAttempts": 5, "retryDelayMs": 4_000}
+            }),
+        ),
+        (
+            "run-1",
+            "completed",
+            46,
+            38,
+            Some("Running the feed tests"),
+            json!({
+                "type": "command_execution", "input": "cargo test -p j3-desktop feed",
+                "output": "   Compiling j3-desktop v0.9.0 (/home/jacob/repos/j3code/crates/j3-desktop)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 31.84s\n     Running unittests src/lib.rs (target/debug/deps/j3_desktop-5c1f0e2a9b7d4e31)\n\nrunning 14 tests\ntest feed::tests::ages_are_compact ... ok\ntest feed::tests::diff_lines_split_omp_and_unified_forms ... ok\ntest feed::tests::dynamic_tools_get_their_omp_titles ... ok\ntest feed::tests::edits_writes_and_searches_read_like_omp ... ok\n\ntest result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 212 filtered out; finished in 0.04s\n",
+                "exitCode": 0
+            }),
+        ),
+        (
+            "run-1",
+            "completed",
+            45,
+            24,
+            Some("Linting with clippy"),
+            json!({
+                "type": "command_execution", "input": "cargo clippy -p j3-desktop --all-targets -- -D warnings",
+                "output": "    Checking j3-desktop v0.9.0 (/home/jacob/repos/j3code/crates/j3-desktop)\nerror: unused variable: `delta`\n  --> crates/j3-desktop/src/thread/anchor.rs:18:9\n   |\n18 |     let delta = after - before;\n   |         ^^^^^ help: if this is intentional, prefix it with an underscore: `_delta`\n   |\n   = note: `-D unused-variables` implied by `-D warnings`\n\nerror: could not compile `j3-desktop` (lib) due to 1 previous error\n",
+                "exitCode": 101, "outputIndicatesFailure": true
+            }),
+        ),
+        (
+            "run-1",
+            "completed",
+            43,
+            1,
+            None,
+            json!({
+                "type": "file_change", "fileName": "crates/j3-desktop/src/thread/mod.rs",
+                "additions": 6, "deletions": 2,
+                "diffStr": "@@ -139,8 +139,12 @@\n 139|        let changed = self.changed_rows(&state);\n-140|        self.remeasure(&changed);\n-141|        self.scroll.keep_offset();\n+140|        let anchor = self.scroll.last_visible();\n+141|        let before = self.scroll.offset_of(anchor);\n+142|        self.remeasure(&changed);\n+143|        let after = self.scroll.offset_of(anchor);\n+144|        self.scroll.shift(anchor::hold(&anchor, before, after));\n+145|        self.scroll.settle();\n 146|    }"
+            }),
+        ),
+        (
+            "run-1",
+            "completed",
+            42,
+            1,
+            None,
+            json!({
+                "type": "dynamic_tool", "toolName": "write",
+                "input": {"path": "crates/j3-desktop/src/thread/anchor.rs",
+                          "content": "//! Keeps the feed still while rows above the viewport change height.\n\n/// The row the viewport is pinned to and its offset from the top.\npub struct Anchor {\n    pub row: usize,\n    pub offset: f32,\n}\n\n/// Keeps `anchor` at the same screen offset across a relayout.\npub fn hold(anchor: &Anchor, before: f32, after: f32) -> f32 {\n    let drift = after - before;\n    anchor.offset - drift\n}\n"},
+                "output": "Wrote crates/j3-desktop/src/thread/anchor.rs (13 lines)"
+            }),
+        ),
+        (
+            "run-1",
+            "completed",
+            41,
+            1,
+            None,
+            json!({
+                "type": "dynamic_tool", "toolName": "edit",
+                "input": {"path": "crates/j3-desktop/src/thread/mod.rs",
+                          "input": "[crates/j3-desktop/src/thread/mod.rs#6163]\nPUT <8:\n+mod anchor;\n+"},
+                "output": "Applied 1 edit to crates/j3-desktop/src/thread/mod.rs"
+            }),
+        ),
+        (
+            "run-1",
+            "completed",
+            40,
+            2,
+            None,
+            json!({
+                "type": "dynamic_tool", "toolName": "eval",
+                "input": {"language": "py", "title": "Comparing frame times",
+                          "code": "before = [6.9, 6.7, 6.8]\nafter = [2.2, 2.0, 2.1]\nprint(f\"{sum(before)/3:.1f} ms -> {sum(after)/3:.1f} ms\")"},
+                "output": "6.8 ms -> 2.1 ms"
+            }),
+        ),
+        (
+            "run-1",
+            "completed",
+            39,
+            0,
+            None,
+            json!({
+                "type": "todo_list", "planId": "plan-feed",
+                "explanation": "Fix the jump, then guard it with a bench.",
+                "steps": todo_steps()
+            }),
+        ),
+        (
+            "run-1",
+            "completed",
+            38,
+            2,
+            None,
+            json!({
+                "type": "dynamic_tool", "toolName": "task",
+                "input": {"agent": "task", "tasks": [
+                    {"name": "AuditScroll", "task": "Find every place the feed changes its scroll offset"},
+                    {"name": "BenchFeed", "task": "Measure frame time while a 4,000-line reply streams"}
+                ]},
+                "output": "Started 2 agents: AuditScroll, BenchFeed"
+            }),
+        ),
+        (
+            "run-1",
+            "completed",
+            37,
+            140,
+            None,
+            json!({
+                "type": "subagent", "subagentId": "sa-audit", "origin": "provider_native",
+                "driver": "pi", "providerInstanceId": "omp", "childThreadId": null,
+                "prompt": "Find every place the feed changes its scroll offset and list them with file:line.",
+                "progress": "Checked 9 call sites",
+                "result": "Three writers: `thread/mod.rs:144` (anchor shift), `thread/mod.rs:201` (jump to bottom on send) and `rune_kit::MessageScroller::follow`. Only the first runs while streaming."
+            }),
+        ),
+        (
+            "run-1",
+            "completed",
+            34,
+            2,
+            None,
+            json!({
+                "type": "dynamic_tool", "toolName": "mcp__github__search_issues",
+                "input": {"query": "scroll jump is:open repo:anomalyco/rune"},
+                "output": "#412 Virtualized lists and dynamic heights (open)\n#398 MessageScroller jumps when a row above grows (open)"
+            }),
+        ),
+        (
+            "run-1",
+            "completed",
+            31,
+            25,
+            None,
+            json!({
+                "type": "assistant_message", "messageId": "msg-1a", "text": ANSWER, "streaming": false
+            }),
+        ),
         // Between runs.
-        ("run-1", "completed", 29, 0, None, json!({
-            "type": "system_notice", "message": "Model changed to GPT-5.1 Codex · thinking high"
-        })),
-        ("run-1", "completed", 28, 12, None, json!({
-            "type": "compaction", "driver": "pi",
-            "summary": "Investigated the feed jump, anchored the scroll to the last visible row and added a bench.",
-            "beforeTokenCount": 182_340, "afterTokenCount": 24_120
-        })),
+        (
+            "run-1",
+            "completed",
+            29,
+            0,
+            None,
+            json!({
+                "type": "system_notice", "message": "Model changed to GPT-5.1 Codex · thinking high"
+            }),
+        ),
+        (
+            "run-1",
+            "completed",
+            28,
+            12,
+            None,
+            json!({
+                "type": "compaction", "driver": "pi",
+                "summary": "Investigated the feed jump, anchored the scroll to the last visible row and added a bench.",
+                "beforeTokenCount": 182_340, "afterTokenCount": 24_120
+            }),
+        ),
         // Run 2: stopped by the user.
-        ("run-2", "completed", 20, 0, None, json!({
-            "type": "user_message", "createdBy": "user", "creationSource": "web",
-            "messageId": "msg-2", "inputIntent": "turn_start",
-            "text": "Also try it on the 240 Hz display.", "attachments": []
-        })),
-        ("run-2", "interrupted", 19, 40, None, json!({
-            "type": "reasoning", "streaming": false,
-            "text": "The 240 Hz display is on the other machine; I need the bench binary there first."
-        })),
-        ("run-2", "completed", 18, 0, None, json!({
-            "type": "run_interrupt_request", "message": "Stop"
-        })),
-        ("run-2", "completed", 18, 0, None, json!({
-            "type": "run_interrupt_result", "message": "Stopped by the user."
-        })),
+        (
+            "run-2",
+            "completed",
+            20,
+            0,
+            None,
+            json!({
+                "type": "user_message", "createdBy": "user", "creationSource": "web",
+                "messageId": "msg-2", "inputIntent": "turn_start",
+                "text": "Also try it on the 240 Hz display.", "attachments": []
+            }),
+        ),
+        (
+            "run-2",
+            "interrupted",
+            19,
+            40,
+            None,
+            json!({
+                "type": "reasoning", "streaming": false,
+                "text": "The 240 Hz display is on the other machine; I need the bench binary there first."
+            }),
+        ),
+        (
+            "run-2",
+            "completed",
+            18,
+            0,
+            None,
+            json!({
+                "type": "run_interrupt_request", "message": "Stop"
+            }),
+        ),
+        (
+            "run-2",
+            "completed",
+            18,
+            0,
+            None,
+            json!({
+                "type": "run_interrupt_result", "message": "Stopped by the user."
+            }),
+        ),
         // Run 3: active, waiting on the user's answer.
-        ("run-3", "completed", 6, 0, None, json!({
-            "type": "user_message", "createdBy": "user", "creationSource": "web",
-            "messageId": "msg-3", "inputIntent": "turn_start",
-            "text": "Keep the anchor, and orchestrate a bench run on both displays.",
-            "attachments": []
-        })),
-        ("run-3", "running", 5, 0, None, json!({
-            "type": "subagent", "subagentId": "sa-bench", "origin": "provider_native",
-            "driver": "pi", "providerInstanceId": "omp", "childThreadId": null,
-            "prompt": "Measure frame time while a 4,000-line reply streams, at 60, 120 and 240 Hz.",
-            "progress": "120 Hz: 2.1 ms median, running 240 Hz", "result": null
-        })),
-        ("run-3", "waiting", 2, 0, None, json!({
-            "type": "user_input_request", "requestId": "req-anchor",
-            "questions": [
-                {"id": "anchor", "header": "Anchor",
-                 "question": "Where should the feed stay anchored while a reply streams?",
-                 "options": [
-                     {"label": "Bottom", "description": "Follow new output as it arrives (recommended)"},
-                     {"label": "Top of the reply", "description": "Keep the start of the reply in view"},
-                     {"label": "Where I left it", "description": "Never scroll on its own"}
-                 ],
-                 "allowCustomAnswer": true},
-                {"id": "displays", "header": "Displays",
-                 "question": "Which refresh rates should the bench cover?",
-                 "options": [
-                     {"label": "60 Hz", "description": "The laptop panel"},
-                     {"label": "120 Hz", "description": "ProMotion"},
-                     {"label": "240 Hz", "description": "The external monitor"}
-                 ],
-                 "multiSelect": true}
-            ]
-        })),
+        (
+            "run-3",
+            "completed",
+            6,
+            0,
+            None,
+            json!({
+                "type": "user_message", "createdBy": "user", "creationSource": "web",
+                "messageId": "msg-3", "inputIntent": "turn_start",
+                "text": "Keep the anchor, and orchestrate a bench run on both displays.",
+                "attachments": []
+            }),
+        ),
+        (
+            "run-3",
+            "running",
+            5,
+            0,
+            None,
+            json!({
+                "type": "subagent", "subagentId": "sa-bench", "origin": "provider_native",
+                "driver": "pi", "providerInstanceId": "omp", "childThreadId": null,
+                "prompt": "Measure frame time while a 4,000-line reply streams, at 60, 120 and 240 Hz.",
+                "progress": "120 Hz: 2.1 ms median, running 240 Hz", "result": null
+            }),
+        ),
+        (
+            "run-3",
+            "waiting",
+            2,
+            0,
+            None,
+            json!({
+                "type": "user_input_request", "requestId": "req-anchor",
+                "questions": [
+                    {"id": "anchor", "header": "Anchor",
+                     "question": "Where should the feed stay anchored while a reply streams?",
+                     "options": [
+                         {"label": "Bottom", "description": "Follow new output as it arrives (recommended)"},
+                         {"label": "Top of the reply", "description": "Keep the start of the reply in view"},
+                         {"label": "Where I left it", "description": "Never scroll on its own"}
+                     ],
+                     "allowCustomAnswer": true},
+                    {"id": "displays", "header": "Displays",
+                     "question": "Which refresh rates should the bench cover?",
+                     "options": [
+                         {"label": "60 Hz", "description": "The laptop panel"},
+                         {"label": "120 Hz", "description": "ProMotion"},
+                         {"label": "240 Hz", "description": "The external monitor"}
+                     ],
+                     "multiSelect": true}
+                ]
+            }),
+        ),
         // Run 4: queued behind run 3 (shown in the queue card, hidden in the feed).
-        ("run-4", "pending", 1, 0, None, json!({
-            "type": "user_message", "createdBy": "user", "creationSource": "web",
-            "messageId": "msg-4", "inputIntent": "queued_turn",
-            "text": "Then write the changelog entry.", "attachments": []
-        })),
+        (
+            "run-4",
+            "pending",
+            1,
+            0,
+            None,
+            json!({
+                "type": "user_message", "createdBy": "user", "creationSource": "web",
+                "messageId": "msg-4", "inputIntent": "queued_turn",
+                "text": "Then write the changelog entry.", "attachments": []
+            }),
+        ),
     ]
 }
 
@@ -1034,9 +1379,7 @@ fn projection() -> ThreadProjection {
 mod tests {
     use j3_client::{
         t3::orchestration::TurnItemKind,
-        workflow::{
-            AgentStatus, T3Section, ThreadStatus, agent_status, t3_section, thread_status,
-        },
+        workflow::{AgentStatus, T3Section, ThreadStatus, agent_status, t3_section, thread_status},
     };
 
     use super::*;
@@ -1094,7 +1437,10 @@ mod tests {
             assert!(kinds.contains(&kind), "the feed has a {kind}");
         }
         assert_eq!(state.queued_runs().len(), 1);
-        assert_eq!(state.queued_runs()[0].text, "Then write the changelog entry.");
+        assert_eq!(
+            state.queued_runs()[0].text,
+            "Then write the changelog entry."
+        );
         let questions = state.pending_user_inputs();
         assert_eq!(questions.len(), 1);
         assert_eq!(questions[0].questions.len(), 2);
@@ -1108,8 +1454,12 @@ mod tests {
     fn the_sidebar_fixtures_span_every_status_and_section() {
         let local = local_state();
         let shieldy = shieldy_state();
-        let threads: Vec<&ThreadShell> =
-            local.shell.threads.iter().chain(&shieldy.shell.threads).collect();
+        let threads: Vec<&ThreadShell> = local
+            .shell
+            .threads
+            .iter()
+            .chain(&shieldy.shell.threads)
+            .collect();
         let statuses: Vec<ThreadStatus> = threads.iter().map(|t| thread_status(t)).collect();
         for status in [
             ThreadStatus::Working,
@@ -1130,7 +1480,10 @@ mod tests {
             T3Section::Snoozed,
             T3Section::Settled,
         ] {
-            assert!(sections.contains(&Some(section)), "a thread is in {section:?}");
+            assert!(
+                sections.contains(&Some(section)),
+                "a thread is in {section:?}"
+            );
         }
         let agents: Vec<AgentStatus> = threads.iter().map(|t| agent_status(t)).collect();
         for status in [

@@ -76,10 +76,13 @@ impl J3 {
                     .envs
                     .get(&candidate.env)
                     .and_then(|env| {
-                        env.state().shell.thread(&candidate.thread_id).map(|thread| {
-                            thread.settled_override == Some(SettledOverride::Settled)
-                                || effective_snoozed(thread, now)
-                        })
+                        env.state()
+                            .shell
+                            .thread(&candidate.thread_id)
+                            .map(|thread| {
+                                thread.settled_override == Some(SettledOverride::Settled)
+                                    || effective_snoozed(thread, now)
+                            })
                     })
                     .unwrap_or(true)
         };

@@ -49,11 +49,13 @@ fn inbox_updates_land_in_poll() {
     let mut app = TestApp::new();
     app.frame();
     let inbox = app.rt.state.inbox.clone();
-    std::thread::spawn(move || inbox.post(|s, _| {
-        s.toasts.info("hello");
-    }))
-        .join()
-        .unwrap();
+    std::thread::spawn(move || {
+        inbox.post(|s, _| {
+            s.toasts.info("hello");
+        })
+    })
+    .join()
+    .unwrap();
     app.frame();
     assert_eq!(app.rt.state.toasts.iter().count(), 1);
     assert!(app.rt.find("toast-region").is_some());

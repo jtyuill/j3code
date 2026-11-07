@@ -103,7 +103,11 @@ const WS: Option<KeyContext> = Some(KeyContext::Workspace);
 pub const BINDINGS: &[Binding] = &[
     bind("mod+q", Action::Quit, None),
     bind("mod+comma", Action::OpenSettings, WS),
-    bind("mod+comma", Action::OpenSettings, Some(KeyContext::Settings)),
+    bind(
+        "mod+comma",
+        Action::OpenSettings,
+        Some(KeyContext::Settings),
+    ),
     bind("escape", Action::CloseSettings, Some(KeyContext::Settings)),
     bind("mod+n", Action::NewThread, WS),
     bind("mod+o", Action::AddProject, WS),
@@ -307,7 +311,10 @@ mod tests {
     #[test]
     fn shortcuts_follow_the_platform() {
         assert_eq!(shortcut_label_on(Action::NewThread, KeyPlatform::Mac), "⌘N");
-        assert_eq!(shortcut_label_on(Action::NewThread, KeyPlatform::Linux), "Ctrl+N");
+        assert_eq!(
+            shortcut_label_on(Action::NewThread, KeyPlatform::Linux),
+            "Ctrl+N"
+        );
         assert_eq!(
             shortcut_label_on(Action::SettleThread, KeyPlatform::Mac),
             "⇧⌘S"

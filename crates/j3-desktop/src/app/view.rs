@@ -24,12 +24,8 @@ pub struct Ui<'a> {
 }
 
 /// `v0.1.0 · d2112d3`: the build's version and source commit.
-pub const VERSION_LABEL: &str = concat!(
-    "v",
-    env!("CARGO_PKG_VERSION"),
-    " · ",
-    env!("J3_GIT_COMMIT")
-);
+pub const VERSION_LABEL: &str =
+    concat!("v", env!("CARGO_PKG_VERSION"), " · ", env!("J3_GIT_COMMIT"));
 
 pub fn view(s: &J3, cx: &mut Cx<J3>) -> El {
     let k = theme::kit(cx.system_dark(), s.prefs.ui());
@@ -53,7 +49,13 @@ pub fn view(s: &J3, cx: &mut Cx<J3>) -> El {
         .w_full()
         .h_full()
         .fill(k.c.bg_deep)
-        .child(el().key("content").w_full().grow(1.0).min_h(0.0).child(content))
+        .child(
+            el().key("content")
+                .w_full()
+                .grow(1.0)
+                .min_h(0.0)
+                .child(content),
+        )
         .child(version_bar(&k));
     zoomed(rune_kit::root(body, layer), m.zoom, cx)
 }

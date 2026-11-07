@@ -471,10 +471,8 @@ mod tests {
         );
         // Under its provider's header a row drops the provider's name.
         let labels = model_labels(&choices);
-        let sections: Vec<Option<&str>> = labels
-            .iter()
-            .map(ModelLabel::section_qualifier)
-            .collect();
+        let sections: Vec<Option<&str>> =
+            labels.iter().map(ModelLabel::section_qualifier).collect();
         assert_eq!(sections, [None, None, Some("20251101")]);
     }
 

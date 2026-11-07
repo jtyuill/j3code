@@ -193,7 +193,9 @@ impl J3 {
         U: FnOnce(&mut J3, &mut Tx) + Send + 'static,
     {
         let inbox = self.inbox.clone();
-        self.services.runtime.spawn_blocking(move || inbox.post(f()));
+        self.services
+            .runtime
+            .spawn_blocking(move || inbox.post(f()));
     }
 
     /// Runs a server command and applies `then` with its value; a failure becomes an error

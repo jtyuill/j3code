@@ -241,9 +241,8 @@ impl Line {
         let body = rest.trim_start_matches([' ', '\t']);
         let heading = is_heading(body);
         let run = body.bytes().take_while(|&b| b == b'$').count();
-        let fence = columns(&rest[..rest.len() - body.len()]) < 4
-            && run >= 2
-            && !body[run..].contains('$');
+        let fence =
+            columns(&rest[..rest.len() - body.len()]) < 4 && run >= 2 && !body[run..].contains('$');
         Self {
             depth,
             starts_block: heading || is_list_item(body),
@@ -489,10 +488,7 @@ mod tests {
     #[test]
     fn a_display_block_becomes_an_image() {
         let prepared = prepare("Sum:\n\\[ \\sum_k k \\]\nafter");
-        assert_eq!(
-            prepared.source,
-            "Sum:\n![\\\\sum\\_k k](j3-math:0)\nafter"
-        );
+        assert_eq!(prepared.source, "Sum:\n![\\\\sum\\_k k](j3-math:0)\nafter");
         assert_eq!(prepared.formulas, [display(r"\sum_k k")]);
 
         let prepared = prepare("$$\nx +\n  y\n$$\n\n$$z$$\n");

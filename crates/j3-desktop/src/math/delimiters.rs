@@ -291,7 +291,8 @@ pub(super) fn list_marker_len(body: &str) -> Option<usize> {
             body[digits..].strip_prefix(['.', ')'])?
         }
     };
-    (rest.is_empty() || rest.starts_with([' ', '\t', '\n', '\r'])).then_some(body.len() - rest.len())
+    (rest.is_empty() || rest.starts_with([' ', '\t', '\n', '\r']))
+        .then_some(body.len() - rest.len())
 }
 
 #[cfg(test)]

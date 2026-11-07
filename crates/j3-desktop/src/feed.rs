@@ -1103,7 +1103,10 @@ mod tests {
             error_message(&error(json!({"attempt": 2, "maxAttempts": 5}))),
             "Overloaded (retry 2 of 5)"
         );
-        assert_eq!(error_message(&error(json!({"attempt": 3}))), "Overloaded (retry 3)");
+        assert_eq!(
+            error_message(&error(json!({"attempt": 3}))),
+            "Overloaded (retry 3)"
+        );
         assert_eq!(error_message(&error(Value::Null)), "Overloaded");
 
         let compaction = |before: Value, after: Value| -> CompactionItem {
@@ -1114,7 +1117,10 @@ mod tests {
             compaction_label(&compaction(json!(182_340), json!(24_120))),
             "Context compacted · 182340 → 24120 tokens"
         );
-        assert_eq!(compaction_label(&compaction(Value::Null, json!(1))), "Context compacted");
+        assert_eq!(
+            compaction_label(&compaction(Value::Null, json!(1))),
+            "Context compacted"
+        );
 
         let todo: TodoListItem = serde_json::from_value(json!({
             "planId": "p",
@@ -1134,8 +1140,14 @@ mod tests {
 
     #[test]
     fn activity_rows_are_tools_thinking_and_plans() {
-        let reasoning = item("completed", json!({"type": "reasoning", "text": "", "streaming": false}));
-        let notice = item("completed", json!({"type": "system_notice", "message": "m"}));
+        let reasoning = item(
+            "completed",
+            json!({"type": "reasoning", "text": "", "streaming": false}),
+        );
+        let notice = item(
+            "completed",
+            json!({"type": "system_notice", "message": "m"}),
+        );
         assert!(is_activity(&reasoning));
         assert!(!is_activity(&notice));
         assert_eq!(subagent_status_label(SubagentStatus::Cancelled), "Stopped");

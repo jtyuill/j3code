@@ -1330,14 +1330,18 @@ mod tests {
             .enable_all()
             .build()
             .expect("a test runtime");
-        let connection = Connection::offline("http://fixture.invalid:3780", runtime.handle().clone());
+        let connection =
+            Connection::offline("http://fixture.invalid:3780", runtime.handle().clone());
         let thread = connection.thread("t");
         let result = runtime.block_on(async {
             tokio::time::timeout(std::time::Duration::from_secs(1), connection.visit("t")).await
         });
         assert!(matches!(result, Ok(Err(Error::Closed))));
         assert_eq!(thread.state().borrow().sync, crate::ThreadSync::Loading);
-        assert_eq!(connection.state().borrow().status, crate::ConnectionStatus::Connecting);
+        assert_eq!(
+            connection.state().borrow().status,
+            crate::ConnectionStatus::Connecting
+        );
         runtime.block_on(connection.close());
     }
 }

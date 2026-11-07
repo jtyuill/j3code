@@ -161,7 +161,14 @@ impl Environment {
                 inbox.post(move |s, tx| s.environment_changed(&env, state, tx));
             }
         });
-        Self::with_state(key, label, kind, connection, state, Some(watch.abort_handle()))
+        Self::with_state(
+            key,
+            label,
+            kind,
+            connection,
+            state,
+            Some(watch.abort_handle()),
+        )
     }
 
     /// An environment over `connection` whose state the caller sets (tests, fixtures).
@@ -329,7 +336,10 @@ impl Environments {
     /// entries stay; they reappear if the ids ever differ.
     pub fn distinct(&self) -> Vec<&Environment> {
         let ids: Vec<Option<&str>> = self.list.iter().map(Environment::environment_id).collect();
-        distinct(&ids).into_iter().map(|ix| &self.list[ix]).collect()
+        distinct(&ids)
+            .into_iter()
+            .map(|ix| &self.list[ix])
+            .collect()
     }
 
     /// Every connection, for shutdown and commands across environments.

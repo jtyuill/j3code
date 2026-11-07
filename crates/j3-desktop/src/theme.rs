@@ -168,16 +168,28 @@ mod tests {
             ..UiSettings::default()
         };
         let k = kit(true, &larger);
-        assert_eq!(k.ty.body.size, rune_theme_opencode::kit(true).ty.body.size * 1.25);
-        assert_eq!(k.ty.mono.size, rune_theme_opencode::kit(true).ty.mono.size * 1.5);
+        assert_eq!(
+            k.ty.body.size,
+            rune_theme_opencode::kit(true).ty.body.size * 1.25
+        );
+        assert_eq!(
+            k.ty.mono.size,
+            rune_theme_opencode::kit(true).ty.mono.size * 1.5
+        );
     }
 
     #[test]
     fn chosen_fonts_lead_the_family_lists() {
         let mut ui = UiSettings::default();
-        assert_eq!(families(&ui), (FAMILIES.0.to_owned(), FAMILIES.1.to_owned()));
+        assert_eq!(
+            families(&ui),
+            (FAMILIES.0.to_owned(), FAMILIES.1.to_owned())
+        );
         ui.mono_font = Some("JetBrains Mono".into());
-        assert_eq!(families(&ui).1, format!("\"JetBrains Mono\", {}", FAMILIES.1));
+        assert_eq!(
+            families(&ui).1,
+            format!("\"JetBrains Mono\", {}", FAMILIES.1)
+        );
     }
 
     #[test]
