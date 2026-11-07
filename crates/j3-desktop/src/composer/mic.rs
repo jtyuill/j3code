@@ -50,8 +50,15 @@ impl J3 {
     fn toggle_dictation(&mut self, key: &ComposerKey, tx: &mut Tx) {
         match self.composer(key).dictation.as_ref().map(|d| d.phase) {
             Some(Phase::Transcribing) => {}
-            Some(Phase::Starting) => self.cancel_dictation(tx),
-            Some(Phase::Recording) => self.stop_dictation(tx),
+            // The button took the press; the keyboard goes back to the draft.
+            Some(Phase::Starting) => {
+                self.cancel_dictation(tx);
+                self.composer(key).edit.focused = true;
+            }
+            Some(Phase::Recording) => {
+                self.stop_dictation(tx);
+                self.composer(key).edit.focused = true;
+            }
             None => {
                 self.start_dictation(key.clone(), tx);
                 let started = self

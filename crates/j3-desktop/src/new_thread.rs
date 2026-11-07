@@ -197,7 +197,8 @@ pub fn view(s: &J3, cx: &mut Cx<J3>, ui: &mut Ui) -> El {
             col()
                 .key("new-thread-bottom")
                 .w_full()
-                .max_w(ui.m.measure)
+                // The composer is the measure wide; the side padding sits outside it.
+                .max_w(ui.m.measure + 32.0)
                 .self_center()
                 .gap(8.0)
                 .px(16.0)

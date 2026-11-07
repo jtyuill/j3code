@@ -50,6 +50,16 @@ impl TestApp {
             environments: Vec::new(),
             ui,
         });
+        Self::with_services(services, prefs, tokio)
+    }
+
+    /// The app over `services` (on `tokio`) and `prefs`, with no environments yet: open
+    /// them with `J3::open_environments` (the integration tests serve a real local server).
+    pub fn with_services(
+        services: Arc<Services>,
+        prefs: Preferences,
+        tokio: tokio::runtime::Runtime,
+    ) -> Self {
         let state = J3::new(services, prefs);
         let mut rt = Runtime::new(state, super::view, SIZE, Env::default());
         rt.poll = Some(super::poll);

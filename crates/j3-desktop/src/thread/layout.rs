@@ -75,7 +75,8 @@ fn chat(s: &J3, cx: &mut Cx<J3>, ui: &mut Ui, key: &ThreadKey) -> El {
     let mut bottom = col()
         .key("thread-bottom")
         .w_full()
-        .max_w(ui.m.measure)
+        // The cards and composer are the measure wide; the side padding sits outside it.
+        .max_w(ui.m.measure + 32.0)
         .self_center()
         .shrink()
         .min_h(0.0)
