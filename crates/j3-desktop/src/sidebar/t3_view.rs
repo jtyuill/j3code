@@ -532,9 +532,10 @@ fn row_action(r: &T3Row, k: &Kit) -> Option<El> {
             .help("Wake thread now")
             .on_press(press(ThreadCommand::Wake))
             .build(k),
-        // A solid button: it sits over the row's text, so a transparent one would blend in.
+        // An opaque, high-contrast button: it sits over the row's text, so the Neutral
+        // variant's translucent fill blends in.
         T3Section::Pinned | T3Section::Active => Button::new("Settle")
-            .variant(ButtonVariant::Neutral)
+            .variant(ButtonVariant::Contrast)
             .control_size(ControlSize::Small)
             .icon(&icons::CHECK)
             .help("Settle thread")
