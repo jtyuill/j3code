@@ -6,7 +6,8 @@
 
 use j3_core::engine::model::tool_output_images;
 use j3_protocol::t3::orchestration::{
-    CommandExecutionItem, DynamicToolItem, FileChangeItem, FileSearchItem, TurnItem, TurnItemKind,
+    CommandExecutionItem, CompactionItem, DynamicToolItem, ErrorItem, FileChangeItem,
+    FileSearchItem, PlanStepStatus, SubagentStatus, TodoListItem, TurnItem, TurnItemKind,
     TurnItemStatus, UserMessageInputIntent, WebSearchItem,
 };
 use serde_json::Value;
@@ -749,6 +750,78 @@ pub fn age_since(at: OffsetDateTime, now: OffsetDateTime) -> String {
     }
 }
 
+/// Rows of agent activity (tool calls, thinking, plan updates) that read as
+/// one list when they follow each other: they sit close together.
+pub fn is_activity(item: &TurnItem) -> bool {
+    matches!(
+        item.kind,
+        TurnItemKind::CommandExecution(_)
+            | TurnItemKind::FileChange(_)
+            | TurnItemKind::FileSearch(_)
+            | TurnItemKind::WebSearch(_)
+            | TurnItemKind::DynamicTool(_)
+            | TurnItemKind::Reasoning(_)
+            | TurnItemKind::TodoList(_)
+    )
+}
+
+/// A subagent's status as the feed and the agents hub name it.
+pub fn subagent_status_label(status: SubagentStatus) -> &'static str {
+    match status {
+        SubagentStatus::Idle => "Idle",
+        SubagentStatus::Pending => "Starting",
+        SubagentStatus::Running => "Running",
+        SubagentStatus::Waiting => "Waiting",
+        SubagentStatus::Completed => "Done",
+        SubagentStatus::Failed => "Failed",
+        SubagentStatus::Cancelled => "Stopped",
+        SubagentStatus::Interrupted => "Interrupted",
+    }
+}
+
+/// An error row's text: the failure, then `(retry N of M)` or `(retry N)`
+/// while the provider retries.
+pub fn error_message(error: &ErrorItem) -> String {
+    let mut message = error.failure.message.clone();
+    if let Some(retry) = &error.retry {
+        match retry.max_attempts {
+            Some(max) => message.push_str(&format!(" (retry {} of {max})", retry.attempt)),
+            None => message.push_str(&format!(" (retry {})", retry.attempt)),
+        }
+    }
+    message
+}
+
+/// A compaction rule's label: `Context compacted`, with ` · {before} → {after}
+/// tokens` when both counts are known.
+pub fn compaction_label(compaction: &CompactionItem) -> String {
+    match (compaction.before_token_count, compaction.after_token_count) {
+        (Some(before), Some(after)) => format!("Context compacted · {before} → {after} tokens"),
+        _ => "Context compacted".to_owned(),
+    }
+}
+
+/// A todo row's notice: `Updated the plan · {done}/{total} done`.
+pub fn todo_notice(todo: &TodoListItem) -> String {
+    let done = todo
+        .steps
+        .iter()
+        .filter(|step| step.status == PlanStepStatus::Completed)
+        .count();
+    format!("Updated the plan · {done}/{} done", todo.steps.len())
+}
+
+/// An answer to a question as the feed shows it: a choice, choices joined
+/// with commas, or nothing.
+pub fn answer_text(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        Value::Array(items) => items.iter().map(answer_text).collect::<Vec<_>>().join(", "),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1015,5 +1088,57 @@ mod tests {
         assert_eq!(age("2026-09-01T12:00:00.000Z").as_deref(), Some("8w"));
         assert_eq!(age("2026-11-02T12:00:00.000Z").as_deref(), Some("now"));
         assert_eq!(age("garbage"), None);
+    }
+
+    #[test]
+    fn notices_count_retries_steps_and_tokens() {
+        let error = |retry: Value| -> ErrorItem {
+            serde_json::from_value(json!({
+                "failure": {"class": "provider_error", "message": "Overloaded", "retryable": true},
+                "retry": retry
+            }))
+            .unwrap()
+        };
+        assert_eq!(
+            error_message(&error(json!({"attempt": 2, "maxAttempts": 5}))),
+            "Overloaded (retry 2 of 5)"
+        );
+        assert_eq!(error_message(&error(json!({"attempt": 3}))), "Overloaded (retry 3)");
+        assert_eq!(error_message(&error(Value::Null)), "Overloaded");
+
+        let compaction = |before: Value, after: Value| -> CompactionItem {
+            serde_json::from_value(json!({"beforeTokenCount": before, "afterTokenCount": after}))
+                .unwrap()
+        };
+        assert_eq!(
+            compaction_label(&compaction(json!(182_340), json!(24_120))),
+            "Context compacted · 182340 → 24120 tokens"
+        );
+        assert_eq!(compaction_label(&compaction(Value::Null, json!(1))), "Context compacted");
+
+        let todo: TodoListItem = serde_json::from_value(json!({
+            "planId": "p",
+            "steps": [
+                {"id": "a", "text": "A", "status": "completed"},
+                {"id": "b", "text": "B", "status": "running"},
+                {"id": "c", "text": "C", "status": "pending"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(todo_notice(&todo), "Updated the plan · 1/3 done");
+
+        assert_eq!(answer_text(&json!(["60 Hz", "120 Hz"])), "60 Hz, 120 Hz");
+        assert_eq!(answer_text(&json!("Bottom")), "Bottom");
+        assert_eq!(answer_text(&Value::Null), "");
+    }
+
+    #[test]
+    fn activity_rows_are_tools_thinking_and_plans() {
+        let reasoning = item("completed", json!({"type": "reasoning", "text": "", "streaming": false}));
+        let notice = item("completed", json!({"type": "system_notice", "message": "m"}));
+        assert!(is_activity(&reasoning));
+        assert!(!is_activity(&notice));
+        assert_eq!(subagent_status_label(SubagentStatus::Cancelled), "Stopped");
+        assert_eq!(subagent_status_label(SubagentStatus::Completed), "Done");
     }
 }

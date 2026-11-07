@@ -6,27 +6,21 @@
 //! of its own. [`prepare`] rewrites a message's markdown so each display
 //! formula that is a paragraph by itself becomes such an image,
 //! `![<tex>](j3-math:<index>)`, and [`Typesetter`] draws the formula an image
-//! names. A markdown view uses them as
+//! names. Markdown draws an image a point per pixel, up to the column's width,
+//! so a formula drawn there rasterizes at scale 1 to keep its size.
 //!
-//! ```ignore
-//! let prepared = math::prepare(&text);
-//! let formulas = prepared.formulas;
-//! let typesetter = typesetter.clone(); // Rc<RefCell<math::Typesetter>>, kept by the view
-//! Markdown::new(prepared.source).images(move |src| {
-//!     let formula = formulas.get(math::parse_src(src)?)?;
-//!     typesetter.borrow_mut().image(&images, formula, ink, font_size, 1.0)
-//! })
-//! ```
-//!
-//! Markdown draws an image a point per pixel, up to the column's width, so a
-//! formula drawn there rasterizes at scale 1 to keep its size. A formula in a
-//! line of text stays its `$…$` source: markdown has no inline images.
+//! A formula in a line of text is drawn in the line by [`view`], which draws
+//! a top-level paragraph holding one itself ([`inline`]); elsewhere it reads
+//! as Unicode ([`unicode`]). [`view::doc`] is the whole of it for a message.
 //!
 //! Formulas are validated as they are found, so TeX RaTeX rejects (and prose
 //! such as `$5 and $10`) stays literal text, and typeset through a bounded
 //! cache: a formula is laid out once per color, never per frame.
 
 mod delimiters;
+pub mod inline;
+pub mod unicode;
+pub mod view;
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -333,6 +327,8 @@ struct Typeset {
     /// The last raster drawn: its size in points, its scale, and the handle
     /// that keeps it decoded while the formula is drawn.
     raster: Option<(f32, f32, Image)>,
+    /// The same for the padded raster a line of text draws ([`view`]).
+    inline_raster: Option<(f32, f32, Image)>,
 }
 
 impl Typeset {
@@ -351,6 +347,7 @@ impl Typeset {
             height: list.height as f32,
             depth: list.depth as f32,
             raster: None,
+            inline_raster: None,
         })
     }
 
@@ -397,27 +394,34 @@ impl Typesetter {
     ) -> Option<Image> {
         let color = ratex_color(color);
         let key = (formula.key(), pack(color));
+        self.typeset(key, formula, color);
+        let typeset = self.entries.get_mut(&key)?.1.as_mut()?;
+        Some(typeset.image(cache, font_size * MATH_SCALE, scale))
+    }
+
+    /// Lays `formula` out in `color` under `key` unless it already is, dropping the oldest
+    /// entries past [`CAPACITY`].
+    fn typeset(&mut self, key: Key, formula: &Formula, color: Color) {
         let cached = self
             .entries
             .get(&key)
             .is_some_and(|(cached, _)| cached == formula);
-        if !cached {
-            let typeset = Typeset::new(formula, color);
-            if self
-                .entries
-                .insert(key, (formula.clone(), typeset))
-                .is_none()
-            {
-                self.order.push_back(key);
-            }
-            while self.order.len() > CAPACITY {
-                if let Some(old) = self.order.pop_front() {
-                    self.entries.remove(&old);
-                }
+        if cached {
+            return;
+        }
+        let typeset = Typeset::new(formula, color);
+        if self
+            .entries
+            .insert(key, (formula.clone(), typeset))
+            .is_none()
+        {
+            self.order.push_back(key);
+        }
+        while self.order.len() > CAPACITY {
+            if let Some(old) = self.order.pop_front() {
+                self.entries.remove(&old);
             }
         }
-        let typeset = self.entries.get_mut(&key)?.1.as_mut()?;
-        Some(typeset.image(cache, font_size * MATH_SCALE, scale))
     }
 }
 

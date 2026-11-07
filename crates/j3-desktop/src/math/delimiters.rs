@@ -144,7 +144,7 @@ fn convert<'a>(chunk: &'a str, out: &mut String, display: &mut Option<Bracket<'a
 }
 
 /// The end of the first run of exactly `len` backticks in `text`.
-fn closing_run(text: &str, len: usize) -> Option<usize> {
+pub(super) fn closing_run(text: &str, len: usize) -> Option<usize> {
     let bytes = text.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
