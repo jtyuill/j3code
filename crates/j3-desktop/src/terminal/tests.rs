@@ -69,7 +69,6 @@ fn ctrl(c: char) -> KeyEvent {
     KeyEvent {
         key: Key::Command(c),
         mods: Mods {
-            cmd: true,
             ctrl: true,
             ..Mods::default()
         },

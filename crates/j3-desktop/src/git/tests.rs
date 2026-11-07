@@ -11,24 +11,11 @@ use j3_protocol::t3::{
     orchestration::RunStatus,
 };
 
-use super::{commit, first_phase, fixtures, pulled};
+use super::{commit, fixtures, pulled};
 use crate::app::{
     fixtures::{Scene, open_thread_key},
     testing::TestApp,
 };
-
-#[test]
-fn the_button_names_the_first_phase_until_the_server_does() {
-    assert_eq!(
-        first_phase(GitStackedAction::CommitPush, true),
-        "Generating commit message..."
-    );
-    assert_eq!(
-        first_phase(GitStackedAction::Commit, false),
-        "Committing..."
-    );
-    assert_eq!(first_phase(GitStackedAction::CreatePr, true), "Pushing...");
-}
 
 #[test]
 fn pull_outcomes_read_as_toasts() {
@@ -155,22 +142,19 @@ fn the_control_shows_for_a_repository_and_opens_the_commit_dialog() {
 }
 
 #[test]
-fn a_commit_runs_labelled_by_its_phase_and_reports_its_failure() {
+fn a_commit_runs_under_one_working_label_and_reports_its_failure() {
     let mut app = TestApp::with_scene(Scene::GitCommit);
     app.settle(10);
     let key = open_thread_key();
     click(&mut app, "git-commit");
     assert!(app.rt.state.git[&key].commit.is_none(), "the dialog closes");
-    assert_eq!(
-        app.rt.state.git[&key].running.as_deref(),
-        Some("Generating commit message...")
-    );
+    assert!(app.rt.state.git[&key].running);
     assert_eq!(
         label(&app, "git-quick-action").as_deref(),
-        Some("Generating commit message...")
+        Some("Working...")
     );
     // Offline, the action fails at once: an error toast, and the control is free again.
-    until(&mut app, |app| app.rt.state.git[&key].running.is_none());
+    until(&mut app, |app| !app.rt.state.git[&key].running);
     assert_eq!(app.rt.state.toasts.iter().count(), 1);
 }
 
@@ -217,16 +201,16 @@ fn a_running_action_keeps_the_control_without_a_status() {
     app.rt.update(move |s, _| {
         let git = s.git.get_mut(&busy).unwrap();
         git.status = None;
-        git.running = Some("Pushing...".to_owned());
+        git.running = true;
     });
     app.frame();
     assert_eq!(
         label(&app, "git-quick-action").as_deref(),
-        Some("Pushing...")
+        Some("Working...")
     );
     let idle = key.clone();
     app.rt
-        .update(move |s, _| s.git.get_mut(&idle).unwrap().running = None);
+        .update(move |s, _| s.git.get_mut(&idle).unwrap().running = false);
     app.frame();
     assert!(app.rt.find("git-quick-action").is_none());
 }

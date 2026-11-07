@@ -13,7 +13,6 @@ fn ctrl_backtick() -> KeyEvent {
     KeyEvent {
         key: Key::Command('`'),
         mods: Mods {
-            cmd: true,
             ctrl: true,
             ..Mods::default()
         },

@@ -6,7 +6,7 @@
 //! an action is running.
 //!
 //! An action runs on tokio and outlives the control: leaving the thread does not interrupt a
-//! commit; its phases label the button and its outcome is a toast.
+//! commit; the button shows one fixed working label meanwhile and its outcome is a toast.
 
 mod commit;
 pub mod fixtures;
@@ -19,8 +19,7 @@ use std::time::Duration;
 use j3_client::{
     GitActionUpdate,
     t3::git::{
-        GitActionProgress, GitStackedAction, GitToast, GitToastCta, VcsPullResult, VcsPullStatus,
-        VcsStatusResult,
+        GitStackedAction, GitToast, GitToastCta, VcsPullResult, VcsPullStatus, VcsStatusResult,
     },
 };
 use rune::{TextEdit, Tx};
@@ -43,8 +42,8 @@ pub struct GitControl {
     cwd: Option<String>,
     /// The latest status read of `cwd`; `None` until one succeeds. A failed read keeps it.
     pub status: Option<VcsStatusResult>,
-    /// The running action's current phase ("Committing..."); the control is busy while set.
-    running: Option<String>,
+    /// An action is running; the control is busy while set.
+    running: bool,
     /// A status read is in flight.
     refreshing: bool,
     /// A read was asked for while one was in flight: it runs when that one ends.
@@ -63,18 +62,12 @@ pub struct GitControl {
 
 impl GitControl {
     pub fn busy(&self) -> bool {
-        self.running.is_some()
+        self.running
     }
 }
 
-/// The button's label before the server names the first phase.
-fn first_phase(action: GitStackedAction, generates: bool) -> &'static str {
-    match (action.commits(), generates) {
-        (true, true) => "Generating commit message...",
-        (true, false) => "Committing...",
-        (false, _) => "Pushing...",
-    }
-}
+/// The button's label while an action runs: one fixed label, whatever the phase.
+const WORKING_LABEL: &str = "Working...";
 
 /// The toast for a pull's outcome: its title and description.
 fn pulled(pull: &VcsPullResult) -> (&'static str, String) {
@@ -204,27 +197,14 @@ impl J3 {
         let Some(cwd) = git.cwd.clone().filter(|_| !git.busy()) else {
             return;
         };
-        let generates = commit_message.is_none()
-            && git
-                .status
-                .as_ref()
-                .is_some_and(|status| status.has_working_tree_changes);
-        git.running = Some(first_phase(action, generates).to_owned());
+        git.running = true;
         let mut run = connection.run_git_action(&cwd, action, commit_message);
         let (inbox, key) = (self.inbox.clone(), key.clone());
         self.services.runtime.spawn(async move {
             let outcome = loop {
                 match run.next().await {
-                    Some(GitActionUpdate::Progress(event)) => {
-                        if let GitActionProgress::PhaseStarted { label, .. } = event.progress {
-                            let key = key.clone();
-                            inbox.post(move |s: &mut J3, _: &mut Tx| {
-                                if let Some(git) = s.git.get_mut(&key).filter(|git| git.busy()) {
-                                    git.running = Some(label);
-                                }
-                            });
-                        }
-                    }
+                    // The button shows one fixed label; phases are not shown.
+                    Some(GitActionUpdate::Progress(_)) => {}
                     Some(GitActionUpdate::Finished(outcome)) => break outcome,
                     None => break Err(j3_client::Error::Closed),
                 }
@@ -252,7 +232,7 @@ impl J3 {
         let Some(cwd) = git.cwd.clone().filter(|_| !git.busy()) else {
             return;
         };
-        git.running = Some("Pulling...".to_owned());
+        git.running = true;
         let key = key.clone();
         self.spawn(async move {
             let outcome = connection.pull(&cwd).await;
@@ -288,7 +268,7 @@ impl J3 {
     /// An action ended: the control is free and the status is read again.
     fn git_finished(&mut self, key: &ThreadKey) {
         if let Some(git) = self.git.get_mut(key) {
-            git.running = None;
+            git.running = false;
         }
         self.refresh_git(key);
     }

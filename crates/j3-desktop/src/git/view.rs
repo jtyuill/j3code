@@ -11,7 +11,7 @@ use rune_kit::{
     Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Menu, MenuItem, Spinner,
 };
 
-use super::commit;
+use super::{WORKING_LABEL, commit};
 use crate::{
     app::{J3, Ui},
     icons,
@@ -33,10 +33,11 @@ pub fn view(s: &J3, _cx: &mut Cx<J3>, ui: &mut Ui, key: &ThreadKey) -> El {
     let k = ui.k;
     let quick = git::quick_action(status, busy);
     let menu = git::menu(status, busy);
-    let label = git
-        .running
-        .clone()
-        .unwrap_or_else(|| quick.label.to_owned());
+    let label = if busy {
+        WORKING_LABEL.to_owned()
+    } else {
+        quick.label.to_owned()
+    };
     let mut button = Button::new(label.clone())
         .variant(ButtonVariant::Outline)
         .control_size(ControlSize::Small)
