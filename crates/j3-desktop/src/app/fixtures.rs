@@ -60,15 +60,18 @@ pub enum Scene {
     Settings,
     /// The herdr workflow's sidebar with [`OPEN_THREAD`] open.
     Herdr,
+    /// [`OPEN_THREAD`] open with its agents hub showing.
+    Hub,
 }
 
 impl Scene {
-    pub const ALL: [Scene; 5] = [
+    pub const ALL: [Scene; 6] = [
         Scene::Fixtures,
         Scene::Thread,
         Scene::NewThread,
         Scene::Settings,
         Scene::Herdr,
+        Scene::Hub,
     ];
 
     /// The `--scene` name.
@@ -79,6 +82,7 @@ impl Scene {
             Scene::NewThread => "new-thread",
             Scene::Settings => "settings",
             Scene::Herdr => "herdr",
+            Scene::Hub => "hub",
         }
     }
 }
@@ -93,6 +97,7 @@ pub const SCENES: &[SceneSetup] = &[
     ("new-thread", |s: &mut J3| start(s, Scene::NewThread)),
     ("settings", |s: &mut J3| start(s, Scene::Settings)),
     ("herdr", |s: &mut J3| start(s, Scene::Herdr)),
+    ("hub", |s: &mut J3| start(s, Scene::Hub)),
 ];
 
 /// A scene from the command line: default UI settings (not the user's `desktop.json`), so
@@ -149,14 +154,18 @@ pub fn install(s: &mut J3, scene: Scene) {
     ));
     match scene {
         Scene::Fixtures => {}
-        Scene::Thread | Scene::Herdr => {
+        Scene::Thread | Scene::Herdr | Scene::Hub => {
             let key = open_thread_key();
             if s.subscribe_thread(&key).is_some()
                 && let Some(thread) = s.threads.get_mut(&key)
             {
                 thread.state = Arc::new(thread_state());
             }
-            s.route.main = Main::Thread(key);
+            s.route.main = Main::Thread(key.clone());
+            if scene == Scene::Hub {
+                let hub = s.hubs.entry(key).or_default();
+                hub.open = true;
+            }
         }
         Scene::NewThread => {
             s.new_thread = NewThreadState {

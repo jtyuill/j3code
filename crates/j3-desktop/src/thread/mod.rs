@@ -1,21 +1,32 @@
 //! One open thread (spec §5): its live state — a `ThreadHandle` subscription forwarded into
-//! the app by a watch task — and its view: the header (in the shell's toolbar band), the feed
-//! (§5.1, §6) and the cards above the composer (§5.2).
+//! the app by a watch task — and its view: the header (in the shell's toolbar band, see
+//! [`header`]), the feed (§5.1, §6), the cards above the composer (§5.2: [`cards`],
+//! [`question`], [`goal`]) and the layout with the terminal drawer and file pane ([`layout`],
+//! §5.4). The agents hub (§5.3) is `crate::hub`.
 //!
 //! `J3::open_thread` subscribes (once per thread; the state stays while the app runs, so a
 //! reopened thread renders at once), routes the main pane to it and marks it visited.
 
+pub mod cards;
 pub mod feed;
+pub mod goal;
+pub mod header;
+pub mod layout;
+pub mod question;
+#[cfg(test)]
+mod tests;
 
 use std::sync::Arc;
 
-use j3_client::{ThreadHandle, ThreadState};
-use rune::{Cx, El, Tx, col, row};
-use rune_kit::shell::Toolbar;
+use j3_client::{Connection, ThreadHandle, ThreadState};
+use rune::{TextEdit, Tx};
+
+pub use header::toolbar;
+pub use layout::view;
+pub use question::build_answers;
 
 use crate::{
-    app::{J3, Main, Ui},
-    composer::ComposerKey,
+    app::{J3, Main},
     sidebar::ThreadKey,
 };
 
@@ -27,6 +38,8 @@ pub struct ThreadUi {
     pub state: Arc<ThreadState>,
     /// The feed's own UI state.
     pub feed: feed::FeedUi,
+    /// The header menu and the cards' own state.
+    pub chrome: ChromeUi,
     /// The task forwarding `handle.state()` into the inbox; stopped on drop.
     watch: tokio::task::AbortHandle,
 }
@@ -35,6 +48,87 @@ impl Drop for ThreadUi {
     fn drop(&mut self) {
         self.watch.abort();
     }
+}
+
+/// What the header and the cards above the composer keep for one thread.
+pub struct ChromeUi {
+    /// The thread actions menu is open.
+    pub actions_open: bool,
+    /// The plan card is unfolded (it starts so).
+    pub todo_open: bool,
+    /// A queued message being edited in place.
+    pub queue_edit: Option<cards::QueueEdit>,
+    /// The first pending question's card.
+    pub question: Option<question::QuestionCard>,
+    /// The "Set goal" dialog, while open.
+    pub goal_dialog: Option<goal::GoalDialog>,
+    /// The state the cards were last brought in line with.
+    synced: Option<Arc<ThreadState>>,
+}
+
+impl Default for ChromeUi {
+    fn default() -> Self {
+        Self {
+            actions_open: false,
+            todo_open: true,
+            queue_edit: None,
+            question: None,
+            goal_dialog: None,
+            synced: None,
+        }
+    }
+}
+
+impl ChromeUi {
+    /// Brings the cards in line with `state`: the question card follows the first pending
+    /// request (a new one starts a fresh questionnaire), and an edit of a queued message
+    /// that left the queue ends. True when anything changed.
+    fn sync(&mut self, state: &Arc<ThreadState>) -> bool {
+        if self
+            .synced
+            .as_ref()
+            .is_some_and(|synced| Arc::ptr_eq(synced, state))
+        {
+            return false;
+        }
+        self.synced = Some(state.clone());
+        let mut changed = false;
+        let pending = state.pending_user_inputs();
+        let first = pending.first();
+        let shown = self.question.as_ref().map(|card| card.request_id.as_str());
+        if first.map(|pending| pending.request.id.as_str()) != shown {
+            self.question = first.map(question::QuestionCard::new);
+            changed = true;
+        }
+        if self.queue_edit.as_ref().is_some_and(|edit| {
+            !state
+                .queued_runs()
+                .iter()
+                .any(|queued| queued.run.id == edit.run_id)
+        }) {
+            self.queue_edit = None;
+            changed = true;
+        }
+        changed
+    }
+}
+
+/// The text field `pick` finds in `key`'s chrome, for a `TextInput::on_edit` accessor. When
+/// the field closed (or the thread went) since the frame was built, the keystroke lands in
+/// the thread's hub entry's sink instead.
+pub(crate) fn chrome_edit<'a>(
+    s: &'a mut J3,
+    key: &ThreadKey,
+    pick: impl FnOnce(&mut ChromeUi) -> Option<&mut TextEdit>,
+) -> &'a mut TextEdit {
+    if let Some(edit) = s
+        .threads
+        .get_mut(key)
+        .and_then(|thread| pick(&mut thread.chrome))
+    {
+        return edit;
+    }
+    s.hubs.entry(key.clone()).or_default().edit_sink()
 }
 
 impl J3 {
@@ -59,7 +153,7 @@ impl J3 {
 
     /// Subscribes to `key`'s thread unless it already is (its `ThreadUi` then exists);
     /// returns its environment's connection, None for an unknown environment.
-    pub fn subscribe_thread(&mut self, key: &ThreadKey) -> Option<j3_client::Connection> {
+    pub fn subscribe_thread(&mut self, key: &ThreadKey) -> Option<Connection> {
         let connection = self.envs.get(&key.env)?.connection().clone();
         if !self.threads.contains_key(key) {
             let handle = connection.thread(&key.thread_id);
@@ -80,6 +174,7 @@ impl J3 {
                     handle,
                     state,
                     feed: feed::FeedUi::default(),
+                    chrome: ChromeUi::default(),
                     watch: watch.abort_handle(),
                 },
             );
@@ -102,7 +197,7 @@ impl J3 {
         if thread.state.active_run().is_none() {
             return;
         }
-        let Some(connection) = self.envs.get(&key.env).map(|env| env.connection().clone()) else {
+        let Some(connection) = self.thread_connection(key) else {
             return;
         };
         let id = key.thread_id.clone();
@@ -112,62 +207,27 @@ impl J3 {
             |_, _, _| {},
         );
     }
-}
 
-/// The thread's header in the shell's toolbar band: its title.
-pub fn toolbar(s: &J3, cx: &mut Cx<J3>, ui: &mut Ui, key: &ThreadKey) -> Toolbar {
-    let title = s
-        .threads
-        .get(key)
-        .and_then(|thread| thread.state.projection.as_ref())
-        .map(|projection| projection.thread.title.clone())
-        .or_else(|| {
-            s.envs
-                .get(&key.env)
-                .and_then(|env| env.state().shell.thread(&key.thread_id))
-                .map(|thread| thread.title.clone())
-        })
-        .unwrap_or_else(|| "Thread".to_owned());
-    Toolbar::new()
-        .title(title)
-        .trailing(crate::git::view(s, cx, ui, key))
-}
+    /// `key`'s environment's connection, None for an unknown environment.
+    pub fn thread_connection(&self, key: &ThreadKey) -> Option<Connection> {
+        self.envs.get(&key.env).map(|env| env.connection().clone())
+    }
 
-/// The open thread: its messages, then the composer.
-pub fn view(s: &J3, cx: &mut Cx<J3>, ui: &mut Ui, key: &ThreadKey) -> El {
-    let feed = feed::view(s, cx, ui, key);
-    let hub_open = s.hubs.get(key).is_some_and(|hub| hub.open);
-    let chat = if hub_open {
-        crate::hub::view(s, cx, ui, key).grow(1.0).min_h(0.0)
-    } else {
-        let composer = crate::composer::view(s, cx, ui, &ComposerKey::Thread(key.clone()));
-        col().key("chat").w_full().grow(1.0).min_h(0.0).child(feed).child(
-            col()
-                .key("thread-bottom")
-                .w_full()
-                .max_w(ui.m.measure)
-                .self_center()
-                .px(16.0)
-                .pt(16.0)
-                .pb(12.0)
-                .child(composer),
-        )
-    };
-    let drawer = crate::terminal::view(s, cx, ui, key);
-    let files = crate::files::view(s, cx, ui, key);
-    row()
-        .key("thread")
-        .w_full()
-        .h_full()
-        .min_h(0.0)
-        .child(
-            col()
-                .key("thread-main")
-                .grow(1.0)
-                .min_w(0.0)
-                .h_full()
-                .child(chat)
-                .child(drawer),
-        )
-        .child(files)
+    /// Before each frame, for the open thread: brings its cards in line with its state (a
+    /// state replaced by any path, not only [`J3::thread_changed`]), confirms a picked
+    /// answer whose moment has passed and reads the agents hub's transcript when due. True
+    /// when anything shown changed.
+    pub(crate) fn poll_thread(&mut self, tx: &mut Tx) -> bool {
+        let Some(key) = self.open_thread_key() else {
+            return false;
+        };
+        let mut changed = false;
+        if let Some(thread) = self.threads.get_mut(&key) {
+            let state = thread.state.clone();
+            changed |= thread.chrome.sync(&state);
+        }
+        changed |= self.poll_question(&key, tx);
+        changed |= self.poll_hub(&key, tx);
+        changed
+    }
 }

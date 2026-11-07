@@ -269,6 +269,7 @@ pub fn poll(s: &mut J3, t: f64, tx: &mut Tx) -> bool {
     changed |= s.poll_usage(tx);
     changed |= s.toasts.poll(s.clock.t, tx);
     changed |= s.poll_sidebar(tx);
+    changed |= s.poll_thread(tx);
     changed
 }
 
@@ -277,6 +278,9 @@ pub fn poll(s: &mut J3, t: f64, tx: &mut Tx) -> bool {
 pub fn on_key(s: &mut J3, ev: &KeyEvent, tx: &mut Tx) -> bool {
     if rune_kit::shell::is_sidebar_toggle(ev) && !s.route.settings {
         s.sidebar.pane.toggle();
+        return true;
+    }
+    if s.hub_key(ev, tx) {
         return true;
     }
     let context = s.key_context(tx);
