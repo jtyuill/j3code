@@ -56,8 +56,9 @@ const MESSAGE_GAP: f32 = 44.0;
 /// A thread's feed UI state, kept in its `ThreadUi`.
 #[derive(Default)]
 pub struct FeedUi {
-    /// Rows the user expanded (tool bodies, reasoning, subagents), by item id.
-    expanded: HashSet<String>,
+    /// Rows the user expanded (tool bodies, reasoning, subagents), by item id; ids that left
+    /// the feed are dropped when a new state is drawn.
+    expanded: RefCell<HashSet<String>>,
     /// The visible rows of the last state drawn and their items' revisions.
     rows: RefCell<Rows>,
     /// Images rows drew before they were decoded: the feed's poll draws again once any is.
@@ -75,7 +76,8 @@ struct Rows {
 }
 
 impl FeedUi {
-    /// The rows of `state`, updating the revisions when it is a new state.
+    /// The rows of `state`, updating the revisions (and forgetting the expansion of items
+    /// that left the feed) when it is a new state.
     fn sync(&self, state: &Arc<ThreadState>) -> Rc<[usize]> {
         let mut rows = self.rows.borrow_mut();
         if rows
@@ -109,6 +111,9 @@ impl FeedUi {
             revisions.insert(item.id.clone(), revision);
         }
         rows.revisions = revisions;
+        self.expanded
+            .borrow_mut()
+            .retain(|id| feed.iter().any(|projected| projected.item.id == *id));
         rows.visible = visible.clone();
         rows.state = Some(state.clone());
         visible
@@ -120,18 +125,19 @@ impl FeedUi {
 
     /// Whether item `id`'s row is expanded.
     pub fn is_expanded(&self, id: &str) -> bool {
-        self.expanded.contains(id)
+        self.expanded.borrow().contains(id)
     }
 }
 
 impl J3 {
     /// Expands or collapses item `id`'s row in `key`'s feed (a tool body, reasoning, a
-    /// subagent card); the choice is kept while the app runs.
+    /// subagent card); the choice is kept while the item stays in the feed.
     pub fn toggle_feed_row(&mut self, key: &ThreadKey, id: &str) {
-        if let Some(thread) = self.threads.get_mut(key)
-            && !thread.feed.expanded.remove(id)
-        {
-            thread.feed.expanded.insert(id.to_owned());
+        if let Some(thread) = self.threads.get_mut(key) {
+            let expanded = thread.feed.expanded.get_mut();
+            if !expanded.remove(id) {
+                expanded.insert(id.to_owned());
+            }
         }
     }
 
