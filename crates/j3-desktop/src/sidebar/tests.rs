@@ -251,7 +251,7 @@ fn the_row_menu_runs_thread_commands() {
     tap_label(&mut app, "Snooze");
     tap_label(&mut app, "Custom…");
     assert!(
-        matches!(&app.rt.state.dialogs.open, Some(Dialog::CustomSnooze { key }) if *key == math)
+        matches!(&app.rt.state.dialogs.open, Some(Dialog::CustomSnooze(form)) if form.key == math)
     );
     close_dialog(&mut app);
 
