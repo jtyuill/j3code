@@ -1155,6 +1155,28 @@ impl Focusable for Workspace {
     }
 }
 
+/// `v0.1.0 · d2112d3`: the build's version and source commit.
+const VERSION_LABEL: &str = concat!(
+    "v",
+    env!("CARGO_PKG_VERSION"),
+    " · ",
+    env!("J3_GIT_COMMIT")
+);
+
+/// The build stamp in the window's bottom-right corner: small and faded so it
+/// reads as chrome, not content. It has no handlers, so clicks fall through.
+fn version_watermark(cx: &App) -> impl IntoElement {
+    div()
+        .id("version-watermark")
+        .test_support()
+        .absolute()
+        .bottom_1()
+        .right_2()
+        .text_xs()
+        .text_color(cx.theme().muted_foreground.opacity(0.55))
+        .child(VERSION_LABEL)
+}
+
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let rem = window.rem_size();
@@ -1190,6 +1212,7 @@ impl Render for Workspace {
             .text_color(cx.theme().foreground)
             .child(titlebar)
             .child(div().flex_1().min_h_0().child(content))
+            .child(version_watermark(cx))
             .when(cfg!(target_os = "macos"), |this| {
                 this.on_mouse_down(MouseButton::Left, titlebar::double_click)
             })

@@ -832,6 +832,13 @@ async fn the_titlebar_and_text_measure_frame_the_thread(cx: &mut TestAppContext)
             window.find("composer").bounds().size.width,
             window.rem_size() * crate::ui_settings::DEFAULT_TEXT_MEASURE
         );
+        // The build stamp sits in the window's bottom-right corner, clear of
+        // the composer.
+        let stamp = window.find("version-watermark").bounds();
+        let viewport = window.viewport_size();
+        assert!(stamp.right() <= viewport.width && stamp.right() > viewport.width - px(24.));
+        assert!(stamp.bottom() <= viewport.height && stamp.bottom() > viewport.height - px(16.));
+        assert!(!stamp.intersects(&window.find("composer").bounds()));
     });
     app.stop(cx);
 }

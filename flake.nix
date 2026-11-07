@@ -104,6 +104,8 @@
                 GGML_AVX2 = "ON";
                 GGML_FMA = "ON";
                 GGML_F16C = "ON";
+                # The source set has no .git; build.rs reads the commit from here.
+                J3_GIT_COMMIT = self.shortRev or self.dirtyShortRev or "unknown";
               };
               # Named after the window's app id (APP_ID in crates/j3-desktop/src/main.rs),
               # so the compositor ties the window to this entry and its icon.
