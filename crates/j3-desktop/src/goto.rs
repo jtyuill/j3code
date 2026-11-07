@@ -4,7 +4,7 @@
 //! ↑↓ move the selection, Enter jumps to the agent and closes. `Dialog::Goto` draws [`body`];
 //! the picker's state lives in `s.sidebar.goto`.
 
-use j3_client::workflow::{AgentOrder, AgentStatus};
+use j3_client::workflow::AgentStatus;
 use rune::{Cx, El, Key, KeyEvent, Mods, ScrollSpec, Tx, col, row, spacer, text};
 use rune_kit::{Kit, TextInput};
 
@@ -63,15 +63,6 @@ fn visible<'r>(rows: &'r HerdrRows, state: &GotoState) -> Vec<&'r AgentRow> {
 }
 
 impl J3 {
-    /// Every agent in space order, whatever the sidebar's workflow and order.
-    fn goto_rows(&self) -> HerdrRows {
-        HerdrRows::build(
-            &self.env_snapshots(),
-            self.prefs.ui().status_indicators,
-            AgentOrder::Spaces,
-        )
-    }
-
     /// Opens the picker afresh: no search, no filter, the open thread selected.
     pub fn open_goto(&mut self, tx: &mut Tx) {
         self.sidebar.goto = GotoState::default();

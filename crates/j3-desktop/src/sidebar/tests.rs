@@ -488,7 +488,7 @@ fn the_goto_picker_filters_searches_and_jumps() {
             .find(|e| e.key.as_deref() == Some("goto-count"))
             .and_then(|e| e.text)
     };
-    let agents = app.rt.state.herdr_rows().agents;
+    let agents = app.rt.state.goto_rows().agents.clone();
     let with = |status| {
         let n = agents.iter().filter(|a| a.status == status).count();
         format!("{n} agents")
@@ -511,4 +511,114 @@ fn the_goto_picker_filters_searches_and_jumps() {
         app.rt.state.route.main,
         Main::Thread(ThreadKey::new(SHIELDY_URL, "thr-acl"))
     );
+}
+
+#[test]
+fn only_the_sidebar_rows_take_the_sidebar_keys() {
+    let mut app = scene(Scene::Thread, UiSettings::default());
+    let s = &app.rt.state;
+    assert!(s.sidebar_owns_keys(Some(&local("thr-math").element_id("thread"))));
+    assert!(
+        !s.sidebar_owns_keys(Some("thread-actions")),
+        "the header's thread menu only shares the prefix"
+    );
+    assert!(!s.sidebar_owns_keys(Some("thread-title")));
+    assert!(
+        !s.sidebar_owns_keys(None),
+        "nothing gave the sidebar the keyboard"
+    );
+    app.rt
+        .update(|s, tx| s.update_ui(|ui| ui.workflow = Workflow::Herdr, tx));
+    app.settle(5);
+    let s = &app.rt.state;
+    assert!(s.sidebar_owns_keys(Some(&local("thr-math").element_id("agent"))));
+    assert!(s.sidebar_owns_keys(Some("space-local-prj-rune")));
+    assert!(!s.sidebar_owns_keys(Some(&local("thr-math").element_id("thread"))));
+}
+
+#[test]
+fn rows_are_built_once_per_change() {
+    let mut app = scene(Scene::Fixtures, UiSettings::default());
+    let s = &app.rt.state;
+    let rows = s.t3_rows();
+    assert!(
+        Rc::ptr_eq(&rows, &s.t3_rows()),
+        "the view and navigation share one build"
+    );
+    let _ = s.thread_order();
+    assert!(Rc::ptr_eq(&rows, &s.t3_rows()));
+    app.rt.update(|s, _| {
+        s.set_project_filter(Some(ProjectKey {
+            env: LOCAL_KEY.into(),
+            project_id: "prj-rune".into(),
+        }))
+    });
+    app.settle(5);
+    assert!(
+        !Rc::ptr_eq(&rows, &app.rt.state.t3_rows()),
+        "a new filter rebuilds them"
+    );
+}
+
+#[test]
+fn menus_close_when_the_list_is_hidden_and_keep_their_place_on_zoom() {
+    let mut app = scene(Scene::Fixtures, UiSettings::default());
+    let row = local("thr-math").element_id("thread");
+    right_click(&mut app, &row);
+    let at = app
+        .rt
+        .state
+        .sidebar
+        .row_menu
+        .as_ref()
+        .expect("the menu opened")
+        .at;
+    dispatch(&mut app, Action::ZoomIn);
+    assert_eq!(
+        app.rt.state.sidebar.row_menu.as_ref().map(|m| m.at),
+        Some(at),
+        "the menu keeps its point in the zoomed content"
+    );
+    dispatch(&mut app, Action::OpenSettings);
+    assert!(
+        app.rt.state.sidebar.row_menu.is_none(),
+        "Settings hides the list"
+    );
+    dispatch(&mut app, Action::CloseSettings);
+    assert!(
+        app.rt.find("thread-menu-menu").is_none(),
+        "it doesn't come back"
+    );
+
+    tap(&mut app, "project-filter");
+    assert!(app.rt.state.sidebar.filter_menu);
+    app.rt
+        .update(|s, tx| s.update_ui(|ui| ui.workflow = Workflow::Herdr, tx));
+    app.settle(5);
+    app.rt
+        .update(|s, tx| s.update_ui(|ui| ui.workflow = Workflow::T3, tx));
+    app.settle(5);
+    assert!(!app.rt.state.sidebar.filter_menu);
+    assert!(app.rt.find("project-filter-menu-menu").is_none());
+}
+
+#[test]
+fn drop_targets_of_rows_that_left_are_forgotten() {
+    let mut app = scene(Scene::Fixtures, UiSettings::default());
+    let math = local("thr-math").element_id("thread");
+    assert!(app.rt.state.sidebar.drop_rects.contains_key(&math));
+    app.rt.update(|s, _| {
+        s.set_project_filter(Some(ProjectKey {
+            env: LOCAL_KEY.into(),
+            project_id: "prj-rune".into(),
+        }))
+    });
+    app.settle(5);
+    let rects = &app.rt.state.sidebar.drop_rects;
+    assert!(
+        !rects.contains_key(&math),
+        "{:?}",
+        rects.keys().collect::<Vec<_>>()
+    );
+    assert!(rects.contains_key(&local("thr-tokens").element_id("thread")));
 }

@@ -10,11 +10,13 @@ use time::OffsetDateTime;
 use super::{ThreadCommand, ThreadKey, t3::T3Row};
 use crate::{app::J3, dialogs::Dialog};
 
-/// The open row menu: whose, where (window points), and which submenu shows.
+/// The open row menu: whose, where (layer points: the press's window point over the zoom
+/// when it opened, so the menu stays by its row if the zoom changes), and which submenu
+/// shows.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RowMenu {
     pub key: ThreadKey,
-    pub at: PointerPress,
+    pub at: [f32; 2],
     pub sub: Option<Submenu>,
 }
 
@@ -25,10 +27,15 @@ pub enum Submenu {
 }
 
 impl J3 {
-    /// Opens `key`'s row menu at `at`.
+    /// Opens `key`'s row menu at window point `at`.
     pub fn open_row_menu(&mut self, key: ThreadKey, at: PointerPress) {
+        let zoom = self.prefs.ui().zoom();
         self.sidebar.filter_menu = false;
-        self.sidebar.row_menu = Some(RowMenu { key, at, sub: None });
+        self.sidebar.row_menu = Some(RowMenu {
+            key,
+            at: [at.x / zoom, at.y / zoom],
+            sub: None,
+        });
     }
 
     pub fn close_row_menu(&mut self) {
@@ -62,21 +69,14 @@ impl J3 {
 }
 
 /// The menu for `row`, opened by `menu`, into `layer`. Returns its (empty) anchor element.
-pub fn build(
-    row: &T3Row,
-    menu: &RowMenu,
-    now: OffsetDateTime,
-    zoom: f32,
-    k: &Kit,
-    layer: &mut Vec<El>,
-) -> El {
+pub fn build(row: &T3Row, menu: &RowMenu, now: OffsetDateTime, k: &Kit, layer: &mut Vec<El>) -> El {
     let key = &row.key;
     let command = |label: &str, command: ThreadCommand| {
         let key = key.clone();
         MenuItem::new(label).on_select(move |s: &mut J3| s.menu_command(&key, command.clone()))
     };
     let mut m = Menu::new("thread-menu")
-        .at(menu.at.x / zoom, menu.at.y / zoom)
+        .at(menu.at[0], menu.at[1])
         .open(true)
         .min_width(200.0)
         .on_close(|s: &mut J3| s.close_row_menu())

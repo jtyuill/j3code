@@ -77,10 +77,6 @@ impl J3 {
             .map(|over| rows.plan(&drag.key, over))
             .unwrap_or_default();
         self.sidebar.drag = None;
-        // Rows that left the list (filtered, folded, gone) report again when they return.
-        self.sidebar
-            .drop_rects
-            .retain(|target, _| rows.target_slot(target).is_some());
         if !commands.is_empty() {
             self.apply_thread_commands(commands);
         }

@@ -20,13 +20,15 @@ mod t3_view;
 mod tests;
 
 use std::{
+    cell::RefCell,
     collections::HashMap,
     hash::{DefaultHasher, Hash, Hasher},
+    rc::Rc,
     sync::Arc,
     time::Duration,
 };
 
-use j3_client::ConnectionState;
+use j3_client::{ConnectionState, workflow::AgentOrder};
 use rune::{Cx, El, Tx};
 use rune_kit::PaneState;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -107,6 +109,10 @@ pub struct SidebarState {
     pub tick_at: Option<f64>,
     /// What the clock was last armed for (environments, settings, filter, open thread).
     armed_for: Option<u64>,
+    /// How many times the clock came due: time-dependent rows change then.
+    ticks: u64,
+    /// The rows of the current inputs and tick, built once for every reader.
+    cache: RefCell<RowsCache>,
     /// The project filter's dropdown is open.
     pub filter_menu: bool,
     /// The open row context menu.
@@ -132,6 +138,8 @@ impl Default for SidebarState {
             settled_shown: SETTLED_INITIAL_COUNT,
             tick_at: None,
             armed_for: None,
+            ticks: 0,
+            cache: RefCell::default(),
             filter_menu: false,
             row_menu: None,
             drag: None,
@@ -151,12 +159,13 @@ impl SidebarState {
     }
 }
 
-/// Whether the focused element `key` belongs to the sidebar (its rows and list), so ↑/↓ move
-/// through threads there.
-pub fn owns_focus(key: &str) -> bool {
-    ["thread-", "agent-", "space-", "sidebar"]
-        .iter()
-        .any(|prefix| key.starts_with(prefix))
+/// The rows built for one [`J3::sidebar_rows_key`], each workflow's when first asked for.
+#[derive(Default)]
+struct RowsCache {
+    key: u64,
+    t3: Option<Rc<T3Rows>>,
+    herdr: Option<Rc<HerdrRows>>,
+    goto: Option<Rc<HerdrRows>>,
 }
 
 /// The thread after (`delta` > 0) or before `current` in `order`, wrapping; from the ends
@@ -202,22 +211,66 @@ impl J3 {
             .collect()
     }
 
-    /// T3 mode's rows now.
-    pub fn t3_rows(&self) -> T3Rows {
-        T3Rows::build(
-            &self.env_snapshots(),
-            self.prefs.ui(),
-            self.sidebar.project_filter.as_ref(),
-            self.open_thread_key().as_ref(),
-            self.sidebar.settled_shown,
-            self.clock.now,
-        )
+    /// The cache for the current inputs and clock tick, emptied when either moved.
+    fn rows_cache(&self) -> std::cell::RefMut<'_, RowsCache> {
+        let key = self.sidebar_rows_key();
+        let mut cache = self.sidebar.cache.borrow_mut();
+        if cache.key != key {
+            *cache = RowsCache {
+                key,
+                ..RowsCache::default()
+            };
+        }
+        cache
+    }
+
+    /// T3 mode's rows now (built once per change of inputs or clock tick).
+    pub fn t3_rows(&self) -> Rc<T3Rows> {
+        let mut cache = self.rows_cache();
+        cache
+            .t3
+            .get_or_insert_with(|| {
+                Rc::new(T3Rows::build(
+                    &self.env_snapshots(),
+                    self.prefs.ui(),
+                    self.sidebar.project_filter.as_ref(),
+                    self.open_thread_key().as_ref(),
+                    self.sidebar.settled_shown,
+                    self.clock.now,
+                ))
+            })
+            .clone()
     }
 
     /// herdr mode's rows now, in the agent order Settings chose.
-    pub fn herdr_rows(&self) -> HerdrRows {
-        let ui = self.prefs.ui();
-        HerdrRows::build(&self.env_snapshots(), ui.status_indicators, ui.agent_order)
+    pub fn herdr_rows(&self) -> Rc<HerdrRows> {
+        let mut cache = self.rows_cache();
+        cache
+            .herdr
+            .get_or_insert_with(|| {
+                let ui = self.prefs.ui();
+                Rc::new(HerdrRows::build(
+                    &self.env_snapshots(),
+                    ui.status_indicators,
+                    ui.agent_order,
+                ))
+            })
+            .clone()
+    }
+
+    /// Every agent in space order, whatever the workflow and order: the goto picker's list.
+    pub fn goto_rows(&self) -> Rc<HerdrRows> {
+        let mut cache = self.rows_cache();
+        cache
+            .goto
+            .get_or_insert_with(|| {
+                Rc::new(HerdrRows::build(
+                    &self.env_snapshots(),
+                    self.prefs.ui().status_indicators,
+                    AgentOrder::Spaces,
+                ))
+            })
+            .clone()
     }
 
     /// The visible threads in display order, for keyboard navigation.
@@ -230,8 +283,15 @@ impl J3 {
 
     /// The sidebar's `n`th visible thread (1-based).
     pub fn nth_thread(&self, n: usize) -> Option<ThreadKey> {
-        n.checked_sub(1)
-            .and_then(|ix| self.thread_order().into_iter().nth(ix))
+        let ix = n.checked_sub(1)?;
+        match self.prefs.ui().workflow {
+            Workflow::T3 => self.t3_rows().rows().nth(ix).map(|row| row.key.clone()),
+            Workflow::Herdr => self
+                .herdr_rows()
+                .agents
+                .get(ix)
+                .map(|agent| agent.key.clone()),
+        }
     }
 
     /// Gives the sidebar the keyboard: ↑/↓ then move through its threads.
@@ -241,11 +301,36 @@ impl J3 {
         tx.blur();
     }
 
-    /// Whether keys arriving with `focused` focused belong to the sidebar.
+    /// Whether keys arriving with `focused` focused belong to the sidebar: one of its rows
+    /// has focus, or ⌘0 gave it the keyboard and nothing has focus since.
     pub fn sidebar_owns_keys(&self, focused: Option<&str>) -> bool {
         match focused {
-            Some(key) => owns_focus(key),
+            Some(key) => self.is_sidebar_row(key),
             None => self.sidebar.keyboard,
+        }
+    }
+
+    /// Whether element `key` is one of the sidebar's rows (a T3 thread, a herdr space or
+    /// agent). Other elements share their prefixes (the header's `thread-actions`).
+    fn is_sidebar_row(&self, key: &str) -> bool {
+        if self.route.settings {
+            return false;
+        }
+        match self.prefs.ui().workflow {
+            Workflow::T3 => {
+                key.starts_with("thread-")
+                    && self
+                        .t3_rows()
+                        .rows()
+                        .any(|row| row.key.element_id("thread") == key)
+            }
+            Workflow::Herdr => {
+                let rows = self.herdr_rows();
+                (key.starts_with("agent-")
+                    && rows.agents.iter().any(|a| a.key.element_id("agent") == key))
+                    || (key.starts_with("space-")
+                        && rows.spaces.iter().any(|s| s.element_id() == key))
+            }
         }
     }
 
@@ -332,6 +417,7 @@ impl J3 {
         }
         let ui = self.prefs.ui();
         (ui.workflow == Workflow::T3, ui.working_shelf).hash(&mut h);
+        (ui.status_indicators, ui.agent_order).hash(&mut h);
         ui.expanded_shelves.hash(&mut h);
         self.sidebar.project_filter.hash(&mut h);
         self.sidebar.settled_shown.hash(&mut h);
@@ -339,19 +425,51 @@ impl J3 {
         h.finish()
     }
 
+    /// [`Self::sidebar_inputs`] at the clock's current tick: the rows cache's key.
+    fn sidebar_rows_key(&self) -> u64 {
+        let mut h = DefaultHasher::new();
+        self.sidebar_inputs().hash(&mut h);
+        self.sidebar.ticks.hash(&mut h);
+        h.finish()
+    }
+
+    /// Whether T3's list is on screen (its menus, drag and drop targets live only then).
+    fn t3_shown(&self) -> bool {
+        !self.route.settings
+            && self.sidebar.pane.is_open()
+            && self.prefs.ui().workflow == Workflow::T3
+    }
+
     /// The sidebar's clock: time-dependent rows (working timers every second, ages on the
     /// minute, snoozes when they wake) re-render on time. True when that time came. Also
-    /// drops a project filter whose project is gone, and the sidebar's keyboard once another
+    /// drops a project filter whose project is gone, menus and drags of a list no longer
+    /// shown, the drop targets of rows that left, and the sidebar's keyboard once another
     /// control has focus.
     pub(crate) fn poll_sidebar(&mut self, tx: &mut Tx) -> bool {
-        if tx.focused().is_some_and(|key| !owns_focus(key)) {
+        if tx.focused().is_some_and(|key| !self.is_sidebar_row(key)) {
             self.sidebar.keyboard = false;
+        }
+        let mut changed = false;
+        if !self.t3_shown() {
+            let open = self.sidebar.row_menu.is_some()
+                || self.sidebar.filter_menu
+                || self.sidebar.drag.is_some();
+            if open {
+                self.sidebar.row_menu = None;
+                self.sidebar.filter_menu = false;
+                self.sidebar.drag = None;
+                changed = true;
+            }
+            self.sidebar.drop_rects.clear();
         }
         let t = self.clock.t;
         let due = self.sidebar.tick_at.is_some_and(|at| t >= at);
+        if due {
+            self.sidebar.ticks += 1;
+        }
         let inputs = self.sidebar_inputs();
         if !due && self.sidebar.armed_for == Some(inputs) {
-            return false;
+            return changed;
         }
         self.sidebar.armed_for = Some(inputs);
         if let Some(filter) = &self.sidebar.project_filter {
@@ -365,14 +483,21 @@ impl J3 {
             }
         }
         let wait = match self.prefs.ui().workflow {
-            Workflow::T3 => Some(self.t3_rows().next_tick(self.clock.now)),
+            Workflow::T3 => {
+                let rows = self.t3_rows();
+                // Rows that left the list report where they are again when they return.
+                self.sidebar
+                    .drop_rects
+                    .retain(|target, _| rows.target_slot(target).is_some());
+                Some(rows.next_tick(self.clock.now))
+            }
             Workflow::Herdr => None,
         };
         self.sidebar.tick_at = wait.map(|wait| t + wait.as_secs_f64());
         if let Some(wait) = wait {
             tx.wake_after(wait);
         }
-        due
+        changed || due
     }
 }
 
