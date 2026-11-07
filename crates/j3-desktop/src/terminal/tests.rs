@@ -158,7 +158,15 @@ fn tabs_open_close_and_the_last_one_hides_the_drawer() {
         .map(|t| t.id.clone())
         .collect();
     assert_eq!(ids, ["term-2", "term-1"]);
-    for id in ["term-2", "term-1"] {
+    // Closing the selected tab selects the one before it, as the old drawer did.
+    app.rt.update(|s, _| s.new_terminal(&key()));
+    app.rt.update(|s, _| s.select_terminal(&key(), "term-1"));
+    app.rt
+        .update(|s, tx| s.close_terminal(&key(), "term-1", tx));
+    app.frame();
+    let drawer = &app.rt.state.terminals[&key()];
+    assert_eq!(drawer.active().map(|t| t.id.as_str()), Some("term-2"));
+    for id in ["term-3", "term-2"] {
         app.rt.update(move |s, tx| s.close_terminal(&key(), id, tx));
         app.frame();
     }
@@ -389,7 +397,7 @@ fn pointer_drags_select_and_the_wheel_scrolls_the_scrollback() {
     // Typing returns to the live screen and drops the selection; the wheel scrolls back.
     let (x, y) = at(2.0, 1);
     app.rt
-        .wheel_event(WheelEvent::new(0.0, cell.height * 3.0).at(x, y));
+        .wheel_event(WheelEvent::new(0.0, 3.0 * 40.0).at(x, y));
     app.frame();
     let text = terminal(&app.rt.state, "term-1").screen().text();
     assert!(!text.ends_with("selected words"), "scrolled back: {text}");

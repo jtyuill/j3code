@@ -425,8 +425,9 @@ impl J3 {
             return;
         };
         drop(drawer.tabs.remove(index));
-        if drawer.active > index || drawer.active >= drawer.tabs.len() {
-            drawer.active = drawer.active.saturating_sub(1);
+        // As the old drawer: the tab before the closed one (or the first) takes over.
+        if drawer.active >= index && drawer.active > 0 {
+            drawer.active -= 1;
         }
         let empty = drawer.tabs.is_empty();
         if !empty {
