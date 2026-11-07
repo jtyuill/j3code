@@ -136,6 +136,10 @@ fn fixture_scenes_render_offline() {
                 assert!(s.route.settings);
                 assert!(app.rt.find("close-settings").is_some());
             }
+            Scene::Composer => {
+                assert_eq!(s.route.main, Main::NewThread);
+                assert!(app.rt.find("composer-ghost").is_some());
+            }
         }
     }
 }

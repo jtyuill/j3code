@@ -7,7 +7,6 @@ use crate::{
     app::{J3, Main, Ui},
     composer::ComposerKey,
     environment::LOCAL_KEY,
-    models,
     sidebar::ThreadKey,
 };
 
@@ -52,41 +51,40 @@ impl J3 {
         self.focus_composer(tx);
     }
 
-    /// Launches a thread with `text` as its first message on the chosen project, with the
-    /// server's default model, then opens it.
-    pub fn launch_new_thread(&mut self, text: String, _: &mut Tx) {
+    /// Launches a thread on the chosen project with the composer's submission (its text,
+    /// uploaded images and model) as the first message, then opens it.
+    pub fn launch_new_thread(&mut self, submission: crate::composer::Submission, _: &mut Tx) {
         let key = self.new_thread.composer_key();
-        let NewThreadState { env, project } = self.new_thread.clone();
-        let Some(project) = project else {
-            self.composer(&key).error =
-                Some("Add a project to this environment to start a thread.".into());
+        let env = self.new_thread.env.clone();
+        let Some(project) = self.new_thread.project.clone() else {
+            self.finish_composer(
+                &key,
+                Err("Add a project to this environment to start a thread.".into()),
+            );
             return;
         };
         let Some(environment) = self.envs.get(&env) else {
+            self.finish_composer(&key, Err("The environment is gone.".into()));
             return;
         };
-        let choices = environment.models().clone();
-        let Some(choice) = models::initial_choice(&choices, None).map(|ix| &choices[ix]) else {
-            self.composer(&key).error = Some("Choose a model.".into());
-            return;
-        };
-        let model = models::model_selection(choice, None);
         let connection = environment.connection().clone();
         self.composer(&key).busy = true;
         self.spawn(async move {
-            let result = connection.launch(&project, &text, Vec::new(), model).await;
-            move |s: &mut J3, tx: &mut Tx| {
-                let composer = s.composer(&key);
-                composer.busy = false;
-                match result {
-                    Ok(thread_id) => {
-                        composer.edit.clear();
-                        composer.error = None;
-                        s.open_thread(ThreadKey::new(env, thread_id), tx);
-                        s.focus_composer(tx);
-                    }
-                    Err(e) => composer.error = Some(format!("Couldn’t start the thread: {e}")),
+            let result = connection
+                .launch(
+                    &project,
+                    &submission.text,
+                    submission.attachments,
+                    submission.model,
+                )
+                .await;
+            move |s: &mut J3, tx: &mut Tx| match result {
+                Ok(thread_id) => {
+                    s.finish_composer(&key, Ok(()));
+                    s.open_thread(ThreadKey::new(env, thread_id), tx);
+                    s.focus_composer(tx);
                 }
+                Err(e) => s.finish_composer(&key, Err(e.to_string())),
             }
         });
     }

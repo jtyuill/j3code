@@ -60,15 +60,19 @@ pub enum Scene {
     Settings,
     /// The herdr workflow's sidebar with [`OPEN_THREAD`] open.
     Herdr,
+    /// The new-thread composer focused with a draft: a model chip, a magic keyword, a pasted
+    /// image and ghost text.
+    Composer,
 }
 
 impl Scene {
-    pub const ALL: [Scene; 5] = [
+    pub const ALL: [Scene; 6] = [
         Scene::Fixtures,
         Scene::Thread,
         Scene::NewThread,
         Scene::Settings,
         Scene::Herdr,
+        Scene::Composer,
     ];
 
     /// The `--scene` name.
@@ -79,6 +83,7 @@ impl Scene {
             Scene::NewThread => "new-thread",
             Scene::Settings => "settings",
             Scene::Herdr => "herdr",
+            Scene::Composer => "composer",
         }
     }
 }
@@ -93,6 +98,7 @@ pub const SCENES: &[SceneSetup] = &[
     ("new-thread", |s: &mut J3| start(s, Scene::NewThread)),
     ("settings", |s: &mut J3| start(s, Scene::Settings)),
     ("herdr", |s: &mut J3| start(s, Scene::Herdr)),
+    ("composer", |s: &mut J3| start(s, Scene::Composer)),
 ];
 
 /// A scene from the command line: default UI settings (not the user's `desktop.json`), so
@@ -168,6 +174,10 @@ pub fn install(s: &mut J3, scene: Scene) {
         Scene::Settings => {
             s.settings.page = Page::General;
             s.route.settings = true;
+        }
+        Scene::Composer => {
+            install(s, Scene::NewThread);
+            crate::composer::fixture::install(s);
         }
     }
 }
