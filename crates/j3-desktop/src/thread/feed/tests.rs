@@ -36,6 +36,40 @@ fn reveal(app: &mut TestApp, key: &str) {
 }
 
 #[test]
+fn a_thread_loaded_on_open_shows_its_end_without_gliding_there() {
+    let mut app = TestApp::with_scene(Scene::Thread);
+    let key = open_thread_key();
+    // Not cached: the subscription has nothing yet, and the feed's images aren't decoded.
+    app.rt.state.threads.get_mut(&key).unwrap().state = Arc::new(j3_client::ThreadState {
+        thread_id: key.thread_id.clone(),
+        sync: j3_client::ThreadSync::Loading,
+        sequence: 0,
+        projection: None,
+    });
+    app.settle(30);
+    let loaded = Arc::new(thread_state());
+    app.rt
+        .update(move |s, tx| s.thread_changed(&key, loaded, tx));
+    for frame in 0..40 {
+        app.frame();
+        let (drawn, target) = app
+            .rt
+            .elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some("feed-rows"))
+            .map(|e| (e.rect, e.target))
+            .expect("the feed draws");
+        assert!(
+            (drawn[3] - target[3]).abs() < 0.5,
+            "frame {frame}: the rows are at their height ({} of {})",
+            drawn[3],
+            target[3]
+        );
+        assert_eq!(app.rt.scroll_at_bottom("feed"), Some(true), "frame {frame}");
+    }
+}
+
+#[test]
 fn every_row_kind_draws_in_the_thread_scene() {
     let mut app = scene();
     let key = open_thread_key();

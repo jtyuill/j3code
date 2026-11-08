@@ -41,7 +41,7 @@ use j3_client::{
     ThreadState, ThreadSync,
     t3::orchestration::{TurnItem, TurnItemKind},
 };
-use rune::{Color, Cx, El, GrowthSpec, Image, ScrollSpec, col, el, icon, memo, text};
+use rune::{Color, Cx, El, GrowthSpec, Image, ScrollSpec, Tx, col, el, icon, memo, text};
 use rune_kit::{Kit, Spinner};
 
 use crate::{
@@ -178,14 +178,21 @@ impl J3 {
     }
 
     /// Before a frame: true when an image a feed row waits on finished decoding, so the
-    /// rows showing it draw again.
-    pub(crate) fn poll_feed(&mut self) -> bool {
+    /// rows showing it draw again. The open thread's rows take their new heights at once: an
+    /// image or formula decoding is not text arriving, so the feed doesn't glide to its end.
+    pub(crate) fn poll_feed(&mut self, tx: &mut Tx) -> bool {
+        let open = self.open_thread_key();
         let mut changed = false;
-        for thread in self.threads.values() {
+        for (key, thread) in &self.threads {
             let mut wait = thread.feed.wait.borrow_mut();
             let before = wait.len();
             wait.retain(|image| !image.is_ready() && image.error().is_none());
-            changed |= wait.len() != before;
+            if wait.len() != before {
+                changed = true;
+                if open.as_ref() == Some(key) {
+                    tx.instant();
+                }
+            }
         }
         changed
     }

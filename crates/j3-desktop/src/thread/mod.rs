@@ -224,11 +224,16 @@ impl J3 {
     }
 
     /// A newer state for `key`'s thread, from its watch-forwarding task. A resubscription's
-    /// first, empty state doesn't replace the cached one.
-    pub fn thread_changed(&mut self, key: &ThreadKey, state: Arc<ThreadState>, _: &mut Tx) {
+    /// first, empty state doesn't replace the cached one. While the open thread loads or
+    /// catches up, its feed lands at its end at once instead of growing into place.
+    pub fn thread_changed(&mut self, key: &ThreadKey, state: Arc<ThreadState>, tx: &mut Tx) {
+        let open = self.open_thread_key().as_ref() == Some(key);
         if let Some(thread) = self.threads.get_mut(key)
             && !(is_blank(&state) && thread.state.projection.is_some())
         {
+            if open && (thread.state.projection.is_none() || state.sync != ThreadSync::Live) {
+                tx.settle();
+            }
             thread.state = state;
         }
     }

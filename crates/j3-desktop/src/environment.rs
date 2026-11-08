@@ -470,12 +470,15 @@ impl J3 {
                     },
                     (_, None) => None,
                 };
-                move |s: &mut J3, _: &mut Tx| {
+                // An image arriving is not text arriving: rows take its size at once rather
+                // than gliding the feed to its end.
+                move |s: &mut J3, tx: &mut Tx| {
                     let load = match bytes {
                         Some(bytes) => s.images.decode(bytes),
                         None => ImageLoad::Failed,
                     };
                     s.images.set(key, load);
+                    tx.instant();
                 }
             });
         }
