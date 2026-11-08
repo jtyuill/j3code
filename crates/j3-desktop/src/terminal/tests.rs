@@ -368,11 +368,14 @@ fn pointer_drags_select_and_the_wheel_scrolls_the_scrollback() {
         t.screen
             .feed(format!("{lines}$ echo selected words").as_bytes());
     });
-    // The status strip goes once the shell runs: the grid grows into its room.
+    // The status strip goes once the shell runs: the grid grows into its room once the
+    // debounced resize lands.
     app.settle(10);
     let cell = CellMetrics::new(app.rt.state.prefs.ui().terminal_font_size());
     let view = rect(&app, "terminal-view-term-1");
-    let rows = usize::from(terminal(&app.rt.state, "term-1").screen().size().rows);
+    let grid = cell.grid([view[2], view[3]]);
+    wait_for(&mut app, |s| terminal(s, "term-1").screen().size() == grid);
+    let rows = usize::from(grid.rows);
     let at = |col: f32, line: usize| {
         (
             view[0] + PADDING + (col + 0.25) * cell.width,
