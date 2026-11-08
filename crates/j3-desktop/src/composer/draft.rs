@@ -169,7 +169,11 @@ pub(super) fn shown_ghost(composer: &ComposerState) -> Option<&Ghost> {
 impl J3 {
     /// After an edit of `key`'s draft: settles a provisional space, follows the ghost,
     /// keeps the chips in step, refreshes the completion menu and asks for a prediction.
+    /// Drafting a new thread closes the popover picking where it starts.
     pub(super) fn composer_changed(&mut self, key: &ComposerKey, tx: &mut Tx) {
+        if matches!(key, ComposerKey::NewThread { .. }) {
+            self.close_new_thread_picker();
+        }
         let choices = self
             .envs
             .get(key.env())

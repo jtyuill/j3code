@@ -291,6 +291,18 @@ fn header(s: &J3, rows: &T3Rows, ui: &mut Ui) -> El {
                 ),
         );
     }
+    let new_thread = IconButton::new(&icons::SQUARE_PEN)
+        .variant(IconButtonVariant::GhostMuted)
+        .control_size(ControlSize::Small)
+        .label("New thread")
+        .help(format!(
+            "New thread ({})",
+            shortcut_label(Action::NewThread)
+        ))
+        // Scoped to the filter (`J3::target_context`).
+        .on_press_tx(|s: &mut J3, tx: &mut Tx| s.press_new_thread(tx))
+        .build(k)
+        .key("new-thread");
     bar.child(spacer())
         .child(
             IconButton::new(&icons::FOLDER_PLUS)
@@ -305,22 +317,7 @@ fn header(s: &J3, rows: &T3Rows, ui: &mut Ui) -> El {
                 .build(k)
                 .key("add-project"),
         )
-        .child(
-            IconButton::new(&icons::SQUARE_PEN)
-                .variant(IconButtonVariant::GhostMuted)
-                .control_size(ControlSize::Small)
-                .label("New thread")
-                .help(format!(
-                    "New thread ({})",
-                    shortcut_label(Action::NewThread)
-                ))
-                .on_press_tx(|s: &mut J3, tx: &mut Tx| {
-                    let scope = s.sidebar.project_filter.clone();
-                    s.new_thread_in(scope, tx);
-                })
-                .build(k)
-                .key("new-thread"),
-        )
+        .child(crate::new_thread::button(s, ui, new_thread))
 }
 
 fn note_row(key: &'static str, note: &str, k: &Kit) -> El {

@@ -197,7 +197,7 @@ pub fn view(s: &J3, ui: &mut Ui) -> El {
             "New thread ({})",
             shortcut_label(Action::NewThread)
         ))
-        .on_press_tx(|s: &mut J3, tx: &mut Tx| s.new_thread_in(None, tx))
+        .on_press_tx(|s: &mut J3, tx: &mut Tx| s.press_new_thread(tx))
         .build(k)
         .key("new-thread");
     let header = row()
@@ -208,7 +208,7 @@ pub fn view(s: &J3, ui: &mut Ui) -> El {
         .center_y()
         .child(section_title("Spaces", k))
         .child(spacer())
-        .child(new_thread);
+        .child(crate::new_thread::button(s, ui, new_thread));
     let mut sidebar = Sidebar::new().label("Agents").header(header);
     if let Some(note) = rows.note {
         sidebar = sidebar.child(placeholder("herdr-note", note, k));

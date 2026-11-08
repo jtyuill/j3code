@@ -219,7 +219,7 @@ impl J3 {
             Action::ShowArchived => self.open_settings(crate::settings::Page::Archived, tx),
             Action::NewThread => {
                 let (env, project) = self.target_context();
-                self.new_thread(env, project, tx);
+                self.new_thread_picking(env, project, tx);
             }
             Action::AddProject => {
                 let (env, _) = self.target_context();

@@ -13,7 +13,7 @@ use crate::{
     actions::Action,
     app::{
         Main,
-        fixtures::{self, NOW, OPEN_THREAD, SHIELDY_URL, Scene},
+        fixtures::{self, J3CODE_PROJECT, NOW, OPEN_THREAD, SHIELDY_URL, Scene},
         testing::TestApp,
     },
     dialogs::Dialog,
@@ -402,6 +402,24 @@ fn the_project_filter_scopes_rows_and_new_threads() {
     tap(&mut app, "new-thread");
     assert_eq!(app.rt.state.route.main, Main::NewThread);
     assert_eq!(app.rt.state.new_thread.project.as_deref(), Some("prj-rune"));
+    // Where it starts is picked in the popover beside the button, not above the composer.
+    let (_, button_y) = app.rt.find("new-thread").unwrap();
+    let (_, picker_y) = app
+        .rt
+        .find("new-thread-project-trigger")
+        .expect("the popover shows");
+    assert!((picker_y - button_y).abs() < 120.0, "beside the button");
+    // The project list opens over the popover and its rows take the press.
+    tap(&mut app, "new-thread-project-trigger");
+    tap(&mut app, "new-thread-project-option-prj-j3code");
+    assert_eq!(
+        app.rt.state.new_thread.project.as_deref(),
+        Some(J3CODE_PROJECT)
+    );
+    assert!(
+        app.rt.find("new-thread-project-trigger").is_none(),
+        "choosing closes it"
+    );
     tap(&mut app, "clear-project-filter");
     assert!(app.rt.state.sidebar.project_filter.is_none());
 }

@@ -89,6 +89,7 @@ impl J3 {
         self.settings.mono_font.close();
         self.settings.speech_model.close();
         self.route.settings = true;
+        self.close_new_thread_picker();
         if matches!(self.settings.fonts, Fonts::Unknown) {
             self.load_fonts();
         }
