@@ -1,5 +1,5 @@
-//! The composer against the real server: launching a new thread, `^model` chips, magic
-//! keywords, omp's word prediction and dictation.
+//! The composer against the real server: launching a new thread, `^model` chips, `@path`
+//! completion, magic keywords, omp's word prediction and dictation.
 
 use std::time::Duration;
 
@@ -115,6 +115,42 @@ fn a_caret_mention_completes_to_a_model_chip_and_sends_its_selector() {
 
     app.press(Key::Enter);
     app.until_called(&format!("prompt:Have ^{MODEL}:0"));
+}
+
+#[test]
+fn an_at_reference_completes_paths_the_server_finds_and_sends_them_typed() {
+    let mut app = Harness::start("at-path");
+    for path in ["src/main.rs", "src/lib.rs", "notes.md"] {
+        let path = app.project_dir.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "").unwrap();
+    }
+    app.focused_new_thread_composer();
+
+    // A directory is taken as `@dir/`, and its entries come next.
+    app.typed("Read @sr");
+    app.until("the menu lists the directory", |h| {
+        h.exists("completion-option-src")
+    });
+    app.press(Key::Enter);
+    assert_eq!(app.draft(), "Read @src/");
+    app.until("its entries follow", |h| {
+        h.exists("completion-option-src/main.rs") && h.exists("completion-option-src/lib.rs")
+    });
+
+    // Typing narrows them; a file is taken with a space after it.
+    app.typed("ma");
+    app.until("the menu narrows", |h| {
+        !h.exists("completion-option-src/lib.rs")
+    });
+    app.press(Key::Enter);
+    assert_eq!(app.draft(), "Read @src/main.rs ");
+    assert!(!app.exists("completion-option-src/main.rs"));
+
+    // omp reads the file itself: the reference goes as typed.
+    app.typed("now");
+    app.press(Key::Enter);
+    app.until_called("prompt:Read @src/main.rs now:0");
 }
 
 #[test]

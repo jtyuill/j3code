@@ -454,21 +454,28 @@ fn send_during_dictation_waits_for_the_last_words_then_sends() {
     tap(&mut app, "send-message");
     // Pressed mid-dictation: nothing sent yet, the send waits for the capture's end.
     assert!(!app.rt.state.composers[&key].busy);
+    // The capture's end sends at once. Observed inside the same update: the offline
+    // fixture's launch fails right away, and its reply may land by the next frame.
     let end = key.clone();
-    app.rt.update(move |s, tx| {
+    let mut sent = None;
+    app.rt.update(|s, tx| {
         s.on_speech_event(
             SpeechEvent::End {
-                owner: end,
+                owner: end.clone(),
                 text: "last words".into(),
                 error: None,
             },
             tx,
-        )
+        );
+        let composer = &s.composers[&end];
+        assert!(composer.dictation.is_none() && !composer.send_after_dictation);
+        sent = composer.busy.then(|| plain_text(&composer.edit));
     });
-    app.frame();
-    let composer = &app.rt.state.composers[&key];
-    assert!(composer.dictation.is_none() && !composer.send_after_dictation);
-    assert!(composer.busy, "the draft with the last words was sent");
+    assert_eq!(
+        sent.as_deref(),
+        Some("Note: last words"),
+        "the draft with the last words was sent"
+    );
 }
 
 fn tap(app: &mut TestApp, element: &str) {

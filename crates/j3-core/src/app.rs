@@ -41,8 +41,9 @@ use j3_protocol::t3::{
         TurnItemKind, WorkspaceStrategy,
     },
     project::{
-        PROJECTS_LIST_ENTRIES, PROJECTS_READ_FILE, Project, ProjectListEntriesInput,
-        ProjectMutation, ProjectMutationError, ProjectReadFileInput, ProjectShell,
+        PROJECTS_LIST_ENTRIES, PROJECTS_READ_FILE, PROJECTS_SEARCH_ENTRIES, Project,
+        ProjectListEntriesInput, ProjectMutation, ProjectMutationError, ProjectReadFileInput,
+        ProjectSearchEntriesInput, ProjectShell,
     },
     server::{
         ServerConfig, ServerProvider, ServerRefreshProvidersInput, ServerSettingsError,
@@ -71,6 +72,7 @@ use crate::{
         session::{OmpFactory, SessionFactory},
         streams::{self, SnapshotFn},
     },
+    entry_search::EntryIndex,
     files, git, http,
     hub::{Commit, Hub, ShellChange},
     omp::OmpLauncher,
@@ -133,6 +135,8 @@ struct Inner {
     data_dir: PathBuf,
     /// Every thread's terminal sessions.
     terminals: Terminals,
+    /// Recent workspace walks answering `projects.searchEntries`.
+    entries: Arc<EntryIndex>,
 }
 
 fn create_dir(path: &Path) -> Result<(), Error> {
@@ -389,6 +393,7 @@ impl App {
             data_dir: config.data_dir,
             omp: config.omp,
             terminals: Terminals::new(),
+            entries: Arc::default(),
         });
         inner.recover()?;
         Ok(Arc::new(App { inner }))
@@ -668,7 +673,13 @@ impl Inner {
                 Ok(input) => blocking(move || files::list_entries(&input)).await,
                 Err(response) => response,
             },
-            "projects.searchEntries" => Response::ok(json!({"entries": [], "truncated": false})),
+            PROJECTS_SEARCH_ENTRIES => match decode::<ProjectSearchEntriesInput>(tag, payload) {
+                Ok(input) => {
+                    let (entries, home) = (Arc::clone(&self.entries), self.home.clone());
+                    blocking(move || entries.search(&input, &home)).await
+                }
+                Err(response) => response,
+            },
             "filesystem.getMetadata" => match decode::<FilesystemGetMetadataInput>(tag, payload) {
                 Ok(input) => Response::ok(json!({"entries": vec![Value::Null; input.paths.len()]})),
                 Err(response) => response,

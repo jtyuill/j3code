@@ -42,9 +42,10 @@ use j3_protocol::t3::{
         Actor, CreationSource, ProviderInteractionMode, RuntimeMode, WorkspaceStrategy,
     },
     project::{
-        PROJECTS_LIST_ENTRIES, PROJECTS_READ_FILE, Project, ProjectCreateMutation,
-        ProjectDeleteMutation, ProjectListEntriesInput, ProjectListEntriesResult, ProjectMutation,
-        ProjectReadFileInput, ProjectReadFileResult,
+        PROJECTS_LIST_ENTRIES, PROJECTS_READ_FILE, PROJECTS_SEARCH_ENTRIES, Project,
+        ProjectCreateMutation, ProjectDeleteMutation, ProjectListEntriesInput,
+        ProjectListEntriesResult, ProjectMutation, ProjectReadFileInput, ProjectReadFileResult,
+        ProjectSearchEntriesInput, ProjectSearchEntriesResult,
     },
     server::{ServerProviderUpdatedPayload, ServerRefreshProvidersInput},
     terminal::{
@@ -525,6 +526,29 @@ impl Connection {
             &ProjectListEntriesInput {
                 cwd: cwd.to_owned(),
                 directory_path: (!dir.is_empty()).then(|| dir.to_owned()),
+            },
+        )
+        .await
+    }
+
+    /// The files and directories of a project on the server that `query`
+    /// names, best first, at most `limit` (`projects.searchEntries`): omp's
+    /// `@` completion. Fuzzy over the paths git doesn't ignore; `dir/` lists
+    /// `dir`; `/…`, `~/…` and `../…` list outside the project.
+    pub async fn search_entries(
+        &self,
+        cwd: &str,
+        query: &str,
+        limit: u64,
+    ) -> Result<ProjectSearchEntriesResult, Error> {
+        self.call(
+            PROJECTS_SEARCH_ENTRIES,
+            &ProjectSearchEntriesInput {
+                cwd: cwd.to_owned(),
+                query: query.to_owned(),
+                limit,
+                kind: None,
+                image_only: None,
             },
         )
         .await

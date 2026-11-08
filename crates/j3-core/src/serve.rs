@@ -39,7 +39,8 @@ pub struct BindError {
 }
 
 impl Server {
-    /// Binds every address (duplicates ignored) and starts serving `app`.
+    /// Binds every address (duplicates ignored) and starts serving `app`. Port 0 picks a
+    /// free port; [`Server::addrs`] reports the one bound.
     pub async fn bind(app: Arc<App>, addrs: &[SocketAddr]) -> Result<Self, BindError> {
         let rpc: Arc<dyn RpcHandler> = app.clone();
         let routes = router(HttpState {
@@ -49,13 +50,18 @@ impl Server {
         });
         let (stop, stop_rx) = watch::channel(false);
         let mut tasks = JoinSet::new();
+        let mut requested = Vec::new();
         let mut bound = Vec::new();
         for &addr in addrs {
-            if bound.contains(&addr) {
+            if requested.contains(&addr) {
                 continue;
             }
+            requested.push(addr);
             let listener = TcpListener::bind(addr)
                 .await
+                .map_err(|source| BindError { addr, source })?;
+            let addr = listener
+                .local_addr()
                 .map_err(|source| BindError { addr, source })?;
             info!("listening on http://{addr}");
             bound.push(addr);
@@ -78,6 +84,7 @@ impl Server {
         })
     }
 
+    /// The addresses bound, in the order requested.
     pub fn addrs(&self) -> &[SocketAddr] {
         &self.addrs
     }

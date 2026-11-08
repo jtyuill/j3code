@@ -102,6 +102,10 @@ impl<'a> Git<'a> {
             .args(args)
             .current_dir(self.dir)
             .env("GIT_TERMINAL_PROMPT", "0")
+            // Status reads would otherwise refresh the index under `index.lock`; a read
+            // killed mid-way (timeout, or a dropped request: `kill_on_drop` is SIGKILL)
+            // leaves that lock behind, and every later commit in the repo fails.
+            .env("GIT_OPTIONAL_LOCKS", "0")
             .env("GH_PROMPT_DISABLED", "1")
             .env("GH_NO_UPDATE_NOTIFIER", "1")
             .env("GH_PAGER", "cat")

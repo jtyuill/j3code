@@ -15,6 +15,8 @@ use super::model::ModelSelection;
 pub const PROJECTS_LIST_ENTRIES: &str = "projects.listEntries";
 /// `projects.readFile` (`C/rpc.ts:410`).
 pub const PROJECTS_READ_FILE: &str = "projects.readFile";
+/// `projects.searchEntries` (`C/rpc.ts:412`).
+pub const PROJECTS_SEARCH_ENTRIES: &str = "projects.searchEntries";
 
 /// `ProjectScriptIcon` (`C/project.ts:24-31`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

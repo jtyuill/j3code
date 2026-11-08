@@ -1,11 +1,13 @@
 //! The completion menu (spec §7.6): `/` commands and skills at the start of the draft, `^`
-//! models anywhere a mention may go, in a rune-kit `PopupList` above the field. The field
-//! keeps focus; ↑ ↓ Tab Enter Escape reach it through `draft::composer_key`.
+//! models anywhere a mention may go and `@` files and directories (searched on the server, as
+//! omp's editor does), in a rune-kit `PopupList` above the field. The field keeps focus; ↑ ↓
+//! Tab Enter Escape reach it through `draft::composer_key`.
 
+use j3_client::t3::project::ProjectEntryKind;
 use rune::{Align, Side, Tx, text};
 use rune_kit::{PopupItem, PopupList};
 
-use super::{ComposerKey, draft};
+use super::{ComposerKey, ComposerState, draft};
 use crate::{
     app::{J3, Ui},
     completion::{self, Completion, CompletionKind},
@@ -21,12 +23,28 @@ const KEPT: usize = MAX_COMPLETIONS * 4;
 /// The popup list's row height.
 const ROW: f32 = 28.0;
 
+impl ComposerState {
+    /// Closes the menu; a search still on its way no longer opens it.
+    pub(super) fn close_completions(&mut self) {
+        self.completions.clear();
+        self.path_query = None;
+    }
+}
+
 impl J3 {
-    /// Recomputes `key`'s menu from its draft and caret, selecting the first row.
+    /// Recomputes `key`'s menu from its draft and caret, selecting the first row. An `@`
+    /// reference's rows come from the server.
     pub(super) fn refresh_completions(&mut self, key: &ComposerKey) {
         let composer = self.composer(key);
         let (text, cursor) = (composer.edit.text.clone(), composer.edit.focus);
         let (a, b) = composer.edit.range();
+        if a == b
+            && mention::allowed(&text)
+            && let Some(path) = completion::path_query(&text, cursor)
+        {
+            self.search_paths(key, path.query.to_owned());
+            return;
+        }
         let mut rows = if a != b {
             Vec::new()
         } else if let Some(query) = completion::slash_query(&text, cursor) {
@@ -36,8 +54,60 @@ impl J3 {
         };
         rows.truncate(KEPT);
         let composer = self.composer(key);
+        composer.path_query = None;
         composer.completions = rows;
         composer.completion_ix = 0;
+    }
+
+    /// Asks `key`'s environment for the entries `@query` names in its workspace, unless that
+    /// answer shows or is on its way. The menu keeps the paths it shows until the answer
+    /// replaces them.
+    fn search_paths(&mut self, key: &ComposerKey, query: String) {
+        let composer = self.composer(key);
+        composer
+            .completions
+            .retain(|row| matches!(row.kind, CompletionKind::Path { .. }));
+        if composer.path_query.as_ref() == Some(&query) {
+            return;
+        }
+        composer.path_query = Some(query.clone());
+        let target = self.composer_target(key);
+        let connection = target
+            .env
+            .filter(|env| env.is_live() && !target.cwd.is_empty())
+            .map(|env| env.connection().clone());
+        let Some(connection) = connection else {
+            self.composer(key).completions.clear();
+            return;
+        };
+        let (cwd, key) = (target.cwd, key.clone());
+        self.spawn(async move {
+            let found = connection.search_entries(&cwd, &query, KEPT as u64).await;
+            move |s: &mut J3, tx: &mut Tx| {
+                let Some(composer) = s.composers.get_mut(&key) else {
+                    return;
+                };
+                if composer.path_query.as_ref() != Some(&query) {
+                    return;
+                }
+                composer.completions = match found {
+                    Ok(found) => found
+                        .entries
+                        .into_iter()
+                        .map(|entry| {
+                            let directory = entry.kind == ProjectEntryKind::Directory;
+                            completion::path_completion(entry.path, directory)
+                        })
+                        .collect(),
+                    Err(e) => {
+                        tracing::debug!("searching {cwd} for @{query}: {e}");
+                        Vec::new()
+                    }
+                };
+                composer.completion_ix = 0;
+                tx.instant();
+            }
+        });
     }
 
     /// The models a `^` mention being typed at `cursor` offers.
@@ -63,17 +133,26 @@ impl J3 {
     }
 
     /// Takes the selected row: a command or skill replaces the leading token (caret at the
-    /// end), a model replaces the `^query` with its chip and a space.
+    /// end), a model replaces the `^query` with its chip and a space, a path replaces the
+    /// `@query` (a directory's entries listed next).
     pub(super) fn accept_completion(&mut self, key: &ComposerKey, tx: &mut Tx) {
         let composer = self.composer(key);
         let Some(row) = composer.completions.get(composer.completion_ix).cloned() else {
             return;
         };
-        composer.completions.clear();
+        composer.close_completions();
         composer.ghost = None;
-        if let CompletionKind::Model(slug) = &row.kind {
-            self.accept_model(key, slug);
-            return;
+        match &row.kind {
+            CompletionKind::Model(slug) => {
+                self.accept_model(key, slug);
+                return;
+            }
+            CompletionKind::Path { path, directory } => {
+                self.accept_path(key, path, *directory);
+                tx.instant();
+                return;
+            }
+            CompletionKind::Command | CompletionKind::Skill => {}
         }
         let edit = &mut composer.edit;
         // `completion::apply` as an edit of the leading token (and the whitespace after it),
@@ -86,6 +165,21 @@ impl J3 {
         edit.insert(&format!("{} ", row.label));
         edit.set_caret(edit.text.len());
         tx.instant();
+    }
+
+    /// Replaces the `@query` before the caret with `path`'s reference; a directory's
+    /// entries come next.
+    fn accept_path(&mut self, key: &ComposerKey, path: &str, directory: bool) {
+        let edit = &mut self.composer(key).edit;
+        let Some(at) = completion::path_query(&edit.text, edit.focus) else {
+            return;
+        };
+        let insert = completion::path_insert(path, directory, at.quoted);
+        edit.set_selection(at.start, edit.focus);
+        edit.insert(&insert);
+        if directory {
+            self.refresh_completions(key);
+        }
     }
 
     /// Replaces the `^query` before the caret with model `slug`'s chip and a space.
@@ -121,11 +215,12 @@ impl J3 {
     }
 }
 
-/// A row's id: the label for commands and skills, the slug for models.
+/// A row's id: the label for commands and skills, the slug for models, the path for paths.
 fn row_id(row: &Completion) -> &str {
     match &row.kind {
         CompletionKind::Model(slug) => slug,
-        _ => &row.label,
+        CompletionKind::Path { path, .. } => path,
+        CompletionKind::Command | CompletionKind::Skill => &row.label,
     }
 }
 
@@ -150,7 +245,7 @@ pub(super) fn view(s: &J3, ui: &mut Ui, key: &ComposerKey, anchor: &str, width: 
             match row.kind {
                 CompletionKind::Skill => item = item.trailing(tag("skill")),
                 CompletionKind::Model(_) => item = item.trailing(tag("model")),
-                CompletionKind::Command => {}
+                CompletionKind::Command | CompletionKind::Path { .. } => {}
             }
             item
         })

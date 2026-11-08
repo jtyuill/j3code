@@ -1,6 +1,7 @@
 //! Completion for the composer: omp slash commands and skills of the
-//! thread's workspace (skills are inserted as `/skill:<name>`), and the
-//! models offered by a `^` mention.
+//! thread's workspace (skills are inserted as `/skill:<name>`), the models
+//! offered by a `^` mention, and the files and directories an `@` reference
+//! names (omp reads `@path` files into the prompt itself on submit).
 
 use std::collections::HashSet;
 
@@ -13,6 +14,12 @@ pub enum CompletionKind {
     /// A model for a `^` mention, by slug. Accepted through the mention
     /// token, not [`apply`].
     Model(String),
+    /// A file or directory for an `@` reference, by its path as the server
+    /// shows it (relative to the workspace, or as typed outside it).
+    Path {
+        path: String,
+        directory: bool,
+    },
 }
 
 /// One row of the completion menu.
@@ -143,6 +150,83 @@ pub fn slash_query(text: &str, cursor: usize) -> Option<&str> {
     (!query.contains(char::is_whitespace)).then_some(query)
 }
 
+/// The characters that end a path token, as omp's editor splits them (it
+/// works per line, hence the newline).
+const PATH_DELIMITERS: [char; 6] = [' ', '\t', '\n', '"', '\'', '='];
+
+/// An `@` file reference being typed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PathQuery<'a> {
+    /// Byte offset of the `@`.
+    pub start: usize,
+    /// The path typed after `@` (or `@"`) up to the cursor.
+    pub query: &'a str,
+    /// Typed as `@"…`, for a path with spaces.
+    pub quoted: bool,
+}
+
+/// omp's `@` reference ending at `cursor` (a byte offset): the token after the
+/// last path delimiter starts with `@`, or an unclosed `"` on the line opens
+/// right after an `@` that starts a token.
+pub fn path_query(text: &str, cursor: usize) -> Option<PathQuery<'_>> {
+    let before = text.get(..cursor)?;
+    let line = &before[before.rfind('\n').map_or(0, |i| i + 1)..];
+    if line.matches('"').count() % 2 == 1 {
+        let open = cursor - line.len() + line.rfind('"')?;
+        if let Some(at) = open.checked_sub(1)
+            && before[at..].starts_with('@')
+            && (at == 0 || before[..at].ends_with(PATH_DELIMITERS))
+        {
+            return Some(PathQuery {
+                start: at,
+                query: &before[open + 1..],
+                quoted: true,
+            });
+        }
+    }
+    let start = before.rfind(PATH_DELIMITERS).map_or(0, |i| i + 1);
+    let query = before[start..].strip_prefix('@')?;
+    Some(PathQuery {
+        start,
+        query,
+        quoted: false,
+    })
+}
+
+/// A menu row for the server's entry `path`: its name (a directory's with a
+/// trailing `/`) over the whole path.
+pub fn path_completion(path: String, directory: bool) -> Completion {
+    let name = path.rsplit('/').next().unwrap_or(&path);
+    let label = if directory {
+        format!("{name}/")
+    } else {
+        name.to_owned()
+    };
+    Completion {
+        kind: CompletionKind::Path {
+            path: path.clone(),
+            directory,
+        },
+        description: (path != name).then_some(path),
+        label,
+        hint: None,
+    }
+}
+
+/// What accepting `path` inserts in place of its `@` reference, like omp: a
+/// file as `@path ` and a directory as `@dir/` so its entries come next; a
+/// path with whitespace (or a reference typed quoted) as `@"path" `, a
+/// directory's quote left open.
+pub fn path_insert(path: &str, directory: bool, quoted: bool) -> String {
+    let quoted = quoted || path.contains(char::is_whitespace);
+    match (quoted, directory) {
+        (false, false) => format!("@{path} "),
+        (false, true) => format!("@{path}/"),
+        (true, false) => format!("@\"{path}\" "),
+        (true, true) => format!("@\"{path}/"),
+    }
+}
+
 /// `text` with its leading `/token` replaced by `completion` and a space.
 pub fn apply(text: &str, completion: &Completion) -> String {
     let rest = text
@@ -245,5 +329,38 @@ mod tests {
         };
         assert_eq!(apply("/je", &completion), "/skill:jev ");
         assert_eq!(apply("/je  rate this", &completion), "/skill:jev rate this");
+    }
+
+    #[test]
+    fn path_query_follows_omps_at_token_rules() {
+        fn query(text: &str) -> Option<(usize, &str, bool)> {
+            path_query(text, text.len()).map(|q| (q.start, q.query, q.quoted))
+        }
+        assert_eq!(query("@"), Some((0, "", false)));
+        assert_eq!(query("look at @src/ma"), Some((8, "src/ma", false)));
+        assert_eq!(query("a\n@x"), Some((2, "x", false)));
+        assert_eq!(query("key=@x"), Some((4, "x", false)));
+        assert_eq!(query("mail me@host"), None);
+        assert_eq!(query("@src/main.rs "), None);
+        assert_eq!(query("see @\"my dir/fi"), Some((4, "my dir/fi", true)));
+        // A closed quote ends the reference; an open one not after `@` is a delimiter.
+        assert_eq!(query("see @\"a b\" c"), None);
+        assert_eq!(query("say \"@x"), Some((5, "x", false)));
+        assert_eq!(path_query("@é", 2), None);
+    }
+
+    #[test]
+    fn path_rows_and_inserts() {
+        let row = path_completion("src/lib".into(), true);
+        assert_eq!(row.label, "lib/");
+        assert_eq!(row.description.as_deref(), Some("src/lib"));
+        assert_eq!(path_completion("README.md".into(), false).description, None);
+        assert_eq!(path_insert("src/main.rs", false, false), "@src/main.rs ");
+        assert_eq!(path_insert("src", true, false), "@src/");
+        assert_eq!(
+            path_insert("my notes.md", false, false),
+            "@\"my notes.md\" "
+        );
+        assert_eq!(path_insert("my dir", true, true), "@\"my dir/");
     }
 }

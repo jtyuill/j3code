@@ -56,7 +56,10 @@ fn a_pending_question_is_answered_from_its_card() {
     app.until("the card shows", |h| {
         h.exists("question-card") && h.has_label("beta")
     });
-    assert!(app.in_sidebar("Ask me, Input"));
+    // The sidebar row follows the shell stream, which may trail the thread's own.
+    app.until("the sidebar asks for input", |h| {
+        h.in_sidebar("Ask me, Input")
+    });
     assert!(app.has_label("alpha"));
 
     app.click_label("beta");

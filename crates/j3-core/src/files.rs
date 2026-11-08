@@ -293,7 +293,7 @@ pub fn image_file(root: &str, requested: &str) -> Result<(PathBuf, &'static str)
 /// `path` normalized to `/`-joined components under the workspace root
 /// (empty for the root itself); `None` when it is absolute, climbs out of
 /// the root, or is not UTF-8.
-fn workspace_relative(path: &str) -> Option<String> {
+pub(crate) fn workspace_relative(path: &str) -> Option<String> {
     let mut parts: Vec<&str> = Vec::new();
     for component in Path::new(path).components() {
         match component {

@@ -348,12 +348,9 @@ impl TestServer {
         )
         .await
         .unwrap();
-        // `Server::bind` reports the requested address, so pick a free port first.
-        let addr = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap();
-        let server = Server::bind(app, &[addr]).await.unwrap();
+        let any_port: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let server = Server::bind(app, &[any_port]).await.unwrap();
+        let addr = server.addrs()[0];
         Self {
             server: Some(server),
             script,

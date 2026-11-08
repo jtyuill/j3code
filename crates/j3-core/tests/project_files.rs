@@ -1,5 +1,6 @@
-//! `projects.listEntries` and `projects.readFile` over the WebSocket against
-//! the real `App`, on temporary project directories.
+//! `projects.listEntries`, `projects.searchEntries` and `projects.readFile`
+//! over the WebSocket against the real `App`, on temporary project
+//! directories.
 
 mod transport_support;
 
@@ -51,11 +52,9 @@ impl Env {
         )
         .await
         .unwrap();
-        let addr: SocketAddr = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap();
-        let server = Server::bind(app, &[addr]).await.unwrap();
+        let any_port: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let server = Server::bind(app, &[any_port]).await.unwrap();
+        let addr = server.addrs()[0];
         Self {
             ws: Ws::connect(addr).await,
             next_id: 0,
@@ -96,6 +95,18 @@ impl Env {
             json!({"cwd": cwd, "relativePath": path}),
         )
         .await
+    }
+
+    /// The paths `query` finds, best first.
+    async fn search(&mut self, cwd: &Path, query: &str) -> Vec<String> {
+        let found = self
+            .call(
+                "projects.searchEntries",
+                json!({"cwd": cwd, "query": query, "limit": 50}),
+            )
+            .await
+            .unwrap();
+        rows(&found).into_iter().map(|(path, ..)| path).collect()
     }
 }
 
@@ -207,6 +218,82 @@ async fn list_entries_without_git_has_no_flags_and_truncates() {
     let rows = rows(&many);
     assert_eq!(rows.len(), MAX_ENTRIES);
     assert_eq!(rows[0], row("many/f00000.txt", "file", false));
+}
+
+#[tokio::test]
+async fn search_entries_matches_like_omps_at_completion() {
+    let mut env = Env::start().await;
+    let project = TempDir::new("files-search");
+    let root = &project.0;
+    let git = Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(root)
+        .status()
+        .unwrap();
+    assert!(git.success());
+    write(root, ".gitignore", "target/\n");
+    write(root, "src/main.rs", "");
+    write(root, "src/domain/mailbox.rs", "");
+    write(root, "docs/main-loop.md", "");
+    write(root, "target/main.rs", "");
+    write(root, ".github/ci.yml", "");
+
+    // Fuzzy over the walk: names starting with the query, names containing
+    // it, paths containing it, then tight subsequences; ignored files and
+    // `.git` never show, hidden ones do.
+    assert_eq!(
+        env.search(root, "main").await,
+        [
+            "src/main.rs",
+            "docs/main-loop.md",
+            "src/domain",
+            "src/domain/mailbox.rs"
+        ]
+    );
+    assert_eq!(
+        env.search(root, "smrs").await,
+        ["src/main.rs", "src/domain/mailbox.rs"]
+    );
+    assert_eq!(env.search(root, "ci.y").await, [".github/ci.yml"]);
+    assert!(env.search(root, "HEAD").await.is_empty());
+
+    // An empty query or `dir/` lists one level, directories first; `dir/rest`
+    // searches under `dir`.
+    assert_eq!(
+        env.search(root, "").await,
+        [".github", "docs", "src", "target", ".gitignore"]
+    );
+    assert_eq!(
+        env.search(root, "src/").await,
+        ["src/domain", "src/main.rs"]
+    );
+    assert_eq!(
+        env.search(root, "src/ma").await,
+        ["src/main.rs", "src/domain/mailbox.rs", "src/domain"]
+    );
+
+    // Outside the workspace: the named directory, by name prefix, as typed.
+    let parent = root.parent().unwrap().to_str().unwrap();
+    let name = root.file_name().unwrap().to_str().unwrap();
+    assert_eq!(
+        env.search(root, &format!("../{name}")).await,
+        [format!("../{name}")]
+    );
+    assert_eq!(
+        env.search(root, &format!("{parent}/{name}/d")).await,
+        [format!("{parent}/{name}/docs")]
+    );
+
+    // A missing workspace is a typed failure.
+    let missing = env
+        .call(
+            "projects.searchEntries",
+            json!({"cwd": root.join("gone"), "query": "x", "limit": 5}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(missing["_tag"], "ProjectSearchEntriesError");
+    assert_eq!(missing["failure"], "workspace_root_not_found");
 }
 
 #[tokio::test]

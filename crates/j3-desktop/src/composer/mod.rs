@@ -1,9 +1,9 @@
 //! The composer (spec §7): the message draft of one thread or of the new-thread surface.
 //! Multi-line text, pasted or dropped images (uploaded as they are added), one model and
-//! thinking picker, the usage gauge, `/` and `^` completion, `^model` mentions shown as chips
-//! (the submitted text stays the typed `^slug`), magic keywords painted with omp's gradient,
-//! omp's word prediction as ghost text and dictation into the draft. Submitting sends to the
-//! thread (queued behind an active run) or launches the new thread.
+//! thinking picker, the usage gauge, `/`, `^` and `@` completion, `^model` mentions shown as
+//! chips (the submitted text stays the typed `^slug`), magic keywords painted with omp's
+//! gradient, omp's word prediction as ghost text and dictation into the draft. Submitting sends
+//! to the thread (queued behind an active run) or launches the new thread.
 //!
 //! The pieces live in submodules by capability: [`draft`] (editing rules), [`menu`]
 //! (completions), [`images`], [`picker`], [`usage`], [`mic`] and [`view`].
@@ -104,9 +104,11 @@ pub struct ComposerState {
     usage_open: bool,
     /// The environment this composer's usage button watches.
     usage_watch: Option<String>,
-    /// The `/` or `^` completion menu's rows (at most 32) and its selection.
+    /// The `/`, `^` or `@` completion menu's rows (at most 32) and its selection.
     pub completions: Vec<Completion>,
     pub completion_ix: usize,
+    /// The `@` query the menu's paths answer or await; a reply for another is stale.
+    path_query: Option<String>,
     /// omp's suggestion for the rest of the word at the caret.
     pub ghost: Option<Ghost>,
     /// The draft right after a Tab accept, while its space is provisional.
@@ -349,7 +351,7 @@ impl J3 {
         let composer = self.composer(key);
         composer.busy = true;
         composer.error = None;
-        composer.completions.clear();
+        composer.close_completions();
         match key {
             ComposerKey::Thread(thread) => self.send_to_thread(thread.clone(), submission),
             ComposerKey::NewThread { env, project } => {
@@ -399,7 +401,7 @@ impl J3 {
             Ok(()) => {
                 composer.error = None;
                 composer.images.clear();
-                composer.completions.clear();
+                composer.close_completions();
                 composer.ghost = None;
                 composer.provisional = None;
                 composer.edit.clear();

@@ -218,14 +218,15 @@ impl J3 {
     }
 
     /// Asks omp for the rest of the word at the caret. omp predicts only at the end of a
-    /// line, never into a selection, a completion menu or a dictation; only an answer for
-    /// the draft and caret as they still are shows.
+    /// line, never into a selection, a completion menu, an `@` reference or a dictation; only
+    /// an answer for the draft and caret as they still are shows.
     fn request_prediction(&mut self, key: &ComposerKey) {
         let composer = self.composer(key);
         let edit = &composer.edit;
         let (a, b) = edit.range();
         let wanted = composer.dictation.is_none()
             && composer.completions.is_empty()
+            && composer.path_query.is_none()
             && !edit.text.trim().is_empty()
             && prediction::at_line_end(&edit.text, edit.focus)
             && a == b;
@@ -321,7 +322,7 @@ impl J3 {
                 }
                 Key::Tab if plain => self.accept_completion(key, tx),
                 Key::Enter if !ev.mods.shift => self.accept_completion(key, tx),
-                Key::Escape => composer.completions.clear(),
+                Key::Escape => composer.close_completions(),
                 _ => return false,
             }
             tx.instant();
