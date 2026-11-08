@@ -55,6 +55,8 @@ whisper-rs = { version = "0.16", features = ["tracing_backend"] }
 whisper-rs = { version = "0.16", features = ["metal"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+# Checks Vulkan has a device before ggml probes it (ggml throws without one).
+ash = "0.38"
 whisper-rs = { version = "0.16", features = ["vulkan"] }
 
 [dev-dependencies]

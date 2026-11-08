@@ -64,6 +64,12 @@ fn gpu() -> (Option<String>, Option<i32>) {
 #[cfg(target_os = "linux")]
 fn gpu() -> (Option<String>, Option<i32>) {
     const MIN_VRAM: usize = 2 << 30;
+    // ggml's Vulkan backend throws a C++ exception, which aborts the process,
+    // when the loader finds no driver (a machine or CI runner without a GPU);
+    // ask Vulkan itself first.
+    if !vulkan_has_devices() {
+        return (None, None);
+    }
     whisper_rs::vulkan::list_devices()
         .into_iter()
         .find(|device| {
@@ -73,6 +79,30 @@ fn gpu() -> (Option<String>, Option<i32>) {
                 && !name.contains("swiftshader")
         })
         .map_or((None, None), |device| (Some(device.name), Some(device.id)))
+}
+
+/// Whether a Vulkan 1.2 instance can be created and sees a physical device:
+/// what ggml needs before it can list devices without throwing.
+#[cfg(target_os = "linux")]
+fn vulkan_has_devices() -> bool {
+    use ash::vk;
+    // SAFETY: loads the system's Vulkan loader; `entry` outlives the instance,
+    // which is destroyed before returning.
+    unsafe {
+        let Ok(entry) = ash::Entry::load() else {
+            return false;
+        };
+        let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_2);
+        let info = vk::InstanceCreateInfo::default().application_info(&app);
+        let Ok(instance) = entry.create_instance(&info, None) else {
+            return false;
+        };
+        let found = instance
+            .enumerate_physical_devices()
+            .is_ok_and(|devices| !devices.is_empty());
+        instance.destroy_instance(None);
+        found
+    }
 }
 
 #[cfg(not(any(all(target_os = "macos", target_arch = "aarch64"), target_os = "linux")))]
