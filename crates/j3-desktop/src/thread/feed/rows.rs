@@ -1,5 +1,6 @@
-//! The non-tool, non-assistant rows of the feed (spec §6.2): user messages, reasoning, the
-//! user-input request card, notices, the compaction rule and subagent cards.
+//! The non-tool, non-assistant rows of the feed (spec §6.2): user messages, reasoning and
+//! notices on the activity rail, the user-input request card, the compaction rule and
+//! subagent cards.
 
 use j3_client::t3::{
     chat_attachment::ChatAttachment,
@@ -11,7 +12,7 @@ use j3_client::t3::{
 use rune::{Color, Easing, El, Icon, LoopSpec, Span, col, el, icon, memo, rich, row, text};
 use rune_kit::{Button, ButtonVariant, ControlSize, Kit, Spinner};
 
-use super::{Ctx, disclosure, tool::INDENT};
+use super::{Ctx, disclosure, rail};
 use crate::{
     app::J3, environment::ImageRef, feed, icons, images::ImageLoad, keywords, math::view::doc,
     mention, message_text, theme::Status,
@@ -133,47 +134,54 @@ fn attachment_thumbnail(s: &J3, cx: &Ctx, id: &str, attachment: &ChatAttachment)
     }
 }
 
-/// Reasoning: a toggle row, "Thinking…" shimmering while it streams, else "Thought";
-/// expanded, the reasoning as muted markdown under a rule.
+/// Reasoning on the rail: "Thinking…" shimmering while it streams, else "Thought" and how long
+/// it took; expanded, the reasoning as muted markdown under the header.
 pub fn reasoning(s: &J3, cx: &Ctx, item: &TurnItem, reasoning: &str, streaming: bool) -> El {
     let k = cx.k;
     let id = &item.id;
     let expanded = cx.expanded(id);
     let (key, toggled) = (cx.key.clone(), id.clone());
-    let label = if streaming {
+    let title = if streaming {
         let now = s.clock.t;
         memo(
             format!("thinking-{id}"),
-            (k.dark, k.ty.text_xsmall.size.to_bits()),
+            (k.dark, k.ty.text_small_medium.size.to_bits()),
             || shimmer(k, "Thinking…", now),
         )
         .key(format!("thinking-{id}"))
     } else {
-        text("Thought").font(k.ty.text_xsmall).color(k.c.text_muted)
+        text("Thought")
+            .font(k.ty.text_small_medium)
+            .color(k.c.text_base)
     };
-    let toggle = row()
+    let took = feed::duration(item)
+        .filter(|_| !streaming)
+        .map(|took| text(took).font(k.ty.text_small).color(k.c.text_muted));
+    let header = rail::header(k, title, took, Vec::new(), Some(expanded))
         .key(format!("reasoning-toggle-{id}"))
-        .gap(8.0)
-        .center_y()
+        .px(4.0)
+        .ml(-4.0)
+        .radius(k.radius.sm)
+        .hover(k.alpha(k.c.hover, 0.5))
         .cursor(rune::Cursor::Pointer)
-        .on_press(move |s: &mut J3| s.toggle_feed_row(&key, &toggled))
-        .child(icon(&icons::BRAIN, 16.0).color(k.c.text_muted))
-        .child(label)
-        .child(disclosure(k, expanded));
-    let mut column = col().w_full().gap(4.0).child(toggle);
-    if expanded && !reasoning.trim().is_empty() {
+        .on_press(move |s: &mut J3| s.toggle_feed_row(&key, &toggled));
+    let body = (expanded && !reasoning.trim().is_empty()).then(|| {
         let look = cx.look(k.c.text_muted, streaming);
         let doc = doc(s, &cx.key.env, &item.thread_id, reasoning, look);
         cx.wait_all(&doc.wait);
-        column = column.child(
-            el().w_full()
-                .ml(INDENT)
-                .pl(12.0)
-                .border_sides([0.0, 0.0, 0.0, 2.0], k.c.border_base)
-                .child(doc.view(s, &format!("md-{id}"), look)),
-        );
-    }
-    column
+        el().w_full()
+            .pt(2.0)
+            .pb(6.0)
+            .child(doc.view(s, &format!("md-{id}"), look))
+    });
+    rail::row(
+        k,
+        cx.rail,
+        cx.top,
+        rail::glyph(&icons::BRAIN, k.c.text_faint),
+        header,
+        body,
+    )
 }
 
 /// `label` with a highlight sweeping through it: a window slides across the dim label while
@@ -182,7 +190,7 @@ pub fn reasoning(s: &J3, cx: &Ctx, item: &TurnItem, reasoning: &str, streaming: 
 fn shimmer(k: &Kit, label: &str, now: f64) -> El {
     const BAND: f32 = 30.0;
     const SPEED: f32 = 90.0;
-    let font = k.ty.text_xsmall;
+    let font = k.ty.text_small_medium;
     let width = label.chars().count() as f32 * font.size * 0.62;
     let period = f64::from((width + BAND) / SPEED);
     let delay = (-now / period).rem_euclid(1.0) * period;
@@ -284,21 +292,16 @@ pub fn question(cx: &Ctx, status: TurnItemStatus, request: &UserInputRequestItem
     card
 }
 
-/// An icon and a message (todo updates, errors, notices, interrupts).
-pub fn notice(k: &Kit, glyph: &'static Icon, color: Color, message: String) -> El {
-    row()
+/// A notice on the rail (todo updates, errors, notices, interrupts): `glyph` in `color`, then
+/// the message in `ink`, wrapped.
+pub fn notice(cx: &Ctx, glyph: &'static Icon, color: Color, ink: Color, message: String) -> El {
+    let k = cx.k;
+    let font = k.ty.text_small;
+    let message = col()
         .w_full()
-        .gap(8.0)
-        .items_start()
-        .child(el().pt(2.0).child(icon(glyph, 16.0).color(color)))
-        .child(
-            text(message)
-                .font(k.ty.body)
-                .color(k.c.text_base)
-                .wrap()
-                .grow(1.0)
-                .shrink(),
-        )
+        .py(((rail::HEADER - font.line_height) / 2.0).max(0.0))
+        .child(text(message).font(font).color(ink).wrap());
+    rail::row(k, cx.rail, cx.top, rail::glyph(glyph, color), message, None)
 }
 
 /// A hairline rule with the compaction label in its middle.

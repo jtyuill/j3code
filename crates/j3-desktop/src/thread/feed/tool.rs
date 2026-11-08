@@ -1,13 +1,13 @@
-//! A tool call row (spec §6.3, §6.4) the way omp's TUI draws it: `icon Title description
-//! meta status`, then a framed preview of its body (the command and the end of its output,
-//! the start of a diff, the first matches) that expands in place, and the images the tool
-//! returned.
+//! A tool call row (spec §6.3, §6.4) on the activity rail: the tool's glyph on the rail (a
+//! spinner while it runs, red once it failed), then `Title description meta ›` in one line,
+//! then its body (a running command's output, a diff) in a tinted block that expands in
+//! place, and the images the tool returned.
 
 use j3_client::t3::orchestration::TurnItem;
-use rune::{El, Icon, col, el, icon, row, text};
+use rune::{El, Icon, TextStyle, col, el, row, text};
 use rune_kit::{Kit, Spinner};
 
-use super::{Ctx, body, disclosure};
+use super::{Ctx, body, rail};
 use crate::{
     app::J3,
     environment::ImageRef,
@@ -23,8 +23,8 @@ pub const MAX_DETAIL_LINES: usize = 400;
 /// Tallest a tool's output image is drawn, in points.
 pub const MAX_OUTPUT_IMAGE_HEIGHT: f32 = 360.0;
 
-/// Where a tool's body starts: under its title, past the icon.
-pub const INDENT: f32 = 22.0;
+/// An expanded body this short has no "Show less" under it: its header is in reach.
+const SHORT_BODY: usize = 12;
 
 fn tool_icon(icon: ToolIcon) -> &'static Icon {
     match icon {
@@ -76,60 +76,53 @@ pub fn view(s: &J3, cx: &Ctx, item: &TurnItem) -> El {
     let expanded = cx.expanded(&id);
     let total = view.body.as_ref().map_or(0, ToolBody::lines);
     let expandable = view.body.is_some() && (view.preview == 0 || total > view.preview || expanded);
-    let icon_color = match view.status {
-        ToolStatus::Running => status.info,
-        ToolStatus::Failed => status.danger,
-        ToolStatus::Done => k.c.text_muted,
+    let glyph = match view.status {
+        ToolStatus::Running => Spinner::new().size(12.0).build(k),
+        ToolStatus::Failed => rail::glyph(tool_icon(view.icon), status.danger),
+        ToolStatus::Done => rail::glyph(tool_icon(view.icon), k.c.text_faint),
     };
     let label = [view.title.as_str(), view.description.as_str()].join(" ");
     let description_font = if view.prose {
-        k.ty.text_xsmall
+        k.ty.text_small
     } else {
-        rune::TextStyle {
-            size: k.ty.text_xsmall.size,
-            line_height: k.ty.text_xsmall.line_height,
+        TextStyle {
+            line_height: k.ty.text_small.line_height,
             ..k.ty.mono
         }
     };
-    let mut header = row()
-        .key(format!("tool-toggle-{id}"))
-        .label(label)
-        .w_full()
-        .gap(8.0)
-        .px(4.0)
-        .ml(-4.0)
-        .center_y()
-        .radius(k.radius.sm)
-        .child(icon(tool_icon(view.icon), 16.0).color(icon_color))
-        .child(
-            text(view.title.clone())
-                .font(k.ty.body_medium)
-                .color(k.c.text_base),
-        )
-        .child(
+    let meta = view
+        .meta
+        .iter()
+        .map(|(meta, tone)| {
+            let color = match tone {
+                Tone::Muted => k.c.text_faint,
+                Tone::Added => status.success,
+                Tone::Removed | Tone::Failed => status.danger,
+            };
+            text(meta.clone()).font(k.ty.text_xsmall).color(color)
+        })
+        .collect();
+    let mut header = rail::header(
+        k,
+        text(view.title.clone())
+            .font(k.ty.text_small_medium)
+            .color(k.c.text_base),
+        Some(
             text(view.description.clone())
                 .font(description_font)
-                .color(k.c.text_muted)
-                .truncate()
-                .grow(1.0),
-        );
-    for (meta, tone) in &view.meta {
-        let color = match tone {
-            Tone::Muted => k.c.text_muted,
-            Tone::Added => status.success,
-            Tone::Removed | Tone::Failed => status.danger,
-        };
-        header = header.child(text(meta.clone()).font(k.ty.text_xsmall).color(color));
-    }
-    header = match view.status {
-        ToolStatus::Running => header.child(Spinner::new().size(12.0).build(k)),
-        ToolStatus::Failed => header.child(icon(&icons::CIRCLE_X, 12.0).color(status.danger)),
-        ToolStatus::Done => header,
-    };
+                .color(k.c.text_muted),
+        ),
+        meta,
+        expandable.then_some(expanded),
+    )
+    .key(format!("tool-toggle-{id}"))
+    .label(label)
+    .px(4.0)
+    .ml(-4.0)
+    .radius(k.radius.sm);
     if expandable {
         let (key, toggled) = (cx.key.clone(), id.clone());
         header = header
-            .child(disclosure(k, expanded))
             .hover(k.alpha(k.c.hover, 0.5))
             .cursor(rune::Cursor::Pointer)
             .on_press(move |s: &mut J3| s.toggle_feed_row(&key, &toggled));
@@ -137,7 +130,8 @@ pub fn view(s: &J3, cx: &Ctx, item: &TurnItem) -> El {
     if let Some(intent) = &view.intent {
         header = header.help(intent.clone());
     }
-    let mut column = col().w_full().child(header);
+    let mut column = col().w_full();
+    let mut has_body = false;
     if let Some(body) = view.body.as_ref().filter(|_| expanded || view.preview > 0) {
         let limit = if expanded {
             MAX_DETAIL_LINES
@@ -146,35 +140,44 @@ pub fn view(s: &J3, cx: &Ctx, item: &TurnItem) -> El {
         };
         let hidden = total.saturating_sub(limit);
         let failed = view.status == ToolStatus::Failed;
-        let mut detail = col()
-            .w_full()
-            .pl(INDENT)
-            .pt(4.0)
-            .child(body::view(k, body, limit, expanded, failed));
-        if hidden > 0 || (expanded && total > view.preview) {
+        let more = (hidden > 0 || (expanded && total > view.preview.max(SHORT_BODY))).then(|| {
             let (key, toggled) = (cx.key.clone(), id.clone());
-            detail = detail.child(
-                el().key(format!("tool-more-{id}"))
-                    .pt(2.0)
-                    .cursor(rune::Cursor::Pointer)
-                    .on_press(move |s: &mut J3| s.toggle_feed_row(&key, &toggled))
-                    .child(
-                        text(more_label(expanded, hidden))
-                            .font(k.ty.text_xsmall)
-                            .color(k.c.text_muted),
-                    ),
-            );
-        }
-        column = column.child(detail);
+            el().key(format!("tool-more-{id}"))
+                .w_full()
+                .px(8.0)
+                .py(4.0)
+                .cursor(rune::Cursor::Pointer)
+                .on_press(move |s: &mut J3| s.toggle_feed_row(&key, &toggled))
+                .child(
+                    text(more_label(expanded, hidden))
+                        .font(k.ty.text_xsmall)
+                        .color(k.c.text_faint),
+                )
+        });
+        column = column.child(
+            el().w_full()
+                .pt(2.0)
+                .pb(4.0)
+                .child(body::view(k, body, limit, expanded, failed, more)),
+        );
+        has_body = true;
     }
     if view.images > 0 {
-        let mut images = row().w_full().pl(INDENT).pt(4.0).gap(8.0).flex_wrap();
+        let mut images = row().w_full().pt(4.0).pb(4.0).gap(8.0).flex_wrap();
         for index in 0..view.images as u64 {
             images = images.child(output_image(s, cx, item, index));
         }
         column = column.child(images);
+        has_body = true;
     }
-    column
+    rail::row(
+        k,
+        cx.rail,
+        cx.top,
+        glyph,
+        header,
+        has_body.then_some(column),
+    )
 }
 
 /// Image `index` of a tool's output, as large as it is up to the feed's width and

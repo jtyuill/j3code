@@ -1190,6 +1190,17 @@ fn feed_items() -> Vec<FeedItem> {
         ),
         (
             "run-3",
+            "running",
+            4,
+            0,
+            Some("Building the bench for shieldy"),
+            json!({
+                "type": "command_execution", "input": "cargo build --release -p j3-desktop --benches",
+                "output": "   Compiling rune v0.9.0\n   Compiling rune-kit v0.9.0\n   Compiling j3-client v0.9.0 (/home/jacob/repos/j3code/crates/j3-client)\n   Compiling j3-desktop v0.9.0 (/home/jacob/repos/j3code/crates/j3-desktop)\n"
+            }),
+        ),
+        (
+            "run-3",
             "waiting",
             2,
             0,

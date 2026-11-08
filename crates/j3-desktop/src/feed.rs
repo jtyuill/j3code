@@ -2,7 +2,8 @@
 //! show, and how a tool call reads, modelled on omp's own TUI renderers: an
 //! icon, a title (`Bash`, `Read`, `Edit`, …), what it acted on, dim meta
 //! (`+3 −1`, `12 matches · 3 files`, `2.1s`) and a body (the command and its
-//! output, the diff, the matches) of which a few lines show until expanded.
+//! output, the diff, the matches). Only a running command's output and a
+//! diff show unasked, a few lines of them; every other body waits for a click.
 
 use j3_core::engine::model::tool_output_images;
 use j3_protocol::t3::orchestration::{
@@ -15,6 +16,10 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 /// Longest single-line summary before it is cut with an ellipsis.
 const SUMMARY_CHARS: usize = 160;
+
+/// Lines of a running command's output and of a diff shown before the row is expanded.
+const COMMAND_PREVIEW: usize = 6;
+const DIFF_PREVIEW: usize = 12;
 
 /// Whether the feed skips this item. Queued messages show in the queue
 /// panel until they start; stop requests show as their result row; kinds
@@ -151,7 +156,8 @@ pub struct ToolView {
     pub prose: bool,
     pub meta: Vec<(String, Tone)>,
     pub body: Option<ToolBody>,
-    /// Body lines shown while collapsed; 0 shows only the header.
+    /// Body lines shown while collapsed; 0 shows only the header. Set by [`tool_view`]:
+    /// only a running command and a diff show theirs unasked.
     pub preview: usize,
     pub status: ToolStatus,
     /// Images in the tool's output (`tool-output-image` indices `0..images`).
@@ -242,7 +248,7 @@ fn hashline_path(input: &str) -> Option<&str> {
 }
 
 /// A run time like `340ms`, `2.1s`, `1m 05s`, from the item's start and end.
-fn duration(item: &TurnItem) -> Option<String> {
+pub fn duration(item: &TurnItem) -> Option<String> {
     let parse = |iso: &Option<String>| OffsetDateTime::parse(iso.as_deref()?, &Rfc3339).ok();
     let elapsed = parse(&item.completed_at)? - parse(&item.started_at)?;
     let ms = elapsed.whole_milliseconds().max(0);
@@ -306,6 +312,11 @@ pub fn tool_view(item: &TurnItem) -> Option<ToolView> {
     if let TurnItemKind::DynamicTool(tool) = &item.kind {
         view.images = output_images(tool);
     }
+    view.preview = match (&view.body, view.status) {
+        (Some(ToolBody::Command { .. }), ToolStatus::Running) => COMMAND_PREVIEW,
+        (Some(ToolBody::Diff { .. }), _) => DIFF_PREVIEW,
+        _ => 0,
+    };
     Some(view)
 }
 
@@ -333,7 +344,6 @@ fn command_view(command: &CommandExecutionItem) -> ToolView {
         command: command.input.trim_end().to_owned(),
         output: strip_notices(command.output.as_deref().unwrap_or_default()).to_owned(),
     });
-    view.preview = 6;
     view
 }
 
@@ -368,7 +378,6 @@ fn file_change_view(change: &FileChangeItem) -> ToolView {
                 first_line: 1,
                 language: crate::syntax::language(&change.file_name),
             });
-            view.preview = 8;
             view
         }
         _ => {
@@ -381,7 +390,6 @@ fn file_change_view(change: &FileChangeItem) -> ToolView {
                 text: diff.trim_end().to_owned(),
                 language: crate::syntax::language(&change.file_name),
             });
-            view.preview = 12;
             view
         }
     }
@@ -394,7 +402,6 @@ fn write_view(path: &str, content: Option<&str>, output: Option<String>) -> Tool
         Some(("agent", peer)) => {
             let mut view = base(ToolIcon::Message, "Message", format!("→ {peer}"));
             view.body = content.map(|content| ToolBody::Sections(vec![(None, content.to_owned())]));
-            view.preview = 3;
             view
         }
         Some(("xd", device)) => {
@@ -421,7 +428,6 @@ fn write_view(path: &str, content: Option<&str>, output: Option<String>) -> Tool
                     first_line: 1,
                     language: crate::syntax::language(path),
                 });
-                view.preview = 8;
             }
             view
         }
@@ -467,7 +473,6 @@ fn file_search_view(search: &FileSearchItem) -> ToolView {
                 })
                 .collect(),
         ));
-        view.preview = 4;
     }
     view
 }
@@ -504,7 +509,6 @@ fn web_search_view(search: &WebSearchItem) -> ToolView {
                 })
                 .collect(),
         ));
-        view.preview = 4;
     }
     view
 }
@@ -610,7 +614,6 @@ fn dynamic_view(tool: &DynamicToolItem) -> ToolView {
                 .flatten()
                 .collect(),
             ));
-            view.preview = 6;
             view
         }
         "task" => {
@@ -750,8 +753,9 @@ pub fn age_since(at: OffsetDateTime, now: OffsetDateTime) -> String {
     }
 }
 
-/// Rows of agent activity (tool calls, thinking, plan updates) that read as
-/// one list when they follow each other: they sit close together.
+/// Rows of agent activity (tool calls, thinking, plan updates, notices) that
+/// read as one list when they follow each other: they sit close together, on
+/// one rail.
 pub fn is_activity(item: &TurnItem) -> bool {
     matches!(
         item.kind,
@@ -762,6 +766,9 @@ pub fn is_activity(item: &TurnItem) -> bool {
             | TurnItemKind::DynamicTool(_)
             | TurnItemKind::Reasoning(_)
             | TurnItemKind::TodoList(_)
+            | TurnItemKind::Error(_)
+            | TurnItemKind::SystemNotice(_)
+            | TurnItemKind::RunInterruptResult(_)
     )
 }
 
@@ -911,6 +918,33 @@ mod tests {
             ("ls", false),
             "the bare tool name is not an intent"
         );
+    }
+
+    #[test]
+    fn only_a_running_command_and_a_diff_show_their_body_unasked() {
+        let command = |status: &str| {
+            tool_view(&item(
+                status,
+                json!({"type":"command_execution","input":"cargo test","output":"ok\n","exitCode":0}),
+            ))
+            .unwrap()
+            .preview
+        };
+        assert!(command("running") > 0, "a running command shows its output");
+        assert_eq!(command("completed"), 0, "a finished one folds away");
+        let diff = tool_view(&item(
+            "completed",
+            json!({"type":"file_change","fileName":"src/a.rs","diffStr":"+1|x"}),
+        ))
+        .unwrap();
+        assert!(diff.preview > 0, "a diff shows unasked");
+        let read = tool_view(&item(
+            "completed",
+            json!({"type":"dynamic_tool","toolName":"read","input":{"path":"a.rs"},"output":"1:fn main() {}"}),
+        ))
+        .unwrap();
+        assert!(read.body.is_some());
+        assert_eq!(read.preview, 0, "a read waits for a click");
     }
 
     #[test]
@@ -1139,7 +1173,7 @@ mod tests {
     }
 
     #[test]
-    fn activity_rows_are_tools_thinking_and_plans() {
+    fn activity_rows_are_tools_thinking_plans_and_notices() {
         let reasoning = item(
             "completed",
             json!({"type": "reasoning", "text": "", "streaming": false}),
@@ -1148,8 +1182,13 @@ mod tests {
             "completed",
             json!({"type": "system_notice", "message": "m"}),
         );
+        let reply = item(
+            "completed",
+            json!({"type": "assistant_message", "messageId": "m", "text": "hi", "streaming": false}),
+        );
         assert!(is_activity(&reasoning));
-        assert!(!is_activity(&notice));
+        assert!(is_activity(&notice), "notices sit on the rail");
+        assert!(!is_activity(&reply));
         assert_eq!(subagent_status_label(SubagentStatus::Cancelled), "Stopped");
         assert_eq!(subagent_status_label(SubagentStatus::Completed), "Done");
     }

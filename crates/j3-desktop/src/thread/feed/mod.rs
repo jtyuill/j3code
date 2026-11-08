@@ -9,9 +9,11 @@
 //! wheel scroll that ends at the bottom keeps following.
 //!
 //! Rows space themselves in one rhythm per turn: 44 points before a user message (a new
-//! turn), 24 after it, 4 between consecutive activity rows (tools, reasoning, plan updates)
-//! and 16 between anything else within the turn. The space sits above a row and the feed's
-//! end padding on the list, so appending never changes the height of the row before.
+//! turn), 24 after it, 4 between consecutive activity rows (tools, reasoning, plan updates,
+//! notices) and 16 between anything else within the turn. The space sits above a row and the
+//! feed's end padding on the list, so appending never changes the height of the row before.
+//! Activity rows sit on one rail (`rail`): a glyph column whose hairline joins consecutive
+//! activity rows.
 //!
 //! Motion follows `crate::motion`: tool calls arrive constantly in a live turn, so a row
 //! that arrives complete fades in quickly while its height glides open on a short spring of
@@ -20,6 +22,7 @@
 
 mod body;
 mod lines;
+mod rail;
 mod rows;
 #[cfg(test)]
 mod tests;
@@ -200,6 +203,10 @@ pub struct Ctx<'a> {
     scale: f32,
     /// Typeset math (the `math_rendering` preference).
     math: bool,
+    /// Space above the row, in points; an activity row draws it itself, beside its rail.
+    pub top: f32,
+    /// Whether the rows around an activity row are on the rail too.
+    pub rail: rail::Rail,
 }
 
 impl Ctx<'_> {
@@ -334,6 +341,27 @@ fn build_row(s: &J3, key: &ThreadKey, visible: &[usize], i: usize, dark: bool, s
     };
     let k = theme::kit(dark, s.prefs.ui());
     let m = Metrics::new(s.prefs.ui());
+    let previous = i.checked_sub(1).and_then(item_at);
+    let next = item_at(i + 1);
+    let is_prompt = |item: &TurnItem| matches!(item.kind, TurnItemKind::UserMessage(_));
+    let top = match previous {
+        None => 0.0,
+        Some(_) if is_prompt(item) => TURN_GAP,
+        Some(previous) if is_prompt(previous) => AFTER_PROMPT_GAP,
+        Some(previous) if is_activity(previous) && is_activity(item) => ACTIVITY_GAP,
+        Some(_) => WITHIN_TURN_GAP,
+    };
+    let on_rail = is_activity(item);
+    let rail = rail::Rail {
+        above: on_rail && previous.is_some_and(is_activity),
+        below: on_rail && next.is_some_and(is_activity),
+    };
+    // Text that streams in keeps the stack's paced growth; everything else arrives whole.
+    let streams = match &item.kind {
+        TurnItemKind::AssistantMessage(_) => true,
+        TurnItemKind::Reasoning(reasoning) => reasoning.streaming,
+        _ => false,
+    };
     let cx = Ctx {
         k: &k,
         key,
@@ -342,20 +370,8 @@ fn build_row(s: &J3, key: &ThreadKey, visible: &[usize], i: usize, dark: bool, s
         width: m.measure,
         scale,
         math: s.prefs.ui().math_rendering,
-    };
-    let is_prompt = |item: &TurnItem| matches!(item.kind, TurnItemKind::UserMessage(_));
-    let top = match i.checked_sub(1).and_then(item_at) {
-        None => 0.0,
-        Some(_) if is_prompt(item) => TURN_GAP,
-        Some(previous) if is_prompt(previous) => AFTER_PROMPT_GAP,
-        Some(previous) if is_activity(previous) && is_activity(item) => ACTIVITY_GAP,
-        Some(_) => WITHIN_TURN_GAP,
-    };
-    // Text that streams in keeps the stack's paced growth; everything else arrives whole.
-    let streams = match &item.kind {
-        TurnItemKind::AssistantMessage(_) => true,
-        TurnItemKind::Reasoning(reasoning) => reasoning.streaming,
-        _ => false,
+        top,
+        rail,
     };
     let label = match &item.kind {
         TurnItemKind::UserMessage(message) => Some(message.text.clone()),
@@ -369,7 +385,11 @@ fn build_row(s: &J3, key: &ThreadKey, visible: &[usize], i: usize, dark: bool, s
             .max_w(m.measure + 32.0)
             .px(16.0)
             .child(content);
-        let row = col().w_full().items_center().pt(top).child(inner);
+        let row = col()
+            .w_full()
+            .items_center()
+            .pt(if on_rail { 0.0 } else { top })
+            .child(inner);
         let row = if streams {
             row
         } else {
@@ -391,6 +411,7 @@ fn build_row(s: &J3, key: &ThreadKey, visible: &[usize], i: usize, dark: bool, s
         k.ty.mono.size.to_bits(),
         (m.measure.to_bits(), scale.to_bits()),
         cx.math,
+        rail,
     );
     // Item ids repeat across threads (`ti_1`…): the thread is part of the row's identity.
     let id = key.element_id(&format!("feed-row-{}", item.id));
@@ -493,23 +514,33 @@ fn content(s: &J3, cx: &Ctx, item: &TurnItem) -> El {
         }
         TurnItemKind::UserInputRequest(request) => rows::question(cx, item.status, request),
         TurnItemKind::TodoList(todo) => rows::notice(
-            k,
+            cx,
             &icons::CIRCLE_CHECK,
+            k.c.text_faint,
             k.c.text_muted,
             feed::todo_notice(todo),
         ),
         TurnItemKind::Error(error) => rows::notice(
-            k,
+            cx,
             &icons::CIRCLE_ALERT,
             status.danger,
+            k.c.text_base,
             feed::error_message(error),
         ),
-        TurnItemKind::SystemNotice(notice) => {
-            rows::notice(k, &icons::INFO, status.info, notice.message.clone())
-        }
-        TurnItemKind::RunInterruptResult(result) => {
-            rows::notice(k, &icons::SQUARE, k.c.text_muted, result.message.clone())
-        }
+        TurnItemKind::SystemNotice(notice) => rows::notice(
+            cx,
+            &icons::INFO,
+            status.info,
+            k.c.text_muted,
+            notice.message.clone(),
+        ),
+        TurnItemKind::RunInterruptResult(result) => rows::notice(
+            cx,
+            &icons::SQUARE,
+            k.c.text_faint,
+            k.c.text_muted,
+            result.message.clone(),
+        ),
         TurnItemKind::Compaction(compaction) => {
             rows::compaction(k, feed::compaction_label(compaction))
         }

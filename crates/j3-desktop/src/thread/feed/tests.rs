@@ -56,8 +56,13 @@ fn every_row_kind_draws_in_the_thread_scene() {
         matches!(kind, TurnItemKind::RunInterruptRequest(_))
     });
     assert!(!ids.contains(&hidden), "stop requests stay out of the feed");
-    let subagent = "subagent-sa-bench";
-    reveal(&mut app, subagent);
+    // The card's key is inside its row: mount the row first.
+    let subagent = item_id(
+        &app,
+        |kind| matches!(kind, TurnItemKind::Subagent(s) if s.subagent_id == "sa-bench"),
+    );
+    reveal(&mut app, &format!("feed-{subagent}"));
+    reveal(&mut app, "subagent-sa-bench");
     assert!(
         app.rt.find("stop-subagent-sa-bench").is_some(),
         "a running subagent has Stop"
@@ -65,31 +70,31 @@ fn every_row_kind_draws_in_the_thread_scene() {
 }
 
 #[test]
-fn a_tool_body_expands_and_the_choice_is_remembered() {
+fn a_folded_tool_body_opens_from_its_header_and_the_choice_is_remembered() {
     let mut app = scene();
     let key = open_thread_key();
-    let id = item_id(&app, |kind| {
-        matches!(kind, TurnItemKind::CommandExecution(_))
-    });
-    let more = format!("tool-more-{id}");
-    reveal(&mut app, &more);
-    let (x, y) = app.rt.find(&more).expect("a long output offers more lines");
+    // The finished feed tests: folded until asked.
+    let id = item_id(
+        &app,
+        |kind| matches!(kind, TurnItemKind::CommandExecution(command) if command.exit_code == Some(0)),
+    );
+    let output = |app: &TestApp| {
+        app.rt
+            .elements()
+            .into_iter()
+            .filter_map(|e| e.text)
+            .any(|text| text.contains("test result: ok. 14 passed"))
+    };
+    let toggle = format!("tool-toggle-{id}");
+    reveal(&mut app, &toggle);
+    assert!(!output(&app), "a finished command starts folded");
+    let (x, y) = app.rt.find(&toggle).expect("the header draws");
     app.rt.pointer_down(x, y);
     app.rt.pointer_up(x, y);
     app.settle(30);
     assert!(app.rt.state.threads[&key].feed.is_expanded(&id));
-    reveal(&mut app, &more);
-    let label: String = app
-        .rt
-        .elements()
-        .into_iter()
-        .filter(|e| e.path.contains(more.as_str()))
-        .filter_map(|e| e.text)
-        .collect();
-    assert!(
-        label.contains("Show less"),
-        "expanded shows the whole output: {label}"
-    );
+    reveal(&mut app, &toggle);
+    assert!(output(&app), "expanded shows the output");
 }
 
 #[test]
