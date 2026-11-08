@@ -20,7 +20,7 @@ use j3_client::{
     Error,
     t3::project::{ProjectEntry, ProjectListEntriesResult},
 };
-use rune::{Cursor, Cx, Drag, El, Phase, TextEdit, Tx, col, el, row, text};
+use rune::{Cursor, Cx, Drag, El, Phase, TextEdit, Transition, Tx, col, el, row, text};
 use rune_kit::{IconButton, IconButtonVariant, Spinner};
 
 use crate::{
@@ -205,7 +205,9 @@ impl FilePane {
 impl J3 {
     /// Shows or hides `key`'s file pane. The first open resolves the thread's project and
     /// lists its root; opening focuses the tree, hiding refocuses the composer.
+    /// Lands at once (see `crate::motion`).
     pub fn toggle_files(&mut self, key: ThreadKey, tx: &mut Tx) {
+        tx.instant();
         if self.files.get(&key).is_some_and(|pane| pane.open) {
             if let Some(pane) = self.files.get_mut(&key) {
                 pane.open = false;
@@ -341,11 +343,15 @@ pub fn view(s: &J3, _cx: &mut Cx<J3>, ui: &mut Ui, key: &ThreadKey) -> El {
                 .h(GRIP),
             ),
     };
+    // Browsing files is frequent: the pane comes and goes, and its tree and preview change,
+    // in the frame they happen (`crate::motion`).
     col()
         .key("file-pane")
         .w(pane.width)
         .h_full()
         .min_h(0.0)
+        .instant_changes()
+        .transition(Transition::none())
         .fill(k.c.bg_base)
         .border_sides([0.0, 0.0, 0.0, 1.0], k.c.border_muted)
         .child(header(pane, ui, key))
@@ -389,14 +395,17 @@ fn grip(
             "Resize the file pane"
         })
         .cursor(cursor);
-    line.on_drag(move |s: &mut J3, d: &mut Drag, _: &mut Tx| {
+    line.on_drag(move |s: &mut J3, d: &mut Drag, tx: &mut Tx| {
         let Some(pane) = s.files.get_mut(&key) else {
             return;
         };
         let value = size(pane);
         match d.phase {
             Phase::Down => d.data = *value,
-            Phase::Move => *value = (d.data + delta(d)).clamp(range.0 * rem, range.1 * rem),
+            Phase::Move => {
+                tx.instant();
+                *value = (d.data + delta(d)).clamp(range.0 * rem, range.1 * rem);
+            }
             Phase::Up if d.cancelled() => *value = d.data,
             Phase::Up => {}
         }

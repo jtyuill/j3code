@@ -139,7 +139,8 @@ fn the_feed_keeps_following_the_reply_after_a_wheel_scroll_at_the_bottom() {
             .presented("feed-ti-streaming")
             .expect("the reply is mounted")
             .0;
-        let row_bottom = row[1] + row[3];
+        // The list's end padding sits under the last row.
+        let row_bottom = row[1] + row[3] + super::END_PAD;
         assert!(
             (row_bottom - bottom).abs() < 2.0,
             "the reply's end stays at the viewport's bottom: {row_bottom} vs {bottom}"

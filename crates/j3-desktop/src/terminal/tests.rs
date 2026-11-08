@@ -62,6 +62,7 @@ fn opened() -> TestApp {
     wait_for(&mut app, |s| {
         !matches!(terminal(s, "term-1").status(), TerminalStatus::Connecting)
     });
+    app.settle(30);
     app
 }
 

@@ -3,7 +3,10 @@
 //! the cursor, and the focus field at the cursor that also shows an input method's
 //! composition there, underlined.
 
-use rune::{Color, Cursor, Cx, Drag, El, Tx, col, edit_access, el, row, spacer, text, text_input};
+use rune::{
+    Color, Cursor, Cx, Drag, El, Spring, Transition, Tx, col, edit_access, el, row, spacer, text,
+    text_input,
+};
 use rune_kit::{Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit};
 
 use super::{CellMetrics, Drawer, MAX_HEIGHT, MIN_HEIGHT, PADDING, Palette, Terminal, render};
@@ -39,10 +42,16 @@ pub fn view(s: &J3, cx: &mut Cx<J3>, ui: &mut Ui, key: &ThreadKey) -> El {
             focused,
         )
     });
+    // The terminal is used constantly: nothing in it animates (`crate::motion`). Lines,
+    // colours, the cursor and the input field land in the frame the shell draws them, and
+    // the drawer comes and goes at once.
     col()
         .key("terminal-drawer")
         .w_full()
         .h(height)
+        .instant_changes()
+        .motion(Spring::NONE)
+        .transition(Transition::none())
         .fill(palette.background)
         .border_sides([1.0, 0.0, 0.0, 0.0], k.c.border_muted)
         .child(tabs(drawer, key, k))

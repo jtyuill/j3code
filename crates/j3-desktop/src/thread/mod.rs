@@ -154,8 +154,10 @@ pub(crate) fn chrome_edit<'a>(
 
 impl J3 {
     /// Opens `key`'s thread in the main pane (closing Settings), subscribing to it on first
-    /// use and telling its server it was visited.
+    /// use and telling its server it was visited. Switching threads is frequent, so it lands
+    /// at once (see `crate::motion`).
     pub fn open_thread(&mut self, key: ThreadKey, tx: &mut Tx) {
+        tx.instant();
         self.close_settings(tx);
         if self.open_thread_key().as_ref() == Some(&key) {
             return;

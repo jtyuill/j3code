@@ -31,6 +31,7 @@ pub mod mention;
 pub mod menus;
 pub mod message_text;
 pub mod models;
+pub mod motion;
 pub mod new_thread;
 pub mod prediction;
 pub mod preferences;

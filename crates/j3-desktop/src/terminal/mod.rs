@@ -353,8 +353,10 @@ pub fn owns_focus(key: &str) -> bool {
 
 impl J3 {
     /// Opens `key`'s drawer (with a first terminal on first use) and focuses its terminal, or
-    /// hides it, refocusing the composer.
+    /// hides it, refocusing the composer. Either lands at once: the chat makes room for the
+    /// drawer in the same frame (see `crate::motion`).
     pub fn toggle_terminal(&mut self, key: ThreadKey, tx: &mut Tx) {
+        tx.instant();
         let drawer = self.terminals.entry(key.clone()).or_default();
         if drawer.open {
             self.hide_terminal(&key, tx);
@@ -371,6 +373,7 @@ impl J3 {
 
     /// Hides `key`'s drawer (its shells keep running) and focuses the composer.
     pub fn hide_terminal(&mut self, key: &ThreadKey, tx: &mut Tx) {
+        tx.instant();
         if let Some(drawer) = self.terminals.get_mut(key) {
             drawer.open = false;
             for terminal in &mut drawer.tabs {

@@ -8,9 +8,15 @@
 //! its own row only. The viewport sticks to the bottom: it follows a streaming reply, and a
 //! wheel scroll that ends at the bottom keeps following.
 //!
-//! Rows space themselves: 4 points between consecutive activity rows (tools, reasoning, plan
-//! updates), 44 between anything else, with the space above a row so appending never changes
-//! the height of the row before.
+//! Rows space themselves in one rhythm per turn: 44 points before a user message (a new
+//! turn), 24 after it, 4 between consecutive activity rows (tools, reasoning, plan updates)
+//! and 16 between anything else within the turn. The space sits above a row and the feed's
+//! end padding on the list, so appending never changes the height of the row before.
+//!
+//! Motion follows `crate::motion`: tool calls arrive constantly in a live turn, so a row
+//! that arrives complete fades in quickly while its height glides open on a short spring of
+//! its own — no clipped unroll, no speed-capped climb in stages as its output lands. Only
+//! streaming text keeps the stack's paced growth.
 
 mod body;
 mod lines;
@@ -42,6 +48,7 @@ use crate::{
     icons,
     images::ImageLoad,
     math::view::{Look, doc},
+    motion,
     sidebar::ThreadKey,
     theme::{self, Metrics, Status},
 };
@@ -49,9 +56,14 @@ use crate::{
 /// Height a row is taken to be until it is measured.
 const ESTIMATED_ROW: f32 = 96.0;
 
-/// Space above a row after an activity row when it is one too, and after anything else.
+/// Space above a row: before a new turn, after the user's message, between consecutive
+/// activity rows, and between anything else within a turn.
+const TURN_GAP: f32 = 44.0;
+const AFTER_PROMPT_GAP: f32 = 24.0;
 const ACTIVITY_GAP: f32 = 4.0;
-const MESSAGE_GAP: f32 = 44.0;
+const WITHIN_TURN_GAP: f32 = 16.0;
+/// Space at the feed's ends.
+const END_PAD: f32 = 8.0;
 
 /// A thread's feed UI state, kept in its `ThreadUi`.
 #[derive(Default)]
@@ -275,7 +287,10 @@ pub fn view(s: &J3, cx: &mut Cx<J3>, ui: &mut Ui, key: &ThreadKey) -> El {
     let (key_of, visible_of) = (key.clone(), visible.clone());
     let build_key = key.clone();
     let build = move |s: &J3, i: usize| build_row(s, &build_key, &visible, i, dark, scale);
+    // Keyed by thread: switching threads mounts a new stack, whose rows land at rest
+    // instead of growing open as rows new to the old one.
     let viewport = col()
+        .key(key.element_id("feed-viewport"))
         .w_full()
         .grow(1.0)
         .min_h(0.0)
@@ -284,6 +299,7 @@ pub fn view(s: &J3, cx: &mut Cx<J3>, ui: &mut Ui, key: &ThreadKey) -> El {
             col()
                 .key("feed-rows")
                 .w_full()
+                .py(END_PAD)
                 .growth(GrowthSpec::default())
                 .virtual_rows(
                     count,
@@ -327,12 +343,20 @@ fn build_row(s: &J3, key: &ThreadKey, visible: &[usize], i: usize, dark: bool, s
         scale,
         math: s.prefs.ui().math_rendering,
     };
+    let is_prompt = |item: &TurnItem| matches!(item.kind, TurnItemKind::UserMessage(_));
     let top = match i.checked_sub(1).and_then(item_at) {
-        None => 8.0,
+        None => 0.0,
+        Some(_) if is_prompt(item) => TURN_GAP,
+        Some(previous) if is_prompt(previous) => AFTER_PROMPT_GAP,
         Some(previous) if is_activity(previous) && is_activity(item) => ACTIVITY_GAP,
-        Some(_) => MESSAGE_GAP,
+        Some(_) => WITHIN_TURN_GAP,
     };
-    let bottom = if i + 1 == visible.len() { 8.0 } else { 0.0 };
+    // Text that streams in keeps the stack's paced growth; everything else arrives whole.
+    let streams = match &item.kind {
+        TurnItemKind::AssistantMessage(_) => true,
+        TurnItemKind::Reasoning(reasoning) => reasoning.streaming,
+        _ => false,
+    };
     let label = match &item.kind {
         TurnItemKind::UserMessage(message) => Some(message.text.clone()),
         TurnItemKind::AssistantMessage(message) => Some(message.text.clone()),
@@ -345,12 +369,12 @@ fn build_row(s: &J3, key: &ThreadKey, visible: &[usize], i: usize, dark: bool, s
             .max_w(m.measure + 32.0)
             .px(16.0)
             .child(content);
-        let row = col()
-            .w_full()
-            .items_center()
-            .pt(top)
-            .pb(bottom)
-            .child(inner);
+        let row = col().w_full().items_center().pt(top).child(inner);
+        let row = if streams {
+            row
+        } else {
+            row.fold_glide(motion::QUICK).transition(motion::arrive())
+        };
         match label {
             Some(label) => row.label(label),
             None => row,
@@ -360,7 +384,7 @@ fn build_row(s: &J3, key: &ThreadKey, visible: &[usize], i: usize, dark: bool, s
     let base = (
         thread.feed.revision(&item.id),
         top.to_bits(),
-        bottom.to_bits(),
+        streams,
         expanded,
         dark,
         k.ty.body.size.to_bits(),
