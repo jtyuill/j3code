@@ -3,9 +3,12 @@
 //! replies dropped by revision), and a name filled in from the folder until the user edits
 //! it. Creating the project closes the dialog and, from the main window, starts a thread in
 //! it.
+//!
+//! While a folder name is typed, the first folder beside it that starts with what was typed
+//! shows after the caret as a suggestion; Tab or → takes it.
 
 use j3_client::t3::filesystem::FilesystemBrowseEntry;
-use rune::{El, ScrollSpec, TextEdit, Tx, col, icon, row, text};
+use rune::{Cx, El, Key, KeyEvent, Mods, ScrollSpec, TextEdit, Tx, col, el, icon, row, text};
 use rune_kit::{Kit, Spinner, TextInput};
 
 use super::{Dialog, Field};
@@ -21,6 +24,15 @@ pub enum Listing {
     Failed(String),
 }
 
+/// The folders of the directory the path's last segment is typed in: what its suggestion
+/// is picked from.
+pub struct Siblings {
+    /// The path up to and including its last `/` (empty: the home directory).
+    pub dir: String,
+    /// `None` until listed (or when listing failed).
+    pub entries: Option<Vec<FilesystemBrowseEntry>>,
+}
+
 /// The Add project dialog's form.
 pub struct ProjectPicker {
     /// The chosen device (environment key).
@@ -32,6 +44,8 @@ pub struct ProjectPicker {
     /// The user typed a name: the folder no longer names the project.
     pub title_edited: bool,
     pub listing: Listing,
+    /// The folders the path's suggestion comes from, listed once per directory.
+    pub siblings: Option<Siblings>,
     /// Which opening of the dialog this is (from `DialogState::next_serial`): a create that
     /// finishes after this picker closed must not act on another one.
     pub id: u64,
@@ -54,12 +68,41 @@ impl ProjectPicker {
             title: TextEdit::new(""),
             title_edited: false,
             listing: Listing::Loading,
+            siblings: None,
             id: 0,
             revision: 0,
             creating: false,
             error: None,
         }
     }
+
+    /// What the path's suggestion adds after the caret: the rest of the first folder (in
+    /// listing order) whose name starts with the segment being typed, and a `/`. Only with
+    /// the caret at the end and nothing selected or being composed.
+    pub fn suggestion(&self) -> Option<String> {
+        let edit = &self.path;
+        let end = edit.text.len();
+        if edit.preedit.is_some() || edit.anchor != end || edit.focus != end {
+            return None;
+        }
+        let dir = dir_part(&edit.text);
+        let typed = &edit.text[dir.len()..];
+        let siblings = self.siblings.as_ref().filter(|s| s.dir == dir)?;
+        if typed.is_empty() {
+            return None;
+        }
+        siblings
+            .entries
+            .as_ref()?
+            .iter()
+            .find(|entry| entry.name.starts_with(typed))
+            .map(|entry| format!("{}/", &entry.name[typed.len()..]))
+    }
+}
+
+/// `path` up to and including its last `/`; empty without one.
+fn dir_part(path: &str) -> &str {
+    path.rfind('/').map_or("", |i| &path[..=i])
 }
 
 /// A project's default title: the last segment of its path. The home directory (`~`) and
@@ -115,6 +158,7 @@ impl J3 {
         }
         picker.env = env;
         picker.error = None;
+        picker.siblings = None;
         picker.path.replace_text("~/".to_owned());
         picker.path.set_caret(picker.path.text.len());
         picker.path.focused = true;
@@ -146,7 +190,27 @@ impl J3 {
         self.project_path_changed();
     }
 
-    /// Lists the folders matching the path on the chosen device.
+    /// The path field's keys: Tab or → at the end takes the suggestion. True when taken.
+    fn project_path_key(&mut self, ev: &KeyEvent, tx: &mut Tx) -> bool {
+        if ev.mods != Mods::default() || !matches!(ev.key, Key::Tab | Key::Right) {
+            return false;
+        }
+        let Some(picker) = self.picker() else {
+            return false;
+        };
+        let Some(suffix) = picker.suggestion() else {
+            return false;
+        };
+        let path = format!("{}{suffix}", picker.path.text);
+        picker.path.replace_text(path);
+        picker.path.set_caret(picker.path.text.len());
+        self.project_path_changed();
+        tx.instant();
+        true
+    }
+
+    /// Lists the folders matching the path on the chosen device, and the folders beside the
+    /// segment being typed when that is a directory not listed yet.
     fn browse_folders(&mut self) {
         let Some(env) = self.picker().map(|picker| picker.env.clone()) else {
             return;
@@ -163,9 +227,35 @@ impl J3 {
         };
         picker.listing = Listing::Loading;
         let partial = picker.path.text.clone();
+        let id = picker.id;
+        let dir = dir_part(&partial).to_owned();
+        let new_dir = picker.siblings.as_ref().is_none_or(|s| s.dir != dir);
+        if new_dir {
+            picker.siblings = Some(Siblings {
+                dir: dir.clone(),
+                entries: None,
+            });
+            // A path ending in `/` lists that directory itself, below.
+            if partial != dir {
+                let connection = connection.clone();
+                self.spawn(async move {
+                    let result = connection.browse(&dir).await;
+                    move |s: &mut J3, _: &mut Tx| {
+                        if let Ok(result) = result {
+                            s.set_siblings(id, &dir, result.entries);
+                        }
+                    }
+                });
+            }
+        }
         self.spawn(async move {
             let result = connection.browse(&partial).await;
             move |s: &mut J3, _: &mut Tx| {
+                if let Ok(result) = &result
+                    && partial.ends_with('/')
+                {
+                    s.set_siblings(id, &partial, result.entries.clone());
+                }
                 let Some(picker) = s.picker() else {
                     return;
                 };
@@ -181,6 +271,19 @@ impl J3 {
                 };
             }
         });
+    }
+
+    /// The folders of `dir` arrived for picker `id`: they back the suggestion while the path
+    /// is still typed in `dir`.
+    fn set_siblings(&mut self, id: u64, dir: &str, entries: Vec<FilesystemBrowseEntry>) {
+        if let Some(siblings) = self
+            .picker()
+            .filter(|picker| picker.id == id)
+            .and_then(|picker| picker.siblings.as_mut())
+            .filter(|siblings| siblings.dir == dir)
+        {
+            siblings.entries = Some(entries);
+        }
     }
 
     /// Creates the project; on success the dialog closes and, when asked, a new thread opens
@@ -238,7 +341,7 @@ impl J3 {
 }
 
 /// The form's body.
-pub(super) fn body(s: &J3, k: &Kit, picker: &ProjectPicker) -> El {
+pub(super) fn body(s: &J3, cx: &mut Cx<J3>, k: &Kit, picker: &ProjectPicker) -> El {
     let status = Status::of(k);
     let label = |title: &str| {
         text(title.to_owned())
@@ -259,17 +362,7 @@ pub(super) fn body(s: &J3, k: &Kit, picker: &ProjectPicker) -> El {
             col()
                 .gap(6.0)
                 .child(label("Folder"))
-                .child(
-                    TextInput::new(&picker.path)
-                        .width(None)
-                        .placeholder("~/Developer/project")
-                        .label("Folder")
-                        .on_edit(|s: &mut J3| s.dialogs.field(Field::Path))
-                        .on_change(|s: &mut J3, _: &mut Tx| s.project_path_changed())
-                        .on_submit(|s: &mut J3, tx: &mut Tx| s.confirm_dialog(tx))
-                        .build(k)
-                        .key("project-path"),
-                )
+                .child(path_field(cx, k, picker))
                 .child(listing(k, &picker.listing)),
         )
         .child(
@@ -312,6 +405,49 @@ pub(super) fn body(s: &J3, k: &Kit, picker: &ProjectPicker) -> El {
         );
     }
     form
+}
+
+/// The folder field, with its suggestion drawn after the caret while it has focus.
+fn path_field(cx: &mut Cx<J3>, k: &Kit, picker: &ProjectPicker) -> El {
+    let style = k.ty.ui_compact;
+    let input = TextInput::new(&picker.path)
+        .width(None)
+        .text_style(style)
+        .placeholder("~/Developer/project")
+        .label("Folder")
+        .on_edit(|s: &mut J3| s.dialogs.field(Field::Path))
+        .on_change(|s: &mut J3, _: &mut Tx| s.project_path_changed())
+        .on_key(|s: &mut J3, ev: &KeyEvent, tx: &mut Tx| s.project_path_key(ev, tx))
+        .on_submit(|s: &mut J3, tx: &mut Tx| s.confirm_dialog(tx))
+        .build(k)
+        .key("project-path");
+    let mut field = el().key("project-path-field").w_full().child(input);
+    let suggestion = picker.suggestion().filter(|_| picker.path.focused);
+    if let Some(suffix) = suggestion
+        && let (Some(caret), Some(area)) =
+            (cx.caret("project-path"), cx.layout("project-path-field"))
+    {
+        // Set like the path, from the caret's own geometry, clipped to the field.
+        let x = caret[0] + caret[2] - area[0];
+        let width = area[2] - 8.0 - x;
+        if width > 0.0 {
+            field = field.child(
+                el().key("project-path-suggestion")
+                    .label(suffix.clone())
+                    .absolute(x, caret[1] - area[1])
+                    .w(width)
+                    .h(caret[3])
+                    .clip_soft(0.0)
+                    .child(
+                        text(suffix)
+                            .font(style)
+                            .color(k.alpha(k.c.text_muted, 0.6))
+                            .a11y_hidden(),
+                    ),
+            );
+        }
+    }
+    field
 }
 
 /// One segment per live device, the chosen one selected (and listed even when offline).

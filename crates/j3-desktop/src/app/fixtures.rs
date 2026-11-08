@@ -29,7 +29,7 @@ use time::{Duration, OffsetDateTime, macros::datetime};
 use super::{Clock, J3, Main};
 use crate::{
     archived::Listing,
-    dialogs::{Dialog, FolderListing},
+    dialogs::{Dialog, FolderListing, FolderSiblings},
     environment::{Environment, EnvironmentKind, Environments, LOCAL_KEY},
     environments::{DesktopConfig, RemoteEnvironment},
     local_server::LocalServerStatus,
@@ -305,19 +305,24 @@ fn add_project_dialog() -> Dialog {
             name: name.to_owned(),
             full_path: format!("/home/jacob/repos/{name}"),
         };
+        let entries: Vec<FilesystemBrowseEntry> = [
+            "dotfiles",
+            "herdr",
+            "j3code",
+            "j3code-wt",
+            "omp",
+            "rune",
+            "t3code",
+        ]
+        .map(entry)
+        .into();
+        picker.siblings = Some(FolderSiblings {
+            dir: "~/repos/".into(),
+            entries: Some(entries.clone()),
+        });
         picker.listing = FolderListing::Loaded {
             parent: "/home/jacob/repos/".into(),
-            entries: [
-                "dotfiles",
-                "herdr",
-                "j3code",
-                "j3code-wt",
-                "omp",
-                "rune",
-                "t3code",
-            ]
-            .map(entry)
-            .into(),
+            entries,
         };
     }
     dialog

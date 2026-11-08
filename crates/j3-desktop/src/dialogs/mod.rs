@@ -12,7 +12,9 @@ mod snooze;
 use rune::{Cx, El, TextEdit, Tx, col, row, spacer, text};
 use rune_kit::{Button, ButtonVariant, Kit, TextInput};
 
-pub use project::{Listing as FolderListing, ProjectPicker, title_from_path};
+pub use project::{
+    Listing as FolderListing, ProjectPicker, Siblings as FolderSiblings, title_from_path,
+};
 pub use snooze::{Schedule as SnoozeSchedule, SnoozeForm};
 
 use crate::{
@@ -430,7 +432,7 @@ pub fn view(s: &J3, cx: &mut Cx<J3>, ui: &mut Ui) {
                 "Add project".into(),
                 None,
                 form(
-                    project::body(s, k, picker),
+                    project::body(s, cx, k, picker),
                     footer(k, "Add Project", false, picker.creating),
                 ),
                 544.0,

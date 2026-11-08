@@ -1,5 +1,7 @@
 //! Dialog forms refuse what they can't use, with the reason inline, and close once done.
 
+use rune::{Key, KeyEvent, Mods};
+
 use super::{Dialog, Field, snooze::INVALID};
 use crate::app::{
     fixtures::{LOCAL_LABEL, Scene, open_thread_key},
@@ -133,6 +135,58 @@ fn the_project_name_follows_the_folder_until_edited() {
         app.rt.state.dialogs.field(Field::ProjectTitle).text,
         "j3code"
     );
+}
+
+#[test]
+fn a_typed_folder_name_shows_its_completion_and_tab_takes_it() {
+    let mut app = TestApp::with_scene(Scene::AddProject);
+    app.frame();
+    tap(&mut app, "project-path");
+    let press = |app: &mut TestApp, key: Key| {
+        app.key(KeyEvent {
+            key,
+            mods: Mods::default(),
+        })
+    };
+    let suggestion = |app: &TestApp| {
+        app.rt
+            .elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some("project-path-suggestion"))
+            .and_then(|e| e.label)
+    };
+    for c in ["j", "3", "c"] {
+        press(&mut app, Key::Text(c.into()));
+    }
+    app.frame();
+    assert_eq!(app.rt.state.dialogs.field(Field::Path).text, "~/repos/j3c");
+    // The first folder in listing order: `j3code` before `j3code-wt`.
+    assert_eq!(suggestion(&app).as_deref(), Some("ode/"));
+
+    press(&mut app, Key::Tab);
+    app.frame();
+    assert_eq!(
+        app.rt.state.dialogs.field(Field::Path).text,
+        "~/repos/j3code/"
+    );
+    assert_eq!(
+        app.rt.state.dialogs.field(Field::ProjectTitle).text,
+        "j3code"
+    );
+    assert_eq!(
+        suggestion(&app),
+        None,
+        "nothing typed in the new folder yet"
+    );
+
+    // Nothing matching: no suggestion, and Tab leaves the path alone.
+    app.rt.update(|s, _| {
+        let path = s.dialogs.field(Field::Path);
+        path.replace_text("~/repos/zz");
+        path.set_caret(path.text.len());
+    });
+    app.frame();
+    assert_eq!(suggestion(&app), None);
 }
 
 #[test]
