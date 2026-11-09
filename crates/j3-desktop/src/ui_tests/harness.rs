@@ -493,6 +493,14 @@ impl Harness {
         self.in_scope("feed-rows", text)
     }
 
+    /// Whether a text drawn in the feed contains `text`.
+    pub fn feed_shows(&self, text: &str) -> bool {
+        self.elements().into_iter().any(|e| {
+            e.path.split('/').any(|part| part == "feed-rows")
+                && e.text.as_deref().is_some_and(|shown| shown.contains(text))
+        })
+    }
+
     /// Whether the composer's one button offers Stop: a run is active and the draft is empty.
     pub fn stoppable(&self) -> bool {
         self.label_of("send-message").as_deref() == Some("Stop")

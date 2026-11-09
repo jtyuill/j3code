@@ -26,3 +26,8 @@ pub const ARRIVE: SpringPair = SpringPair::new(Spring::new(0.16, 0.0), Spring::n
 pub fn arrive() -> Transition {
     Transition::opacity().springs(ARRIVE)
 }
+
+/// A reply's words fading in as each paragraph arrives: a reply streams whole blocks, never word
+/// by word, and their words fade in over this long on Rune's reveal stagger, so a paragraph
+/// washes in down the page rather than landing as a slab.
+pub const WORD_FADE: f32 = 0.3;

@@ -388,14 +388,15 @@ fn the_feed_keeps_following_the_reply_after_a_wheel_scroll_at_the_bottom() {
     });
 }
 
-#[test]
-fn a_sent_message_is_held_at_the_top_while_its_reply_writes_down_under_it() {
-    let mut app = Harness::start("anchor");
+/// Opens a running thread whose first reply has `paragraphs` paragraphs, lets it end, and
+/// sends `next question` from the composer; returns once the message is held at the top, with
+/// its top there.
+fn send_and_hold(app: &mut Harness, paragraphs: usize) -> f32 {
     let project_id = app.project();
     app.open_running_thread(&project_id, "long");
     app.script
         .text("m1", json!({"type": "text_start", "contentIndex": 0}));
-    stream_paragraphs(&mut app, 0..30);
+    stream_paragraphs(app, 0..paragraphs);
     app.script.settle("completed");
     app.until("the run ends", |h| !h.stoppable());
 
@@ -412,13 +413,19 @@ fn a_sent_message_is_held_at_the_top_while_its_reply_writes_down_under_it() {
         h.feed_row("next question")
             .is_some_and(|row| (top(&row) - (feed_top - 20.0)).abs() < 0.5)
     });
-    let held = top(&app.feed_row("next question").unwrap());
-
-    // Its reply writes down under it, past the bottom of the feed, and nothing moves.
     app.script
         .text("m2", json!({"type": "text_start", "contentIndex": 0}));
+    top(&app.feed_row("next question").unwrap())
+}
+
+#[test]
+fn a_sent_message_is_held_at_the_top_while_its_reply_writes_down_under_it() {
+    let mut app = Harness::start("anchor");
+    let held = send_and_hold(&mut app, 30);
+
+    // Its reply writes down under it, past the bottom of the feed, and nothing moves.
     for chunk in 0..6 {
-        stream(&mut app, "m2", "Answer", 0..(chunk + 1) * 5);
+        stream(&mut app, "m2", "Answer", chunk * 5..(chunk + 1) * 5);
         app.pause(Duration::from_millis(300));
         let message = app.feed_row("next question").unwrap();
         assert!(
@@ -443,4 +450,34 @@ fn a_sent_message_is_held_at_the_top_while_its_reply_writes_down_under_it() {
         "the message moved to {}",
         top(&message)
     );
+}
+
+#[test]
+fn a_reader_who_scrolls_to_the_end_of_a_long_reply_is_followed() {
+    let mut app = Harness::start("anchor-follow");
+    send_and_hold(&mut app, 3);
+    stream(&mut app, "m2", "Answer", 0..20);
+    app.until("the reply runs past the feed", |h| {
+        labelled_from(h, "Answer 0:").is_some_and(|row| bottom(&row) > h.rt().viewport.1)
+    });
+
+    // Scrolling down to its end, the reader lands on it and stays there as it grows.
+    let (x, y) = centre(&app.element("feed-area").unwrap());
+    app.rt_mut().pointer_move(x, y);
+    for _ in 0..30 {
+        app.rt_mut().wheel(x, y, -400.0);
+        app.frame();
+    }
+    app.pause(Duration::from_millis(500));
+    let end = bottom(&labelled_from(&app, "Answer 0:").unwrap());
+    assert!(end < app.rt().viewport.1, "the reply's end is in view");
+    stream(&mut app, "m2", "Answer", 20..30);
+    app.until("the reply grows and its end stays in view", |h| {
+        labelled_from(h, "Answer 0:").is_some_and(|row| {
+            row.label
+                .as_deref()
+                .is_some_and(|label| label.contains("Answer 29:"))
+                && (bottom(&row) - end).abs() < 0.5
+        })
+    });
 }

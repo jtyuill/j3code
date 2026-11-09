@@ -84,8 +84,9 @@ pub struct FeedUi {
     anchor: Option<anchor::Anchor>,
     /// Where the held message is laid out, as the view last read it.
     held: Cell<Option<anchor::Held>>,
-    /// The viewport's vertical scroll offset, as it last drew.
-    scroll: Rc<Cell<f32>>,
+    /// The viewport's vertical scroll offset, its largest offset and its height, as it last
+    /// drew.
+    scroll: Rc<Cell<[f32; 3]>>,
 }
 
 #[derive(Default)]
@@ -256,6 +257,7 @@ impl Ctx<'_> {
             width: self.width,
             streaming,
             math: self.math,
+            reveal: 0.0,
         }
     }
 }
@@ -341,7 +343,7 @@ pub fn view(s: &J3, cx: &mut Cx<J3>, ui: &mut Ui, key: &ThreadKey) -> El {
         thread.feed.measure_held(viewport_rect, held_rect, top_pad);
     }
     let tail = thread.feed.tail(viewport_rect, last_rect);
-    let follow = thread.feed.anchor().is_none_or(|anchor| !anchor.live());
+    let follow = thread.feed.anchor().is_none_or(|anchor| !anchor.holds());
     let (key_of, visible_of) = (key.clone(), visible.clone());
     let build_key = key.clone();
     let build = move |s: &J3, i: usize| build_row(s, &build_key, &visible, i, dark, scale);
@@ -356,7 +358,7 @@ pub fn view(s: &J3, cx: &mut Cx<J3>, ui: &mut Ui, key: &ThreadKey) -> El {
         .scroll(ScrollSpec {
             stick_bottom: follow,
         })
-        .on_scroll_offset(move |at| scrolled.set(at.offset[1]))
+        .on_scroll_offset(move |at| scrolled.set([at.offset[1], at.max[1], at.viewport[1]]))
         .child(
             col()
                 .key("feed-rows")
@@ -457,8 +459,21 @@ fn build_row(s: &J3, key: &ThreadKey, visible: &[usize], i: usize, dark: bool, s
         }
     };
     let expanded = cx.expanded(&item.id);
+    // A streaming reply shows only its blocks that have ended (`feed::settled_blocks`), so its
+    // row changes once a paragraph, not once a token: it is versioned by what it shows.
+    let shown = match &item.kind {
+        TurnItemKind::AssistantMessage(message) if message.streaming => {
+            Some(feed::settled_blocks(&message.text))
+        }
+        _ => None,
+    };
+    let version = shown.map_or(thread.feed.revision(&item.id), |shown| {
+        let mut hasher = DefaultHasher::new();
+        shown.hash(&mut hasher);
+        hasher.finish()
+    });
     let base = (
-        thread.feed.revision(&item.id),
+        version,
         top.to_bits(),
         streams,
         expanded,
@@ -474,8 +489,14 @@ fn build_row(s: &J3, key: &ThreadKey, visible: &[usize], i: usize, dark: bool, s
     // Markdown resolves its images first: their states version the row.
     match &item.kind {
         TurnItemKind::AssistantMessage(message) => {
-            let look = cx.look(k.c.text_base, message.streaming);
-            let doc = doc(s, &key.env, &item.thread_id, &message.text, look);
+            // Each block's words fade in as it first draws, the last one too when the stream
+            // ends and it is shown whole.
+            let look = Look {
+                reveal: motion::WORD_FADE,
+                ..cx.look(k.c.text_base, message.streaming)
+            };
+            let text = shown.unwrap_or(&message.text);
+            let doc = doc(s, &key.env, &item.thread_id, text, look);
             cx.wait_all(&doc.wait);
             return memo(id, (base, doc.images), || {
                 frame(doc.view(s, &format!("md-{}", item.id), look))

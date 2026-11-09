@@ -54,28 +54,29 @@ fn new_thread_launches_from_the_composer_and_streams_the_reply() {
     app.until("the thread opens", |h| h.feed_row("Say hi").is_some());
     assert_eq!(app.draft(), "");
 
-    // Streaming text reaches the feed piece by piece.
+    // Streaming text reaches the feed a block at a time: a paragraph shows once it has ended,
+    // the rest once the reply does.
     app.script.emit(json!({"type": "agent_start"}));
     app.until("the row says Working", |h| h.in_sidebar("Say hi, Working"));
     app.script
         .text("m1", json!({"type": "text_start", "contentIndex": 0}));
     app.script.text(
         "m1",
-        json!({"type": "text_delta", "contentIndex": 0, "delta": "Hel"}),
+        json!({"type": "text_delta", "contentIndex": 0, "delta": "Hello there.\n\nAnd mo"}),
     );
-    app.until("the first piece shows", |h| h.feed_row("Hel").is_some());
-    app.script.text(
-        "m1",
-        json!({"type": "text_delta", "contentIndex": 0, "delta": "lo!"}),
-    );
-    app.script.text(
-        "m1",
-        json!({"type": "text_end", "contentIndex": 0, "content": "Hello!"}),
-    );
-    app.until("the whole reply shows", |h| {
-        h.feed_row("Hello!").is_some() && h.feed_row("Hel").is_none()
+    app.until("the first paragraph shows, the second waits", |h| {
+        h.feed_shows("Hello there.") && !h.feed_shows("And mo")
     });
-    let reply = app.feed_row("Hello!").unwrap();
+    app.script.text(
+        "m1",
+        json!({"type": "text_delta", "contentIndex": 0, "delta": "re."}),
+    );
+    app.script.text(
+        "m1",
+        json!({"type": "text_end", "contentIndex": 0, "content": "Hello there.\n\nAnd more."}),
+    );
+    app.until("the whole reply shows", |h| h.feed_shows("And more."));
+    let reply = app.feed_row("Hello there.\n\nAnd more.").unwrap();
     assert!(reply.rect[1] > app.feed_row("Say hi").unwrap().rect[1]);
 
     app.script.settle("completed");

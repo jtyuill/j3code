@@ -3,11 +3,13 @@
 //! under the viewport's top, and room is kept below the rows so the reply writes downward into
 //! the view instead of pushing the conversation up past the reader.
 //!
-//! While the run is live the room is a viewport less the message, so the reply never runs out
-//! of it however far its growth trails its text, and the feed doesn't follow its end. A moment
-//! after the run ends ([`REST_DELAY`], once the growth has landed) the room shrinks to what
-//! keeps the message at the top: a short reply leaves the blank a full screen needs, a long
-//! one none, and the feed follows its end again.
+//! While the reply fits under the message, the room is a viewport less the message, so the
+//! reply never runs out of it however far its growth trails its text, and the feed doesn't
+//! follow its end. Once the drawn reply runs past the bottom of the view, the room goes and
+//! the feed follows its end again for a reader who scrolls down to it, as it always does: the
+//! reply keeps writing below the fold for one who doesn't. A moment after the run ends
+//! ([`REST_DELAY`], once the growth has landed) a reply that stayed short keeps only the room
+//! that holds the message at the top.
 
 use std::time::Duration;
 
@@ -28,6 +30,9 @@ pub const REST_DELAY: f64 = 1.0;
 const AIM_FOR: f64 = 3.0;
 /// The feed's scroll viewport: `rune_kit::scroll_bar` keys it `feed` inside `feed-area`.
 const VIEWPORT: &str = "feed-area/feed";
+/// Points the drawn reply must run past the view's bottom before the room goes, so the reader
+/// isn't left standing at the new end (which would start following on its own).
+const OVERFLOW: f32 = 8.0;
 
 /// The message the feed holds at its top.
 #[derive(Debug, Clone)]
@@ -43,6 +48,9 @@ pub struct Anchor {
     aim_until: f64,
     /// Its run was seen active, so its end can be told.
     ran: bool,
+    /// The drawn reply ran past the bottom of the view: no more room, and the feed follows its
+    /// end for a reader who is there.
+    overflowed: bool,
     /// When the room shrinks: `REST_DELAY` after the run was seen ending.
     rest_at: Option<f64>,
     rested: bool,
@@ -64,15 +72,16 @@ impl Anchor {
             waited: 0,
             aim_until: 0.0,
             ran: false,
+            overflowed: false,
             rest_at: None,
             rested: false,
         }
     }
 
-    /// The reply may still be growing: the room stays a viewport tall and the feed doesn't
-    /// follow its end.
-    pub fn live(&self) -> bool {
-        !self.rested
+    /// The reply may still grow and fits under the message: the room stays a viewport tall
+    /// and the feed doesn't follow its end.
+    pub fn holds(&self) -> bool {
+        !self.rested && !self.overflowed
     }
 
     pub fn item(&self) -> &str {
@@ -161,7 +170,7 @@ impl FeedUi {
             return height;
         };
         let live = (height - held.head - END_PAD).max(0.0);
-        if anchor.live() {
+        if anchor.holds() {
             return live;
         }
         last.map_or(live, |[_, y, _, h]| {
@@ -174,14 +183,15 @@ impl FeedUi {
 impl J3 {
     /// Before a frame, for the open thread `key`: starts the glide to a newly held message once
     /// its row is laid out (revealing it if it didn't mount: the reader was far up), renews the
-    /// glide while the feed isn't there yet ([`AIM_FOR`]), and lets the room shrink once the
-    /// run ended `REST_DELAY` ago. True when the feed must draw again.
+    /// glide while the feed isn't there yet ([`AIM_FOR`]), drops the room once the drawn reply
+    /// runs past the view, and lets it shrink once the run ended `REST_DELAY` ago. True when
+    /// the feed must draw again.
     pub(super) fn poll_anchor(&mut self, key: &ThreadKey, tx: &mut Tx) -> bool {
         let now = self.clock.t;
         let Some(feed) = self.threads.get_mut(key).map(|thread| &mut thread.feed) else {
             return false;
         };
-        let (held, scroll) = (feed.held.get(), feed.scroll.get());
+        let (held, [scroll, max, view]) = (feed.held.get(), feed.scroll.get());
         let Some(anchor) = feed.anchor.as_mut() else {
             return false;
         };
@@ -205,6 +215,18 @@ impl J3 {
                 tx.wake_after(Duration::from_millis(16));
             } else {
                 anchor.aim_until = 0.0;
+            }
+        }
+        // The scroll's end, less the room, is where the drawn rows end: past the view's bottom
+        // with the message at the top, the reply no longer fits.
+        if let Some(held) = held
+            && anchor.holds()
+            && view > 0.0
+        {
+            let room = (view - held.head - END_PAD).max(0.0);
+            if max - room >= held.offset + OVERFLOW {
+                anchor.overflowed = true;
+                return true;
             }
         }
         if !anchor.rested && anchor.rest_at.is_some_and(|at| now >= at) {
