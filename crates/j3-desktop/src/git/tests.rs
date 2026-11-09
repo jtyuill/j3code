@@ -4,10 +4,7 @@
 use std::sync::Arc;
 
 use j3_protocol::t3::{
-    git::{
-        GitStackedAction, VcsChangeRequest, VcsChangeRequestState, VcsPullResult, VcsPullStatus,
-        VcsStatusResult,
-    },
+    git::{VcsChangeRequest, VcsChangeRequestState, VcsPullResult, VcsPullStatus, VcsStatusResult},
     orchestration::RunStatus,
 };
 
