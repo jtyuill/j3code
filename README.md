@@ -2,12 +2,48 @@
 
 A native desktop and mobile client for running [Oh My Pi](https://github.com/can1357/oh-my-pi) (`omp`) coding agents on your own machines.
 
+<picture>
+  <source media="(prefers-color-scheme: light)" srcset="docs/screenshots/thread-light.png">
+  <img alt="j3 desktop: a thread with its tool calls, a diff, the agent's plan and a question from omp" src="docs/screenshots/thread-dark.png">
+</picture>
+
 - **One agent.** `omp` is the only harness. Threads are ordinary omp sessions, so `omp --resume` sees them.
 - **Native desktop.** Rust + [Rune](https://github.com/anomalyco/rune), not Electron. macOS (arm64) and Linux (x86_64).
 - **Rust server.** `j3-core` is embedded in the desktop app and also ships headless as `j3-server`.
 - **iOS client.** A trimmed Expo app that talks to the same server.
 
 Forked from [t3code](https://github.com/pingdotgg/t3code). See [PLAN.md](PLAN.md) for design decisions and [docs/protocol](docs/protocol) for the wire format.
+
+## Screenshots
+
+<table>
+  <tr>
+    <td width="50%"><img alt="Markdown reply with display math, a table and highlighted code" src="docs/screenshots/answer.png"></td>
+    <td width="50%"><img alt="herdr workflow: agents grouped by space and attention" src="docs/screenshots/herdr.png"></td>
+  </tr>
+  <tr>
+    <td><b>Replies</b>: streaming Markdown with math, tables and syntax-highlighted code.</td>
+    <td><b>herdr workflow</b>: every agent on every machine, grouped by space or by what it needs from you.</td>
+  </tr>
+  <tr>
+    <td><img alt="File tree and preview beside a thread" src="docs/screenshots/files.png"></td>
+    <td><img alt="Terminal drawer under a thread" src="docs/screenshots/terminal.png"></td>
+  </tr>
+  <tr>
+    <td><b>Files</b>: browse and preview the thread's workspace.</td>
+    <td><b>Terminal</b>: a shell in the workspace, in a drawer under the thread.</td>
+  </tr>
+  <tr>
+    <td><img alt="Commit dialog listing changed files" src="docs/screenshots/git-commit.png"></td>
+    <td><img alt="Add project dialog choosing between the local machine and a remote one" src="docs/screenshots/add-project.png"></td>
+  </tr>
+  <tr>
+    <td><b>Git</b>: commit, push and open a PR from the thread.</td>
+    <td><b>Multiple machines</b>: add projects on this computer or any j3 server on your tailnet.</td>
+  </tr>
+</table>
+
+Screenshots are rendered headlessly from the offline fixture scenes in `crates/j3-desktop/src/app/fixtures.rs` (see [CONTRIBUTING.md](CONTRIBUTING.md)).
 
 ## Layout
 
