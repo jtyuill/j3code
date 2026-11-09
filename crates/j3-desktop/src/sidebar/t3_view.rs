@@ -5,8 +5,8 @@
 use j3_client::workflow::{T3Section, ThreadStatus, format_working_duration, snooze_wake_label};
 use rune::{Color, Cx, El, Icon, PointerPress, ScrollSpec, Tx, col, el, icon, row, spacer, text};
 use rune_kit::{
-    Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, Menu, MenuItem, State,
-    shell::SidebarHeader,
+    Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, Loader, Menu, MenuItem,
+    State, shell::SidebarHeader,
 };
 use time::OffsetDateTime;
 
@@ -216,29 +216,29 @@ fn header(s: &J3, rows: &T3Rows, ui: &mut Ui) -> El {
     if filtered {
         filter_button = filter_button.state(State::Pressed);
     }
-    let pick = |label: &str, value: Option<super::ProjectKey>| {
+    // Choosing the checked project again clears the filter (as does the chip's ×).
+    let pick = |label: &str, value: super::ProjectKey| {
+        let checked = rows.filter.as_ref() == Some(&value);
         MenuItem::new(label)
-            .checked(value == rows.filter)
+            .checked(checked)
             .on_select(move |s: &mut J3| {
                 s.sidebar.filter_menu = false;
-                s.set_project_filter(value.clone());
+                s.set_project_filter((!checked).then(|| value.clone()));
             })
     };
     let mut menu = Menu::new("project-filter-menu")
         .trigger(filter_button.build(k).key("project-filter"))
         .open(s.sidebar.filter_menu)
         .min_width(200.0)
-        .on_close(|s: &mut J3| s.sidebar.filter_menu = false)
-        .item(pick("All projects", None));
+        .on_close(|s: &mut J3| s.sidebar.filter_menu = false);
+    for (project, label) in &rows.projects {
+        menu = menu.item(pick(label, project.clone()));
+    }
     if !rows.projects.is_empty() {
         menu = menu.separator();
     }
-    for (project, label) in &rows.projects {
-        menu = menu.item(pick(label, Some(project.clone())));
-    }
     // Projects are added from this menu too: the filter is where the project list lives.
     let menu = menu
-        .separator()
         .item(
             MenuItem::new("Add project…")
                 .icon(&icons::FOLDER_PLUS)
@@ -452,7 +452,13 @@ fn status(r: &T3Row, c: &Ctx) -> El {
     let k = c.k;
     let slot = || row().key("status").gap(4.0).center_y();
     let pill = |color: Color, glyph: &'static Icon, label: String, medium: bool| {
-        slot().child(icon(glyph, 12.0).color(color)).child(
+        // Working turns a ring in place of its static dashed circle.
+        let lead = if r.status == ThreadStatus::Working && medium {
+            Loader::new().size(12.0).color(color).build(k)
+        } else {
+            icon(glyph, 12.0).color(color)
+        };
+        slot().child(lead).child(
             text(label)
                 .font(if medium {
                     k.ty.text_xsmall_medium

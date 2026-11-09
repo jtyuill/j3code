@@ -97,7 +97,7 @@ pub(super) fn view(s: &J3, ui: &mut Ui) -> El {
             k,
             "status-indicators",
             "Status indicators",
-            Some("Dots: ● working, blocked, done; ○ idle. Symbols: ◐ working, × blocked, ✓ done, ○ idle."),
+            Some("Dots: ● working, blocked, done; ○ idle. Symbols: a spinning ring working, × blocked, ✓ done, ○ idle."),
             segmented_setting(k, "status-indicators", &INDICATORS, prefs.status_indicators, |ui, v| {
                 ui.status_indicators = v
             }),

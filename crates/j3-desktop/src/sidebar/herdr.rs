@@ -9,7 +9,7 @@ use j3_client::workflow::{
 };
 use rune::{Color, El, Tx, col, el, row, spacer, text};
 use rune_kit::{
-    ControlSize, IconButton, IconButtonVariant, Kit,
+    ControlSize, IconButton, IconButtonVariant, Kit, Loader,
     shell::{Sidebar, SidebarRow},
 };
 
@@ -173,13 +173,18 @@ pub fn status_color(status: AgentStatus, k: &Kit) -> Color {
     }
 }
 
-/// The glyph in a fixed 16 pt slot, so labels keep one leading edge.
+/// The glyph in a fixed 16 pt slot, so labels keep one leading edge. Working, in symbols,
+/// is a turning ring (`Loader`) rather than its static `◐`.
 pub fn glyph(status: AgentStatus, indicators: StatusIndicators, k: &Kit) -> El {
-    row().w(16.0).center().child(
+    let color = status_color(status, k);
+    let mark = if (status, indicators) == (AgentStatus::Working, StatusIndicators::Symbols) {
+        Loader::new().size(12.0).color(color).build(k)
+    } else {
         text(status.glyph(indicators))
             .font(k.ty.text_small)
-            .color(status_color(status, k)),
-    )
+            .color(color)
+    };
+    row().w(16.0).center().child(mark)
 }
 
 /// The herdr sidebar: a "Spaces" header with a new-thread button, then the spaces and every
