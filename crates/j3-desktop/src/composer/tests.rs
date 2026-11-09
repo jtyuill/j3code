@@ -198,6 +198,8 @@ fn word_prediction_shows_as_ghost_text_and_tab_space_and_punctuation_follow_omp(
     typed(&mut app, "refac");
     suggest(&mut app, &key, "tor");
     typed(&mut app, "t");
+    // No answer arriving since takes the rest away.
+    settle_predictions(&mut app, &key);
     assert_eq!(label(&app, "composer-ghost").as_deref(), Some("or"));
     press(&mut app, Key::Right, Mods::default());
     assert_eq!(draft(&app, &key), "please refactor, refactor refactor");

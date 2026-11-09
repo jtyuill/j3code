@@ -193,14 +193,19 @@ impl J3 {
                 composer.edit.set_caret(end);
             }
         }
-        let mut unchanged = false;
+        // A ghost still showing is omp's answer for the word at the caret: asking again
+        // could only race it, and a `None` would drop the rest being typed through.
+        let mut showing = false;
         if let Some(ghost) = composer.ghost.take() {
             match ghost.follow(&composer.edit.text, composer.edit.focus) {
                 Follow::Unchanged => {
-                    unchanged = true;
+                    showing = true;
                     composer.ghost = Some(ghost);
                 }
-                Follow::TypedThrough(rest) => composer.ghost = rest,
+                Follow::TypedThrough(rest) => {
+                    showing = rest.is_some();
+                    composer.ghost = rest;
+                }
                 Follow::Diverged => {
                     let at = prediction::utf16_offset(&ghost.text, ghost.cursor);
                     self.predict_word_feedback(ghost.text, at, ghost.suffix, false);
@@ -212,7 +217,7 @@ impl J3 {
         sync_mentions(&mut composer.edit, &choices);
         self.refresh_completions(key);
         tx.instant();
-        if !unchanged {
+        if !showing {
             self.request_prediction(key);
         }
     }
