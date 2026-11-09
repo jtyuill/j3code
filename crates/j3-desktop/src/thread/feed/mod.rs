@@ -6,7 +6,8 @@
 //! `memo` versioned by its item's revision (bumped when the item changes between thread
 //! states), its expansion and the state of the images it draws, so a streaming reply rebuilds
 //! its own row only. The viewport sticks to the bottom: it follows a streaming reply, and a
-//! wheel scroll that ends at the bottom keeps following.
+//! wheel scroll that ends at the bottom keeps following — except while a message sent here is
+//! held at the top for its reply to write down under it (`anchor`).
 //!
 //! Rows space themselves in one rhythm per turn: 44 points before a user message (a new
 //! turn), 24 after it, 4 between consecutive activity rows (tools, reasoning, plan updates,
@@ -20,6 +21,7 @@
 //! its own — no clipped unroll, no speed-capped climb in stages as its output lands. Only
 //! streaming text keeps the stack's paced growth.
 
+mod anchor;
 mod body;
 mod lines;
 mod rail;
@@ -30,7 +32,7 @@ mod tool;
 
 use std::{
     borrow::Cow,
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     hash::{DefaultHasher, Hash, Hasher},
     rc::Rc,
@@ -78,6 +80,12 @@ pub struct FeedUi {
     rows: RefCell<Rows>,
     /// Images rows drew before they were decoded: the feed's poll draws again once any is.
     wait: RefCell<Vec<Image>>,
+    /// The sent message held at the top while its reply comes in.
+    anchor: Option<anchor::Anchor>,
+    /// Where the held message is laid out, as the view last read it.
+    held: Cell<Option<anchor::Held>>,
+    /// The viewport's vertical scroll offset, as it last drew.
+    scroll: Rc<Cell<f32>>,
 }
 
 #[derive(Default)]
@@ -180,6 +188,7 @@ impl J3 {
     /// Before a frame: true when an image a feed row waits on finished decoding, so the
     /// rows showing it draw again. The open thread's rows take their new heights at once: an
     /// image or formula decoding is not text arriving, so the feed doesn't glide to its end.
+    /// Also moves the open thread's held message along (`anchor`).
     pub(crate) fn poll_feed(&mut self, tx: &mut Tx) -> bool {
         let open = self.open_thread_key();
         let mut changed = false;
@@ -193,6 +202,9 @@ impl J3 {
                     tx.instant();
                 }
             }
+        }
+        if let Some(open) = &open {
+            changed |= self.poll_anchor(open, tx);
         }
         changed
     }
@@ -298,9 +310,42 @@ pub fn view(s: &J3, cx: &mut Cx<J3>, ui: &mut Ui, key: &ThreadKey) -> El {
     let (dark, scale) = (k.dark, cx.env().scale);
     let count = visible.len();
     let version = Rc::as_ptr(&visible) as *const () as usize;
+    // A held message: room below the rows for its reply, and no following the end while it
+    // may still grow.
+    let row_key = |ix: usize| {
+        state
+            .feed()
+            .get(ix)
+            .map(|projected| format!("feed-{}", projected.item.id))
+    };
+    let last_row = visible.last().and_then(|&ix| row_key(ix));
+    let held = thread.feed.anchor().and_then(|anchor| {
+        let at = visible.iter().position(|&ix| {
+            state
+                .feed()
+                .get(ix)
+                .is_some_and(|p| p.item.id == anchor.item())
+        })?;
+        // The row's own space above the message: a new turn's gap, none for the first row.
+        Some((
+            format!("feed-{}", anchor.item()),
+            if at == 0 { 0.0 } else { TURN_GAP },
+        ))
+    });
+    let [viewport_rect, held_rect, last_rect] = anchor::reads(
+        cx,
+        held.as_ref().map(|(row, _)| row.as_str()),
+        last_row.as_deref(),
+    );
+    if let Some((_, top_pad)) = held {
+        thread.feed.measure_held(viewport_rect, held_rect, top_pad);
+    }
+    let tail = thread.feed.tail(viewport_rect, last_rect);
+    let follow = thread.feed.anchor().is_none_or(|anchor| !anchor.live());
     let (key_of, visible_of) = (key.clone(), visible.clone());
     let build_key = key.clone();
     let build = move |s: &J3, i: usize| build_row(s, &build_key, &visible, i, dark, scale);
+    let scrolled = thread.feed.scroll.clone();
     // Keyed by thread: switching threads mounts a new stack, whose rows land at rest
     // instead of growing open as rows new to the old one.
     let viewport = col()
@@ -308,12 +353,16 @@ pub fn view(s: &J3, cx: &mut Cx<J3>, ui: &mut Ui, key: &ThreadKey) -> El {
         .w_full()
         .grow(1.0)
         .min_h(0.0)
-        .scroll(ScrollSpec { stick_bottom: true })
+        .scroll(ScrollSpec {
+            stick_bottom: follow,
+        })
+        .on_scroll_offset(move |at| scrolled.set(at.offset[1]))
         .child(
             col()
                 .key("feed-rows")
                 .w_full()
-                .py(END_PAD)
+                .pt(END_PAD)
+                .pb(END_PAD + tail)
                 .growth(GrowthSpec::default())
                 .virtual_rows(
                     count,

@@ -1,5 +1,6 @@
 //! An open thread against the real server: questions, queueing and steering, stopping,
-//! the goal chip, subagents and the agents hub, images, and the feed following a reply.
+//! the goal chip, subagents and the agents hub, images, the feed following a reply, and a
+//! sent message held at the top while its reply writes down under it.
 
 use std::{ops::Range, sync::Arc, time::Duration};
 
@@ -13,33 +14,44 @@ use serde_json::json;
 use super::harness::{Harness, bottom, centre, primary, top};
 use crate::sidebar::ThreadKey;
 
-/// The streaming reply of the follow test (the feed row labelled with its text).
+/// The streaming reply `m1` (the feed row labelled with its text).
 fn reply_row(app: &Harness) -> Option<ElementInfo> {
+    labelled_from(app, "Paragraph 0:")
+}
+
+/// The feed row whose label starts with `prefix`.
+fn labelled_from(app: &Harness, prefix: &str) -> Option<ElementInfo> {
     app.elements().into_iter().find(|row| {
         row.path.split('/').any(|part| part == "feed-rows")
             && row
                 .label
                 .as_deref()
-                .is_some_and(|label| label.starts_with("Paragraph 0:"))
+                .is_some_and(|label| label.starts_with(prefix))
     })
 }
 
-/// Streams `Paragraph {i}: …` for each `i` into reply `m1` and waits until the feed shows
+/// Streams `{word} {i}: …` for each `i` into reply `message` and waits until the feed shows
 /// the last one.
-fn stream_paragraphs(app: &mut Harness, range: Range<usize>) {
-    let marker = format!("Paragraph {}:", range.end - 1);
+fn stream(app: &mut Harness, message: &str, word: &str, range: Range<usize>) {
+    let marker = format!("{word} {}:", range.end - 1);
     for i in range {
         let delta = format!(
-            "Paragraph {i}: enough words to wrap across the column at least once or twice.\n\n"
+            "{word} {i}: enough words to wrap across the column at least once or twice.\n\n"
         );
         app.script.text(
-            "m1",
+            message,
             json!({"type": "text_delta", "contentIndex": 0, "delta": delta}),
         );
     }
+    let first = format!("{word} 0:");
     app.until("the last paragraph shows", |h| {
-        reply_row(h).is_some_and(|row| row.label.unwrap().contains(&marker))
+        labelled_from(h, &first).is_some_and(|row| row.label.unwrap().contains(&marker))
     });
+}
+
+/// Streams `Paragraph {i}: …` into reply `m1`.
+fn stream_paragraphs(app: &mut Harness, range: Range<usize>) {
+    stream(app, "m1", "Paragraph", range);
 }
 
 #[test]
@@ -374,4 +386,61 @@ fn the_feed_keeps_following_the_reply_after_a_wheel_scroll_at_the_bottom() {
     app.until("the reply grows and stays pinned", |h| {
         reply_row(h).is_some_and(|row| top(&row) < first_top - 200.0 && bottom(&row) == pinned)
     });
+}
+
+#[test]
+fn a_sent_message_is_held_at_the_top_while_its_reply_writes_down_under_it() {
+    let mut app = Harness::start("anchor");
+    let project_id = app.project();
+    app.open_running_thread(&project_id, "long");
+    app.script
+        .text("m1", json!({"type": "text_start", "contentIndex": 0}));
+    stream_paragraphs(&mut app, 0..30);
+    app.script.settle("completed");
+    app.until("the run ends", |h| !h.stoppable());
+
+    app.click_composer();
+    app.typed("next question");
+    app.press(Key::Enter);
+    app.until_called("prompt:next question:0");
+    app.script.emit(json!({"type": "agent_start"}));
+
+    // The message glides up until its bubble sits 24 points under the feed's top: its row
+    // starts with the 44 points that open a new turn, so the row's top is 20 points above.
+    let feed_top = top(&app.element("feed-area").unwrap());
+    app.until("the message is held at the top", |h| {
+        h.feed_row("next question")
+            .is_some_and(|row| (top(&row) - (feed_top - 20.0)).abs() < 0.5)
+    });
+    let held = top(&app.feed_row("next question").unwrap());
+
+    // Its reply writes down under it, past the bottom of the feed, and nothing moves.
+    app.script
+        .text("m2", json!({"type": "text_start", "contentIndex": 0}));
+    for chunk in 0..6 {
+        stream(&mut app, "m2", "Answer", 0..(chunk + 1) * 5);
+        app.pause(Duration::from_millis(300));
+        let message = app.feed_row("next question").unwrap();
+        assert!(
+            (top(&message) - held).abs() < 0.5,
+            "the message moved from {held} to {} while its reply grew",
+            top(&message)
+        );
+    }
+    let answer = labelled_from(&app, "Answer 0:").unwrap();
+    assert!(
+        bottom(&answer) > app.rt().viewport.1,
+        "the reply runs past the feed"
+    );
+
+    // The run ends; once the room below shrinks the message is still where it was.
+    app.script.settle("completed");
+    app.until("the run ends", |h| !h.stoppable());
+    app.pause(Duration::from_millis(1500));
+    let message = app.feed_row("next question").unwrap();
+    assert!(
+        (top(&message) - held).abs() < 0.5,
+        "the message moved to {}",
+        top(&message)
+    );
 }

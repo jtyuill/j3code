@@ -162,6 +162,7 @@ impl J3 {
         if self.open_thread_key().as_ref() == Some(&key) {
             return;
         }
+        self.settle_anchor(&key);
         let Some(connection) = self.subscribe_thread(&key) else {
             return;
         };
@@ -225,15 +226,20 @@ impl J3 {
 
     /// A newer state for `key`'s thread, from its watch-forwarding task. A resubscription's
     /// first, empty state doesn't replace the cached one. While the open thread loads or
-    /// catches up, its feed lands at its end at once instead of growing into place.
+    /// catches up, its feed lands at its end at once instead of growing into place. A message
+    /// sent while it is open is held at the top of the feed for its reply (`feed::anchor`).
     pub fn thread_changed(&mut self, key: &ThreadKey, state: Arc<ThreadState>, tx: &mut Tx) {
         let open = self.open_thread_key().as_ref() == Some(key);
+        let now = self.clock.t;
         if let Some(thread) = self.threads.get_mut(key)
             && !(is_blank(&state) && thread.state.projection.is_some())
         {
             if open && (thread.state.projection.is_none() || state.sync != ThreadSync::Live) {
                 tx.settle();
             }
+            thread
+                .feed
+                .track_anchor(&thread.state, &state, open, now, tx);
             thread.state = state;
         }
     }
