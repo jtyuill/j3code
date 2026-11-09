@@ -3,8 +3,10 @@
 //! attention alerts, and leaving whatever showed a removed environment.
 
 use j3_client::{
-    t3::orchestration::SettledOverride,
-    workflow::{AgentNotification, effective_snoozed, forward_target, has_unseen_completion},
+    entities::Settled,
+    herdr::AgentNotification,
+    inbox::{can_settle, completed_at, forward_target, is_snoozed, is_unread},
+    methods::{DeleteThreadParams, RenameThreadParams, ThreadParams, VisitParams},
 };
 use rune::Tx;
 
@@ -30,7 +32,8 @@ impl J3 {
             let project = env
                 .state()
                 .shell
-                .thread(&key.thread_id)
+                .threads
+                .get(&key.thread_id)
                 .map(|thread| thread.project_id.clone());
             return (key.env, project);
         }
@@ -51,8 +54,9 @@ impl J3 {
         }
     }
 
-    /// t3's settle-and-advance (⌘⇧S): un-settles a settled open thread; otherwise settles it
-    /// and opens the next row that is not settled or snoozed, else a new thread in its project.
+    /// Settle-and-advance (⌘⇧S, `docs/triage.md` §6.3): un-settles a settled open thread;
+    /// otherwise, where the server accepts a settle, settles it and opens the next row that is
+    /// not settled or snoozed, else a new thread in its project.
     pub fn settle_open_thread(&mut self, tx: &mut Tx) {
         let Some(key) = self.open_thread_key() else {
             return;
@@ -60,12 +64,15 @@ impl J3 {
         let Some(thread) = self
             .envs
             .get(&key.env)
-            .and_then(|env| env.state().shell.thread(&key.thread_id).cloned())
+            .and_then(|env| env.state().shell.threads.get(&key.thread_id).cloned())
         else {
             return;
         };
-        if thread.settled_override == Some(SettledOverride::Settled) {
+        if thread.triage.settled == Some(Settled::Settled) {
             self.apply_thread_commands(vec![(key, ThreadCommand::Unsettle)]);
+            return;
+        }
+        if !can_settle(&thread) {
             return;
         }
         let now = self.clock.now;
@@ -78,10 +85,11 @@ impl J3 {
                     .and_then(|env| {
                         env.state()
                             .shell
-                            .thread(&candidate.thread_id)
+                            .threads
+                            .get(&candidate.thread_id)
                             .map(|thread| {
-                                thread.settled_override == Some(SettledOverride::Settled)
-                                    || effective_snoozed(thread, now)
+                                thread.triage.settled == Some(Settled::Settled)
+                                    || is_snoozed(thread, now)
                             })
                     })
                     .unwrap_or(true)
@@ -99,7 +107,7 @@ impl J3 {
     pub fn thread_title(&self, key: &ThreadKey) -> String {
         self.envs
             .get(&key.env)
-            .and_then(|env| env.state().shell.thread(&key.thread_id))
+            .and_then(|env| env.state().shell.threads.get(&key.thread_id))
             .map(|thread| thread.title.clone())
             .unwrap_or_else(|| "this thread".to_owned())
     }
@@ -109,10 +117,16 @@ impl J3 {
         let Some(connection) = self.envs.get(&key.env).map(|env| env.connection().clone()) else {
             return;
         };
-        let id = key.thread_id.clone();
+        let thread_id = key.thread_id.clone();
         self.run_command(
             "archive the thread",
-            async move { connection.archive(&id).await },
+            async move {
+                let params = ThreadParams {
+                    thread_id,
+                    command_id: None,
+                };
+                connection.threads_archive(params).await
+            },
             move |s, _, _| s.leave_thread(&key),
         );
     }
@@ -122,10 +136,17 @@ impl J3 {
         let Some(connection) = self.envs.get(&key.env).map(|env| env.connection().clone()) else {
             return;
         };
-        let id = key.thread_id.clone();
+        let thread_id = key.thread_id.clone();
         self.run_command(
             "delete the thread",
-            async move { connection.delete_thread(&id).await },
+            async move {
+                let params = DeleteThreadParams {
+                    thread_id,
+                    only_if_unused: None,
+                    command_id: None,
+                };
+                connection.threads_delete(params).await
+            },
             move |s, _, _| s.leave_thread(&key),
         );
     }
@@ -139,10 +160,17 @@ impl J3 {
         let Some(connection) = self.envs.get(&key.env).map(|env| env.connection().clone()) else {
             return false;
         };
-        let id = key.thread_id.clone();
+        let thread_id = key.thread_id.clone();
         self.run_command(
             "rename the thread",
-            async move { connection.rename(&id, &title).await },
+            async move {
+                let params = RenameThreadParams {
+                    thread_id,
+                    title,
+                    command_id: None,
+                };
+                connection.threads_rename(params).await
+            },
             |_, _, _| {},
         );
         true
@@ -177,8 +205,8 @@ impl J3 {
     }
 
     /// Raises attention toasts and, while the window is in the background, sounds for
-    /// environment `key`'s status changes, and acknowledges a completion of the open thread
-    /// (it was watched).
+    /// environment `key`'s status changes, and visits the open thread once per newly finished
+    /// turn while the window has focus (`docs/triage.md` §12.1(4)).
     pub(crate) fn observe_attention(&mut self, key: &str, _: &mut Tx) {
         let Some(env) = self.envs.get(key) else {
             return;
@@ -214,20 +242,49 @@ impl J3 {
                 self.toasts.push_thread(kind, alert.message(), thread);
             }
         }
-        if let Some(open) = open
-            && let Some(thread) = state.shell.thread(&open.thread_id)
-            && has_unseen_completion(thread)
-            && let Some(Some(completed)) = &thread.latest_run_completed_at
-        {
-            let mark = (open.clone(), completed.clone());
-            if self.visited_completion.as_ref() != Some(&mark) {
-                self.visited_completion = Some(mark);
-                self.services.runtime.spawn(async move {
-                    if let Err(e) = connection.visit(&open.thread_id).await {
-                        tracing::debug!("visit {}: {e}", open.thread_id);
-                    }
-                });
-            }
+        if focused && let Some(open) = open {
+            self.visit_finished_turn(open, &state.shell, connection);
         }
+    }
+
+    /// Visits the open thread when its latest turn finished since it was last looked at here
+    /// and left the thread unread. Each finished turn is remembered (keyed by turn id and end
+    /// time), so marking the open thread unread sticks: only a newly finished turn visits.
+    fn visit_finished_turn(
+        &mut self,
+        open: ThreadKey,
+        shell: &j3_client::Shell,
+        connection: j3_client::Connection,
+    ) {
+        let Some(thread) = shell.threads.get(&open.thread_id) else {
+            return;
+        };
+        let Some(turn) = thread.latest_turn.as_ref() else {
+            return;
+        };
+        let (Some(completed), Some(ended_at)) = (completed_at(thread), turn.ended_at.as_deref())
+        else {
+            return;
+        };
+        let mark = (open.clone(), format!("{}@{ended_at}", turn.id));
+        if self.visited_completion.as_ref() == Some(&mark) {
+            return;
+        }
+        self.visited_completion = Some(mark);
+        if !is_unread(thread) {
+            return;
+        }
+        // Never before the turn's end, whatever the clocks say: the visit must read it.
+        let params = VisitParams {
+            thread_id: open.thread_id.clone(),
+            visited_at: crate::sidebar::iso(self.clock.now.max(completed)),
+            opened: None,
+            command_id: None,
+        };
+        self.services.runtime.spawn(async move {
+            if let Err(e) = connection.triage_visit(params).await {
+                tracing::debug!("visit {}: {e}", open.thread_id);
+            }
+        });
     }
 }

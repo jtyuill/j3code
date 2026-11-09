@@ -1,0 +1,47 @@
+[package]
+name = "j3-mobile"
+description = "UniFFI bindings over j3-client v2 and j3-text for the iOS app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["lib", "staticlib", "cdylib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["bindgen"]
+
+# A j3 server with a scripted omp, for the iOS simulator smoke test
+# (`contrib/ios/smoke.sh`).
+[[bin]]
+name = "j3-test-server"
+path = "src/bin/j3-test-server.rs"
+required-features = ["test-server"]
+
+[features]
+# The `uniffi-bindgen` binary. On by default so `cargo run --bin
+# uniffi-bindgen` works as is; iOS builds pass `--no-default-features` so the
+# static library does not carry the generator.
+default = ["bindgen"]
+bindgen = ["uniffi/cli", "uniffi/cargo-metadata"]
+test-server = ["dep:j3-core", "dep:futures-util"]
+
+[dependencies]
+futures-util = { workspace = true, optional = true }
+j3-client.workspace = true
+j3-core = { workspace = true, optional = true }
+j3-text.workspace = true
+pulldown-cmark.workspace = true
+resvg.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+uniffi.workspace = true
+
+[dev-dependencies]
+futures-util.workspace = true
+j3-core.workspace = true

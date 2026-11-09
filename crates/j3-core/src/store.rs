@@ -1,14 +1,22 @@
-//! SQLite persistence: environment identity, the global sequence high-water
-//! mark, projects, the thread index, every thread projection entity, and
-//! command receipts for idempotent dispatch.
+//! SQLite persistence: the server identity, the sequence high-water mark,
+//! projects, the thread index (one row per thread, holding its wire row),
+//! each thread's records (turns, items, requests and its queue), and command
+//! results for idempotent commands (`docs/protocol/wire.md` §3.4).
 //!
 //! The store is synchronous; [`crate::hub::Hub`] owns it behind a mutex and
 //! runs each commit as one transaction.
 
 use std::path::Path;
 
+use j3_protocol::v2::{
+    entities::{Item, Project, QueueEntry, Request, RequestStatus, Thread, Turn},
+    streams::ThreadSnapshot,
+};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use serde::de::DeserializeOwned;
 use serde_json::Value;
+
+mod legacy;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -16,11 +24,25 @@ pub enum Error {
     Sqlite(#[from] rusqlite::Error),
     #[error("stored json: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("database schema version {found} is newer than this build's {known}")]
+    TooNew { found: u32, known: u32 },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-const SCHEMA: &str = "
+/// One schema migration.
+enum Migration {
+    Sql(&'static str),
+    Rust(fn(&Transaction<'_>) -> Result<()>),
+}
+
+/// Schema migrations in order; migration `n` (1-based) moves a database from
+/// `user_version` `n - 1` to `n`. Databases written before versioning have
+/// `user_version` 0 and already hold migration 1's tables, which is why it
+/// only creates what is missing.
+const MIGRATIONS: &[Migration] = &[
+    Migration::Sql(
+        "
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -49,41 +71,69 @@ CREATE TABLE IF NOT EXISTS receipts (
     command_id TEXT PRIMARY KEY,
     result TEXT NOT NULL
 );
-";
+",
+    ),
+    Migration::Rust(legacy::migrate),
+];
 
-const KEY_ENVIRONMENT: &str = "environment_id";
+const KEY_SERVER: &str = "environment_id";
 const KEY_SEQUENCE: &str = "sequence";
 
 /// One row of the thread index.
 #[derive(Debug, Clone, PartialEq)]
-pub struct ThreadRow {
+pub struct ThreadIndex {
     pub id: String,
     pub project_id: String,
-    /// omp session transcript, once omp has started for this thread.
+    /// omp's session file, once omp has started for this thread.
     pub session_file: Option<String>,
-    pub archived: bool,
     pub deleted: bool,
-    /// Current `OrchestrationV2ThreadShell` JSON.
-    pub shell: Value,
+    /// The thread's records are still to be rebuilt from its session file.
+    pub replay: bool,
+    /// The thread's wire row.
+    pub row: Thread,
 }
 
-/// One projection entity of a thread.
+/// One stored entity of a thread: a turn, item or request, or its queue.
 #[derive(Debug, Clone, PartialEq)]
-pub struct EntityRow {
-    pub kind: String,
+pub struct Record {
+    pub kind: &'static str,
     pub id: String,
     pub ordinal: i64,
-    pub json: Value,
+    pub json: String,
+}
+
+impl Record {
+    pub fn new(kind: &'static str, id: &str, ordinal: i64, value: &Value) -> Self {
+        Self {
+            kind,
+            id: id.to_owned(),
+            ordinal,
+            json: value.to_string(),
+        }
+    }
+}
+
+/// Everything stored about one thread's conversation.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ThreadRecords {
+    pub turns: Vec<Turn>,
+    pub items: Vec<Item>,
+    pub requests: Vec<Request>,
+    pub queue: Vec<QueueEntry>,
 }
 
 pub struct Store {
     conn: Connection,
-    environment_id: String,
+    server_id: String,
     high_water: u64,
 }
 
+fn decode<T: DeserializeOwned>(json: &str) -> Result<T> {
+    Ok(serde_json::from_str(json)?)
+}
+
 impl Store {
-    /// Opens (creating if needed) the database at `path` in WAL mode.
+    /// Opens (creating and migrating if needed) the database at `path` in WAL mode.
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -96,13 +146,13 @@ impl Store {
         Self::init(Connection::open_in_memory()?)
     }
 
-    fn init(conn: Connection) -> Result<Self> {
-        conn.execute_batch(SCHEMA)?;
-        let environment_id = match meta(&conn, KEY_ENVIRONMENT)? {
+    fn init(mut conn: Connection) -> Result<Self> {
+        migrate(&mut conn)?;
+        let server_id = match meta(&conn, KEY_SERVER)? {
             Some(id) => id,
             None => {
                 let id = format!("env-{}", random_hex(16));
-                set_meta(&conn, KEY_ENVIRONMENT, &id)?;
+                set_meta(&conn, KEY_SERVER, &id)?;
                 id
             }
         };
@@ -111,99 +161,131 @@ impl Store {
             .unwrap_or(0);
         Ok(Self {
             conn,
-            environment_id,
+            server_id,
             high_water,
         })
     }
 
     /// Generated on first open, then stable for the life of the database.
-    pub fn environment_id(&self) -> &str {
-        &self.environment_id
+    pub fn server_id(&self) -> &str {
+        &self.server_id
     }
 
-    /// Highest sequence assigned so far (0 before any commit).
+    /// Highest sequence committed so far (0 before any commit).
     pub fn high_water(&self) -> u64 {
         self.high_water
     }
 
-    pub fn projects(&self) -> Result<Vec<Value>> {
+    pub fn projects(&self) -> Result<Vec<Project>> {
         let mut statement = self
             .conn
             .prepare_cached("SELECT json FROM projects ORDER BY rowid")?;
         let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
-        rows.map(|json| Ok(serde_json::from_str(&json?)?)).collect()
+        rows.map(|json| decode(&json?)).collect()
     }
 
-    pub fn project(&self, id: &str) -> Result<Option<Value>> {
+    pub fn project(&self, id: &str) -> Result<Option<Project>> {
         let json: Option<String> = self
             .conn
             .query_row("SELECT json FROM projects WHERE id = ?1", [id], |row| {
                 row.get(0)
             })
             .optional()?;
-        Ok(json.map(|json| serde_json::from_str(&json)).transpose()?)
+        json.map(|json| decode(&json)).transpose()
     }
 
     /// Every thread that is not deleted, in creation order.
-    pub fn threads(&self) -> Result<Vec<ThreadRow>> {
-        let mut statement = self.conn.prepare_cached(
-            "SELECT id, project_id, session_file, archived, deleted, shell
-             FROM threads WHERE deleted = 0 ORDER BY rowid",
-        )?;
-        let rows = statement.query_map([], thread_row)?;
-        rows.map(|row| row?.decode()).collect()
+    pub fn threads(&self) -> Result<Vec<ThreadIndex>> {
+        self.thread_rows("WHERE deleted = 0", [])
     }
 
-    pub fn thread(&self, id: &str) -> Result<Option<ThreadRow>> {
-        let row = self
-            .conn
-            .query_row(
-                "SELECT id, project_id, session_file, archived, deleted, shell
-                 FROM threads WHERE id = ?1",
-                [id],
-                thread_row,
-            )
-            .optional()?;
-        row.map(RawThreadRow::decode).transpose()
+    /// Threads whose records are still to be rebuilt from their session file.
+    pub fn pending_replays(&self) -> Result<Vec<ThreadIndex>> {
+        self.thread_rows("WHERE deleted = 0 AND replay = 1", [])
     }
 
-    /// All entities of one thread, ordered by kind, ordinal, then id.
-    pub fn entities(&self, thread_id: &str) -> Result<Vec<EntityRow>> {
-        let mut statement = self.conn.prepare_cached(
-            "SELECT kind, id, ordinal, json FROM entities
-             WHERE thread_id = ?1 ORDER BY kind, ordinal, id",
-        )?;
-        let rows = statement.query_map([thread_id], |row| {
+    /// Thread `id`, deleted or not.
+    pub fn thread(&self, id: &str) -> Result<Option<ThreadIndex>> {
+        Ok(self.thread_rows("WHERE id = ?1", [id])?.pop())
+    }
+
+    fn thread_rows<P: rusqlite::Params>(
+        &self,
+        filter: &str,
+        params: P,
+    ) -> Result<Vec<ThreadIndex>> {
+        let mut statement = self.conn.prepare_cached(&format!(
+            "SELECT id, project_id, session_file, deleted, replay, row FROM threads {filter} ORDER BY rowid"
+        ))?;
+        let rows = statement.query_map(params, |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, bool>(3)?,
+                row.get::<_, bool>(4)?,
+                row.get::<_, String>(5)?,
             ))
         })?;
         rows.map(|row| {
-            let (kind, id, ordinal, json) = row?;
-            Ok(EntityRow {
-                kind,
+            let (id, project_id, session_file, deleted, replay, row) = row?;
+            Ok(ThreadIndex {
                 id,
-                ordinal,
-                json: serde_json::from_str(&json)?,
+                project_id,
+                session_file,
+                deleted,
+                replay,
+                row: decode(&row)?,
             })
         })
         .collect()
     }
 
-    /// One entity of one thread.
-    pub fn entity(&self, thread_id: &str, kind: &str, id: &str) -> Result<Option<Value>> {
-        let json: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT json FROM entities WHERE thread_id = ?1 AND kind = ?2 AND id = ?3",
-                params![thread_id, kind, id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(json.map(|json| serde_json::from_str(&json)).transpose()?)
+    /// The stored conversation of one thread, each kind in ordinal order.
+    pub fn records(&self, thread_id: &str) -> Result<ThreadRecords> {
+        let mut statement = self.conn.prepare_cached(
+            "SELECT kind, json FROM records WHERE thread_id = ?1 ORDER BY kind, ordinal, id",
+        )?;
+        let rows = statement.query_map([thread_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut records = ThreadRecords::default();
+        for row in rows {
+            let (kind, json) = row?;
+            match kind.as_str() {
+                "turn" => records.turns.push(decode(&json)?),
+                "item" => records.items.push(decode(&json)?),
+                "request" => records.requests.push(decode(&json)?),
+                "queue" => records.queue = decode(&json)?,
+                _ => {}
+            }
+        }
+        Ok(records)
+    }
+
+    /// `threads.watch`'s snapshot of a thread that is not deleted (wire.md
+    /// §6.6): its requests are the open ones and those of the latest turn.
+    pub fn snapshot(&self, thread_id: &str) -> Result<Option<ThreadSnapshot>> {
+        let Some(index) = self.thread(thread_id)?.filter(|index| !index.deleted) else {
+            return Ok(None);
+        };
+        let records = self.records(thread_id)?;
+        let latest = records.turns.last().map(|turn| turn.id.clone());
+        Ok(Some(ThreadSnapshot {
+            sequence: self.high_water,
+            thread: index.row,
+            turns: records.turns,
+            items: records.items,
+            requests: records
+                .requests
+                .into_iter()
+                .filter(|request| {
+                    request.status == RequestStatus::Open
+                        || Some(&request.turn_id) == latest.as_ref()
+                })
+                .collect(),
+            queue: records.queue,
+        }))
     }
 
     pub fn receipt(&self, command_id: &str) -> Result<Option<Value>> {
@@ -215,7 +297,7 @@ impl Store {
                 |row| row.get(0),
             )
             .optional()?;
-        Ok(json.map(|json| serde_json::from_str(&json)).transpose()?)
+        json.map(|json| decode(&json)).transpose()
     }
 
     /// Starts a write transaction. Dropping it without
@@ -244,66 +326,62 @@ impl StoreTx<'_> {
         self.next_high_water
     }
 
-    /// Last sequence reserved in this transaction, or the stored high water.
-    pub fn last_sequence(&self) -> u64 {
-        self.next_high_water
-    }
-
-    pub fn upsert_entity(&self, thread_id: &str, row: &EntityRow) -> Result<()> {
+    pub fn upsert_record(&self, thread_id: &str, record: &Record) -> Result<()> {
         self.tx
             .prepare_cached(
-                "INSERT INTO entities (thread_id, kind, id, ordinal, json)
+                "INSERT INTO records (thread_id, kind, id, ordinal, json)
                  VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT (thread_id, kind, id)
                  DO UPDATE SET ordinal = excluded.ordinal, json = excluded.json",
             )?
             .execute(params![
                 thread_id,
-                row.kind,
-                row.id,
-                row.ordinal,
-                serde_json::to_string(&row.json)?
+                record.kind,
+                record.id,
+                record.ordinal,
+                record.json
             ])?;
         Ok(())
     }
 
-    pub fn upsert_thread(&self, row: &ThreadRow) -> Result<()> {
+    /// Writes a thread's index row; its records are current (no replay
+    /// pending).
+    pub fn upsert_thread(
+        &self,
+        id: &str,
+        project_id: &str,
+        session_file: Option<&str>,
+        row: &Value,
+    ) -> Result<()> {
         self.tx
             .prepare_cached(
-                "INSERT INTO threads (id, project_id, session_file, archived, deleted, shell)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                "INSERT INTO threads (id, project_id, session_file, deleted, replay, row)
+                 VALUES (?1, ?2, ?3, 0, 0, ?4)
                  ON CONFLICT (id) DO UPDATE SET project_id = excluded.project_id,
-                   session_file = excluded.session_file, archived = excluded.archived,
-                   deleted = excluded.deleted, shell = excluded.shell",
+                   session_file = excluded.session_file, deleted = 0, replay = 0,
+                   row = excluded.row",
             )?
-            .execute(params![
-                row.id,
-                row.project_id,
-                row.session_file,
-                row.archived,
-                row.deleted,
-                serde_json::to_string(&row.shell)?
-            ])?;
+            .execute(params![id, project_id, session_file, row.to_string()])?;
         Ok(())
     }
 
-    /// Drops a thread's entities and marks its index row deleted (the row
+    /// Drops a thread's records and marks its index row deleted (the row
     /// stays so a later lookup reports "deleted", not "unknown").
     pub fn delete_thread(&self, thread_id: &str) -> Result<()> {
         self.tx
-            .execute("DELETE FROM entities WHERE thread_id = ?1", [thread_id])?;
+            .execute("DELETE FROM records WHERE thread_id = ?1", [thread_id])?;
         self.tx
             .execute("UPDATE threads SET deleted = 1 WHERE id = ?1", [thread_id])?;
         Ok(())
     }
 
-    pub fn upsert_project(&self, id: &str, json: &Value) -> Result<()> {
+    pub fn upsert_project(&self, project: &Project) -> Result<()> {
         self.tx
             .prepare_cached(
                 "INSERT INTO projects (id, json) VALUES (?1, ?2)
                  ON CONFLICT (id) DO UPDATE SET json = excluded.json",
             )?
-            .execute(params![id, serde_json::to_string(json)?])?;
+            .execute(params![project.id, serde_json::to_string(project)?])?;
         Ok(())
     }
 
@@ -316,7 +394,7 @@ impl StoreTx<'_> {
     pub fn put_receipt(&self, command_id: &str, result: &Value) -> Result<()> {
         self.tx.execute(
             "INSERT OR REPLACE INTO receipts (command_id, result) VALUES (?1, ?2)",
-            params![command_id, serde_json::to_string(result)?],
+            params![command_id, result.to_string()],
         )?;
         Ok(())
     }
@@ -328,39 +406,6 @@ impl StoreTx<'_> {
         *self.high_water = self.next_high_water;
         Ok(self.next_high_water)
     }
-}
-
-struct RawThreadRow {
-    id: String,
-    project_id: String,
-    session_file: Option<String>,
-    archived: bool,
-    deleted: bool,
-    shell: String,
-}
-
-impl RawThreadRow {
-    fn decode(self) -> Result<ThreadRow> {
-        Ok(ThreadRow {
-            id: self.id,
-            project_id: self.project_id,
-            session_file: self.session_file,
-            archived: self.archived,
-            deleted: self.deleted,
-            shell: serde_json::from_str(&self.shell)?,
-        })
-    }
-}
-
-fn thread_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawThreadRow> {
-    Ok(RawThreadRow {
-        id: row.get(0)?,
-        project_id: row.get(1)?,
-        session_file: row.get(2)?,
-        archived: row.get(3)?,
-        deleted: row.get(4)?,
-        shell: row.get(5)?,
-    })
 }
 
 fn meta(conn: &Connection, key: &str) -> Result<Option<String>> {
@@ -377,6 +422,26 @@ fn set_meta(conn: &Connection, key: &str, value: &str) -> Result<()> {
          ON CONFLICT (key) DO UPDATE SET value = excluded.value",
         params![key, value],
     )?;
+    Ok(())
+}
+
+/// Applies every migration past the database's `user_version`, each in its
+/// own transaction together with the version bump.
+fn migrate(conn: &mut Connection) -> Result<()> {
+    let known = MIGRATIONS.len() as u32;
+    let found: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if found > known {
+        return Err(Error::TooNew { found, known });
+    }
+    for (index, migration) in MIGRATIONS.iter().enumerate().skip(found as usize) {
+        let tx = conn.transaction()?;
+        match migration {
+            Migration::Sql(sql) => tx.execute_batch(sql)?,
+            Migration::Rust(run) => run(&tx)?,
+        }
+        tx.pragma_update(None, "user_version", index as u32 + 1)?;
+        tx.commit()?;
+    }
     Ok(())
 }
 
@@ -397,35 +462,88 @@ pub fn random_hex(len: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use j3_protocol::v2::entities::{ModelRef, ThreadMode, ThreadStatus, Triage};
     use serde_json::json;
 
+    use super::*;
+
+    fn project(id: &str) -> Project {
+        Project {
+            id: id.into(),
+            title: "P".into(),
+            path: "/p".into(),
+            default_model: None,
+            created_at: "2026-11-01T00:00:00.000Z".into(),
+            updated_at: "2026-11-01T00:00:00.000Z".into(),
+        }
+    }
+
+    pub(super) fn row(id: &str) -> Thread {
+        Thread {
+            id: id.into(),
+            project_id: "p".into(),
+            title: "T".into(),
+            created_at: "2026-11-01T00:00:00.000Z".into(),
+            updated_at: "2026-11-01T00:00:00.000Z".into(),
+            archived_at: None,
+            status: ThreadStatus::Idle,
+            model: ModelRef {
+                provider: "anthropic".into(),
+                id: "claude".into(),
+                thinking: None,
+            },
+            mode: ThreadMode::Default,
+            active_turn_id: None,
+            pending_request: None,
+            queued: 0,
+            last_message: None,
+            latest_turn: None,
+            latest_user_message_at: None,
+            goal: None,
+            triage: Triage {
+                bumped_at: "2026-11-01T00:00:00.000Z".into(),
+                ..Triage::default()
+            },
+        }
+    }
+
     #[test]
-    fn engine_store_environment_id_and_sequence_survive_reopen() {
+    fn server_id_and_sequence_survive_reopen() {
         let dir = std::env::temp_dir().join(format!("j3-store-{}", random_hex(8)));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("j3.sqlite");
-        let (environment_id, last) = {
+        let (server_id, last) = {
             let mut store = Store::open(&path).unwrap();
             assert_eq!(store.high_water(), 0);
             let mut tx = store.transaction().unwrap();
             tx.next_sequence();
             tx.next_sequence();
-            tx.upsert_project("p1", &json!({"id": "p1"})).unwrap();
+            tx.upsert_project(&project("p1")).unwrap();
             let last = tx.commit().unwrap();
-            (store.environment_id().to_owned(), last)
+            (store.server_id().to_owned(), last)
         };
         assert_eq!(last, 2);
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.environment_id(), environment_id);
-        assert!(environment_id.starts_with("env-"));
+        assert_eq!(store.server_id(), server_id);
+        assert!(server_id.starts_with("env-"));
         assert_eq!(store.high_water(), 2);
-        assert_eq!(store.projects().unwrap(), vec![json!({"id": "p1"})]);
+        assert_eq!(store.projects().unwrap(), vec![project("p1")]);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
-    fn engine_store_dropped_transaction_rolls_back_sequence() {
+    fn refuses_a_newer_schema() {
+        let conn = Connection::open_in_memory().unwrap();
+        let newer = MIGRATIONS.len() as u32 + 1;
+        conn.pragma_update(None, "user_version", newer).unwrap();
+        assert!(matches!(
+            Store::init(conn),
+            Err(Error::TooNew { found, .. }) if found == newer
+        ));
+    }
+
+    #[test]
+    fn a_dropped_transaction_rolls_back() {
         let mut store = Store::open_in_memory().unwrap();
         {
             let mut tx = store.transaction().unwrap();
@@ -437,28 +555,44 @@ mod tests {
     }
 
     #[test]
-    fn engine_store_entities_round_trip_in_order() {
+    fn threads_and_records_round_trip() {
         let mut store = Store::open_in_memory().unwrap();
         let tx = store.transaction().unwrap();
-        for (id, ordinal) in [("b", 2), ("a", 1), ("c", 2)] {
-            tx.upsert_entity(
+        tx.upsert_thread("t1", "p", Some("/s.jsonl"), &json!(row("t1")))
+            .unwrap();
+        let turn = json!({"id": "turn_1", "threadId": "t1", "ordinal": 1, "status": "completed",
+            "model": {"provider": "a", "id": "b"}, "requestedAt": "2026-11-01T00:00:00.000Z"});
+        tx.upsert_record("t1", &Record::new("turn", "turn_1", 1, &turn))
+            .unwrap();
+        for ordinal in [2, 1] {
+            let item = json!({"id": format!("item_{ordinal}"), "threadId": "t1", "turnId": "turn_1",
+                "ordinal": ordinal, "status": "completed", "startedAt": "2026-11-01T00:00:00.000Z",
+                "kind": "text", "text": "x"});
+            tx.upsert_record(
                 "t1",
-                &EntityRow {
-                    kind: "turnItem".into(),
-                    id: id.into(),
-                    ordinal,
-                    json: json!({"id": id}),
-                },
+                &Record::new("item", &format!("item_{ordinal}"), ordinal, &item),
             )
             .unwrap();
         }
+        tx.upsert_record("t1", &Record::new("queue", "queue", 0, &json!([])))
+            .unwrap();
         tx.commit().unwrap();
-        let ids: Vec<_> = store
-            .entities("t1")
-            .unwrap()
-            .into_iter()
-            .map(|row| row.id)
-            .collect();
-        assert_eq!(ids, ["a", "b", "c"]);
+        let records = store.records("t1").unwrap();
+        assert_eq!(records.turns.len(), 1);
+        let ids: Vec<_> = records.items.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(ids, ["item_1", "item_2"]);
+        let index = store.thread("t1").unwrap().unwrap();
+        assert_eq!(index.session_file.as_deref(), Some("/s.jsonl"));
+        assert!(!index.replay && !index.deleted);
+        let snapshot = store.snapshot("t1").unwrap().unwrap();
+        assert_eq!(snapshot.items.len(), 2);
+
+        let tx = store.transaction().unwrap();
+        tx.delete_thread("t1").unwrap();
+        tx.commit().unwrap();
+        assert!(store.thread("t1").unwrap().unwrap().deleted);
+        assert!(store.threads().unwrap().is_empty());
+        assert!(store.snapshot("t1").unwrap().is_none());
+        assert!(store.records("t1").unwrap().items.is_empty());
     }
 }

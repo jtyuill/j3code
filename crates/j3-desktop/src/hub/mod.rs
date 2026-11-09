@@ -5,7 +5,7 @@
 //!
 //! The roster lists running subagents first, then the most recently updated. The selected
 //! subagent's transcript is read from its omp session file through
-//! `connection.subagent_transcript` a slice at a time (`from_byte` → `next_byte`), right
+//! `subagents.transcript` a slice at a time (`from_byte` → `next_byte`), right
 //! away while more is waiting and every [`POLL_INTERVAL`] while it runs. Keys: ↑/↓ or k/j
 //! select, PageUp/PageDown scroll the transcript, x stops the selected subagent.
 
@@ -17,8 +17,11 @@ use std::{
     time::Duration,
 };
 
-use j3_client::{ThreadState, t3::orchestration::Subagent};
-use j3_protocol::j3::{SubagentTranscript, TranscriptEntry};
+use j3_client::{
+    ThreadView,
+    entities::{Item, ItemStatus, SubagentItem},
+    methods::{TranscriptEntry, TranscriptParams, TranscriptResult},
+};
 use rune::{Key, KeyEvent, TextEdit, Tx};
 
 pub use double_tap::{DoubleTap, tap_time};
@@ -66,15 +69,27 @@ pub struct Transcript {
     pub error: Option<String>,
 }
 
+/// A subagent of the thread: its feed item and the item's subagent fields.
+pub type Entry<'a> = (&'a Item, &'a SubagentItem);
+
+/// Whether subagent item `item` still runs.
+pub fn is_running(item: &Item) -> bool {
+    item.status == ItemStatus::Running
+}
+
+/// When subagent item `item` last changed: its end, else its start.
+fn updated_at(item: &Item) -> &str {
+    item.ended_at.as_deref().unwrap_or(&item.started_at)
+}
+
 /// `state`'s subagents, running ones first, then the most recently updated, then by id.
-pub fn roster(state: &ThreadState) -> Vec<&Subagent> {
-    let mut roster: Vec<&Subagent> = state.subagents().iter().collect();
-    roster.sort_by(|a, b| {
-        b.status
-            .is_active()
-            .cmp(&a.status.is_active())
-            .then_with(|| b.updated_at.cmp(&a.updated_at))
-            .then_with(|| a.id.cmp(&b.id))
+pub fn roster(state: &ThreadView) -> Vec<Entry<'_>> {
+    let mut roster: Vec<Entry> = state.subagents().collect();
+    roster.sort_by(|(a, sa), (b, sb)| {
+        is_running(b)
+            .cmp(&is_running(a))
+            .then_with(|| updated_at(b).cmp(updated_at(a)))
+            .then_with(|| sa.subagent_id.cmp(&sb.subagent_id))
     });
     roster
 }
@@ -94,7 +109,7 @@ impl AgentHub {
 
     /// Keeps a selection that still exists, else selects the roster's first; true when the
     /// selection changed.
-    fn follow(&mut self, state: &ThreadState) -> bool {
+    fn follow(&mut self, state: &ThreadView) -> bool {
         if self
             .selected
             .as_ref()
@@ -102,7 +117,9 @@ impl AgentHub {
         {
             return false;
         }
-        let first = roster(state).first().map(|subagent| subagent.id.clone());
+        let first = roster(state)
+            .first()
+            .map(|(_, subagent)| subagent.subagent_id.clone());
         let changed = first != self.selected;
         self.selected = first;
         self.next_read = 0.0;
@@ -110,9 +127,9 @@ impl AgentHub {
     }
 
     /// The read the selected transcript needs now, if any: (subagent id, from byte).
-    fn next_fetch(&self, state: &ThreadState) -> Option<(String, u64)> {
+    fn next_fetch(&self, state: &ThreadView) -> Option<(String, u64)> {
         let id = self.selected.as_ref()?;
-        let active = state.subagent(id)?.status.is_active();
+        let active = is_running(state.subagent(id)?.0);
         let transcript = self.transcripts.get(id);
         let due = transcript.is_none_or(|t| match t.error {
             // Not found yet (a subagent that just started): keep trying while it runs.
@@ -127,7 +144,7 @@ impl AgentHub {
         &mut self,
         subagent_id: &str,
         from_byte: u64,
-        result: Result<SubagentTranscript, j3_client::Error>,
+        result: Result<TranscriptResult, j3_client::Error>,
         active: bool,
     ) -> bool {
         let transcript = self.transcripts.entry(subagent_id.to_owned()).or_default();
@@ -158,7 +175,7 @@ impl AgentHub {
     }
 
     /// Selects the roster entry `delta` rows away (clamped); true when it moved.
-    fn move_selection(&mut self, state: &ThreadState, delta: isize) -> bool {
+    fn move_selection(&mut self, state: &ThreadView, delta: isize) -> bool {
         let roster = roster(state);
         if roster.is_empty() {
             return false;
@@ -166,10 +183,14 @@ impl AgentHub {
         let current = self
             .selected
             .as_ref()
-            .and_then(|id| roster.iter().position(|subagent| &subagent.id == id))
+            .and_then(|id| {
+                roster
+                    .iter()
+                    .position(|(_, subagent)| &subagent.subagent_id == id)
+            })
             .unwrap_or(0);
         let next = (current as isize + delta).clamp(0, roster.len() as isize - 1) as usize;
-        let id = roster[next].id.clone();
+        let id = roster[next].1.subagent_id.clone();
         self.select(id)
     }
 
@@ -190,7 +211,7 @@ impl J3 {
         let Some(thread) = self.threads.get(&key) else {
             return;
         };
-        if thread.state.subagents().is_empty() {
+        if thread.state.subagents().next().is_none() {
             return;
         }
         let state = thread.state.clone();
@@ -227,25 +248,22 @@ impl J3 {
         }
     }
 
-    /// Stops the selected subagent while it runs (`connection.stop_subagent`).
+    /// Stops the selected subagent while it runs (`subagents.stop`).
     pub fn stop_selected_subagent(&mut self, key: &ThreadKey) {
         let Some(state) = self.threads.get(key).map(|thread| thread.state.clone()) else {
             return;
         };
-        let Some(subagent) = self
+        let Some((_, subagent)) = self
             .hubs
             .get(key)
             .and_then(|hub| hub.selected.as_ref())
             .and_then(|id| state.subagent(id))
-            .filter(|subagent| subagent.status.is_active())
+            .filter(|(item, _)| is_running(item))
         else {
             return;
         };
-        let Some(run_id) = subagent.run_id.clone() else {
-            return;
-        };
-        let subagent_id = subagent.id.clone();
-        self.stop_subagent(key, &run_id, &subagent_id);
+        let subagent_id = subagent.subagent_id.clone();
+        self.stop_subagent(key, &subagent_id);
     }
 
     /// A key for the open thread's hub while nothing has focus (the window's `on_key`):
@@ -338,11 +356,14 @@ impl J3 {
         if let Some(hub) = self.hubs.get_mut(key) {
             hub.reading = true;
         }
-        let (key, thread_id) = (key.clone(), key.thread_id.clone());
+        let key = key.clone();
+        let params = TranscriptParams {
+            thread_id: key.thread_id.clone(),
+            subagent_id: subagent_id.clone(),
+            from_byte,
+        };
         self.spawn(async move {
-            let result = connection
-                .subagent_transcript(&thread_id, &subagent_id, from_byte)
-                .await;
+            let result = connection.subagents_transcript(params).await;
             move |s: &mut J3, tx: &mut Tx| s.hub_read(&key, &subagent_id, from_byte, result, tx)
         });
         changed
@@ -355,14 +376,14 @@ impl J3 {
         key: &ThreadKey,
         subagent_id: &str,
         from_byte: u64,
-        result: Result<SubagentTranscript, j3_client::Error>,
+        result: Result<TranscriptResult, j3_client::Error>,
         tx: &mut Tx,
     ) {
         let active = self
             .threads
             .get(key)
             .and_then(|thread| thread.state.subagent(subagent_id))
-            .is_some_and(|subagent| subagent.status.is_active());
+            .is_some_and(|(item, _)| is_running(item));
         let now = self.clock.t;
         let Some(hub) = self.hubs.get_mut(key) else {
             return;

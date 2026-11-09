@@ -30,10 +30,7 @@ image = { version = "0.25", default-features = false, features = ["bmp", "gif", 
 j3-client.workspace = true
 j3-core.workspace = true
 j3-protocol.workspace = true
-ratex-layout.workspace = true
-ratex-parser.workspace = true
-ratex-svg.workspace = true
-ratex-types.workspace = true
+j3-text.workspace = true
 # HTTPS for speech model downloads.
 reqwest = { workspace = true, features = ["rustls"] }
 rune.workspace = true

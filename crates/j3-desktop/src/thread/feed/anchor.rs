@@ -13,7 +13,7 @@
 
 use std::time::Duration;
 
-use j3_client::{ThreadState, ThreadSync, t3::orchestration::TurnItemKind};
+use j3_client::{ThreadSync, ThreadView, entities::ItemKind};
 use rune::{Cx, Tx};
 
 use super::{END_PAD, FeedUi};
@@ -90,13 +90,12 @@ impl Anchor {
 }
 
 /// The newest user message shown in `state`'s feed.
-fn latest_prompt(state: &ThreadState) -> Option<&str> {
+fn latest_prompt(state: &ThreadView) -> Option<&str> {
     state
-        .feed()
+        .items
         .iter()
         .rev()
-        .map(|projected| &projected.item)
-        .find(|item| matches!(item.kind, TurnItemKind::UserMessage(_)) && !is_hidden(item))
+        .find(|item| matches!(item.kind, ItemKind::User(_)) && !is_hidden(item))
         .map(|item| item.id.as_str())
 }
 
@@ -110,15 +109,15 @@ impl FeedUi {
     /// feed becomes the anchor, and the anchor's run ending starts its rest.
     pub(crate) fn track_anchor(
         &mut self,
-        old: &ThreadState,
-        new: &ThreadState,
+        old: &ThreadView,
+        new: &ThreadView,
         open: bool,
         now: f64,
         tx: &mut Tx,
     ) {
-        let caught_up = old.projection.is_some()
-            && old.sync == ThreadSync::Live
-            && new.sync == ThreadSync::Live;
+        let caught_up = old.thread.is_some()
+            && old.sync == ThreadSync::Synced
+            && new.sync == ThreadSync::Synced;
         if open
             && caught_up
             && let Some(id) = latest_prompt(new)
@@ -130,7 +129,11 @@ impl FeedUi {
         let Some(anchor) = self.anchor.as_mut() else {
             return;
         };
-        if new.active_run().is_some() {
+        if new
+            .thread
+            .as_ref()
+            .is_some_and(|thread| thread.active_turn_id.is_some())
+        {
             anchor.ran = true;
             anchor.rest_at = None;
             anchor.rested = false;

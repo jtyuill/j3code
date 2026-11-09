@@ -243,10 +243,15 @@ impl J3 {
         let Some(state) = self.envs.get(env).map(|e| e.state().clone()) else {
             return;
         };
-        let Some(project) = state.shell.project(project_id) else {
+        let Some(project) = state.shell.projects.get(project_id) else {
             return;
         };
-        let threads = state.shell.threads_of(project_id).len();
+        let threads = state
+            .shell
+            .threads
+            .values()
+            .filter(|thread| thread.project_id == project_id && thread.archived_at.is_none())
+            .count();
         if threads > 0 {
             self.toasts.error(format!(
                 "“{}” still has {threads} thread(s). Archive or delete them first.",
@@ -268,7 +273,15 @@ impl J3 {
         };
         self.run_command(
             "remove the project",
-            async move { connection.delete_project(&project_id).await },
+            async move {
+                connection
+                    .projects_delete(j3_client::methods::DeleteProjectParams {
+                        project_id,
+                        force: None,
+                        command_id: None,
+                    })
+                    .await
+            },
             |_, _, _| {},
         );
     }

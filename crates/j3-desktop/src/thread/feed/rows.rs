@@ -1,21 +1,15 @@
 //! The non-tool, non-assistant rows of the feed (spec §6.2): user messages, reasoning and
-//! notices on the activity rail, the user-input request card, the compaction rule and
-//! subagent cards.
+//! notices on the activity rail, goal updates, the compaction rule and subagent cards.
 
-use j3_client::t3::{
-    chat_attachment::ChatAttachment,
-    orchestration::{
-        SubagentItem, SubagentStatus, TurnItem, TurnItemStatus, UserInputRequestItem,
-        UserMessageInputIntent,
-    },
-};
+use j3_client::entities::{Attachment, Delivery, Goal, Item, ItemStatus, SubagentItem};
+use j3_text::message::SpanKind;
 use rune::{Color, Easing, El, Icon, LoopSpec, Span, col, el, icon, memo, rich, row, text};
 use rune_kit::{Button, ButtonVariant, ControlSize, Kit, Spinner};
 
 use super::{Ctx, disclosure, rail};
 use crate::{
     app::J3, environment::ImageRef, feed, icons, images::ImageLoad, keywords, math::view::doc,
-    mention, message_text, theme::Status,
+    mention, theme::Status,
 };
 
 /// A user message: a right-aligned bubble with its badge, attachments and text, mentions as
@@ -25,15 +19,13 @@ pub fn user_message(
     cx: &Ctx,
     id: &str,
     message: &str,
-    attachments: &[ChatAttachment],
-    intent: UserMessageInputIntent,
+    attachments: &[Attachment],
+    delivery: Delivery,
 ) -> El {
     let k = cx.k;
-    let badge = match intent {
-        UserMessageInputIntent::Steer => Some("Steer"),
-        UserMessageInputIntent::PromotedQueuedToSteer => Some("Steer (from queue)"),
-        UserMessageInputIntent::QueuedTurn => Some("Queued"),
-        UserMessageInputIntent::TurnStart => None,
+    let badge = match delivery {
+        Delivery::Steer => Some("Steer"),
+        Delivery::Prompt => None,
     };
     let mut bubble = col()
         .max_w(cx.width * 0.8)
@@ -60,7 +52,7 @@ pub fn user_message(
     }
     if !message.is_empty() {
         let models = s.envs.get(&cx.key.env).map(|env| env.models().clone());
-        let rich_text = message_text::rich(message, |selector| {
+        let rich_text = j3_text::message::rich(message, |selector| {
             let choices = models.as_deref()?;
             mention::find_choice(choices, selector).map(|choice| choice.label.text().to_owned())
         });
@@ -68,7 +60,7 @@ pub fn user_message(
         let mut spans = Vec::with_capacity(rich_text.spans.len());
         for span in &rich_text.spans {
             match span.kind {
-                message_text::SpanKind::Keyword(keyword) => {
+                SpanKind::Keyword(keyword) => {
                     let chars = rich_text.text[span.range.clone()].char_indices();
                     for ((offset, ch), color) in chars.zip(keywords::colors(keyword, 0.0)) {
                         let start = span.range.start + offset;
@@ -77,7 +69,7 @@ pub fn user_message(
                         spans.push(s);
                     }
                 }
-                message_text::SpanKind::Model => spans.push(
+                SpanKind::Model => spans.push(
                     Span::new(span.range.start, span.range.end)
                         .bold()
                         .color(info)
@@ -98,13 +90,9 @@ pub fn user_message(
 }
 
 /// An attachment as a 64 point frame: the picture, a spinner while it loads, or its name.
-fn attachment_thumbnail(s: &J3, cx: &Ctx, id: &str, attachment: &ChatAttachment) -> El {
+fn attachment_thumbnail(s: &J3, cx: &Ctx, id: &str, attachment: &Attachment) -> El {
     let k = cx.k;
-    let name = match attachment {
-        ChatAttachment::Image(image) => image.name.clone(),
-        ChatAttachment::File(file) => file.name.clone(),
-        ChatAttachment::Unknown(other) => other.name.clone(),
-    };
+    let name = attachment.name.clone();
     let frame = el()
         .key(format!("attachment-{id}"))
         .label(name.clone())
@@ -136,7 +124,7 @@ fn attachment_thumbnail(s: &J3, cx: &Ctx, id: &str, attachment: &ChatAttachment)
 
 /// Reasoning on the rail: "Thinking…" shimmering while it streams, else "Thought" and how long
 /// it took; expanded, the reasoning as muted markdown under the header.
-pub fn reasoning(s: &J3, cx: &Ctx, item: &TurnItem, reasoning: &str, streaming: bool) -> El {
+pub fn reasoning(s: &J3, cx: &Ctx, item: &Item, reasoning: &str, streaming: bool) -> El {
     let k = cx.k;
     let id = &item.id;
     let expanded = cx.expanded(id);
@@ -167,7 +155,7 @@ pub fn reasoning(s: &J3, cx: &Ctx, item: &TurnItem, reasoning: &str, streaming: 
         .on_press(move |s: &mut J3| s.toggle_feed_row(&key, &toggled));
     let body = (expanded && !reasoning.trim().is_empty()).then(|| {
         let look = cx.look(k.c.text_muted, streaming);
-        let doc = doc(s, &cx.key.env, &item.thread_id, reasoning, look);
+        let doc = doc(s, &cx.key.env, cx.project_id(), reasoning, look);
         cx.wait_all(&doc.wait);
         el().w_full()
             .pt(2.0)
@@ -225,73 +213,6 @@ fn shimmer(k: &Kit, label: &str, now: f64) -> El {
         .child(sheen)
 }
 
-/// A question the agent asked: a bordered card (warning while it waits) with each question
-/// and its answer.
-pub fn question(cx: &Ctx, status: TurnItemStatus, request: &UserInputRequestItem) -> El {
-    let k = cx.k;
-    let tone = Status::of(k);
-    let answers = request
-        .question_answer
-        .as_ref()
-        .map(|answer| &answer.answers);
-    let waiting = matches!(status, TurnItemStatus::Waiting | TurnItemStatus::Pending);
-    let mut card = col()
-        .w_full()
-        .gap(4.0)
-        .px(12.0)
-        .py(8.0)
-        .radius(k.radius.lg)
-        .border(
-            1.0,
-            if waiting {
-                tone.warning
-            } else {
-                k.c.border_base
-            },
-        );
-    for question in &request.questions {
-        let answer = answers
-            .and_then(|answers| answers.get(&question.id))
-            .map(feed::answer_text);
-        let answer = match answer {
-            Some(answer) if !answer.is_empty() => row()
-                .gap(4.0)
-                .center_y()
-                .child(icon(&icons::CHECK, 12.0).color(tone.success))
-                .child(
-                    text(answer)
-                        .font(k.ty.body_medium)
-                        .color(k.c.text_base)
-                        .wrap(),
-                ),
-            _ if waiting => text("Waiting for your answer")
-                .font(k.ty.text_xsmall)
-                .color(tone.warning),
-            _ => text("No answer")
-                .font(k.ty.text_xsmall)
-                .color(k.c.text_muted),
-        };
-        card = card.child(
-            col()
-                .w_full()
-                .gap(2.0)
-                .child(
-                    text(question.header.clone())
-                        .font(k.ty.text_xsmall)
-                        .color(k.c.text_muted),
-                )
-                .child(
-                    text(question.question.clone())
-                        .font(k.ty.body)
-                        .color(k.c.text_base)
-                        .wrap(),
-                )
-                .child(answer),
-        );
-    }
-    card
-}
-
 /// A notice on the rail (todo updates, errors, notices, interrupts): `glyph` in `color`, then
 /// the message in `ink`, wrapped.
 pub fn notice(cx: &Ctx, glyph: &'static Icon, color: Color, ink: Color, message: String) -> El {
@@ -302,6 +223,18 @@ pub fn notice(cx: &Ctx, glyph: &'static Icon, color: Color, ink: Color, message:
         .py(((rail::HEADER - font.line_height) / 2.0).max(0.0))
         .child(text(message).font(font).color(ink).wrap());
     rail::row(k, cx.rail, cx.top, rail::glyph(glyph, color), message, None)
+}
+
+/// A goal update on the rail.
+pub fn goal(cx: &Ctx, goal: &Goal) -> El {
+    let k = cx.k;
+    notice(
+        cx,
+        &icons::STAR,
+        k.c.text_faint,
+        k.c.text_muted,
+        feed::goal_label(goal),
+    )
 }
 
 /// A hairline rule with the compaction label in its middle.
@@ -318,33 +251,23 @@ pub fn compaction(k: &Kit, label: String) -> El {
 
 /// A subagent the agent started: title, model, status, live progress and, expanded, its
 /// assignment and result; Stop while it runs.
-pub fn subagent(cx: &Ctx, item: &TurnItem, subagent: &SubagentItem) -> El {
+pub fn subagent(cx: &Ctx, item: &Item, subagent: &SubagentItem) -> El {
     let k = cx.k;
     let tone = Status::of(k);
     let id = &item.id;
-    let entity = cx.state.subagent(&subagent.subagent_id);
-    let status = entity.map(|s| s.status);
-    let active = status.is_some_and(SubagentStatus::is_active);
-    let title = entity
-        .and_then(|s| s.title.clone())
-        .or_else(|| item.title.clone())
+    let status = item.status;
+    let active = status == ItemStatus::Running;
+    let title = Some(crate::hub::view::subagent_title(subagent))
         .filter(|t| !t.trim().is_empty())
         .unwrap_or_else(|| "Subagent".to_owned());
-    let model = entity.and_then(|s| s.model.clone());
-    let progress = entity
-        .and_then(|s| s.progress.clone())
-        .or_else(|| subagent.progress.clone());
-    let result = entity
-        .and_then(|s| s.result.clone())
-        .or_else(|| subagent.result.clone());
-    let failed = matches!(status, Some(SubagentStatus::Failed));
+    let model = subagent.model.clone();
+    let progress = subagent.progress.clone();
+    let result = subagent.result.clone();
+    let failed = status == ItemStatus::Failed;
     let expanded = cx.expanded(id);
     let summary = result.as_deref().map(feed::one_line);
     let progress = progress.filter(|_| active || summary.is_none());
-    let mut label = format!(
-        "{title}, {}",
-        status.map_or("Unknown", feed::subagent_status_label)
-    );
+    let mut label = format!("{title}, {}", feed::subagent_status_label(status));
     if let Some(progress) = &progress {
         label.push_str(&format!(", {progress}"));
     }
@@ -382,25 +305,20 @@ pub fn subagent(cx: &Ctx, item: &TurnItem, subagent: &SubagentItem) -> El {
     if active {
         toggle = toggle.child(Spinner::new().size(12.0).build(k));
     }
-    if let Some(status) = status {
-        toggle = toggle.child(
-            text(feed::subagent_status_label(status))
-                .font(k.ty.text_xsmall)
-                .color(if failed { tone.danger } else { k.c.text_muted }),
-        );
-    }
+    toggle = toggle.child(
+        text(feed::subagent_status_label(status))
+            .font(k.ty.text_xsmall)
+            .color(if failed { tone.danger } else { k.c.text_muted }),
+    );
     let mut header = row().w_full().gap(8.0).center_y().child(toggle);
-    if let Some((run_id, subagent_id)) = entity
-        .filter(|_| active)
-        .and_then(|s| Some((s.run_id.clone()?, s.id.clone())))
-    {
-        let key = cx.key.clone();
+    if active {
+        let (key, subagent_id) = (cx.key.clone(), subagent.subagent_id.clone());
         header = header.child(
             Button::new("Stop")
                 .icon(&icons::SQUARE)
                 .variant(ButtonVariant::Ghost)
                 .control_size(ControlSize::Mini)
-                .on_press(move |s: &mut J3| s.stop_subagent(&key, &run_id, &subagent_id))
+                .on_press(move |s: &mut J3| s.stop_subagent(&key, &subagent_id))
                 .build(k)
                 .key(format!("stop-subagent-{}", subagent.subagent_id)),
         );

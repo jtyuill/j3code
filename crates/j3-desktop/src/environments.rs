@@ -95,13 +95,24 @@ pub fn config_path() -> Result<PathBuf, ConfigError> {
 
 impl DesktopConfig {
     /// Reads `path`, creating it with [`DesktopConfig::default_for_host`]
-    /// when missing.
+    /// when missing. A file that stores the workflow under its old name is
+    /// rewritten with the current one.
     pub fn load_or_create(path: &Path, hostname: &str) -> Result<Self, ConfigError> {
         match fs::read(path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|source| ConfigError::Parse {
-                path: path.to_owned(),
-                source,
-            }),
+            Ok(bytes) => {
+                let parse = |source| ConfigError::Parse {
+                    path: path.to_owned(),
+                    source,
+                };
+                let raw: serde_json::Value = serde_json::from_slice(&bytes).map_err(parse)?;
+                let stored = raw.pointer("/ui/workflow").cloned();
+                let config: Self = serde_json::from_value(raw).map_err(parse)?;
+                let current = serde_json::to_value(config.ui.workflow).ok();
+                if stored.is_some() && stored != current {
+                    config.save(path)?;
+                }
+                Ok(config)
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 let config = Self::default_for_host(hostname);
                 config.save(path)?;
@@ -294,7 +305,7 @@ mod tests {
             on_disk["environments"],
             serde_json::json!([{"label":"shieldy","url":"http://shieldy:3780"}])
         );
-        assert_eq!(on_disk["ui"]["workflow"], "t3");
+        assert_eq!(on_disk["ui"]["workflow"], "inbox");
 
         let mut changed = created;
         changed.add("revived", "revived").unwrap();
@@ -309,6 +320,22 @@ mod tests {
             DesktopConfig::load_or_create(&path, "revolver"),
             Err(ConfigError::Parse { .. })
         ));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_old_workflow_name_is_rewritten_on_load() {
+        let dir = std::env::temp_dir().join(format!("j3-desktop-migrate-{}", std::process::id()));
+        let path = dir.join("desktop.json");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let old = r#"{"environments": [], "ui": {"workflow": "t3"}}"#; // deny-list: allow
+        fs::write(&path, old).unwrap();
+
+        let config = DesktopConfig::load_or_create(&path, "revolver").unwrap();
+        assert_eq!(config.ui.workflow, crate::ui_settings::Workflow::Inbox);
+        let on_disk: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(on_disk["ui"]["workflow"], "inbox");
         fs::remove_dir_all(&dir).unwrap();
     }
 

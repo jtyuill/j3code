@@ -1,62 +1,55 @@
-//! `orchestration.subscribeShell` / `orchestration.subscribeThread` streams
-//! (ios-surface §4.1–§4.2).
+//! `shell.watch` and `threads.watch` (`docs/protocol/wire.md` §6).
 //!
 //! Each stream subscribes to the hub broadcast first, then reads its snapshot
-//! and the high-water mark under the store lock, emits the snapshot and
-//! `synchronized`, then forwards live items whose sequence is above the last
-//! one emitted. A lagging receiver gets a fresh snapshot, which clients accept
-//! at any time.
+//! and the high-water mark under the store lock, emits `snapshot` and
+//! `synced`, then forwards live commits whose sequence is above the last one
+//! emitted. Every subscription starts with a snapshot, whatever its `after`
+//! (wire.md §6.2 allows that). A lagging receiver gets a fresh snapshot.
 
 use std::{collections::VecDeque, sync::Arc};
 
 use futures_util::stream::{self, BoxStream, StreamExt};
-use serde_json::{Value, json};
+use j3_protocol::v2::{
+    envelope::Error,
+    streams::{ShellItem, ShellSnapshot, ThreadItem},
+};
+use serde_json::Value;
 use tokio::sync::broadcast::{self, error::RecvError};
 
 use crate::{
     hub::{Hub, ShellEvent, ThreadEvent},
-    rpc::StreamItem,
-    store::Store,
+    store::{self, Store},
+    v2::driver::StreamEvent,
 };
 
-/// Builds a snapshot body from a consistent store view; `Err` is the typed
-/// error JSON that ends the stream.
-pub type SnapshotFn = Arc<dyn Fn(&Store) -> Result<Value, Value> + Send + Sync>;
+/// Reads a snapshot item from a consistent store view.
+type SnapshotFn = Arc<dyn Fn(&Store) -> Result<Value, Error> + Send + Sync>;
 
-fn synchronized() -> StreamItem {
-    StreamItem::Value(json!({"kind": "synchronized"}))
+fn encode<T: serde::Serialize>(value: &T) -> Value {
+    serde_json::to_value(value).expect("v2 stream items always encode")
 }
 
-/// Reads `(high water, snapshot body)` atomically.
-fn read_snapshot(hub: &Hub, snapshot: &SnapshotFn) -> Result<(u64, Value), Value> {
-    hub.read(|store| Ok((store.high_water(), snapshot(store)?)))
+fn store_error(error: store::Error) -> Error {
+    tracing::error!(%error, "reading a stream snapshot");
+    Error::internal("The server could not read its state.")
 }
 
-struct State<E> {
-    hub: Arc<Hub>,
-    rx: broadcast::Receiver<E>,
-    snapshot: SnapshotFn,
-    wrap: fn(u64, Value) -> Value,
-    last: u64,
-    queue: VecDeque<StreamItem>,
-    done: bool,
-}
-
+/// One broadcast commit.
 trait Live: Clone + Send + Sync + 'static {
     fn sequence(&self) -> u64;
-    fn item(&self) -> &Value;
-    fn wanted(&self, filter: &Option<Arc<str>>) -> bool;
+    fn items(&self) -> &[Value];
+    fn wanted(&self, thread: Option<&str>) -> bool;
 }
 
 impl Live for ThreadEvent {
     fn sequence(&self) -> u64 {
         self.sequence
     }
-    fn item(&self) -> &Value {
-        &self.item
+    fn items(&self) -> &[Value] {
+        &self.items
     }
-    fn wanted(&self, filter: &Option<Arc<str>>) -> bool {
-        filter.as_deref() == Some(&*self.thread_id)
+    fn wanted(&self, thread: Option<&str>) -> bool {
+        thread == Some(&*self.thread_id)
     }
 }
 
@@ -64,11 +57,44 @@ impl Live for ShellEvent {
     fn sequence(&self) -> u64 {
         self.sequence
     }
-    fn item(&self) -> &Value {
-        &self.item
+    fn items(&self) -> &[Value] {
+        &self.items
     }
-    fn wanted(&self, _: &Option<Arc<str>>) -> bool {
+    fn wanted(&self, _: Option<&str>) -> bool {
         true
+    }
+}
+
+struct State<E> {
+    hub: Arc<Hub>,
+    rx: broadcast::Receiver<E>,
+    snapshot: SnapshotFn,
+    thread: Option<String>,
+    last: u64,
+    queue: VecDeque<StreamEvent>,
+    done: bool,
+}
+
+impl<E: Live> State<E> {
+    /// Queues a fresh snapshot (and `synced` on the first one).
+    fn snapshot(&mut self, first: bool) {
+        let read = self
+            .hub
+            .read(|store| Ok::<_, Error>((store.high_water(), (self.snapshot)(store)?)));
+        match read {
+            Ok((sequence, item)) => {
+                self.last = sequence;
+                self.queue.push_back(StreamEvent::Item(item));
+                if first {
+                    self.queue
+                        .push_back(StreamEvent::Item(encode(&ShellItem::Synced)));
+                }
+            }
+            Err(error) => {
+                self.queue.push_back(StreamEvent::Fail(error));
+                self.done = true;
+            }
+        }
     }
 }
 
@@ -76,64 +102,44 @@ fn live_stream<E: Live>(
     hub: Arc<Hub>,
     rx: broadcast::Receiver<E>,
     snapshot: SnapshotFn,
-    wrap: fn(u64, Value) -> Value,
-    filter: Option<Arc<str>>,
-) -> BoxStream<'static, StreamItem> {
+    thread: Option<String>,
+) -> BoxStream<'static, StreamEvent> {
     let mut state = State {
         hub,
         rx,
         snapshot,
-        wrap,
+        thread,
         last: 0,
         queue: VecDeque::new(),
         done: false,
     };
-    match read_snapshot(&state.hub, &state.snapshot) {
-        Ok((sequence, body)) => {
-            state.last = sequence;
-            state
-                .queue
-                .push_back(StreamItem::Value((state.wrap)(sequence, body)));
-            state.queue.push_back(synchronized());
-        }
-        Err(error) => {
-            state.queue.push_back(StreamItem::Fail(error));
-            state.done = true;
-        }
-    }
-    stream::unfold((state, filter), |(mut state, filter)| async move {
+    state.snapshot(true);
+    stream::unfold(state, |mut state| async move {
         loop {
             if let Some(item) = state.queue.pop_front() {
-                return Some((item, (state, filter)));
+                return Some((item, state));
             }
             if state.done {
                 return None;
             }
             match state.rx.recv().await {
                 Ok(event) => {
-                    if event.wanted(&filter) && event.sequence() > state.last {
+                    if event.wanted(state.thread.as_deref()) && event.sequence() > state.last {
                         state.last = event.sequence();
-                        state
-                            .queue
-                            .push_back(StreamItem::Value(event.item().clone()));
+                        for item in event.items() {
+                            // A removed thread's stream ends after saying so.
+                            if item["type"] == "thread.removed" && state.thread.is_some() {
+                                state.done = true;
+                            }
+                            state.queue.push_back(StreamEvent::Item(item.clone()));
+                        }
                     }
                 }
                 Err(RecvError::Lagged(_)) => {
                     // Jump to the live tail before reading the snapshot, so
                     // stale buffered items cannot lag the receiver again.
                     state.rx = state.rx.resubscribe();
-                    match read_snapshot(&state.hub, &state.snapshot) {
-                        Ok((sequence, body)) => {
-                            state.last = sequence;
-                            state
-                                .queue
-                                .push_back(StreamItem::Value((state.wrap)(sequence, body)));
-                        }
-                        Err(error) => {
-                            state.queue.push_back(StreamItem::Fail(error));
-                            state.done = true;
-                        }
-                    }
+                    state.snapshot(false);
                 }
                 Err(RecvError::Closed) => return None,
             }
@@ -142,53 +148,56 @@ fn live_stream<E: Live>(
     .boxed()
 }
 
-/// `subscribeShell`. `snapshot` returns the `OrchestrationV2ShellSnapshot`
-/// body without `snapshotSequence`, which is filled in here.
-pub fn shell_stream(hub: Arc<Hub>, snapshot: SnapshotFn) -> BoxStream<'static, StreamItem> {
+/// `shell.watch`: every project and every thread that is not deleted.
+pub fn shell_stream(hub: Arc<Hub>) -> BoxStream<'static, StreamEvent> {
     let rx = hub.subscribe_shell();
-    live_stream(
-        hub,
-        rx,
-        snapshot,
-        |sequence, mut body| {
-            body["snapshotSequence"] = json!(sequence);
-            json!({"kind": "snapshot", "snapshot": body})
-        },
-        None,
-    )
+    let snapshot: SnapshotFn = Arc::new(|store: &Store| {
+        let projects = store.projects().map_err(store_error)?;
+        let threads = store
+            .threads()
+            .map_err(store_error)?
+            .into_iter()
+            .map(|index| index.row)
+            .collect();
+        Ok(encode(&ShellItem::Snapshot(ShellSnapshot {
+            sequence: store.high_water(),
+            projects,
+            threads,
+        })))
+    });
+    live_stream(hub, rx, snapshot, None)
 }
 
-/// `subscribeThread`. `snapshot` returns the `OrchestrationV2ThreadProjection`.
-pub fn thread_stream(
-    hub: Arc<Hub>,
-    thread_id: &str,
-    snapshot: SnapshotFn,
-) -> BoxStream<'static, StreamItem> {
+/// `threads.watch`: the thread's snapshot, then its commits. Ends after
+/// `thread.removed`, or with `not_found` when the thread does not exist.
+pub fn thread_stream(hub: Arc<Hub>, thread_id: &str) -> BoxStream<'static, StreamEvent> {
     let rx = hub.subscribe_threads();
-    live_stream(
-        hub,
-        rx,
-        snapshot,
-        |sequence, projection| json!({"kind": "snapshot", "snapshotSequence": sequence, "projection": projection}),
-        Some(Arc::from(thread_id)),
-    )
+    let id = thread_id.to_owned();
+    let snapshot: SnapshotFn =
+        Arc::new(
+            move |store: &Store| match store.snapshot(&id).map_err(store_error)? {
+                Some(snapshot) => Ok(encode(&ThreadItem::Snapshot(Box::new(snapshot)))),
+                None => Err(Error::not_found("thread", &id)),
+            },
+        );
+    live_stream(hub, rx, snapshot, Some(thread_id.to_owned()))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::hub::{Commit, PendingEvent, ThreadWrite};
+    use serde_json::{Map, json};
 
-    fn commit_event(hub: &Hub, thread_id: &str) -> u64 {
+    use super::*;
+    use crate::hub::{Commit, ThreadWrite};
+
+    fn commit(hub: &Hub, thread_id: &str) -> u64 {
+        let Value::Object(item) = json!({"type": "queue", "queue": []}) else {
+            unreachable!()
+        };
         hub.commit(Commit {
             thread: Some(ThreadWrite {
                 thread_id: thread_id.into(),
-                events: vec![PendingEvent {
-                    event_type: "message.updated",
-                    payload: json!({}),
-                    run_id: None,
-                    node_id: None,
-                }],
+                items: vec![item],
                 ..ThreadWrite::default()
             }),
             ..Commit::default()
@@ -196,71 +205,63 @@ mod tests {
         .unwrap()
     }
 
-    fn value(item: StreamItem) -> Value {
-        match item {
-            StreamItem::Value(value) => value,
-            StreamItem::Fail(error) => panic!("unexpected failure {error}"),
+    fn item(event: StreamEvent) -> Value {
+        match event {
+            StreamEvent::Item(item) => item,
+            StreamEvent::Fail(error) => panic!("unexpected failure {error}"),
         }
     }
 
-    fn counting_snapshot() -> SnapshotFn {
-        Arc::new(|store: &Store| Ok(json!({"at": store.high_water()})))
-    }
-
     #[tokio::test]
-    async fn thread_stream_snapshot_then_filtered_live_events() {
+    async fn shell_snapshot_then_synced_then_live_commits() {
         let hub = Arc::new(Hub::new(Store::open_in_memory().unwrap()));
-        commit_event(&hub, "t1");
-        let mut stream = thread_stream(Arc::clone(&hub), "t1", counting_snapshot());
-        let snapshot = value(stream.next().await.unwrap());
-        assert_eq!(snapshot["kind"], "snapshot");
-        assert_eq!(snapshot["snapshotSequence"], 1);
-        assert_eq!(snapshot["projection"]["at"], 1);
-        assert_eq!(value(stream.next().await.unwrap())["kind"], "synchronized");
-        commit_event(&hub, "other");
-        let third = commit_event(&hub, "t1");
-        let live = value(stream.next().await.unwrap());
-        assert_eq!(live["kind"], "event");
-        assert_eq!(live["sequence"], third);
-    }
-
-    #[tokio::test]
-    async fn lagged_subscriber_gets_fresh_snapshot() {
-        let hub = Arc::new(Hub::with_capacity(Store::open_in_memory().unwrap(), 2, 2));
-        let mut stream = thread_stream(Arc::clone(&hub), "t1", counting_snapshot());
-        stream.next().await.unwrap();
-        stream.next().await.unwrap();
-        for _ in 0..5 {
-            commit_event(&hub, "t1");
-        }
-        let item = value(stream.next().await.unwrap());
-        assert_eq!(item["kind"], "snapshot");
-        assert_eq!(item["snapshotSequence"], 5);
-        // Nothing older than the snapshot follows it.
-        let next = commit_event(&hub, "t1");
-        let live = value(stream.next().await.unwrap());
-        assert_eq!(live["sequence"], next);
-    }
-
-    #[tokio::test]
-    async fn failing_snapshot_ends_with_typed_failure() {
-        let hub = Arc::new(Hub::new(Store::open_in_memory().unwrap()));
-        let mut stream = thread_stream(
-            hub,
-            "missing",
-            Arc::new(|_: &Store| Err(json!({"_tag": "OrchestrationV2GetThreadProjectionError"}))),
+        commit(&hub, "t1");
+        let mut stream = shell_stream(Arc::clone(&hub));
+        let snapshot = item(stream.next().await.unwrap());
+        assert_eq!(snapshot["type"], "snapshot");
+        assert_eq!(snapshot["sequence"], 1);
+        assert_eq!(
+            item(stream.next().await.unwrap()),
+            json!({"type": "synced"})
         );
-        assert!(matches!(stream.next().await, Some(StreamItem::Fail(_))));
+        let sequence = hub
+            .commit(Commit {
+                projects: vec![crate::hub::ProjectWrite::Remove("p".into())],
+                ..Commit::default()
+            })
+            .unwrap();
+        let live = item(stream.next().await.unwrap());
+        assert_eq!(live["type"], "project.removed");
+        assert_eq!(live["sequence"], sequence);
+    }
+
+    #[tokio::test]
+    async fn a_missing_thread_fails_not_found() {
+        let hub = Arc::new(Hub::new(Store::open_in_memory().unwrap()));
+        let mut stream = thread_stream(hub, "missing");
+        match stream.next().await {
+            Some(StreamEvent::Fail(error)) => assert_eq!(error.code.as_str(), "not_found"),
+            _ => panic!("expected a failure"),
+        }
         assert!(stream.next().await.is_none());
     }
 
     #[tokio::test]
-    async fn shell_stream_fills_snapshot_sequence() {
-        let hub = Arc::new(Hub::new(Store::open_in_memory().unwrap()));
-        commit_event(&hub, "t1");
-        let mut stream = shell_stream(Arc::clone(&hub), counting_snapshot());
-        let snapshot = value(stream.next().await.unwrap());
-        assert_eq!(snapshot["snapshot"]["snapshotSequence"], 1);
-        assert_eq!(value(stream.next().await.unwrap())["kind"], "synchronized");
+    async fn a_lagging_subscriber_gets_a_fresh_snapshot() {
+        let hub = Arc::new(Hub::with_capacity(Store::open_in_memory().unwrap(), 2, 2));
+        let mut stream = shell_stream(Arc::clone(&hub));
+        stream.next().await.unwrap();
+        stream.next().await.unwrap();
+        for _ in 0..5 {
+            hub.commit(Commit {
+                projects: vec![crate::hub::ProjectWrite::Remove("p".into())],
+                ..Commit::default()
+            })
+            .unwrap();
+        }
+        let snapshot = item(stream.next().await.unwrap());
+        assert_eq!(snapshot["type"], "snapshot");
+        assert_eq!(snapshot["sequence"], 5);
+        let _ = Map::<String, Value>::new();
     }
 }

@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use j3_client::t3::orchestration::{TurnItemKind, TurnItemStatus};
+use j3_client::entities::{ItemKind, ItemStatus, ToolDetail};
 
 use crate::app::{
     fixtures::{Scene, open_thread_key, thread_state},
@@ -17,14 +17,14 @@ fn scene() -> TestApp {
 }
 
 /// The id of the first feed item `pick` accepts.
-fn item_id(app: &TestApp, pick: impl Fn(&TurnItemKind) -> bool) -> String {
+fn item_id(app: &TestApp, pick: impl Fn(&ItemKind) -> bool) -> String {
     let key = open_thread_key();
     app.rt.state.threads[&key]
         .state
-        .feed()
+        .items
         .iter()
-        .find(|projected| pick(&projected.item.kind))
-        .map(|projected| projected.item.id.clone())
+        .find(|item| pick(&item.kind))
+        .map(|item| item.id.clone())
         .expect("the scene has the item")
 }
 
@@ -40,12 +40,8 @@ fn a_thread_loaded_on_open_shows_its_end_without_gliding_there() {
     let mut app = TestApp::with_scene(Scene::Thread);
     let key = open_thread_key();
     // Not cached: the subscription has nothing yet, and the feed's images aren't decoded.
-    app.rt.state.threads.get_mut(&key).unwrap().state = Arc::new(j3_client::ThreadState {
-        thread_id: key.thread_id.clone(),
-        sync: j3_client::ThreadSync::Loading,
-        sequence: 0,
-        projection: None,
-    });
+    app.rt.state.threads.get_mut(&key).unwrap().state =
+        Arc::new(j3_client::ThreadView::new(key.thread_id.clone()));
     app.settle(30);
     let loaded = Arc::new(thread_state());
     app.rt
@@ -75,10 +71,10 @@ fn every_row_kind_draws_in_the_thread_scene() {
     let key = open_thread_key();
     let ids: Vec<String> = app.rt.state.threads[&key]
         .state
-        .feed()
+        .items
         .iter()
-        .filter(|projected| !crate::feed::is_hidden(&projected.item))
-        .map(|projected| projected.item.id.clone())
+        .filter(|item| !crate::feed::is_hidden(item))
+        .map(|item| item.id.clone())
         .collect();
     assert!(ids.len() > 20, "the scene holds every kind");
     for id in &ids {
@@ -86,14 +82,10 @@ fn every_row_kind_draws_in_the_thread_scene() {
         reveal(&mut app, &row);
         assert!(app.rt.find(&row).is_some(), "{row} draws");
     }
-    let hidden = item_id(&app, |kind| {
-        matches!(kind, TurnItemKind::RunInterruptRequest(_))
-    });
-    assert!(!ids.contains(&hidden), "stop requests stay out of the feed");
     // The card's key is inside its row: mount the row first.
     let subagent = item_id(
         &app,
-        |kind| matches!(kind, TurnItemKind::Subagent(s) if s.subagent_id == "sa-bench"),
+        |kind| matches!(kind, ItemKind::Subagent(s) if s.subagent_id == "sa-bench"),
     );
     reveal(&mut app, &format!("feed-{subagent}"));
     reveal(&mut app, "subagent-sa-bench");
@@ -108,10 +100,11 @@ fn a_folded_tool_body_opens_from_its_header_and_the_choice_is_remembered() {
     let mut app = scene();
     let key = open_thread_key();
     // The finished feed tests: folded until asked.
-    let id = item_id(
-        &app,
-        |kind| matches!(kind, TurnItemKind::CommandExecution(command) if command.exit_code == Some(0)),
-    );
+    let id = item_id(&app, |kind| {
+        matches!(kind, ItemKind::Tool(tool)
+            if matches!(tool.detail, Some(ToolDetail::Command { .. }))
+                && tool.output.as_ref().and_then(|output| output.exit_code) == Some(0))
+    });
     let output = |app: &TestApp| {
         app.rt
             .elements()
@@ -119,6 +112,10 @@ fn a_folded_tool_body_opens_from_its_header_and_the_choice_is_remembered() {
             .filter_map(|e| e.text)
             .any(|text| text.contains("test result: ok. 14 passed"))
     };
+    // Fold the plan card: with the question and queue cards it covers the top of the feed.
+    let open = key.clone();
+    app.rt
+        .update(move |s, _| s.threads.get_mut(&open).unwrap().chrome.todo_open = false);
     let toggle = format!("tool-toggle-{id}");
     reveal(&mut app, &toggle);
     assert!(!output(&app), "a finished command starts folded");
@@ -148,9 +145,9 @@ fn the_feed_keeps_following_the_reply_after_a_wheel_scroll_at_the_bottom() {
     // A reply starts streaming after the last row and grows twice.
     let mut state = thread_state();
     let template = state
-        .feed()
+        .items
         .iter()
-        .find(|projected| matches!(projected.item.kind, TurnItemKind::AssistantMessage(_)))
+        .find(|item| matches!(item.kind, ItemKind::Text(_)))
         .cloned()
         .unwrap();
     for text in [
@@ -158,17 +155,15 @@ fn the_feed_keeps_following_the_reply_after_a_wheel_scroll_at_the_bottom() {
         "Streaming the reply.\n\nIt keeps growing, line after line, so the list must move with it.\n\nOne more paragraph to push the end down past the old bottom of the viewport.\n\nAnd another.",
     ] {
         let mut reply = template.clone();
-        reply.item.id = "ti-streaming".into();
-        reply.item.status = TurnItemStatus::Running;
-        if let TurnItemKind::AssistantMessage(message) = &mut reply.item.kind {
+        reply.id = "ti-streaming".into();
+        reply.status = ItemStatus::Running;
+        reply.ended_at = None;
+        reply.ordinal = state.items.last().map_or(1, |last| last.ordinal + 1);
+        if let ItemKind::Text(message) = &mut reply.kind {
             message.text = text.into();
-            message.streaming = true;
         }
-        let projection = state.projection.as_mut().unwrap();
-        projection
-            .visible_turn_items
-            .retain(|projected| projected.item.id != "ti-streaming");
-        projection.visible_turn_items.push(reply);
+        state.items.retain(|item| item.id != "ti-streaming");
+        state.items.push(reply);
         let next = Arc::new(state.clone());
         let key = key.clone();
         app.rt.update(move |s, tx| s.thread_changed(&key, next, tx));
@@ -191,10 +186,11 @@ fn the_feed_keeps_following_the_reply_after_a_wheel_scroll_at_the_bottom() {
 fn an_expanded_row_is_forgotten_once_its_item_leaves_the_feed() {
     let mut app = scene();
     let key = open_thread_key();
-    let id = item_id(&app, |kind| {
-        matches!(kind, TurnItemKind::CommandExecution(_))
-    });
-    let other = item_id(&app, |kind| matches!(kind, TurnItemKind::Reasoning(_)));
+    let id = item_id(
+        &app,
+        |kind| matches!(kind, ItemKind::Tool(tool) if matches!(tool.detail, Some(ToolDetail::Command { .. }))),
+    );
+    let other = item_id(&app, |kind| matches!(kind, ItemKind::Thinking(_)));
     let (k, i, o) = (key.clone(), id.clone(), other.clone());
     app.rt.update(move |s, _| {
         s.toggle_feed_row(&k, &i);
@@ -203,12 +199,7 @@ fn an_expanded_row_is_forgotten_once_its_item_leaves_the_feed() {
     app.settle(10);
 
     let mut state = thread_state();
-    state
-        .projection
-        .as_mut()
-        .unwrap()
-        .visible_turn_items
-        .retain(|projected| projected.item.id != id);
+    state.items.retain(|item| item.id != id);
     let next = Arc::new(state);
     let k = key.clone();
     app.rt.update(move |s, tx| s.thread_changed(&k, next, tx));

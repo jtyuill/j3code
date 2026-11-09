@@ -5,11 +5,9 @@
 //! output, the diff, the matches). Only a running command's output and a
 //! diff show unasked, a few lines of them; every other body waits for a click.
 
-use j3_core::engine::model::tool_output_images;
-use j3_protocol::t3::orchestration::{
-    CommandExecutionItem, CompactionItem, DynamicToolItem, ErrorItem, FileChangeItem,
-    FileSearchItem, PlanStepStatus, SubagentStatus, TodoListItem, TurnItem, TurnItemKind,
-    TurnItemStatus, UserMessageInputIntent, WebSearchItem,
+use j3_client::entities::{
+    Answer, CompactionItem, Goal, GoalState, Item, ItemKind, ItemStatus, SearchMatch, StopItem,
+    TodoItem, TodoStatus, ToolDetail, ToolItem, ToolOutput, WebResult,
 };
 use serde_json::Value;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -21,18 +19,10 @@ const SUMMARY_CHARS: usize = 160;
 const COMMAND_PREVIEW: usize = 6;
 const DIFF_PREVIEW: usize = 12;
 
-/// Whether the feed skips this item. Queued messages show in the queue
-/// panel until they start; stop requests show as their result row; kinds
-/// j3 never emits are dropped.
-pub fn is_hidden(item: &TurnItem) -> bool {
-    match &item.kind {
-        TurnItemKind::UserMessage(message) => {
-            message.input_intent == UserMessageInputIntent::QueuedTurn
-                && item.status == TurnItemStatus::Pending
-        }
-        TurnItemKind::RunInterruptRequest(_) | TurnItemKind::Unknown(_) => true,
-        _ => false,
-    }
+/// Whether the feed skips this item: kinds this build doesn't know. (Queued
+/// messages are not items; they show in the queue panel until they start.)
+pub fn is_hidden(item: &Item) -> bool {
+    matches!(item.kind, ItemKind::Unknown)
 }
 
 /// What a tool did, which picks its icon.
@@ -160,8 +150,8 @@ pub struct ToolView {
     /// only a running command and a diff show theirs unasked.
     pub preview: usize,
     pub status: ToolStatus,
-    /// Images in the tool's output (`tool-output-image` indices `0..images`).
-    pub images: usize,
+    /// The attachment ids of the images in the tool's output.
+    pub images: Vec<String>,
 }
 
 /// First line of `text`, cut to [`SUMMARY_CHARS`] characters.
@@ -248,9 +238,9 @@ fn hashline_path(input: &str) -> Option<&str> {
 }
 
 /// A run time like `340ms`, `2.1s`, `1m 05s`, from the item's start and end.
-pub fn duration(item: &TurnItem) -> Option<String> {
-    let parse = |iso: &Option<String>| OffsetDateTime::parse(iso.as_deref()?, &Rfc3339).ok();
-    let elapsed = parse(&item.completed_at)? - parse(&item.started_at)?;
+pub fn duration(item: &Item) -> Option<String> {
+    let parse = |iso: &str| OffsetDateTime::parse(iso, &Rfc3339).ok();
+    let elapsed = parse(item.ended_at.as_deref()?)? - parse(&item.started_at)?;
     let ms = elapsed.whole_milliseconds().max(0);
     Some(match ms {
         0..1_000 => format!("{ms}ms"),
@@ -260,58 +250,77 @@ pub fn duration(item: &TurnItem) -> Option<String> {
 }
 
 /// The tool row for `item`, or `None` if it is not a tool item.
-pub fn tool_view(item: &TurnItem) -> Option<ToolView> {
+pub fn tool_view(item: &Item) -> Option<ToolView> {
+    let ItemKind::Tool(tool) = &item.kind else {
+        return None;
+    };
     let status = match item.status {
-        TurnItemStatus::Pending | TurnItemStatus::Running | TurnItemStatus::Waiting => {
-            ToolStatus::Running
+        ItemStatus::Running => ToolStatus::Running,
+        ItemStatus::Failed => ToolStatus::Failed,
+        ItemStatus::Completed | ItemStatus::Cancelled => ToolStatus::Done,
+    };
+    let output = tool.output.as_ref();
+    let images: Vec<String> = output
+        .into_iter()
+        .flat_map(|output| &output.images)
+        .map(|image| image.attachment_id.clone())
+        .collect();
+    let mut view = match &tool.detail {
+        Some(ToolDetail::Command { command }) => command_view(command, output),
+        Some(ToolDetail::FileChange {
+            path,
+            diff,
+            additions,
+            deletions,
+            content,
+        }) => file_change_view(
+            path,
+            diff.as_deref(),
+            additions.zip(*deletions),
+            content.as_deref(),
+        ),
+        Some(ToolDetail::Search { pattern, matches }) => {
+            search_view(&tool.name, pattern, matches.as_deref())
         }
-        TurnItemStatus::Failed => ToolStatus::Failed,
-        _ => ToolStatus::Done,
+        Some(ToolDetail::WebSearch { query, results }) => {
+            web_search_view(query, results.as_deref())
+        }
+        Some(ToolDetail::Unknown) | None => plain_view(
+            &tool.name,
+            &tool.input,
+            output_text(tool),
+            !images.is_empty(),
+        ),
     };
-    let mut view = match &item.kind {
-        TurnItemKind::CommandExecution(command) => command_view(command),
-        TurnItemKind::FileChange(change) => file_change_view(change),
-        TurnItemKind::FileSearch(search) => file_search_view(search),
-        TurnItemKind::WebSearch(search) => web_search_view(search),
-        TurnItemKind::DynamicTool(tool) => dynamic_view(tool),
-        _ => return None,
-    };
-    view.status = match (status, &item.kind) {
-        (ToolStatus::Done, TurnItemKind::CommandExecution(command))
-            if command.exit_code.is_some_and(|code| code != 0)
-                || command.output_indicates_failure == Some(true) =>
+    let command = matches!(tool.detail, Some(ToolDetail::Command { .. }));
+    view.status = match status {
+        ToolStatus::Done
+            if command
+                && output
+                    .and_then(|o| o.exit_code)
+                    .is_some_and(|code| code != 0) =>
         {
             ToolStatus::Failed
         }
-        _ => status,
+        status => status,
     };
-    // The server titles a row with the call's intent, else the tool name.
-    view.intent = item
-        .title
-        .clone()
-        .filter(|title| !title.trim().is_empty() && !title.eq_ignore_ascii_case(&view.title))
-        .filter(|title| match &item.kind {
-            TurnItemKind::DynamicTool(tool) => tool.tool_name.as_deref() != Some(title.as_str()),
-            _ => !matches!(
-                title.as_str(),
-                "bash" | "edit" | "write" | "grep" | "glob" | "find"
-            ),
-        });
+    // The header names the call's intent, unless it only repeats the tool.
+    view.intent = tool.intent.clone().filter(|intent| {
+        !intent.trim().is_empty()
+            && !intent.eq_ignore_ascii_case(&view.title)
+            && *intent != tool.name
+    });
     if view.status != ToolStatus::Running
         && let Some(elapsed) = duration(item)
     {
         view.meta.push(muted(elapsed));
     }
     // A command shows itself in its box; the header says what it is for.
-    if matches!(item.kind, TurnItemKind::CommandExecution(_))
-        && let Some(intent) = view.intent.take()
-    {
+    if command && let Some(intent) = view.intent.take() {
         view.description = intent;
         view.prose = true;
     }
-    if let TurnItemKind::DynamicTool(tool) = &item.kind {
-        view.images = output_images(tool);
-    }
+    view.images = images;
     view.preview = match (&view.body, view.status) {
         (Some(ToolBody::Command { .. }), ToolStatus::Running) => COMMAND_PREVIEW,
         (Some(ToolBody::Diff { .. }), _) => DIFF_PREVIEW,
@@ -331,18 +340,18 @@ fn base(icon: ToolIcon, title: &str, description: String) -> ToolView {
         body: None,
         preview: 0,
         status: ToolStatus::Done,
-        images: 0,
+        images: Vec::new(),
     }
 }
 
-fn command_view(command: &CommandExecutionItem) -> ToolView {
-    let mut view = base(ToolIcon::Terminal, "Bash", one_line(&command.input));
-    if let Some(code) = command.exit_code.filter(|code| *code != 0) {
+fn command_view(command: &str, output: Option<&ToolOutput>) -> ToolView {
+    let mut view = base(ToolIcon::Terminal, "Bash", one_line(command));
+    if let Some(code) = output.and_then(|o| o.exit_code).filter(|code| *code != 0) {
         view.meta.push((format!("exit {code}"), Tone::Failed));
     }
     view.body = Some(ToolBody::Command {
-        command: command.input.trim_end().to_owned(),
-        output: strip_notices(command.output.as_deref().unwrap_or_default()).to_owned(),
+        command: command.trim_end().to_owned(),
+        output: strip_notices(output.map_or("", |o| o.text.as_str())).to_owned(),
     });
     view
 }
@@ -361,34 +370,38 @@ fn strip_notices(output: &str) -> &str {
     }
 }
 
-fn file_change_view(change: &FileChangeItem) -> ToolView {
-    // Servers before the scheme check sent writes to `agent://` and the
-    // like as file changes.
-    if change.file_name.contains("://") {
-        return write_view(&change.file_name, change.new_str.as_deref(), None);
+fn file_change_view(
+    path: &str,
+    diff: Option<&str>,
+    counts: Option<(u64, u64)>,
+    content: Option<&str>,
+) -> ToolView {
+    // A write to `agent://` and the like is not a file.
+    if path.contains("://") {
+        return write_view(path, content, None);
     }
-    let diff = change.diff_str.as_deref().filter(|d| !d.trim().is_empty());
-    match (diff, change.new_str.as_deref()) {
+    let diff = diff.filter(|d| !d.trim().is_empty());
+    match (diff, content) {
         (None, Some(content)) => {
-            let mut view = base(ToolIcon::Write, "Write", change.file_name.clone());
+            let mut view = base(ToolIcon::Write, "Write", path.to_owned());
             view.meta
                 .push(muted(count(content.lines().count(), "line", "lines")));
             view.body = Some(ToolBody::Code {
                 text: content.trim_end().to_owned(),
                 first_line: 1,
-                language: crate::syntax::language(&change.file_name),
+                language: crate::syntax::language(path),
             });
             view
         }
         _ => {
-            let mut view = base(ToolIcon::Edit, "Edit", change.file_name.clone());
-            if let (Some(added), Some(removed)) = (change.additions, change.deletions) {
+            let mut view = base(ToolIcon::Edit, "Edit", path.to_owned());
+            if let Some((added, removed)) = counts {
                 view.meta.push((format!("+{added}"), Tone::Added));
                 view.meta.push((format!("−{removed}"), Tone::Removed));
             }
             view.body = diff.map(|diff| ToolBody::Diff {
                 text: diff.trim_end().to_owned(),
-                language: crate::syntax::language(&change.file_name),
+                language: crate::syntax::language(path),
             });
             view
         }
@@ -434,18 +447,22 @@ fn write_view(path: &str, content: Option<&str>, output: Option<String>) -> Tool
     }
 }
 
-fn file_search_view(search: &FileSearchItem) -> ToolView {
-    let pattern = search.pattern.as_deref().map(one_line).unwrap_or_default();
-    let results = search.results.as_deref().unwrap_or_default();
-    let grep = results.iter().any(|r| r.line.is_some())
-        || (results.is_empty() && !pattern.contains(['*', '?', '{']));
+/// `grep` hits, or the files `glob`/`find` matched.
+fn search_view(name: &str, pattern: &str, matches: Option<&[SearchMatch]>) -> ToolView {
+    let pattern = one_line(pattern);
+    let results = matches.unwrap_or_default();
+    let grep = match name {
+        "grep" => true,
+        "glob" | "find" => false,
+        _ => results.iter().any(|r| r.line.is_some()),
+    };
     let mut view = if grep {
         base(ToolIcon::Grep, "Grep", pattern)
     } else {
         base(ToolIcon::Glob, "Glob", pattern)
     };
-    if search.results.is_some() {
-        let mut files: Vec<&str> = results.iter().map(|r| r.file_name.as_str()).collect();
+    if matches.is_some() {
+        let mut files: Vec<&str> = results.iter().map(|r| r.path.as_str()).collect();
         files.dedup();
         view.meta.push(muted(if grep {
             format!(
@@ -462,11 +479,11 @@ fn file_search_view(search: &FileSearchItem) -> ToolView {
             results
                 .iter()
                 .map(|result| {
-                    let mut line = result.file_name.clone();
+                    let mut line = result.path.clone();
                     if let Some(n) = result.line {
                         line.push_str(&format!(":{n}"));
                     }
-                    if let Some(preview) = result.preview.as_deref().filter(|p| !p.is_empty()) {
+                    if let Some(preview) = result.text.as_deref().filter(|p| !p.is_empty()) {
                         line.push_str(&format!("  {preview}"));
                     }
                     line
@@ -477,34 +494,27 @@ fn file_search_view(search: &FileSearchItem) -> ToolView {
     view
 }
 
-fn web_search_view(search: &WebSearchItem) -> ToolView {
-    let query = search
-        .patterns
-        .as_ref()
-        .map(|p| one_line(&p.join(", ")))
-        .unwrap_or_default();
-    let mut view = base(ToolIcon::Web, "Web Search", query);
-    if let Some(results) = &search.results {
+fn web_search_view(query: &str, results: Option<&[WebResult]>) -> ToolView {
+    let mut view = base(ToolIcon::Web, "Web Search", one_line(query));
+    if let Some(results) = results {
         view.meta
             .push(muted(count(results.len(), "source", "sources")));
         view.body = Some(ToolBody::List(
             results
                 .iter()
                 .map(|result| {
-                    let host = result.url.as_deref().map(|url| {
-                        url.split("://")
-                            .nth(1)
-                            .unwrap_or(url)
-                            .split('/')
-                            .next()
-                            .unwrap_or(url)
-                            .to_owned()
-                    });
-                    match (&result.title, host) {
-                        (Some(title), Some(host)) => format!("{title} ({host})"),
-                        (Some(title), None) => title.clone(),
-                        (None, Some(host)) => host,
-                        (None, None) => String::new(),
+                    let url = result.url.as_str();
+                    let host = url
+                        .split("://")
+                        .nth(1)
+                        .unwrap_or(url)
+                        .split('/')
+                        .next()
+                        .unwrap_or(url);
+                    match (result.title.trim(), host) {
+                        ("", host) => host.to_owned(),
+                        (title, "") => title.to_owned(),
+                        (title, host) => format!("{title} ({host})"),
                     }
                 })
                 .collect(),
@@ -513,28 +523,12 @@ fn web_search_view(search: &WebSearchItem) -> ToolView {
     view
 }
 
-/// The output text of a dynamic tool, if any. Output with images is t3's
-/// block list; its text blocks are the text.
-fn output_text(tool: &DynamicToolItem) -> Option<String> {
-    let output = tool.output.as_ref()?.as_ref()?;
-    let text = match output {
-        Value::Array(blocks) => blocks
-            .iter()
-            .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
-            .filter_map(|block| block.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        other => pretty(other),
-    };
-    (!text.trim().is_empty()).then_some(text)
-}
-
-/// How many images a dynamic tool's output shows.
-fn output_images(tool: &DynamicToolItem) -> usize {
+/// A tool's output text, if it has any.
+fn output_text(tool: &ToolItem) -> Option<String> {
     tool.output
         .as_ref()
-        .and_then(Option::as_ref)
-        .map_or(0, |output| tool_output_images(output).count())
+        .map(|output| output.text.clone())
+        .filter(|text| !text.trim().is_empty())
 }
 
 /// Drops the `[PATH#TAG]` header omp's `read` puts above a file.
@@ -545,10 +539,9 @@ fn strip_hashline_header(text: &str) -> &str {
     }
 }
 
-fn dynamic_view(tool: &DynamicToolItem) -> ToolView {
-    let name = tool.tool_name.as_deref().unwrap_or("tool");
-    let input = &tool.input;
-    let output = output_text(tool);
+/// A tool without a structured detail: its view from its name, input and output text, as
+/// omp's renderers draw it.
+fn plain_view(name: &str, input: &Value, output: Option<String>, has_images: bool) -> ToolView {
     let path = str_arg(input, "path");
     match name {
         "read" => {
@@ -561,7 +554,7 @@ fn dynamic_view(tool: &DynamicToolItem) -> ToolView {
                 _ => ToolIcon::Read,
             };
             let mut view = base(icon, "Read", path.to_owned());
-            if let Some(output) = output.filter(|_| output_images(tool) == 0) {
+            if let Some(output) = output.filter(|_| !has_images) {
                 // Only a file's text is code; pages and agent output are not.
                 let language = if matches!(icon, ToolIcon::Read) {
                     read_language(path)
@@ -683,7 +676,6 @@ fn dynamic_view(tool: &DynamicToolItem) -> ToolView {
         }
     }
 }
-
 /// One line of a diff, split for display.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DiffLine<'a> {
@@ -753,80 +745,84 @@ pub fn age_since(at: OffsetDateTime, now: OffsetDateTime) -> String {
     }
 }
 
-/// Rows of agent activity (tool calls, thinking, plan updates, notices) that
+/// Rows of agent activity (tool calls, thinking, plan updates, notices, stops) that
 /// read as one list when they follow each other: they sit close together, on
 /// one rail.
-pub fn is_activity(item: &TurnItem) -> bool {
+pub fn is_activity(item: &Item) -> bool {
     matches!(
         item.kind,
-        TurnItemKind::CommandExecution(_)
-            | TurnItemKind::FileChange(_)
-            | TurnItemKind::FileSearch(_)
-            | TurnItemKind::WebSearch(_)
-            | TurnItemKind::DynamicTool(_)
-            | TurnItemKind::Reasoning(_)
-            | TurnItemKind::TodoList(_)
-            | TurnItemKind::Error(_)
-            | TurnItemKind::SystemNotice(_)
-            | TurnItemKind::RunInterruptResult(_)
+        ItemKind::Tool(_)
+            | ItemKind::Thinking(_)
+            | ItemKind::Todo(_)
+            | ItemKind::Notice(_)
+            | ItemKind::Stop(_)
     )
 }
 
-/// A subagent's status as the feed and the agents hub name it.
-pub fn subagent_status_label(status: SubagentStatus) -> &'static str {
+/// A subagent's status (its item's status) as the feed and the agents hub name it.
+pub fn subagent_status_label(status: ItemStatus) -> &'static str {
     match status {
-        SubagentStatus::Idle => "Idle",
-        SubagentStatus::Pending => "Starting",
-        SubagentStatus::Running => "Running",
-        SubagentStatus::Waiting => "Waiting",
-        SubagentStatus::Completed => "Done",
-        SubagentStatus::Failed => "Failed",
-        SubagentStatus::Cancelled => "Stopped",
-        SubagentStatus::Interrupted => "Interrupted",
+        ItemStatus::Running => "Running",
+        ItemStatus::Completed => "Done",
+        ItemStatus::Failed => "Failed",
+        ItemStatus::Cancelled => "Stopped",
     }
 }
 
-/// An error row's text: the failure, then `(retry N of M)` or `(retry N)`
-/// while the provider retries.
-pub fn error_message(error: &ErrorItem) -> String {
-    let mut message = error.failure.message.clone();
-    if let Some(retry) = &error.retry {
-        match retry.max_attempts {
-            Some(max) => message.push_str(&format!(" (retry {} of {max})", retry.attempt)),
-            None => message.push_str(&format!(" (retry {})", retry.attempt)),
-        }
+/// A stop row's text: the stop while it is under way, then its result.
+pub fn stop_label(stop: &StopItem) -> &'static str {
+    match stop.stopped_at {
+        Some(_) => "Stopped",
+        None => "Stopping…",
     }
-    message
 }
 
-/// A compaction rule's label: `Context compacted`, with ` · {before} → {after}
-/// tokens` when both counts are known.
+/// A goal row's text: what became of the goal, then its objective.
+pub fn goal_label(goal: &Goal) -> String {
+    let state = match goal.state {
+        GoalState::Active => "Goal set",
+        GoalState::Paused => "Goal paused",
+        GoalState::BudgetLimited => "Goal reached its budget",
+        GoalState::Complete => "Goal complete",
+        GoalState::Dropped => "Goal dropped",
+    };
+    format!("{state}: {}", one_line(&goal.objective))
+}
+
+/// A compaction rule's label: `Context compacted`, with ` · {before} tokens
+/// before` when the count is known.
 pub fn compaction_label(compaction: &CompactionItem) -> String {
-    match (compaction.before_token_count, compaction.after_token_count) {
-        (Some(before), Some(after)) => format!("Context compacted · {before} → {after} tokens"),
-        _ => "Context compacted".to_owned(),
+    match compaction.tokens_before {
+        Some(before) => format!("Context compacted · {before} tokens before"),
+        None => "Context compacted".to_owned(),
     }
 }
 
 /// A todo row's notice: `Updated the plan · {done}/{total} done`.
-pub fn todo_notice(todo: &TodoListItem) -> String {
-    let done = todo
-        .steps
-        .iter()
-        .filter(|step| step.status == PlanStepStatus::Completed)
+pub fn todo_notice(todo: &TodoItem) -> String {
+    let tasks = todo.phases.iter().flat_map(|phase| &phase.tasks);
+    let total = tasks.clone().count();
+    let done = tasks
+        .filter(|task| task.status == TodoStatus::Completed)
         .count();
-    format!("Updated the plan · {done}/{} done", todo.steps.len())
+    format!("Updated the plan · {done}/{total} done")
 }
 
-/// An answer to a question as the feed shows it: a choice, choices joined
-/// with commas, or nothing.
-pub fn answer_text(value: &Value) -> String {
-    match value {
-        Value::String(s) => s.clone(),
-        Value::Array(items) => items.iter().map(answer_text).collect::<Vec<_>>().join(", "),
-        Value::Null => String::new(),
-        other => other.to_string(),
-    }
+/// An answer to a question as the feed shows it: the choices joined with
+/// commas, then the typed answer.
+pub fn answer_text(answer: &Answer) -> String {
+    answer
+        .values
+        .iter()
+        .map(String::as_str)
+        .chain(
+            answer
+                .other
+                .as_deref()
+                .filter(|other| !other.trim().is_empty()),
+        )
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The part of a streaming reply that has arrived as whole blocks: everything before the last
@@ -867,58 +863,119 @@ pub fn settled_blocks(text: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use j3_client::entities::{
+        CompactionItem, NoticeItem, NoticeLevel, TextItem, TodoPhase, TodoTask, ToolImage,
+    };
     use serde_json::json;
 
-    fn item(status: &str, body: Value) -> TurnItem {
-        let mut value = json!({
-            "id":"ti","threadId":"T","runId":"r","nodeId":"n","providerThreadId":null,"providerTurnId":null,
-            "nativeItemRef":null,"parentItemId":null,"ordinal":1,"status":status,"title":null,
-            "startedAt":null,"completedAt":null,"updatedAt":"2026-11-01T12:00:00.000Z"
-        });
-        value
-            .as_object_mut()
-            .unwrap()
-            .extend(body.as_object().unwrap().clone());
-        serde_json::from_value(value).unwrap()
+    fn item(status: ItemStatus, kind: ItemKind) -> Item {
+        Item {
+            id: "it".into(),
+            thread_id: "T".into(),
+            turn_id: "tu".into(),
+            ordinal: 1,
+            status,
+            started_at: "2026-11-01T12:00:00.000Z".into(),
+            ended_at: None,
+            kind,
+        }
+    }
+
+    fn output(text: &str) -> ToolOutput {
+        ToolOutput {
+            text: text.into(),
+            ..ToolOutput::default()
+        }
+    }
+
+    fn tool(
+        status: ItemStatus,
+        name: &str,
+        input: Value,
+        output: Option<ToolOutput>,
+        detail: Option<ToolDetail>,
+    ) -> Item {
+        item(
+            status,
+            ItemKind::Tool(ToolItem {
+                call_id: "c".into(),
+                name: name.into(),
+                intent: None,
+                input,
+                output,
+                detail,
+            }),
+        )
+    }
+
+    fn view(item: &Item) -> ToolView {
+        tool_view(item).unwrap()
+    }
+
+    fn command(status: ItemStatus, command: &str, out: Option<ToolOutput>) -> Item {
+        tool(
+            status,
+            "bash",
+            json!({"command": command}),
+            out,
+            Some(ToolDetail::Command {
+                command: command.into(),
+            }),
+        )
+    }
+
+    fn change(
+        path: &str,
+        diff: Option<&str>,
+        counts: Option<(u64, u64)>,
+        content: Option<&str>,
+    ) -> Item {
+        tool(
+            ItemStatus::Completed,
+            "edit",
+            json!({}),
+            None,
+            Some(ToolDetail::FileChange {
+                path: path.into(),
+                diff: diff.map(Into::into),
+                additions: counts.map(|c| c.0),
+                deletions: counts.map(|c| c.1),
+                content: content.map(Into::into),
+            }),
+        )
     }
 
     #[test]
-    fn hides_pending_queued_messages_and_stop_requests() {
-        let user = |intent: &str, status: &str| {
-            item(
-                status,
-                json!({"type":"user_message","createdBy":"user","creationSource":"mobile","messageId":"m",
-                       "inputIntent":intent,"text":"hi","attachments":[]}),
-            )
-        };
-        assert!(is_hidden(&user("queued_turn", "pending")));
-        assert!(!is_hidden(&user("queued_turn", "completed")));
-        assert!(!is_hidden(&user("turn_start", "completed")));
-        assert!(is_hidden(&item(
-            "completed",
-            json!({"type":"run_interrupt_request","message":"stop"})
+    fn hides_only_unknown_kinds() {
+        assert!(is_hidden(&item(ItemStatus::Completed, ItemKind::Unknown)));
+        assert!(!is_hidden(&item(
+            ItemStatus::Completed,
+            ItemKind::Text(TextItem { text: "hi".into() })
         )));
         assert!(!is_hidden(&item(
-            "completed",
-            json!({"type":"run_interrupt_result","message":"stopped"})
-        )));
-        assert!(is_hidden(&item(
-            "completed",
-            json!({"type":"proposed_plan","markdown":"x"})
+            ItemStatus::Completed,
+            ItemKind::Stop(StopItem {
+                requested_at: "2026-11-01T12:00:00.000Z".into(),
+                stopped_at: None
+            })
         )));
     }
 
     #[test]
     fn commands_fail_on_a_nonzero_exit_and_time_their_run() {
-        let mut failed = item(
-            "completed",
-            json!({"type":"command_execution","input":"sleep 30\necho done",
-                   "output":"done\n\nWall time: 2.10 seconds\n","exitCode":1}),
+        let mut failed = command(
+            ItemStatus::Completed,
+            "sleep 30\necho done",
+            Some(ToolOutput {
+                exit_code: Some(1),
+                ..output("done\n\nWall time: 2.10 seconds\n")
+            }),
         );
-        failed.title = Some("Waiting for the build".into());
-        failed.started_at = Some("2026-11-01T12:00:00.000Z".into());
-        failed.completed_at = Some("2026-11-01T12:00:02.140Z".into());
-        let view = tool_view(&failed).unwrap();
+        if let ItemKind::Tool(tool) = &mut failed.kind {
+            tool.intent = Some("Waiting for the build".into());
+        }
+        failed.ended_at = Some("2026-11-01T12:00:02.140Z".into());
+        let view = view(&failed);
         assert_eq!(
             (view.icon, view.title.as_str()),
             (ToolIcon::Terminal, "Bash")
@@ -944,8 +1001,10 @@ mod tests {
             })
         );
 
-        let mut running = item("running", json!({"type":"command_execution","input":"ls"}));
-        running.title = Some("bash".into());
+        let mut running = command(ItemStatus::Running, "ls", None);
+        if let ItemKind::Tool(tool) = &mut running.kind {
+            tool.intent = Some("bash".into());
+        }
         let view = tool_view(&running).unwrap();
         assert_eq!(view.status, ToolStatus::Running);
         assert_eq!(
@@ -957,38 +1016,42 @@ mod tests {
 
     #[test]
     fn only_a_running_command_and_a_diff_show_their_body_unasked() {
-        let command = |status: &str| {
-            tool_view(&item(
+        let preview = |status| {
+            view(&command(
                 status,
-                json!({"type":"command_execution","input":"cargo test","output":"ok\n","exitCode":0}),
+                "cargo test",
+                Some(ToolOutput {
+                    exit_code: Some(0),
+                    ..output("ok\n")
+                }),
             ))
-            .unwrap()
             .preview
         };
-        assert!(command("running") > 0, "a running command shows its output");
-        assert_eq!(command("completed"), 0, "a finished one folds away");
-        let diff = tool_view(&item(
-            "completed",
-            json!({"type":"file_change","fileName":"src/a.rs","diffStr":"+1|x"}),
-        ))
-        .unwrap();
+        assert!(
+            preview(ItemStatus::Running) > 0,
+            "a running command shows its output"
+        );
+        assert_eq!(
+            preview(ItemStatus::Completed),
+            0,
+            "a finished one folds away"
+        );
+        let diff = view(&change("src/a.rs", Some("+1|x"), None, None));
         assert!(diff.preview > 0, "a diff shows unasked");
-        let read = tool_view(&item(
-            "completed",
-            json!({"type":"dynamic_tool","toolName":"read","input":{"path":"a.rs"},"output":"1:fn main() {}"}),
-        ))
-        .unwrap();
+        let read = view(&tool(
+            ItemStatus::Completed,
+            "read",
+            json!({"path": "a.rs"}),
+            Some(output("1:fn main() {}")),
+            None,
+        ));
         assert!(read.body.is_some());
         assert_eq!(read.preview, 0, "a read waits for a click");
     }
 
     #[test]
     fn edits_writes_and_searches_read_like_omp() {
-        let edit = tool_view(&item(
-            "completed",
-            json!({"type":"file_change","fileName":"src/a.rs","additions":3,"deletions":1,"diffStr":"+1|x"}),
-        ))
-        .unwrap();
+        let edit = view(&change("src/a.rs", Some("+1|x"), Some((3, 1)), None));
         assert_eq!(
             (edit.title.as_str(), edit.description.as_str()),
             ("Edit", "src/a.rs")
@@ -1008,24 +1071,28 @@ mod tests {
             })
         );
 
-        let write = tool_view(&item(
-            "completed",
-            json!({"type":"file_change","fileName":"b.txt","newStr":"one\ntwo\n"}),
-        ))
-        .unwrap();
+        let write = view(&change("b.txt", None, None, Some("one\ntwo\n")));
         assert_eq!(
             (write.title.as_str(), write.icon),
             ("Write", ToolIcon::Write)
         );
         assert_eq!(write.meta, [("2 lines".to_owned(), Tone::Muted)]);
 
-        let grep = tool_view(&item(
-            "completed",
-            json!({"type":"file_search","pattern":"fn main","results":[
-                {"fileName":"a.rs","line":3,"preview":"fn main() {"},
-                {"fileName":"a.rs","line":9,"preview":"fn main2()"}]}),
-        ))
-        .unwrap();
+        let hit = |line: u64, text: &str| SearchMatch {
+            path: "a.rs".into(),
+            line: Some(line),
+            text: Some(text.into()),
+        };
+        let grep = view(&tool(
+            ItemStatus::Completed,
+            "grep",
+            json!({"pattern": "fn main"}),
+            None,
+            Some(ToolDetail::Search {
+                pattern: "fn main".into(),
+                matches: Some(vec![hit(3, "fn main() {"), hit(9, "fn main2()")]),
+            }),
+        ));
         assert_eq!((grep.title.as_str(), grep.icon), ("Grep", ToolIcon::Grep));
         assert_eq!(grep.meta, [("2 matches · 1 file".to_owned(), Tone::Muted)]);
         assert_eq!(
@@ -1036,22 +1103,35 @@ mod tests {
             ]))
         );
 
-        let glob = tool_view(&item(
-            "running",
-            json!({"type":"file_search","pattern":"src/**/*.rs"}),
-        ))
-        .unwrap();
+        let glob = view(&tool(
+            ItemStatus::Running,
+            "glob",
+            json!({"pattern": "src/**/*.rs"}),
+            None,
+            Some(ToolDetail::Search {
+                pattern: "src/**/*.rs".into(),
+                matches: None,
+            }),
+        ));
         assert_eq!(glob.title, "Glob");
     }
 
     #[test]
-    fn dynamic_tools_get_their_omp_titles() {
-        let read = tool_view(&item(
-            "completed",
-            json!({"type":"dynamic_tool","toolName":"read","input":{"path":"PLAN.md:7-8"},
-                   "output":"[PLAN.md#C34C]\n7:# plan\n8:"}),
-        ))
-        .unwrap();
+    fn plain_tools_get_their_omp_titles() {
+        let plain = |name: &str, input: Value, out: Option<&str>| {
+            view(&tool(
+                ItemStatus::Completed,
+                name,
+                input,
+                out.map(output),
+                None,
+            ))
+        };
+        let read = plain(
+            "read",
+            json!({"path": "PLAN.md:7-8"}),
+            Some("[PLAN.md#C34C]\n7:# plan\n8:"),
+        );
         assert_eq!(
             (read.title.as_str(), read.description.as_str()),
             ("Read", "PLAN.md:7-8")
@@ -1066,33 +1146,28 @@ mod tests {
             })
         );
         // Not one numbered range: shown as it is.
-        let listing = tool_view(&item(
-            "completed",
-            json!({"type":"dynamic_tool","toolName":"read","input":{"path":"src/"},
-                   "output":"main.rs\nlib.rs"}),
-        ))
-        .unwrap();
+        let listing = plain("read", json!({"path": "src/"}), Some("main.rs\nlib.rs"));
         assert_eq!(
             listing.body,
             Some(ToolBody::Sections(vec![(None, "main.rs\nlib.rs".into())]))
         );
 
-        // An edit from a server that predates hashline mapping.
-        let edit = tool_view(&item(
-            "completed",
-            json!({"type":"dynamic_tool","toolName":"edit","input":{"input":"[README.md#AF62]\nPUT 1:\n+x"}}),
-        ))
-        .unwrap();
+        // An edit without a file-change detail names its file from the script.
+        let edit = plain(
+            "edit",
+            json!({"input": "[README.md#AF62]\nPUT 1:\n+x"}),
+            None,
+        );
         assert_eq!(
             (edit.title.as_str(), edit.description.as_str()),
             ("Edit", "README.md")
         );
 
-        let message = tool_view(&item(
-            "completed",
-            json!({"type":"dynamic_tool","toolName":"write","input":{"path":"agent://Hexmap","content":"hi"}}),
-        ))
-        .unwrap();
+        let message = plain(
+            "write",
+            json!({"path": "agent://Hexmap", "content": "hi"}),
+            None,
+        );
         assert_eq!(
             (
                 message.icon,
@@ -1102,25 +1177,42 @@ mod tests {
             (ToolIcon::Message, "Message", "→ Hexmap")
         );
 
-        let eval = tool_view(&item(
-            "completed",
-            json!({"type":"dynamic_tool","toolName":"eval","input":{"code":"1+1","language":"js","title":"Adding"},
-                   "output":"2"}),
-        ))
-        .unwrap();
+        let eval = plain(
+            "eval",
+            json!({"code": "1+1", "language": "js", "title": "Adding"}),
+            Some("2"),
+        );
         assert_eq!(
             (eval.title.as_str(), eval.description.as_str()),
             ("Eval", "Adding")
         );
         assert_eq!(eval.meta, [("js".to_owned(), Tone::Muted)]);
 
-        let other = tool_view(&item(
-            "completed",
-            json!({"type":"dynamic_tool","toolName":"search_tool_bm25","input":{"i":"Finding","query":"x","limit":2}}),
-        ))
-        .unwrap();
+        let other = plain(
+            "search_tool_bm25",
+            json!({"i": "Finding", "query": "x", "limit": 2}),
+            None,
+        );
         assert_eq!(other.title, "Search tool bm25");
         assert_eq!(other.description, "query=x, limit=2");
+    }
+
+    #[test]
+    fn tool_images_are_their_attachments() {
+        let shot = view(&tool(
+            ItemStatus::Completed,
+            "browser",
+            json!({"action": "screenshot"}),
+            Some(ToolOutput {
+                images: vec![ToolImage {
+                    attachment_id: "att_1".into(),
+                    mime_type: "image/png".into(),
+                }],
+                ..output("")
+            }),
+            None,
+        ));
+        assert_eq!(shot.images, ["att_1".to_owned()]);
     }
 
     #[test]
@@ -1160,72 +1252,76 @@ mod tests {
     }
 
     #[test]
-    fn notices_count_retries_steps_and_tokens() {
-        let error = |retry: Value| -> ErrorItem {
-            serde_json::from_value(json!({
-                "failure": {"class": "provider_error", "message": "Overloaded", "retryable": true},
-                "retry": retry
-            }))
-            .unwrap()
+    fn notices_count_steps_tokens_and_answers() {
+        let compaction = |before| CompactionItem {
+            summary: None,
+            tokens_before: before,
         };
         assert_eq!(
-            error_message(&error(json!({"attempt": 2, "maxAttempts": 5}))),
-            "Overloaded (retry 2 of 5)"
+            compaction_label(&compaction(Some(182_340))),
+            "Context compacted · 182340 tokens before"
         );
-        assert_eq!(
-            error_message(&error(json!({"attempt": 3}))),
-            "Overloaded (retry 3)"
-        );
-        assert_eq!(error_message(&error(Value::Null)), "Overloaded");
+        assert_eq!(compaction_label(&compaction(None)), "Context compacted");
 
-        let compaction = |before: Value, after: Value| -> CompactionItem {
-            serde_json::from_value(json!({"beforeTokenCount": before, "afterTokenCount": after}))
-                .unwrap()
+        let task = |text: &str, status| TodoTask {
+            text: text.into(),
+            status,
         };
-        assert_eq!(
-            compaction_label(&compaction(json!(182_340), json!(24_120))),
-            "Context compacted · 182340 → 24120 tokens"
-        );
-        assert_eq!(
-            compaction_label(&compaction(Value::Null, json!(1))),
-            "Context compacted"
-        );
-
-        let todo: TodoListItem = serde_json::from_value(json!({
-            "planId": "p",
-            "steps": [
-                {"id": "a", "text": "A", "status": "completed"},
-                {"id": "b", "text": "B", "status": "running"},
-                {"id": "c", "text": "C", "status": "pending"}
-            ]
-        }))
-        .unwrap();
+        let todo = TodoItem {
+            phases: vec![
+                TodoPhase {
+                    name: "One".into(),
+                    tasks: vec![
+                        task("A", TodoStatus::Completed),
+                        task("B", TodoStatus::InProgress),
+                    ],
+                },
+                TodoPhase {
+                    name: "Two".into(),
+                    tasks: vec![task("C", TodoStatus::Pending)],
+                },
+            ],
+        };
         assert_eq!(todo_notice(&todo), "Updated the plan · 1/3 done");
 
-        assert_eq!(answer_text(&json!(["60 Hz", "120 Hz"])), "60 Hz, 120 Hz");
-        assert_eq!(answer_text(&json!("Bottom")), "Bottom");
-        assert_eq!(answer_text(&Value::Null), "");
+        let answer = |values: &[&str], other: Option<&str>| Answer {
+            question_id: "q".into(),
+            values: values.iter().map(|v| (*v).to_owned()).collect(),
+            other: other.map(Into::into),
+        };
+        assert_eq!(
+            answer_text(&answer(&["60 Hz", "120 Hz"], None)),
+            "60 Hz, 120 Hz"
+        );
+        assert_eq!(answer_text(&answer(&["Bottom"], None)), "Bottom");
+        assert_eq!(answer_text(&answer(&[], Some("Left"))), "Left");
+        assert_eq!(answer_text(&answer(&[], None)), "");
     }
 
     #[test]
     fn activity_rows_are_tools_thinking_plans_and_notices() {
-        let reasoning = item(
-            "completed",
-            json!({"type": "reasoning", "text": "", "streaming": false}),
+        let thinking = item(
+            ItemStatus::Completed,
+            ItemKind::Thinking(TextItem {
+                text: String::new(),
+            }),
         );
         let notice = item(
-            "completed",
-            json!({"type": "system_notice", "message": "m"}),
+            ItemStatus::Completed,
+            ItemKind::Notice(NoticeItem {
+                level: NoticeLevel::Info,
+                text: "m".into(),
+            }),
         );
         let reply = item(
-            "completed",
-            json!({"type": "assistant_message", "messageId": "m", "text": "hi", "streaming": false}),
+            ItemStatus::Completed,
+            ItemKind::Text(TextItem { text: "hi".into() }),
         );
-        assert!(is_activity(&reasoning));
+        assert!(is_activity(&thinking));
         assert!(is_activity(&notice), "notices sit on the rail");
         assert!(!is_activity(&reply));
-        assert_eq!(subagent_status_label(SubagentStatus::Cancelled), "Stopped");
-        assert_eq!(subagent_status_label(SubagentStatus::Completed), "Done");
+        assert_eq!(subagent_status_label(ItemStatus::Cancelled), "Stopped");
+        assert_eq!(subagent_status_label(ItemStatus::Completed), "Done");
     }
 
     #[test]

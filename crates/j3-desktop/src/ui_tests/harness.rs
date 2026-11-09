@@ -13,8 +13,9 @@ use std::{
 };
 
 use j3_client::{
-    Connection, ConnectionStatus, ThreadState,
-    t3::{model::ModelSelection, orchestration::ThreadShell},
+    Connection, Status, ThreadView,
+    entities::{ModelRef, ThinkingLevel, Thread, TurnStatus},
+    methods::{CreateProjectParams, CreateThreadParams},
 };
 use j3_core::{
     app::{App as CoreApp, AppConfig},
@@ -25,7 +26,9 @@ use j3_core::{
 use rune::{ElementInfo, Key, KeyEvent, Mods, Runtime};
 use serde_json::{Value, json};
 
-use super::omp::{FakeFactory, FakeMicrophone, FakeRecognizer, MODEL, Script, install_fake_omp};
+use super::omp::{
+    FakeFactory, FakeMicrophone, FakeRecognizer, MODEL_ID, PROVIDER, Script, install_fake_omp,
+};
 use crate::{
     app::{J3, testing::TestApp},
     assist::AssistOmp,
@@ -45,16 +48,33 @@ pub fn temp_dir(name: &str) -> PathBuf {
     dir
 }
 
-pub fn model() -> ModelSelection {
-    serde_json::from_value(
-        json!({"instanceId": "omp", "model": MODEL, "options": [{"id": "thinking", "value": "high"}]}),
-    )
-    .unwrap()
+/// The fake omp's model (as its catalog names it) at high thinking.
+pub fn model() -> ModelRef {
+    ModelRef {
+        provider: PROVIDER.to_owned(),
+        id: MODEL_ID.to_owned(),
+        thinking: Some(ThinkingLevel::High),
+    }
 }
 
-/// The UI preferences tests start with: quiet, every T3 shelf open.
+/// The UI preferences tests start with: quiet, every Inbox shelf open.
 pub fn test_ui() -> Value {
     json!({"sounds": false, "expandedShelves": ["working", "snoozed", "settled"]})
+}
+
+/// Creates project `title` at `path` on `connection`'s server; returns its id.
+pub async fn create_project(
+    connection: &Connection,
+    title: &str,
+    path: String,
+) -> Result<String, j3_client::Error> {
+    let params = CreateProjectParams {
+        title: title.to_owned(),
+        path,
+        default_model: None,
+        command_id: None,
+    };
+    Ok(connection.projects_create(params).await?.project.id)
 }
 
 /// Serves a j3 server over `data_dir` on a free port, sessions faked by `script` (their
@@ -213,7 +233,7 @@ impl Harness {
         harness.until("the local connection is live", |h| {
             let state = h.connection.state();
             let state = state.borrow();
-            state.status == ConnectionStatus::Live && state.shell.loaded
+            state.status == Status::Connected && state.shell.synced
         });
         harness
     }
@@ -282,7 +302,7 @@ impl Harness {
         &mut self,
         what: &str,
         thread_id: &str,
-        mut check: impl FnMut(&ThreadState) -> bool,
+        mut check: impl FnMut(&ThreadView) -> bool,
     ) {
         let handle = self.connection.thread(thread_id);
         self.until(what, move |_| check(&handle.state().borrow()));
@@ -293,7 +313,7 @@ impl Harness {
         &mut self,
         what: &str,
         thread_id: &str,
-        mut check: impl FnMut(&ThreadShell) -> bool,
+        mut check: impl FnMut(&Thread) -> bool,
     ) {
         let connection = self.connection.clone();
         self.until(what, move |_| {
@@ -301,9 +321,21 @@ impl Harness {
                 .state()
                 .borrow()
                 .shell
-                .thread(thread_id)
+                .threads
+                .get(thread_id)
                 .is_some_and(&mut check)
         });
+    }
+
+    /// The shell's row of the thread, now.
+    pub fn shell_thread(&self, thread_id: &str) -> Option<Thread> {
+        self.connection
+            .state()
+            .borrow()
+            .shell
+            .threads
+            .get(thread_id)
+            .cloned()
     }
 
     /// Waits until `desktop.json` satisfies `check`.
@@ -324,9 +356,9 @@ impl Harness {
             connection
                 .state()
                 .borrow()
-                .config
+                .catalog
                 .as_ref()
-                .is_some_and(|config| config.providers.iter().any(|p| !p.models.is_empty()))
+                .is_some_and(|catalog| !catalog.models.is_empty())
         });
     }
 
@@ -334,54 +366,59 @@ impl Harness {
     pub fn project(&mut self) -> String {
         let connection = self.connection.clone();
         let dir = self.project_dir.to_string_lossy().into_owned();
-        let project = self
-            .block_on(async move { connection.create_project("Demo", &dir).await })
+        let id = self
+            .block_on(async move { create_project(&connection, "Demo", dir).await })
             .unwrap();
-        let id = project.id.clone();
         self.until("the app has the project", |h| {
             h.state()
                 .envs
                 .local()
-                .is_some_and(|env| env.state().shell.project(&id).is_some())
+                .is_some_and(|env| env.state().shell.projects.contains_key(&id))
         });
-        project.id
+        id
     }
 
-    /// Launches a thread through the connection and starts its run (in the newest fake
+    /// Launches a thread through the connection and starts its turn (in the newest fake
     /// session); returns its id.
     pub fn launch(&mut self, project_id: &str, text: &str) -> String {
         let connection = self.connection.clone();
-        let (project, message) = (project_id.to_owned(), text.to_owned());
+        let params = CreateThreadParams {
+            project_id: project_id.to_owned(),
+            model: model(),
+            mode: None,
+            title: Some(j3_client::prompt_title(text, 0)),
+            text: text.to_owned(),
+            attachments: Vec::new(),
+            command_id: None,
+        };
         let thread_id = self
-            .block_on(async move {
-                connection
-                    .launch(&project, &message, Vec::new(), model())
-                    .await
-            })
-            .unwrap();
+            .block_on(async move { connection.threads_create(params).await })
+            .unwrap()
+            .thread
+            .id;
         self.until_called(&format!("prompt:{text}:0"));
         self.script.emit(json!({"type": "agent_start"}));
-        self.until_shell("the run starts", &thread_id, |thread| {
-            thread.active_run_id.is_some()
+        self.until_shell("the turn starts", &thread_id, |thread| {
+            thread.active_turn_id.is_some()
         });
         thread_id
     }
 
-    /// Launches a thread and lets its run complete; returns its id.
+    /// Launches a thread and lets its turn complete; returns its id.
     pub fn completed(&mut self, project_id: &str, text: &str) -> String {
         let thread_id = self.launch(project_id, text);
         self.script.settle("completed");
-        self.until_shell("the run completes", &thread_id, |thread| {
-            thread.active_run_id.is_none()
+        self.until_shell("the turn completes", &thread_id, |thread| {
+            thread.active_turn_id.is_none()
                 && thread
-                    .latest_run_completed_at
+                    .latest_turn
                     .as_ref()
-                    .is_some_and(Option::is_some)
+                    .is_some_and(|turn| turn.ended_at.is_some())
         });
         thread_id
     }
 
-    /// Launches a thread, starts its run and opens it from the sidebar; returns its id.
+    /// Launches a thread, starts its turn and opens it from the sidebar; returns its id.
     pub fn open_running_thread(&mut self, project_id: &str, text: &str) -> String {
         let thread_id = self.launch(project_id, text);
         let row = format!("{text}, Working");
@@ -389,9 +426,13 @@ impl Harness {
             h.in_sidebar(&row)
         });
         self.click_sidebar(&row);
-        // The thread view's composer offers Stop while the run is active.
+        // The thread view's composer offers Stop while the turn is active.
         self.until("the composer offers Stop", |h| h.stoppable());
-        self.until_thread("the run can steer", &thread_id, |state| state.can_steer());
+        self.until_thread("the turn runs", &thread_id, |state| {
+            state
+                .active_turn()
+                .is_some_and(|turn| turn.status == TurnStatus::Running)
+        });
         thread_id
     }
 

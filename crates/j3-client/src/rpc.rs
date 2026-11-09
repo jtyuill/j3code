@@ -1,17 +1,22 @@
-//! Effect RPC over one WebSocket (`docs/protocol/effect-rpc.md`): JSON text
-//! frames, numeric request ids from one process-wide counter, an `Ack` for
-//! every `Chunk` the consumer pulls, `Interrupt` for abandoned requests, a
-//! `Ping` every 5 s, and a socket that stays silent for 15 s counts as dead.
+//! The v2 envelope over one WebSocket (`docs/protocol/wire.md` §3): `call`
+//! frames with per-connection ids, `ack {id, n: 1}` for every `items` frame
+//! the consumer pulls, `cancel` for abandoned calls, a `ping` every
+//! [`PING_INTERVAL_SECS`], and [`CLIENT_TIMEOUT_SECS`] of silence counts as
+//! a dead socket. `err` with `id: null` or a closed socket fails every open
+//! call.
 
 use std::{
     collections::HashMap,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
 use futures_util::{SinkExt, StreamExt};
-use j3_protocol::effect_rpc::{
-    CauseReason, ClientMessage, Exit, Request, RequestId, ServerMessage, decode_server_frame,
+use j3_protocol::v2::envelope::{
+    CLIENT_TIMEOUT_SECS, CallId, ClientFrame, PING_INTERVAL_SECS, ServerFrame,
 };
 use serde_json::Value;
 use tokio::{
@@ -19,99 +24,111 @@ use tokio::{
     task::JoinHandle,
     time::{Instant, MissedTickBehavior},
 };
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::{self, Message};
 use tracing::{debug, warn};
 
 use crate::Error;
 
-const PING_INTERVAL: Duration = Duration::from_secs(5);
-const PING_TIMEOUT: Duration = Duration::from_secs(15);
+const PING_INTERVAL: Duration = Duration::from_secs(PING_INTERVAL_SECS);
+const SILENCE_LIMIT: Duration = Duration::from_secs(CLIENT_TIMEOUT_SECS);
 const OPEN_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Effect's client allocates ids from one module-global counter starting at 0.
-static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(0);
-
-fn next_id() -> u64 {
-    NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+/// Why a connection attempt failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Failure {
+    /// The server speaks another protocol version; retrying soon won't help.
+    Incompatible(String),
+    /// Anything else; worth retrying.
+    Failed(String),
 }
 
 enum Cmd {
-    Unary {
-        id: u64,
-        tag: &'static str,
-        payload: Value,
-        reply: oneshot::Sender<Result<Value, Error>>,
+    Call {
+        id: CallId,
+        method: &'static str,
+        params: Value,
+        reply: Reply,
     },
-    Stream {
-        id: u64,
-        tag: &'static str,
-        payload: Value,
-        events: mpsc::UnboundedSender<StreamEvent>,
-    },
-    Ack(u64),
-    Interrupt(u64),
+    Ack(CallId),
+    Cancel(CallId),
     Close,
 }
 
+enum Reply {
+    Unary(oneshot::Sender<Result<Value, Error>>),
+    Stream(mpsc::UnboundedSender<StreamEvent>),
+}
+
 enum StreamEvent {
-    Chunk(Vec<Value>),
+    Items(Vec<Value>),
     End(Result<(), Error>),
 }
 
-/// A connected socket. Cheap to clone; the socket closes when [`Session::close`]
-/// is called or the server goes away.
+/// A connected socket. Cheap to clone; the socket closes on
+/// [`Session::close`], when the server goes away, or when it stays silent.
 #[derive(Clone)]
 pub(crate) struct Session {
     tx: mpsc::UnboundedSender<Cmd>,
+    ids: Arc<AtomicU64>,
 }
 
 impl Session {
     /// Opens the WebSocket at `url` and starts its I/O task, which resolves
     /// with the reason the socket ended.
-    pub(crate) async fn connect(url: &str) -> Result<(Self, JoinHandle<String>), String> {
+    pub(crate) async fn connect(url: &str) -> Result<(Self, JoinHandle<String>), Failure> {
         let (socket, _) = tokio::time::timeout(OPEN_TIMEOUT, tokio_tungstenite::connect_async(url))
             .await
-            .map_err(|_| format!("opening {url} timed out"))?
-            .map_err(|e| format!("opening {url}: {e}"))?;
+            .map_err(|_| Failure::Failed(format!("opening {url} timed out")))?
+            .map_err(|error| open_failure(url, error))?;
         let (tx, rx) = mpsc::unbounded_channel();
         let task = tokio::spawn(run_socket(socket, rx));
-        Ok((Self { tx }, task))
+        Ok((
+            Self {
+                tx,
+                ids: Arc::new(AtomicU64::new(0)),
+            },
+            task,
+        ))
     }
 
-    /// One unary call. Dropping the returned future interrupts the request.
-    pub(crate) async fn request(&self, tag: &'static str, payload: Value) -> Result<Value, Error> {
-        let id = next_id();
+    fn next_id(&self) -> CallId {
+        self.ids.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// One unary call. Dropping the returned future cancels the call.
+    pub(crate) async fn call(&self, method: &'static str, params: Value) -> Result<Value, Error> {
+        let id = self.next_id();
         let (reply, response) = oneshot::channel();
         self.tx
-            .send(Cmd::Unary {
+            .send(Cmd::Call {
                 id,
-                tag,
-                payload,
-                reply,
+                method,
+                params,
+                reply: Reply::Unary(reply),
             })
-            .map_err(|_| closed())?;
-        let mut guard = InterruptGuard {
+            .map_err(|_| Error::Disconnected)?;
+        let mut guard = CancelGuard {
             id,
             tx: &self.tx,
             armed: true,
         };
-        let result = response.await.unwrap_or_else(|_| Err(closed()));
+        let result = response.await.unwrap_or(Err(Error::Disconnected));
         guard.armed = false;
         result
     }
 
-    /// Starts a streaming call. Dropping the stream before it ends interrupts it.
-    pub(crate) fn stream(&self, tag: &'static str, payload: Value) -> Result<RpcStream, Error> {
-        let id = next_id();
+    /// Starts a stream call. Dropping the stream before it ends cancels it.
+    pub(crate) fn stream(&self, method: &'static str, params: Value) -> Result<RpcStream, Error> {
+        let id = self.next_id();
         let (events, rx) = mpsc::unbounded_channel();
         self.tx
-            .send(Cmd::Stream {
+            .send(Cmd::Call {
                 id,
-                tag,
-                payload,
-                events,
+                method,
+                params,
+                reply: Reply::Stream(events),
             })
-            .map_err(|_| closed())?;
+            .map_err(|_| Error::Disconnected)?;
         Ok(RpcStream {
             id,
             rx,
@@ -120,49 +137,61 @@ impl Session {
         })
     }
 
-    /// Closes the socket; in-flight requests fail with [`Error::Disconnected`].
+    /// Closes the socket; open calls fail with [`Error::Disconnected`].
     pub(crate) fn close(&self) {
         let _ = self.tx.send(Cmd::Close);
     }
 }
 
-fn closed() -> Error {
-    Error::Disconnected("the connection to the server was lost".into())
+/// A refused upgrade with `426` is a protocol mismatch (wire.md §1).
+fn open_failure(url: &str, error: tungstenite::Error) -> Failure {
+    if let tungstenite::Error::Http(response) = &error
+        && response.status().as_u16() == 426
+    {
+        let message = response
+            .body()
+            .as_deref()
+            .and_then(|body| serde_json::from_slice::<Value>(body).ok())
+            .and_then(|body| body.get("message")?.as_str().map(str::to_owned))
+            .unwrap_or_else(|| format!("{url} refused this client's protocol version"));
+        return Failure::Incompatible(message);
+    }
+    Failure::Failed(format!("opening {url}: {error}"))
 }
 
-struct InterruptGuard<'a> {
-    id: u64,
+struct CancelGuard<'a> {
+    id: CallId,
     tx: &'a mpsc::UnboundedSender<Cmd>,
     armed: bool,
 }
 
-impl Drop for InterruptGuard<'_> {
+impl Drop for CancelGuard<'_> {
     fn drop(&mut self) {
         if self.armed {
-            let _ = self.tx.send(Cmd::Interrupt(self.id));
+            let _ = self.tx.send(Cmd::Cancel(self.id));
         }
     }
 }
 
-/// The chunks of one streaming call.
+/// The `items` frames of one stream call.
 pub(crate) struct RpcStream {
-    id: u64,
+    id: CallId,
     rx: mpsc::UnboundedReceiver<StreamEvent>,
     tx: mpsc::UnboundedSender<Cmd>,
     done: bool,
 }
 
 impl RpcStream {
-    /// The next chunk (acked as it is pulled); `None` once the stream ended
-    /// normally. A failure ends the stream.
+    /// The next `items` frame, acked as it is pulled; `None` once the stream
+    /// ended with `end`. A failure is the stream's last element.
     pub(crate) async fn next(&mut self) -> Option<Result<Vec<Value>, Error>> {
         if self.done {
             return None;
         }
         match self.rx.recv().await {
-            Some(StreamEvent::Chunk(values)) => {
+            Some(StreamEvent::Items(items)) => {
                 let _ = self.tx.send(Cmd::Ack(self.id));
-                Some(Ok(values))
+                Some(Ok(items))
             }
             Some(StreamEvent::End(result)) => {
                 self.done = true;
@@ -170,7 +199,7 @@ impl RpcStream {
             }
             None => {
                 self.done = true;
-                Some(Err(closed()))
+                Some(Err(Error::Disconnected))
             }
         }
     }
@@ -179,44 +208,21 @@ impl RpcStream {
 impl Drop for RpcStream {
     fn drop(&mut self) {
         if !self.done {
-            let _ = self.tx.send(Cmd::Interrupt(self.id));
+            let _ = self.tx.send(Cmd::Cancel(self.id));
         }
     }
-}
-
-/// Maps an `Exit` to the call's result.
-fn exit_result(exit: Exit) -> Result<Value, Error> {
-    match exit {
-        Exit::Success { value } => Ok(value),
-        Exit::Failure { cause } => Err(cause_error(cause)),
-    }
-}
-
-fn cause_error(cause: Vec<CauseReason>) -> Error {
-    // A typed failure explains the most; then a defect; else an interrupt.
-    let mut fallback = None;
-    for reason in cause {
-        match reason {
-            CauseReason::Fail { error } => return Error::rejected(error),
-            CauseReason::Die { defect } => fallback = Some(Error::defect(&defect)),
-            CauseReason::Interrupt { .. } => {
-                fallback.get_or_insert(Error::Interrupted);
-            }
-        }
-    }
-    fallback.unwrap_or(Error::Interrupted)
 }
 
 type Socket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 #[derive(Default)]
-struct Pending {
-    unary: HashMap<u64, oneshot::Sender<Result<Value, Error>>>,
-    streams: HashMap<u64, mpsc::UnboundedSender<StreamEvent>>,
+struct Open {
+    unary: HashMap<CallId, oneshot::Sender<Result<Value, Error>>>,
+    streams: HashMap<CallId, mpsc::UnboundedSender<StreamEvent>>,
 }
 
-impl Pending {
+impl Open {
     fn fail_all(&mut self, error: &Error) {
         for (_, reply) in self.unary.drain() {
             let _ = reply.send(Err(error.clone()));
@@ -225,143 +231,136 @@ impl Pending {
             let _ = events.send(StreamEvent::End(Err(error.clone())));
         }
     }
+
+    /// Routes one frame for call `id`; returns a `cancel` to send when the
+    /// stream's consumer went away.
+    fn route(&mut self, frame: ServerFrame) -> Option<ClientFrame> {
+        let unexpected = |what: &str| Error::Decode(format!("unexpected `{what}` frame"));
+        match frame {
+            ServerFrame::Ok { id, result } => {
+                if let Some(reply) = self.unary.remove(&id) {
+                    let _ = reply.send(Ok(result));
+                } else if let Some(events) = self.streams.remove(&id) {
+                    let _ = events.send(StreamEvent::End(Err(unexpected("ok"))));
+                }
+            }
+            ServerFrame::Items { id, items } => {
+                if let Some(events) = self.streams.get(&id) {
+                    if events.send(StreamEvent::Items(items)).is_err() {
+                        self.streams.remove(&id);
+                        return Some(ClientFrame::Cancel { id });
+                    }
+                } else if let Some(reply) = self.unary.remove(&id) {
+                    let _ = reply.send(Err(unexpected("items")));
+                    return Some(ClientFrame::Cancel { id });
+                }
+            }
+            ServerFrame::End { id } => {
+                if let Some(events) = self.streams.remove(&id) {
+                    let _ = events.send(StreamEvent::End(Ok(())));
+                } else if let Some(reply) = self.unary.remove(&id) {
+                    let _ = reply.send(Err(unexpected("end")));
+                }
+            }
+            ServerFrame::Err {
+                id: Some(id),
+                error,
+            } => {
+                if let Some(reply) = self.unary.remove(&id) {
+                    let _ = reply.send(Err(Error::Server(error)));
+                } else if let Some(events) = self.streams.remove(&id) {
+                    let _ = events.send(StreamEvent::End(Err(Error::Server(error))));
+                }
+            }
+            // Handled by the socket loop.
+            ServerFrame::Err { id: None, .. } | ServerFrame::Pong => {}
+        }
+        None
+    }
 }
 
-fn encode(message: &ClientMessage) -> Message {
-    Message::text(serde_json::to_string(message).expect("client messages always encode"))
-}
-
-fn request_message(id: u64, tag: &str, payload: Value) -> ClientMessage {
-    ClientMessage::Request(Request {
-        id: RequestId::Number(id),
-        tag: tag.to_owned(),
-        payload,
-        headers: Vec::new(),
-        is_notification: None,
-        trace_id: None,
-        span_id: None,
-        sampled: None,
-    })
+fn encode(frame: &ClientFrame) -> Message {
+    Message::text(serde_json::to_string(frame).expect("client frames always encode"))
 }
 
 /// The socket's I/O loop. Resolves with the reason it ended.
 async fn run_socket(socket: Socket, mut commands: mpsc::UnboundedReceiver<Cmd>) -> String {
     let (mut sink, mut frames) = socket.split();
-    let mut pending = Pending::default();
+    let mut open = Open::default();
     let mut ping = tokio::time::interval_at(Instant::now() + PING_INTERVAL, PING_INTERVAL);
     ping.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let silence = tokio::time::sleep(PING_TIMEOUT);
+    let silence = tokio::time::sleep(SILENCE_LIMIT);
     tokio::pin!(silence);
 
-    let reason = loop {
-        tokio::select! {
-            command = commands.recv() => {
-                let outgoing = match command {
-                    None | Some(Cmd::Close) => break "closed by the client".to_owned(),
-                    Some(Cmd::Unary { id, tag, payload, reply }) => {
-                        pending.unary.insert(id, reply);
-                        request_message(id, tag, payload)
+    let (reason, error) = loop {
+        let outgoing = tokio::select! {
+            command = commands.recv() => match command {
+                None | Some(Cmd::Close) => break ("closed by the client".to_owned(), Error::Disconnected),
+                Some(Cmd::Call { id, method, params, reply }) => {
+                    match reply {
+                        Reply::Unary(reply) => { open.unary.insert(id, reply); }
+                        Reply::Stream(events) => { open.streams.insert(id, events); }
                     }
-                    Some(Cmd::Stream { id, tag, payload, events }) => {
-                        pending.streams.insert(id, events);
-                        request_message(id, tag, payload)
-                    }
-                    Some(Cmd::Ack(id)) => {
-                        if !pending.streams.contains_key(&id) {
-                            continue;
-                        }
-                        ClientMessage::ack(id)
-                    }
-                    Some(Cmd::Interrupt(id)) => {
-                        let known = pending.unary.remove(&id).is_some()
-                            | pending.streams.remove(&id).is_some();
-                        if !known {
-                            continue;
-                        }
-                        ClientMessage::interrupt(id)
-                    }
-                };
-                if let Err(e) = sink.send(encode(&outgoing)).await {
-                    break format!("sending: {e}");
+                    ClientFrame::Call { id, method: method.to_owned(), params }
                 }
-            }
+                Some(Cmd::Ack(id)) => {
+                    if !open.streams.contains_key(&id) {
+                        continue;
+                    }
+                    ClientFrame::Ack { id, n: 1 }
+                }
+                Some(Cmd::Cancel(id)) => {
+                    let known = open.unary.remove(&id).is_some() | open.streams.remove(&id).is_some();
+                    if !known {
+                        continue;
+                    }
+                    ClientFrame::Cancel { id }
+                }
+            },
             frame = frames.next() => {
-                silence.as_mut().reset(Instant::now() + PING_TIMEOUT);
+                silence.as_mut().reset(Instant::now() + SILENCE_LIMIT);
                 let text = match frame {
-                    None => break "the server closed the connection".to_owned(),
-                    Some(Err(e)) => break format!("receiving: {e}"),
+                    None => break ("the server closed the connection".to_owned(), Error::Disconnected),
+                    Some(Err(e)) => break (format!("receiving: {e}"), Error::Disconnected),
                     Some(Ok(Message::Text(text))) => text,
                     Some(Ok(Message::Close(frame))) => {
-                        break match frame {
-                            Some(frame) => format!("the server closed the connection ({})", frame.reason),
-                            None => "the server closed the connection".to_owned(),
+                        let reason = match frame {
+                            Some(frame) if !frame.reason.is_empty() => {
+                                format!("the server closed the connection ({})", frame.reason)
+                            }
+                            _ => "the server closed the connection".to_owned(),
                         };
+                        break (reason, Error::Disconnected);
                     }
                     Some(Ok(_)) => continue,
                 };
-                let messages = match decode_server_frame(text.as_str()) {
-                    Ok(messages) => messages,
+                let frame = match serde_json::from_str::<ServerFrame>(text.as_str()) {
+                    Ok(frame) => frame,
                     Err(e) => {
                         warn!(error = %e, "undecodable frame from the server");
                         continue;
                     }
                 };
-                for message in messages {
-                    if let Some(interrupt) = on_message(&mut pending, message)
-                        && let Err(e) = sink.send(encode(&interrupt)).await
-                    {
-                        pending.fail_all(&Error::Disconnected(format!("sending: {e}")));
-                        return format!("sending: {e}");
-                    }
+                if let ServerFrame::Err { id: None, error } = frame {
+                    break (format!("the server ended the connection: {error}"), Error::Server(error));
+                }
+                match open.route(frame) {
+                    Some(cancel) => cancel,
+                    None => continue,
                 }
             }
-            _ = ping.tick() => {
-                if let Err(e) = sink.send(encode(&ClientMessage::Ping)).await {
-                    break format!("sending: {e}");
-                }
-            }
-            () = &mut silence => break format!("no response from the server for {}s", PING_TIMEOUT.as_secs()),
+            _ = ping.tick() => ClientFrame::Ping,
+            () = &mut silence => break (
+                format!("no response from the server for {CLIENT_TIMEOUT_SECS}s"),
+                Error::Disconnected,
+            ),
+        };
+        if let Err(e) = sink.send(encode(&outgoing)).await {
+            break (format!("sending: {e}"), Error::Disconnected);
         }
     };
     debug!(%reason, "socket ended");
+    open.fail_all(&error);
     let _ = sink.close().await;
-    pending.fail_all(&Error::Disconnected(reason.clone()));
     reason
-}
-
-/// Routes one server message; returns an `Interrupt` to send for a stream
-/// whose consumer went away.
-fn on_message(pending: &mut Pending, message: ServerMessage) -> Option<ClientMessage> {
-    match message {
-        ServerMessage::Chunk { request_id, values } => {
-            let RequestId::Number(id) = request_id else {
-                return None;
-            };
-            let events = pending.streams.get(&id)?;
-            if events.send(StreamEvent::Chunk(values)).is_err() {
-                pending.streams.remove(&id);
-                return Some(ClientMessage::interrupt(id));
-            }
-            None
-        }
-        ServerMessage::Exit { request_id, exit } => {
-            let RequestId::Number(id) = request_id else {
-                return None;
-            };
-            if let Some(reply) = pending.unary.remove(&id) {
-                let _ = reply.send(exit_result(exit));
-            } else if let Some(events) = pending.streams.remove(&id) {
-                let _ = events.send(StreamEvent::End(exit_result(exit).map(drop)));
-            }
-            None
-        }
-        ServerMessage::Defect { defect } => {
-            pending.fail_all(&Error::defect(&defect));
-            None
-        }
-        ServerMessage::Pong
-        | ServerMessage::ClientProtocolError { .. }
-        | ServerMessage::Request(_)
-        | ServerMessage::Unknown(_) => None,
-    }
 }

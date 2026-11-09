@@ -1,11 +1,15 @@
 //! The plan and queue cards above the composer (spec §5.2, items 1–2).
 //!
-//! The plan card shows the latest todo list (`todo-toggle` folds it). The queue card lists
-//! messages waiting behind the active run: each can steer the run (when it can be steered),
-//! start now, be edited in place or leave the queue; a held queue says "Paused" and offers
-//! Resume.
+//! The plan card shows the latest todo list's tasks, by phase (`todo-toggle` folds it). The
+//! queue card lists messages waiting behind the active turn: each can steer the turn (while
+//! one runs), start now, be edited in place or leave the queue; a held queue says "Paused"
+//! and offers Resume.
 
-use j3_client::{ThreadState, t3::orchestration::PlanStepStatus};
+use j3_client::{
+    ThreadView,
+    entities::TodoStatus,
+    methods::{QueueEditParams, QueueEntryParams, ThreadParams},
+};
 use rune::{El, TextEdit, Tx, col, icon, row, spacer, text};
 use rune_kit::{Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, TextInput};
 
@@ -19,8 +23,16 @@ use crate::{
 
 /// A queued message being edited in place.
 pub struct QueueEdit {
-    pub run_id: String,
+    pub entry_id: String,
     pub edit: TextEdit,
+}
+
+/// What a queue entry's button asks of the server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueueCommand {
+    Steer,
+    Start,
+    Cancel,
 }
 
 impl J3 {
@@ -31,53 +43,44 @@ impl J3 {
         }
     }
 
-    /// Sends queued run `run_id` into the active run as a steer.
-    pub fn steer_queued(&mut self, key: &ThreadKey, run_id: &str) {
-        let Some(target) = self
-            .threads
-            .get(key)
-            .and_then(|thread| thread.state.active_run())
-            .map(|run| run.id.clone())
-        else {
-            return;
-        };
+    /// Sends queue entry `entry_id` into the active turn as a steer.
+    pub fn steer_queued(&mut self, key: &ThreadKey, entry_id: &str) {
+        self.queue_command(key, entry_id, QueueCommand::Steer);
+    }
+
+    /// Stops the active turn and starts queue entry `entry_id`.
+    pub fn send_queued_now(&mut self, key: &ThreadKey, entry_id: &str) {
+        self.queue_command(key, entry_id, QueueCommand::Start);
+    }
+
+    /// Takes queue entry `entry_id` out of the queue.
+    pub fn cancel_queued(&mut self, key: &ThreadKey, entry_id: &str) {
+        self.queue_command(key, entry_id, QueueCommand::Cancel);
+    }
+
+    fn queue_command(&mut self, key: &ThreadKey, entry_id: &str, command: QueueCommand) {
         let Some(connection) = self.thread_connection(key) else {
             return;
         };
-        let (thread_id, run_id) = (key.thread_id.clone(), run_id.to_owned());
+        let params = QueueEntryParams {
+            thread_id: key.thread_id.clone(),
+            entry_id: entry_id.to_owned(),
+            command_id: None,
+        };
+        let what = match command {
+            QueueCommand::Steer => "steer the turn",
+            QueueCommand::Start => "send the message now",
+            QueueCommand::Cancel => "remove the message from the queue",
+        };
         self.run_command(
-            "steer the run",
+            what,
             async move {
-                connection
-                    .promote_to_steer(&thread_id, &run_id, &target)
-                    .await
+                match command {
+                    QueueCommand::Steer => connection.queue_steer(params).await,
+                    QueueCommand::Start => connection.queue_start(params).await,
+                    QueueCommand::Cancel => connection.queue_cancel(params).await,
+                }
             },
-            |_, _, _| {},
-        );
-    }
-
-    /// Stops the active run and starts queued run `run_id`.
-    pub fn send_queued_now(&mut self, key: &ThreadKey, run_id: &str) {
-        let Some(connection) = self.thread_connection(key) else {
-            return;
-        };
-        let (thread_id, run_id) = (key.thread_id.clone(), run_id.to_owned());
-        self.run_command(
-            "send the message now",
-            async move { connection.start_queued(&thread_id, &run_id).await },
-            |_, _, _| {},
-        );
-    }
-
-    /// Takes queued run `run_id` out of the queue.
-    pub fn cancel_queued(&mut self, key: &ThreadKey, run_id: &str) {
-        let Some(connection) = self.thread_connection(key) else {
-            return;
-        };
-        let (thread_id, run_id) = (key.thread_id.clone(), run_id.to_owned());
-        self.run_command(
-            "remove the message from the queue",
-            async move { connection.cancel_queued(&thread_id, &run_id).await },
             |_, _, _| {},
         );
     }
@@ -87,16 +90,19 @@ impl J3 {
         let Some(connection) = self.thread_connection(key) else {
             return;
         };
-        let thread_id = key.thread_id.clone();
+        let params = ThreadParams {
+            thread_id: key.thread_id.clone(),
+            command_id: None,
+        };
         self.run_command(
             "resume the queue",
-            async move { connection.resume_queue(&thread_id).await },
+            async move { connection.queue_resume(params).await },
             |_, _, _| {},
         );
     }
 
-    /// Edits queued run `run_id`'s `text` in place, focused with the caret at the end.
-    pub fn edit_queued(&mut self, key: &ThreadKey, run_id: &str, text: &str) {
+    /// Edits queue entry `entry_id`'s `text` in place, focused with the caret at the end.
+    pub fn edit_queued(&mut self, key: &ThreadKey, entry_id: &str, text: &str) {
         let Some(thread) = self.threads.get_mut(key) else {
             return;
         };
@@ -105,12 +111,12 @@ impl J3 {
         edit.anchor = text.len();
         edit.focus = text.len();
         thread.chrome.queue_edit = Some(QueueEdit {
-            run_id: run_id.to_owned(),
+            entry_id: entry_id.to_owned(),
             edit,
         });
     }
 
-    /// Saves the queued message being edited (`connection.edit_queued`).
+    /// Saves the queued message being edited (`queue.edit`; its attachments stay).
     pub fn save_queued_edit(&mut self, key: &ThreadKey) {
         let Some(edit) = self
             .threads
@@ -122,15 +128,16 @@ impl J3 {
         let Some(connection) = self.thread_connection(key) else {
             return;
         };
-        let thread_id = key.thread_id.clone();
-        let text = edit.edit.text.clone();
+        let params = QueueEditParams {
+            thread_id: key.thread_id.clone(),
+            entry_id: edit.entry_id,
+            text: edit.edit.text.clone(),
+            attachments: None,
+            command_id: None,
+        };
         self.run_command(
             "edit the queued message",
-            async move {
-                connection
-                    .edit_queued(&thread_id, &edit.run_id, &text)
-                    .await
-            },
+            async move { connection.queue_edit(params).await },
             |_, _, _| {},
         );
     }
@@ -143,17 +150,21 @@ impl J3 {
     }
 }
 
-/// The plan card: the latest todo list's steps, folded by `todo-toggle`; None without steps.
-pub fn todo(ui: &Ui, key: &ThreadKey, state: &ThreadState, chrome: &ChromeUi) -> Option<El> {
+/// The plan card: the latest todo list's tasks under their phases (a single phase goes
+/// unnamed), folded by `todo-toggle`; None without tasks.
+pub fn todo(ui: &Ui, key: &ThreadKey, state: &ThreadView, chrome: &ChromeUi) -> Option<El> {
     let k = ui.k;
-    let todo = state.latest_todo().filter(|todo| !todo.steps.is_empty())?;
-    let done = todo
-        .steps
-        .iter()
-        .filter(|step| step.status == PlanStepStatus::Completed)
+    let (_, todo) = state.latest_todo()?;
+    let tasks = || todo.phases.iter().flat_map(|phase| &phase.tasks);
+    let total = tasks().count();
+    if total == 0 {
+        return None;
+    }
+    let done = tasks()
+        .filter(|task| task.status == TodoStatus::Completed)
         .count();
     let open = chrome.todo_open;
-    let summary = format!("{done}/{} done", todo.steps.len());
+    let summary = format!("{done}/{total} done");
     let toggle_key = key.clone();
     let toggle = row()
         .key("todo-toggle")
@@ -181,29 +192,44 @@ pub fn todo(ui: &Ui, key: &ThreadKey, state: &ThreadState, chrome: &ChromeUi) ->
         )
         .child(text(summary).font(k.ty.text_xsmall).color(k.c.text_muted));
     let mut card = card(k, "todo").child(toggle);
-    if open {
-        let status = Status::of(k);
-        for step in todo.steps {
-            let (glyph, color) = match step.status {
-                PlanStepStatus::Completed => (&icons::CIRCLE_CHECK, status.success),
-                PlanStepStatus::Running => (&icons::LOADER_CIRCLE, k.c.icon_accent),
-                PlanStepStatus::Pending => (&icons::MINUS, k.c.icon_muted),
+    if !open {
+        return Some(card);
+    }
+    let status = Status::of(k);
+    let named = todo.phases.len() > 1;
+    for (pix, phase) in todo.phases.iter().enumerate() {
+        if named && !phase.tasks.is_empty() {
+            card = card.child(
+                text(&phase.name)
+                    .key(format!("todo-phase-{pix}"))
+                    .font(k.ty.text_xsmall_medium)
+                    .color(k.c.text_muted)
+                    .pt(4.0),
+            );
+        }
+        for (tix, task) in phase.tasks.iter().enumerate() {
+            let (glyph, color) = match task.status {
+                TodoStatus::Completed => (&icons::CIRCLE_CHECK, status.success),
+                TodoStatus::InProgress => (&icons::LOADER_CIRCLE, k.c.icon_accent),
+                TodoStatus::Pending => (&icons::MINUS, k.c.icon_muted),
+                TodoStatus::Blocked => (&icons::MINUS, status.warning),
+                TodoStatus::Abandoned => (&icons::X, k.c.icon_muted),
             };
-            let completed = step.status == PlanStepStatus::Completed;
-            let mut label = text(&step.text)
+            let finished = matches!(task.status, TodoStatus::Completed | TodoStatus::Abandoned);
+            let mut label = text(&task.text)
                 .font(k.ty.text_small)
-                .color(if completed {
+                .color(if finished {
                     k.c.text_muted
                 } else {
                     k.c.text_base
                 })
                 .wrap();
-            if completed {
-                label = label.strike(0, step.text.len(), None);
+            if finished {
+                label = label.strike(0, task.text.len(), None);
             }
             card = card.child(
                 row()
-                    .key(format!("todo-step-{}", step.id))
+                    .key(format!("todo-step-{pix}-{tix}"))
                     .w_full()
                     .gap(8.0)
                     .items_start()
@@ -216,13 +242,12 @@ pub fn todo(ui: &Ui, key: &ThreadKey, state: &ThreadState, chrome: &ChromeUi) ->
 }
 
 /// The queue card: one row per queued message; None while nothing waits.
-pub fn queue(ui: &Ui, key: &ThreadKey, state: &ThreadState, chrome: &ChromeUi) -> Option<El> {
+pub fn queue(ui: &Ui, key: &ThreadKey, state: &ThreadView, chrome: &ChromeUi) -> Option<El> {
     let k = ui.k;
-    let queued = state.queued_runs();
-    if queued.is_empty() {
+    if state.queue.is_empty() {
         return None;
     }
-    let steerable = state.active_run().is_some() && state.can_steer();
+    let steerable = state.active_turn().is_some();
     let mut header = row()
         .key("queue-header")
         .w_full()
@@ -249,20 +274,20 @@ pub fn queue(ui: &Ui, key: &ThreadKey, state: &ThreadState, chrome: &ChromeUi) -
             );
     }
     let mut card = card(k, "queue").child(header);
-    for queued in &queued {
-        let run_id = queued.run.id.as_str();
+    for entry in &state.queue {
+        let entry_id = entry.id.as_str();
         let editing = chrome
             .queue_edit
             .as_ref()
-            .filter(|edit| edit.run_id == run_id);
+            .filter(|edit| edit.entry_id == entry_id);
         let body = match editing {
-            Some(edit) => editing_row(k, key, run_id, &edit.edit),
-            None => queued_row(k, key, run_id, queued.text, steerable),
+            Some(edit) => editing_row(k, key, entry_id, &edit.edit),
+            None => queued_row(k, key, entry_id, &entry.text, steerable),
         };
         card = card.child(
             row()
-                .key(format!("queued-{run_id}"))
-                .label(queued.text)
+                .key(format!("queued-{entry_id}"))
+                .label(&entry.text)
                 .w_full()
                 .gap(8.0)
                 .center_y()
@@ -274,10 +299,10 @@ pub fn queue(ui: &Ui, key: &ThreadKey, state: &ThreadState, chrome: &ChromeUi) -
 }
 
 /// A queued message: its text, then Steer, Send now, Edit and remove.
-fn queued_row(k: &Kit, key: &ThreadKey, run_id: &str, message: &str, steerable: bool) -> El {
+fn queued_row(k: &Kit, key: &ThreadKey, entry_id: &str, message: &str, steerable: bool) -> El {
     let action =
-        |label: &str, id: &str, help: Option<&str>, run_fn: fn(&mut J3, &ThreadKey, &str)| {
-            let (key, run) = (key.clone(), run_id.to_owned());
+        |label: &str, id: &str, help: Option<&str>, command: fn(&mut J3, &ThreadKey, &str)| {
+            let (key, entry) = (key.clone(), entry_id.to_owned());
             let mut button = Button::new(label)
                 .variant(ButtonVariant::Ghost)
                 .control_size(ControlSize::Small);
@@ -285,9 +310,9 @@ fn queued_row(k: &Kit, key: &ThreadKey, run_id: &str, message: &str, steerable: 
                 button = button.help(help);
             }
             button
-                .on_press(move |s: &mut J3| run_fn(s, &key, &run))
+                .on_press(move |s: &mut J3| command(s, &key, &entry))
                 .build(k)
-                .key(format!("{id}-{run_id}"))
+                .key(format!("{id}-{entry_id}"))
         };
     let mut body = row().grow(1.0).min_w(0.0).gap(4.0).center_y().child(
         text(message)
@@ -306,22 +331,22 @@ fn queued_row(k: &Kit, key: &ThreadKey, run_id: &str, message: &str, steerable: 
         ));
     }
     let edit_key = key.clone();
-    let (edit_run, edit_text) = (run_id.to_owned(), message.to_owned());
+    let (edit_entry, edit_text) = (entry_id.to_owned(), message.to_owned());
     let cancel_key = key.clone();
-    let cancel_run = run_id.to_owned();
+    let cancel_entry = entry_id.to_owned();
     body.child(action(
         "Send now",
         "send-now",
-        Some("Stop the current run and start this one"),
+        Some("Stop the current turn and start this one"),
         J3::send_queued_now,
     ))
     .child(
         Button::new("Edit")
             .variant(ButtonVariant::Ghost)
             .control_size(ControlSize::Small)
-            .on_press(move |s: &mut J3| s.edit_queued(&edit_key, &edit_run, &edit_text))
+            .on_press(move |s: &mut J3| s.edit_queued(&edit_key, &edit_entry, &edit_text))
             .build(k)
-            .key(format!("edit-{run_id}")),
+            .key(format!("edit-{entry_id}")),
     )
     .child(
         IconButton::new(&icons::X)
@@ -329,14 +354,14 @@ fn queued_row(k: &Kit, key: &ThreadKey, run_id: &str, message: &str, steerable: 
             .control_size(ControlSize::Small)
             .label("Remove from queue")
             .help("Remove from queue")
-            .on_press(move |s: &mut J3| s.cancel_queued(&cancel_key, &cancel_run))
+            .on_press(move |s: &mut J3| s.cancel_queued(&cancel_key, &cancel_entry))
             .build(k)
-            .key(format!("cancel-{run_id}")),
+            .key(format!("cancel-{entry_id}")),
     )
 }
 
 /// The message in a field, with Save (or Enter) and Cancel.
-fn editing_row(k: &Kit, key: &ThreadKey, run_id: &str, edit: &TextEdit) -> El {
+fn editing_row(k: &Kit, key: &ThreadKey, entry_id: &str, edit: &TextEdit) -> El {
     let (edit_key, submit_key, save_key, cancel_key) =
         (key.clone(), key.clone(), key.clone(), key.clone());
     row()
@@ -356,7 +381,7 @@ fn editing_row(k: &Kit, key: &ThreadKey, run_id: &str, edit: &TextEdit) -> El {
                     })
                     .on_submit(move |s: &mut J3, _: &mut Tx| s.save_queued_edit(&submit_key))
                     .build(k)
-                    .key(format!("queue-input-{run_id}")),
+                    .key(format!("queue-input-{entry_id}")),
             ),
         )
         .child(
@@ -365,7 +390,7 @@ fn editing_row(k: &Kit, key: &ThreadKey, run_id: &str, edit: &TextEdit) -> El {
                 .control_size(ControlSize::Small)
                 .on_press(move |s: &mut J3| s.save_queued_edit(&save_key))
                 .build(k)
-                .key(format!("save-{run_id}")),
+                .key(format!("save-{entry_id}")),
         )
         .child(
             Button::new("Cancel")
@@ -373,7 +398,7 @@ fn editing_row(k: &Kit, key: &ThreadKey, run_id: &str, edit: &TextEdit) -> El {
                 .control_size(ControlSize::Small)
                 .on_press(move |s: &mut J3| s.cancel_queued_edit(&cancel_key))
                 .build(k)
-                .key(format!("cancel-edit-{run_id}")),
+                .key(format!("cancel-edit-{entry_id}")),
         )
 }
 

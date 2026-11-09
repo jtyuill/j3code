@@ -1,5 +1,5 @@
 //! "Add project" (spec §8.4): a device (any live environment; a chosen one that went
-//! offline stays listed), a folder typed or browsed on it with `connection.browse` (stale
+//! offline stays listed), a folder typed or browsed on it with `projects.browse` (stale
 //! replies dropped by revision), and a name filled in from the folder until the user edits
 //! it. Creating the project closes the dialog and, from the main window, starts a thread in
 //! it.
@@ -7,7 +7,7 @@
 //! While a folder name is typed, the first folder beside it that starts with what was typed
 //! shows after the caret as a suggestion; Tab or → takes it.
 
-use j3_client::t3::filesystem::FilesystemBrowseEntry;
+use j3_client::methods::{BrowseEntry, BrowseParams, CreateProjectParams};
 use rune::{Cx, El, Key, KeyEvent, Mods, ScrollSpec, TextEdit, Tx, col, el, icon, row, text};
 use rune_kit::{Kit, Spinner, TextInput};
 
@@ -19,7 +19,7 @@ pub enum Listing {
     Loading,
     Loaded {
         parent: String,
-        entries: Vec<FilesystemBrowseEntry>,
+        entries: Vec<BrowseEntry>,
     },
     Failed(String),
 }
@@ -30,7 +30,7 @@ pub struct Siblings {
     /// The path up to and including its last `/` (empty: the home directory).
     pub dir: String,
     /// `None` until listed (or when listing failed).
-    pub entries: Option<Vec<FilesystemBrowseEntry>>,
+    pub entries: Option<Vec<BrowseEntry>>,
 }
 
 /// The Add project dialog's form.
@@ -239,7 +239,11 @@ impl J3 {
             if partial != dir {
                 let connection = connection.clone();
                 self.spawn(async move {
-                    let result = connection.browse(&dir).await;
+                    let result = connection
+                        .projects_browse(BrowseParams {
+                            partial_path: dir.clone(),
+                        })
+                        .await;
                     move |s: &mut J3, _: &mut Tx| {
                         if let Ok(result) = result {
                             s.set_siblings(id, &dir, result.entries);
@@ -249,7 +253,11 @@ impl J3 {
             }
         }
         self.spawn(async move {
-            let result = connection.browse(&partial).await;
+            let result = connection
+                .projects_browse(BrowseParams {
+                    partial_path: partial.clone(),
+                })
+                .await;
             move |s: &mut J3, _: &mut Tx| {
                 if let Ok(result) = &result
                     && partial.ends_with('/')
@@ -275,7 +283,7 @@ impl J3 {
 
     /// The folders of `dir` arrived for picker `id`: they back the suggestion while the path
     /// is still typed in `dir`.
-    fn set_siblings(&mut self, id: u64, dir: &str, entries: Vec<FilesystemBrowseEntry>) {
+    fn set_siblings(&mut self, id: u64, dir: &str, entries: Vec<BrowseEntry>) {
         if let Some(siblings) = self
             .picker()
             .filter(|picker| picker.id == id)
@@ -316,7 +324,14 @@ impl J3 {
         picker.creating = true;
         picker.error = None;
         self.spawn(async move {
-            let result = connection.create_project(&title, &path).await;
+            let result = connection
+                .projects_create(CreateProjectParams {
+                    title,
+                    path,
+                    default_model: None,
+                    command_id: None,
+                })
+                .await;
             move |s: &mut J3, tx: &mut Tx| {
                 // Cancelled, or another dialog took its place: the project exists, but
                 // nothing on screen asked for what comes next any more.
@@ -324,10 +339,10 @@ impl J3 {
                     return;
                 };
                 match result {
-                    Ok(project) => {
+                    Ok(created) => {
                         s.close_dialog();
                         if then_new_thread {
-                            s.new_thread(env, Some(project.id), tx);
+                            s.new_thread(env, Some(created.project.id), tx);
                         }
                     }
                     Err(e) => {
@@ -512,12 +527,12 @@ fn listing(k: &Kit, listing: &Listing) -> El {
                 rows = rows.child(muted("No folders".into()));
             }
             for entry in entries {
-                let full_path = entry.full_path.clone();
+                let full_path = entry.path.clone();
                 rows = rows.child(
                     row()
-                        .key(format!("browse-{}", entry.full_path))
+                        .key(format!("browse-{}", entry.path))
                         .role("button")
-                        .label(entry.full_path.clone())
+                        .label(entry.path.clone())
                         .w_full()
                         .gap(8.0)
                         .px(8.0)

@@ -1,7 +1,7 @@
 //! The project file pane (spec §5.4, §8.5): the thread's project as it is on the thread's
 //! server host, beside the chat. A tree loaded one directory at a time
-//! (`connection.list_entries`) over a read-only, syntax-coloured preview of the opened file
-//! (`connection.read_file`). ⌘⇧E toggles it; with the tree focused ↑/↓ move, → expands (or
+//! (`projects.listEntries`) over a read-only, syntax-coloured preview of the opened file
+//! (`projects.readFile`). ⌘⇧E toggles it; with the tree focused ↑/↓ move, → expands (or
 //! enters) a directory, ← collapses it (or goes to the parent) and Enter opens.
 //!
 //! The pane's tree and preview logic lives on [`FilePane`] and returns [`Effect`]s (a listing
@@ -18,7 +18,7 @@ use std::collections::{HashMap, HashSet};
 
 use j3_client::{
     Error,
-    t3::project::{ProjectEntry, ProjectListEntriesResult},
+    methods::{EntriesResult, Entry, ListEntriesParams, ReadFileParams},
 };
 use rune::{Cursor, Cx, Drag, El, Phase, TextEdit, Transition, Tx, col, el, row, text};
 use rune_kit::{IconButton, IconButtonVariant, Spinner};
@@ -39,7 +39,7 @@ const TREE_RANGE_REM: (f32, f32) = (4.5, 60.0);
 /// One directory's listing.
 #[derive(Default)]
 struct Listing {
-    entries: Vec<ProjectEntry>,
+    entries: Vec<Entry>,
     truncated: bool,
     /// A request is in flight; `entries` are the previous answer's.
     loading: bool,
@@ -66,8 +66,8 @@ pub struct FilePane {
     tree_height: f32,
     /// The pane was opened once: its project is resolved and the root listed.
     started: bool,
-    /// The project's directory on the server host.
-    cwd: String,
+    /// The project the pane lists, by id.
+    project_id: String,
     project: String,
     /// Listings by directory path, `""` for the project root.
     listings: HashMap<String, Listing>,
@@ -90,7 +90,7 @@ impl Default for FilePane {
             width: WIDTH_REM * 16.0,
             tree_height: TREE_REM * 16.0,
             started: false,
-            cwd: String::new(),
+            project_id: String::new(),
             project: String::new(),
             listings: HashMap::new(),
             expanded: HashSet::new(),
@@ -105,14 +105,14 @@ impl Default for FilePane {
 }
 
 impl FilePane {
-    /// A pane over `cwd` (titled `project`) that has not listed anything yet, sized for an
-    /// interface font of `rem` points.
-    fn new(cwd: String, project: String, rem: f32) -> Self {
+    /// A pane over project `project_id` (titled `project`) that has not listed anything yet,
+    /// sized for an interface font of `rem` points.
+    fn new(project_id: String, project: String, rem: f32) -> Self {
         Self {
             width: WIDTH_REM * rem,
             tree_height: TREE_REM * rem,
             started: true,
-            cwd,
+            project_id,
             project,
             ..Self::default()
         }
@@ -137,7 +137,7 @@ impl FilePane {
     }
 
     /// The answer to listing `dir` as `request`.
-    fn listed(&mut self, dir: &str, request: u64, result: Result<ProjectListEntriesResult, Error>) {
+    fn listed(&mut self, dir: &str, request: u64, result: Result<EntriesResult, Error>) {
         let Some(listing) = self
             .listings
             .get_mut(dir)
@@ -216,17 +216,18 @@ impl J3 {
             return;
         }
         if !self.files.get(&key).is_some_and(|pane| pane.started) {
-            let (cwd, project) = self
+            let (project_id, project) = self
                 .envs
                 .get(&key.env)
                 .and_then(|env| {
                     let shell = &env.state().shell;
-                    let thread = shell.thread(&key.thread_id)?;
-                    let project = shell.project(&thread.project_id)?;
-                    Some((project.workspace_root.clone(), project.title.clone()))
+                    let thread = shell.threads.get(&key.thread_id)?;
+                    let project = shell.projects.get(&thread.project_id)?;
+                    Some((project.id.clone(), project.title.clone()))
                 })
                 .unwrap_or_default();
-            let mut pane = FilePane::new(cwd, project, self.prefs.ui().interface_font_size());
+            let mut pane =
+                FilePane::new(project_id, project, self.prefs.ui().interface_font_size());
             let effect = pane.begin_load("");
             self.files.insert(key.clone(), pane);
             self.run_file_effects(&key, [effect]);
@@ -245,12 +246,17 @@ impl J3 {
         ) else {
             return;
         };
-        let cwd = pane.cwd.clone();
+        let project_id = pane.project_id.clone();
         for effect in effects {
-            let (connection, cwd, key) = (connection.clone(), cwd.clone(), key.clone());
+            let (connection, project_id, key) =
+                (connection.clone(), project_id.clone(), key.clone());
             match effect {
                 Effect::Load { dir, request } => self.spawn(async move {
-                    let result = connection.list_entries(&cwd, &dir).await;
+                    let params = ListEntriesParams {
+                        project_id,
+                        dir: (!dir.is_empty()).then(|| dir.clone()),
+                    };
+                    let result = connection.projects_list_entries(params).await;
                     move |s: &mut J3, _: &mut Tx| {
                         if let Some(pane) = s.files.get_mut(&key) {
                             pane.listed(&dir, request, result);
@@ -258,7 +264,12 @@ impl J3 {
                     }
                 }),
                 Effect::Read { path, request } => self.spawn(async move {
-                    let result = connection.read_file(&cwd, &path).await;
+                    let params = ReadFileParams {
+                        project_id,
+                        path: path.clone(),
+                        allow_missing: None,
+                    };
+                    let result = connection.projects_read_file(params).await;
                     let body = preview::Body::read(&path, result);
                     move |s: &mut J3, _: &mut Tx| {
                         if let Some(pane) = s.files.get_mut(&key) {

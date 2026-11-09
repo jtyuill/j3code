@@ -1,10 +1,10 @@
 //! The thread's header and cards, driven like a window over the offline fixture thread. Its
 //! connection fails every command at once, so a command a control runs shows up as its error
-//! toast ("Couldn’t steer the run: …").
+//! toast ("Couldn’t steer the turn: …").
 
 use std::{sync::Arc, time::Duration};
 
-use j3_client::{ThreadState, t3::orchestration::ProviderGoalStatus};
+use j3_client::{ThreadView, entities::GoalState};
 
 use crate::{
     actions::{Action, shortcut_label},
@@ -86,20 +86,25 @@ fn until_failed(app: &mut TestApp, what: &str) {
     panic!("no “{prefix}…” toast; shown: {shown:?}");
 }
 
+/// The open thread's state.
+fn state(app: &TestApp) -> &ThreadView {
+    &app.rt.state.threads[&open_thread_key()].state
+}
+
 /// Replaces the open thread's state with `edit` applied to it.
-fn edit_state(app: &mut TestApp, edit: impl FnOnce(&mut ThreadState)) {
+fn edit_state(app: &mut TestApp, edit: impl FnOnce(&mut ThreadView)) {
     let key = open_thread_key();
-    let mut state = ThreadState::clone(&app.rt.state.threads[&key].state);
+    let mut state = ThreadView::clone(&app.rt.state.threads[&key].state);
     edit(&mut state);
     app.rt
         .update(|s: &mut J3, tx| s.thread_changed(&key, Arc::new(state), tx));
     app.frame();
 }
 
-fn set_goal_status(app: &mut TestApp, status: ProviderGoalStatus) {
+fn set_goal_state(app: &mut TestApp, goal: GoalState) {
     edit_state(app, |state| {
-        let projection = state.projection.as_mut().unwrap();
-        projection.provider_threads[0].goal.as_mut().unwrap().status = status;
+        let thread = state.thread.as_mut().unwrap();
+        thread.goal.as_mut().unwrap().state = goal;
     });
 }
 
@@ -204,7 +209,7 @@ fn the_actions_menu_offers_a_goal_only_without_one() {
     app.rt.state.close_dialog();
 
     edit_state(&mut app, |state| {
-        state.projection.as_mut().unwrap().provider_threads[0].goal = None;
+        state.thread.as_mut().unwrap().goal = None;
     });
     assert!(app.rt.find("goal").is_none());
     click(&mut app, "thread-actions");
@@ -240,78 +245,104 @@ fn goal_dialog(app: &mut TestApp) -> &mut super::goal::GoalDialog {
 #[test]
 fn queued_messages_steer_send_now_and_edit_in_place() {
     let mut app = thread_app();
-    assert_eq!(
-        label_of(&app, "queued-run-4").as_deref(),
-        Some("Then write the changelog entry.")
-    );
-    // The waiting run can't be steered.
-    assert!(app.rt.find("steer-run-4").is_none());
-    click(&mut app, "send-now-run-4");
+    let entry = state(&app).queue[0].clone();
+    let id = entry.id.as_str();
+    let element = |name: &str| format!("{name}-{id}");
+    assert_eq!(label_of(&app, &element("queued")), Some(entry.text.clone()));
+    click(&mut app, &element("send-now"));
     until_failed(&mut app, "send the message now");
+    click(&mut app, &element("steer"));
+    until_failed(&mut app, "steer the turn");
 
-    // A `/compact` run is steered by stopping it.
-    edit_state(&mut app, |state| {
-        state.projection.as_mut().unwrap().messages[2].text = "/compact".into();
-    });
-    click(&mut app, "steer-run-4");
-    until_failed(&mut app, "steer the run");
-
-    click(&mut app, "edit-run-4");
-    assert!(app.rt.find("queue-input-run-4").is_some());
-    assert!(app.rt.find("send-now-run-4").is_none());
-    click(&mut app, "cancel-edit-run-4");
-    assert!(app.rt.find("queue-input-run-4").is_none());
-    click(&mut app, "edit-run-4");
-    click(&mut app, "save-run-4");
+    click(&mut app, &element("edit"));
+    assert!(app.rt.find(&element("queue-input")).is_some());
+    assert!(app.rt.find(&element("send-now")).is_none());
+    click(&mut app, &element("cancel-edit"));
+    assert!(app.rt.find(&element("queue-input")).is_none());
+    click(&mut app, &element("edit"));
+    click(&mut app, &element("save"));
     until_failed(&mut app, "edit the queued message");
 
-    click(&mut app, "cancel-run-4");
+    click(&mut app, &element("cancel"));
     until_failed(&mut app, "remove the message from the queue");
+
+    // Without an active turn there is nothing to steer; a held queue offers Resume.
+    edit_state(&mut app, |state| {
+        state.thread.as_mut().unwrap().active_turn_id = None;
+        state.queue[0].held = true;
+    });
+    assert!(app.rt.find(&element("steer")).is_none());
+    click(&mut app, "resume-queue");
+    until_failed(&mut app, "resume the queue");
 }
 
 #[test]
-fn goal_controls_follow_its_status() {
+fn goal_controls_follow_its_state() {
     let mut app = thread_app();
+    let objective = state(&app)
+        .thread
+        .as_ref()
+        .and_then(|thread| thread.goal.as_ref())
+        .map(|goal| goal.objective.clone())
+        .expect("the fixture thread has a goal");
+    set_goal_state(&mut app, GoalState::Active);
     assert_eq!(
         label_of(&app, "goal").as_deref(),
-        Some("Feed renders every turn item kind on Rune with no scroll jumps, Active")
+        Some(format!("{objective}, Active").as_str())
     );
     assert!(app.rt.find("goal-resume").is_none());
     click(&mut app, "goal-pause");
     until_failed(&mut app, "pause the goal");
 
-    set_goal_status(&mut app, ProviderGoalStatus::Paused);
+    set_goal_state(&mut app, GoalState::Paused);
     assert!(app.rt.find("goal-pause").is_none());
     click(&mut app, "goal-resume");
     until_failed(&mut app, "resume the goal");
 
-    set_goal_status(&mut app, ProviderGoalStatus::BudgetLimited);
+    set_goal_state(&mut app, GoalState::BudgetLimited);
     assert!(app.rt.find("goal-resume").is_some());
 
-    set_goal_status(&mut app, ProviderGoalStatus::Complete);
+    set_goal_state(&mut app, GoalState::Complete);
     assert!(app.rt.find("goal-resume").is_none());
     assert_eq!(label_of(&app, "goal-drop").as_deref(), Some("Clear"));
     click(&mut app, "goal-drop");
     until_failed(&mut app, "drop the goal");
+
+    set_goal_state(&mut app, GoalState::Dropped);
+    assert!(app.rt.find("goal").is_none(), "a dropped goal goes");
 }
 
 #[test]
 fn the_plan_card_folds() {
     let mut app = thread_app();
-    assert_eq!(
-        label_of(&app, "todo-toggle").as_deref(),
-        Some("Plan, 2/4 done")
-    );
-    assert!(app.rt.find("todo-step-s1").is_some());
+    let (_, todo) = state(&app)
+        .latest_todo()
+        .expect("the fixture thread has a plan");
+    let tasks: Vec<_> = todo.phases.iter().flat_map(|phase| &phase.tasks).collect();
+    let done = tasks
+        .iter()
+        .filter(|task| task.status == j3_client::entities::TodoStatus::Completed)
+        .count();
+    let summary = format!("Plan, {done}/{} done", tasks.len());
+    assert_eq!(label_of(&app, "todo-toggle"), Some(summary));
+    assert!(app.rt.find("todo-step-0-0").is_some());
     click(&mut app, "todo-toggle");
-    assert!(app.rt.find("todo-step-s1").is_none());
+    assert!(app.rt.find("todo-step-0-0").is_none());
     click(&mut app, "todo-toggle");
-    assert!(app.rt.find("todo-step-s1").is_some());
+    assert!(app.rt.find("todo-step-0-0").is_some());
 }
 
 #[test]
 fn the_question_card_walks_the_questions_and_answers() {
     let mut app = thread_app();
+    let request = state(&app)
+        .open_requests()
+        .next()
+        .expect("the fixture thread asks")
+        .clone();
+    let [first, second] = &request.questions[..] else {
+        panic!("the fixture asks two questions");
+    };
     assert!(app.rt.find("question-card").is_some());
     assert_eq!(
         text_of(&app, "question-progress").as_deref(),
@@ -320,10 +351,10 @@ fn the_question_card_walks_the_questions_and_answers() {
     click(&mut app, "question-next");
     assert_eq!(
         text_of(&app, "question-problem").as_deref(),
-        Some("Choose an answer to continue.")
+        Some(super::question::MISSING)
     );
     // A pick shows for a moment, then moves on.
-    click_label(&mut app, "Bottom");
+    click_label(&mut app, &first.options[0].label);
     assert!(app.rt.find("question-problem").is_none());
     for _ in 0..15 {
         app.frame();
@@ -332,7 +363,10 @@ fn the_question_card_walks_the_questions_and_answers() {
         text_of(&app, "question-progress").as_deref(),
         Some("Question 2 of 2")
     );
-    click(&mut app, "question-choice-displays-120 Hz");
+    click(
+        &mut app,
+        &format!("question-choice-{}-{}", second.id, second.options[0].label),
+    );
     click(&mut app, "question-submit");
     until_failed(&mut app, "answer the question");
     click(&mut app, "dismiss-question");
@@ -354,7 +388,7 @@ fn only_the_open_thread_stays_subscribed_and_a_recent_one_reopens_at_once() {
         "leaving a thread ends its subscription"
     );
     assert!(
-        threads[&first].state.projection.is_some(),
+        threads[&first].state.thread.is_some(),
         "its last state stays cached"
     );
 

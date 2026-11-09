@@ -14,12 +14,12 @@ rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$root/target/release/j3" "$app/Contents/MacOS/j3"
 
-# Icon: the iOS app icon, scaled into an .icns.
+# Icon: the app icon, scaled into an .icns.
 iconset=$(mktemp -d)/j3.iconset
 mkdir -p "$iconset"
 for size in 16 32 128 256 512; do
-  sips -z $size $size "$root/apps/mobile/assets/brand/ios-icon-1024.png" --out "$iconset/icon_${size}x${size}.png" >/dev/null
-  sips -z $((size * 2)) $((size * 2)) "$root/apps/mobile/assets/brand/ios-icon-1024.png" --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
+  sips -z $size $size "$root/assets/icon-1024.png" --out "$iconset/icon_${size}x${size}.png" >/dev/null
+  sips -z $((size * 2)) $((size * 2)) "$root/assets/icon-1024.png" --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
 done
 iconutil -c icns "$iconset" -o "$app/Contents/Resources/j3.icns"
 

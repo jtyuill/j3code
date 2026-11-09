@@ -1,8 +1,8 @@
-//! Settings › General (spec §8.2): the thread workflow and its T3 and herdr options,
+//! Settings › General (spec §8.2): the thread workflow and its inbox and herdr options,
 //! appearance (zoom, font families, font sizes), conversation (text width, math), the
 //! dictation model, and the composer's usage windows.
 
-use j3_client::workflow::{AgentOrder, StatusIndicators};
+use j3_client::herdr::{AgentOrder, StatusIndicators};
 use rune::{El, Tx, col};
 use rune_kit::{Combobox, ComboboxOption, ComboboxState, Kit, Select, SelectAppearance, Switch};
 
@@ -23,7 +23,7 @@ use crate::{
 /// The font pickers' first option: no family chosen.
 const DEFAULT_FONT: &str = "__default__";
 
-const WORKFLOWS: [(Workflow, &str); 2] = [(Workflow::T3, "T3"), (Workflow::Herdr, "herdr")];
+const WORKFLOWS: [(Workflow, &str); 2] = [(Workflow::Inbox, "Inbox"), (Workflow::Herdr, "herdr")];
 const INDICATORS: [(StatusIndicators, &str); 2] = [
     (StatusIndicators::Dots, "Dots"),
     (StatusIndicators::Symbols, "Symbols"),
@@ -79,10 +79,10 @@ pub(super) fn view(s: &J3, ui: &mut Ui) -> El {
         k,
         "workflow",
         "Workflow",
-        Some("T3 settles finished threads onto shelves. herdr lists every agent by what it needs from you."),
+        Some("Inbox settles finished threads onto shelves. herdr lists every agent by what it needs from you."),
         segmented_setting(k, "workflow", &WORKFLOWS, prefs.workflow, |ui, v| ui.workflow = v),
     ));
-    let t3 = Group::new("settings-t3").title("T3").row(item(
+    let inbox = Group::new("settings-inbox").title("Inbox").row(item(
         k,
         "working-shelf",
         "Working shelf",
@@ -157,7 +157,7 @@ pub(super) fn view(s: &J3, ui: &mut Ui) -> El {
         .w_full()
         .gap(24.0)
         .child(workflow.build(k))
-        .child(t3.build(k))
+        .child(inbox.build(k))
         .child(herdr.build(k))
         .child(appearance)
         .child(conversation.build(k))

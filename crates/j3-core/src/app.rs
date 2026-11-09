@@ -1,9 +1,9 @@
-//! The j3 server application: every WS RPC method of the iOS thread surface
-//! (ios-surface §2.1, §3, §4) on top of the store, hub, thread actors and the
-//! omp catalog.
+//! The j3 server application behind protocol v2 (`docs/protocol/wire.md`):
+//! the store, hub, thread actors, the omp catalog, terminals and project
+//! files. [`crate::v2::router`] decodes calls and answers them here.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, PoisonError},
     time::Duration,
@@ -11,100 +11,63 @@ use std::{
 
 use futures_util::{
     StreamExt,
-    future::BoxFuture,
     stream::{self, BoxStream},
 };
-use j3_protocol::j3::{
-    self as j3, SubagentTranscriptError, SubagentTranscriptInput, UsageError, UsageSnapshot,
-};
-use j3_protocol::t3::{
-    self,
-    assets::{AssetCreateUrlInput, AssetResource},
-    commands::{
-        DispatchCommandResult, OrchestrationV2Command, OrchestrationV2DispatchCommandError,
-        OrchestrationV2GetShellSnapshotError, OrchestrationV2GetThreadProjectionError,
-        OrchestrationV2ThreadLaunchError, ThreadDeleteCommand, ThreadLaunchInput,
-        ThreadLaunchResult,
-    },
-    environment::ExecutionEnvironmentDescriptor,
-    filesystem::{
-        FilesystemBrowseEntry, FilesystemBrowseError, FilesystemBrowseFailure,
-        FilesystemBrowseInput, FilesystemBrowseResult, FilesystemGetMetadataInput,
-    },
-    git::{GitRunStackedActionInput, VcsCwdInput},
+use j3_protocol::v2::{
+    PROTOCOL,
+    entities::{Attachment, ModelRef, Project},
+    envelope::{Error, ErrorCode},
     methods::{
-        ArchivedShellSnapshot, ForceStopOutcome, ForceStopThreadInput, ForceStopThreadResult,
-        GetThreadProjectionInput, GetTurnItemInput, GetTurnItemResult, SubscribeThreadInput,
+        BrowseResult, Catalog, CreateProjectParams, CreateThreadParams, DeleteProjectParams,
+        EntriesResult, GitAction, GitRunItem, GitStatus, ImageUrlResult, PullResult,
+        ReadFileResult, SearchEntriesParams, TranscriptResult, UpdateProjectParams, Usage,
     },
-    orchestration::{
-        Actor as Creator, CreationSource, ShellSnapshot, ThreadProjection, ThreadShell,
-        TurnItemKind, WorkspaceStrategy,
-    },
-    project::{
-        PROJECTS_LIST_ENTRIES, PROJECTS_READ_FILE, PROJECTS_SEARCH_ENTRIES, Project,
-        ProjectListEntriesInput, ProjectMutation, ProjectMutationError, ProjectReadFileInput,
-        ProjectSearchEntriesInput, ProjectShell,
-    },
-    server::{
-        ServerConfig, ServerProvider, ServerRefreshProvidersInput, ServerSettingsError,
-        ServerSettingsOperation,
-    },
-    terminal::{
-        TERMINAL_ATTACH, TERMINAL_CLOSE, TERMINAL_OPEN, TERMINAL_RESIZE, TERMINAL_WRITE,
-        TerminalAttachInput, TerminalCloseInput, TerminalError, TerminalOpenInput,
-        TerminalResizeInput, TerminalWriteInput,
-    },
+    streams::ThreadSnapshot,
 };
-use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::sync::{broadcast::error::RecvError, oneshot};
 
 use crate::{
-    attachments::AttachmentStore,
-    catalog::Catalog,
+    attachments::{self, AttachmentKind, AttachmentStore},
+    catalog::Catalog as OmpCatalog,
+    clock::{iso, now_iso, now_ms},
     engine::{
-        actor::{self, ActorConfig, Request, ThreadHandle},
-        model::{
-            NewThread, Reject, ThreadModel, UserInput, tool_output_image,
-            triage::{self, DAY_MS},
-        },
-        projection::Projection,
+        actor::{self, ActorConfig, Command, Request, ThreadHandle},
+        model::{NewThread, ThreadModel, UserInput},
         session::{OmpFactory, SessionFactory},
-        streams::{self, SnapshotFn},
+        streams,
+        triage::{self, AUTO_SETTLE_AFTER_MS, Facts},
     },
     entry_search::EntryIndex,
-    files, git, http,
-    hub::{Commit, Hub, ShellChange},
+    files, git,
+    hub::{Commit, Hub, ProjectWrite, ResultFn},
     omp::OmpLauncher,
-    rpc::{Response, RpcHandler, StreamItem},
-    store::{self, Store, random_hex},
+    store::{self, Store, ThreadIndex, ThreadRecords, random_hex},
     terminal::Terminals,
     transcript,
+    v2::{driver::StreamEvent, replay},
 };
 
-/// Close a thread's omp after it has been settled this long.
+/// Close a thread's omp after it has been idle this long.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
-/// Coalescing window for streaming text.
+/// Coalescing window for growing text (wire.md §6.4).
 const COALESCE: Duration = Duration::from_millis(50);
-/// How long the config handshake waits for the model list before sending
-/// a provider that is still loading.
-const CONFIG_WAIT: Duration = Duration::from_secs(8);
-/// Threads inactive this long settle automatically (t3's default
-/// `sidebarAutoSettleAfterDays`, `contracts/src/settings.ts:85`).
-const AUTO_SETTLE_AFTER_MS: i64 = 3 * DAY_MS;
+/// How long `server.watch` waits for the model list before sending a
+/// catalog that is still loading.
+const CATALOG_WAIT: Duration = Duration::from_secs(8);
 /// How often the auto-settle sweep runs (also once at startup).
 const AUTO_SETTLE_EVERY: Duration = Duration::from_secs(5 * 60);
 
 pub struct AppConfig {
     /// `j3.sqlite`, `attachments/`, `logs/`.
     pub data_dir: PathBuf,
-    /// Descriptor label (hostname).
+    /// Server name shown in clients (the host name).
     pub label: String,
     pub omp: OmpLauncher,
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum Error {
+pub enum OpenError {
     #[error("creating {path}: {source}")]
     Io {
         path: PathBuf,
@@ -116,38 +79,36 @@ pub enum Error {
     Recovery { thread: String, message: String },
 }
 
-/// The server application. Cheap to share; implements [`RpcHandler`].
+/// The server application. Cheap to share.
 pub struct App {
     inner: Arc<Inner>,
 }
 
-struct Inner {
+pub(crate) struct Inner {
     hub: Arc<Hub>,
     attachments: Arc<AttachmentStore>,
-    catalog: Arc<Catalog>,
-    /// For `omp usage` (`j3.getUsage`) and commit messages
-    /// (`git.runStackedAction`).
+    catalog: Arc<OmpCatalog>,
+    /// For `omp usage` and the git actions' commit messages.
     omp: OmpLauncher,
     actor_config: ActorConfig,
     actors: Mutex<HashMap<String, ThreadHandle>>,
-    descriptor: Value,
+    info: Value,
     home: String,
-    data_dir: PathBuf,
-    /// Every thread's terminal sessions.
+    /// Every thread's terminals.
     terminals: Terminals,
-    /// Recent workspace walks answering `projects.searchEntries`.
+    /// Recent project walks answering `projects.searchEntries`.
     entries: Arc<EntryIndex>,
 }
 
-fn create_dir(path: &Path) -> Result<(), Error> {
-    std::fs::create_dir_all(path).map_err(|source| Error::Io {
+fn create_dir(path: &Path) -> Result<(), OpenError> {
+    std::fs::create_dir_all(path).map_err(|source| OpenError::Io {
         path: path.to_owned(),
         source,
     })
 }
 
-fn to_value<T: Serialize>(value: &T) -> Value {
-    serde_json::to_value(value).expect("wire types always encode")
+fn encode<T: serde::Serialize>(value: &T) -> Value {
+    serde_json::to_value(value).expect("v2 types always encode")
 }
 
 fn home_dir() -> String {
@@ -166,7 +127,7 @@ fn expand_home(path: &str, home: &str) -> PathBuf {
 }
 
 /// A random UUIDv4-shaped id.
-fn new_id() -> String {
+pub(crate) fn new_id() -> String {
     let hex = random_hex(32);
     format!(
         "{}-{}-4{}-a{}-{}",
@@ -178,159 +139,49 @@ fn new_id() -> String {
     )
 }
 
-/// `ExecutionEnvironmentDescriptor` JSON (ios-surface H1).
-fn descriptor(environment_id: &str, label: &str) -> Value {
-    let os = match std::env::consts::OS {
-        "macos" => "darwin",
-        "linux" => "linux",
-        "windows" => "windows",
-        _ => "unknown",
-    };
-    let arch = match std::env::consts::ARCH {
-        "aarch64" => "arm64",
-        "x86_64" => "x64",
-        _ => "other",
-    };
-    let label = if label.trim().is_empty() {
+fn storage(error: store::Error) -> Error {
+    tracing::error!(%error, "store");
+    Error::internal("The server could not read its state.")
+}
+
+/// Runs blocking file work off the runtime.
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, Error> + Send + 'static,
+) -> Result<T, Error> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|error| Error::internal(error.to_string()))?
+}
+
+/// `GET /api/v1/info` (wire.md §2).
+fn info(server_id: &str, label: &str, home: &str) -> Value {
+    let name = if label.trim().is_empty() {
         "j3"
     } else {
         label.trim()
     };
-    let descriptor: ExecutionEnvironmentDescriptor = serde_json::from_value(json!({
-        "environmentId": environment_id,
-        "label": label,
-        "platform": {"os": os, "arch": arch},
-        "serverVersion": env!("CARGO_PKG_VERSION"),
-        "orchestrationProtocolVersion": 2,
-        "capabilities": {
-            "repositoryIdentity": false,
-            "attachmentUploads": true,
-            "threadStop": true,
-            "providerWorkspaceSnapshotsOnDemand": true,
-            "threadSettlement": true,
-            "threadAutoSettlement": true,
-            "threadSnooze": true,
-            "threadPinning": true,
-            "threadPinReorder": true,
-            "threadActiveReorder": true,
-            "threadAutoSettleOptOut": true,
-            "threadVisitedTracking": true,
-        },
-    }))
-    .expect("descriptor matches ExecutionEnvironmentDescriptor");
-    to_value(&descriptor)
-}
-
-fn dispatch_error(command_id: &str, command_type: &str, message: &str) -> Response {
-    let command_id = if command_id.trim().is_empty() {
-        "unknown"
-    } else {
-        command_id
-    };
-    let command_type = if command_type.trim().is_empty() {
-        "unknown"
-    } else {
-        command_type
-    };
-    Response::fail(to_value(&OrchestrationV2DispatchCommandError::new(
-        command_id,
-        command_type,
-        message,
-    )))
-}
-
-fn projection_error(thread_id: &str, message: &str) -> Value {
-    to_value(&OrchestrationV2GetThreadProjectionError::new(
-        if thread_id.trim().is_empty() {
-            "unknown"
-        } else {
-            thread_id
-        },
-        message,
-    ))
-}
-
-/// Typed decode of a request payload; a bad payload is a per-request defect.
-fn decode<T: serde::de::DeserializeOwned>(tag: &str, payload: Value) -> Result<T, Response> {
-    serde_json::from_value(payload)
-        .map_err(|error| Response::die(format!("invalid {tag} payload: {error}")))
-}
-
-/// A unary git method's answer: the value, or its `GitManagerServiceError`.
-fn git_response<T: Serialize>(result: git::GitResult<T>) -> Response {
-    match result {
-        Ok(value) => Response::ok(to_value(&value)),
-        Err(error) => Response::fail(to_value(&error)),
-    }
-}
-
-/// A unary terminal method's answer: the value, or its `TerminalError`.
-fn terminal_response<T: Serialize>(result: Result<T, TerminalError>) -> Response {
-    match result {
-        Ok(value) => Response::ok(to_value(&value)),
-        Err(error) => Response::fail(to_value(&error)),
-    }
-}
-
-/// Runs blocking filesystem `work` off the runtime: its value, or its typed
-/// error.
-async fn blocking<T, E>(work: impl FnOnce() -> Result<T, E> + Send + 'static) -> Response
-where
-    T: Serialize + Send + 'static,
-    E: Serialize + Send + 'static,
-{
-    match tokio::task::spawn_blocking(work).await {
-        Ok(Ok(value)) => Response::ok(to_value(&value)),
-        Ok(Err(error)) => Response::fail(to_value(&error)),
-        Err(error) => Response::die(error.to_string()),
-    }
-}
-
-/// The thread projection as stored.
-fn stored_projection(
-    store: &Store,
-    thread_id: &str,
-) -> Result<Option<ThreadProjection>, store::Error> {
-    match store.thread(thread_id)? {
-        Some(row) if !row.deleted => {}
-        _ => return Ok(None),
-    }
-    Ok(Projection::from_rows(store.entities(thread_id)?)?.map(|projection| projection.to_wire()))
-}
-
-/// Shell rows of stored threads, split into (active, archived).
-fn stored_shells(store: &Store) -> Result<(Vec<ThreadShell>, Vec<ThreadShell>), store::Error> {
-    let mut active = Vec::new();
-    let mut archived = Vec::new();
-    for row in store.threads()? {
-        let shell: ThreadShell = serde_json::from_value(row.shell)?;
-        if row.archived {
-            archived.push(shell);
-        } else {
-            active.push(shell);
-        }
-    }
-    Ok((active, archived))
-}
-
-fn stored_project_shells(store: &Store) -> Result<Vec<ProjectShell>, store::Error> {
-    store
-        .projects()?
-        .into_iter()
-        .map(|json| Ok(serde_json::from_value(json)?))
-        .collect()
+    json!({
+        "serverId": server_id,
+        "name": name,
+        "protocol": PROTOCOL,
+        "version": env!("CARGO_PKG_VERSION"),
+        "capabilities": ["terminal", "git", "files", "usage", "goals"],
+        "platform": std::env::consts::OS,
+        "home": home,
+    })
 }
 
 impl App {
-    /// Opens the data directory, recovers interrupted threads, starts
-    /// loading the omp model catalog in the background and runs the
-    /// auto-settle sweep now and every [`AUTO_SETTLE_EVERY`].
-    pub async fn open(config: AppConfig) -> Result<Arc<App>, Error> {
+    /// Opens the data directory (migrating and rebuilding threads from their
+    /// omp sessions when needed), recovers interrupted threads, starts
+    /// loading omp's catalog in the background and runs the auto-settle
+    /// sweep now and every [`AUTO_SETTLE_EVERY`].
+    pub async fn open(config: AppConfig) -> Result<Arc<App>, OpenError> {
         let factory = Arc::new(OmpFactory(config.omp.clone()));
         let app = Self::open_with(config, factory, IDLE_TIMEOUT).await?;
         let catalog = Arc::clone(&app.inner.catalog);
         tokio::spawn(async move {
-            catalog.provider().await;
+            catalog.catalog().await;
         });
         let inner = Arc::downgrade(&app.inner);
         tokio::spawn(async move {
@@ -341,9 +192,7 @@ impl App {
                 let Some(inner) = inner.upgrade() else {
                     break;
                 };
-                inner
-                    .auto_settle(triage::now_ms(), AUTO_SETTLE_AFTER_MS)
-                    .await;
+                inner.auto_settle(now_ms(), AUTO_SETTLE_AFTER_MS).await;
             }
         });
         Ok(app)
@@ -356,22 +205,22 @@ impl App {
         config: AppConfig,
         factory: Arc<dyn SessionFactory>,
         idle_timeout: Duration,
-    ) -> Result<Arc<App>, Error> {
+    ) -> Result<Arc<App>, OpenError> {
         create_dir(&config.data_dir)?;
         create_dir(&config.data_dir.join("logs"))?;
         let store = Store::open(&config.data_dir.join("j3.sqlite"))?;
         let attachments_dir = config.data_dir.join("attachments");
         let attachments = Arc::new(AttachmentStore::open(attachments_dir.clone()).map_err(
-            |source| Error::Io {
+            |source| OpenError::Io {
                 path: attachments_dir,
                 source,
             },
         )?);
-        let descriptor = descriptor(store.environment_id(), &config.label);
-        let hub = Arc::new(Hub::new(store));
         let home = home_dir();
-        let catalog = Arc::new(Catalog::new(config.omp.clone(), PathBuf::from(&home)));
-        let sink_catalog = Arc::clone(&catalog);
+        let info = info(store.server_id(), &config.label, &home);
+        let hub = Arc::new(Hub::new(store));
+        let catalog = Arc::new(OmpCatalog::new(config.omp.clone(), PathBuf::from(&home)));
+        let sink = Arc::clone(&catalog);
         let actor_config = ActorConfig {
             hub: Arc::clone(&hub),
             factory,
@@ -379,41 +228,49 @@ impl App {
             idle_timeout,
             coalesce: COALESCE,
             commands: Some(Arc::new(move |cwd, commands| {
-                sink_catalog.put_commands(cwd, commands)
+                sink.put_commands(cwd, commands)
             })),
         };
         let inner = Arc::new(Inner {
             hub,
             attachments,
             catalog,
+            omp: config.omp,
             actor_config,
             actors: Mutex::new(HashMap::new()),
-            descriptor,
+            info,
             home,
-            data_dir: config.data_dir,
-            omp: config.omp,
             terminals: Terminals::new(),
             entries: Arc::default(),
         });
+        inner.replay_pending().await?;
         inner.recover()?;
         Ok(Arc::new(App { inner }))
     }
 
-    /// `ExecutionEnvironmentDescriptor` JSON (static for the process).
-    pub fn descriptor(&self) -> Value {
-        self.inner.descriptor.clone()
+    /// The `GET /api/v1/info` body.
+    pub fn info(&self) -> Value {
+        self.inner.info.clone()
     }
 
-    /// One auto-settle sweep as of `now_ms` (epoch ms): settles every thread
-    /// t3 would settle automatically after `inactive_for` without activity.
-    /// Returns how many it settled.
-    pub async fn auto_settle(&self, now_ms: i64, inactive_for: Duration) -> usize {
-        let after_ms = i64::try_from(inactive_for.as_millis()).unwrap_or(i64::MAX);
-        self.inner.auto_settle(now_ms, after_ms).await
+    /// Stable for the life of the database.
+    pub fn server_id(&self) -> String {
+        self.inner.info["serverId"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned()
     }
 
     pub fn attachments(&self) -> Arc<AttachmentStore> {
         Arc::clone(&self.inner.attachments)
+    }
+
+    /// One auto-settle sweep as of `now_ms` (epoch ms): settles every thread
+    /// quiet for longer than `inactive_for` (`docs/triage.md` §8). Returns
+    /// how many it settled.
+    pub async fn auto_settle(&self, now_ms: i64, inactive_for: Duration) -> usize {
+        let after_ms = i64::try_from(inactive_for.as_millis()).unwrap_or(i64::MAX);
+        self.inner.auto_settle(now_ms, after_ms).await
     }
 
     /// Stops every terminal, then every thread actor and its omp process.
@@ -434,12 +291,9 @@ impl App {
             }
         }
     }
-}
 
-impl RpcHandler for App {
-    fn call(&self, tag: String, payload: Value) -> BoxFuture<'static, Response> {
-        let inner = Arc::clone(&self.inner);
-        Box::pin(async move { inner.call(&tag, payload).await })
+    pub(crate) fn inner(&self) -> &Inner {
+        &self.inner
     }
 }
 
@@ -449,34 +303,114 @@ enum ThreadError {
     Store(store::Error),
 }
 
+impl ThreadError {
+    fn into_error(self, thread_id: &str) -> Error {
+        match self {
+            Self::NotFound => Error::not_found("thread", thread_id),
+            Self::Store(error) => storage(error),
+        }
+    }
+}
+
 impl Inner {
-    /// Runs left non-terminal by a previous process are interrupted and
-    /// pending requests expire, through normal commits.
-    fn recover(&self) -> Result<(), Error> {
-        let rows = self.hub.read(|store| store.threads())?;
-        for row in rows {
-            let entities = self.hub.read(|store| store.entities(&row.id))?;
-            let Some(projection) = Projection::from_rows(entities).map_err(store::Error::from)?
-            else {
-                continue;
+    // -----------------------------------------------------------------------
+    // Startup
+    // -----------------------------------------------------------------------
+
+    /// Rebuilds threads whose records are missing (after migration 2) from
+    /// their omp session files, keeping replayed images as attachments.
+    async fn replay_pending(&self) -> Result<(), OpenError> {
+        let pending = self.hub.read(|store| store.pending_replays())?;
+        for index in pending {
+            let lines = match &index.session_file {
+                Some(path) => match tokio::fs::read_to_string(path).await {
+                    Ok(text) => Some(text),
+                    Err(error) => {
+                        tracing::warn!(%error, path, thread = %index.id, "reading omp session file");
+                        None
+                    }
+                },
+                None => None,
             };
-            let mut model = ThreadModel::load(projection);
+            let session_file = index.session_file.as_deref().map(Path::new);
+            let image_bytes = |data: &str| match attachments::image_bytes(data, session_file) {
+                Ok(bytes) => Some(bytes),
+                Err(error) => {
+                    tracing::warn!(%error, thread = %index.id, "reading a replayed image");
+                    None
+                }
+            };
+            let replayed = lines
+                .as_deref()
+                .map(|text| replay::replay(&index.id, text.lines(), &image_bytes))
+                .unwrap_or_default();
+            for (attachment, bytes) in &replayed.images {
+                if let Err(error) = self
+                    .attachments
+                    .store_image(
+                        &attachment.id,
+                        &attachment.name,
+                        &attachment.mime_type,
+                        bytes,
+                    )
+                    .await
+                {
+                    tracing::warn!(%error, thread = %index.id, "storing a replayed image");
+                }
+            }
+            let mut model = ThreadModel::load(
+                &index.row,
+                ThreadRecords {
+                    turns: replayed.turns,
+                    items: replayed.items,
+                    ..ThreadRecords::default()
+                },
+            );
+            if let Some(model_ref) = &replayed.model {
+                model.set_model(model_ref);
+            }
+            model.rewrite_all();
+            tracing::info!(
+                thread = %index.id,
+                turns = model.turns.len(),
+                items = model.items.len(),
+                "rebuilt from the omp session"
+            );
+            actor::commit_thread(
+                &self.hub,
+                &mut model,
+                index.session_file.as_deref(),
+                false,
+                None,
+            )
+            .map_err(|error| OpenError::Recovery {
+                thread: index.id.clone(),
+                message: error.message,
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Turns left active by a previous process stop and open requests
+    /// expire, through normal commits.
+    fn recover(&self) -> Result<(), OpenError> {
+        for index in self.hub.read(|store| store.threads())? {
+            let records = self.hub.read(|store| store.records(&index.id))?;
+            let mut model = ThreadModel::load(&index.row, records);
             if !model.needs_recovery() {
                 continue;
             }
             model.recover();
-            let mut last_shell = Some(row.shell.clone());
             actor::commit_thread(
                 &self.hub,
                 &mut model,
-                row.session_file.clone(),
+                index.session_file.as_deref(),
                 false,
-                &mut last_shell,
                 None,
             )
-            .map_err(|Reject(message)| Error::Recovery {
-                thread: row.id.clone(),
-                message,
+            .map_err(|error| OpenError::Recovery {
+                thread: index.id.clone(),
+                message: error.message,
             })?;
         }
         Ok(())
@@ -486,28 +420,32 @@ impl Inner {
     // Thread actors
     // -----------------------------------------------------------------------
 
+    fn index(&self, thread_id: &str) -> Result<ThreadIndex, ThreadError> {
+        self.hub
+            .read(|store| store.thread(thread_id))
+            .map_err(ThreadError::Store)?
+            .filter(|index| !index.deleted)
+            .ok_or(ThreadError::NotFound)
+    }
+
     fn actor(&self, thread_id: &str) -> Result<ThreadHandle, ThreadError> {
         let mut actors = self.actors.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(handle) = actors.get(thread_id).filter(|handle| !handle.is_closed()) {
             return Ok(handle.clone());
         }
-        let (row, entities) = self
+        let index = self.index(thread_id)?;
+        let (records, project) = self
             .hub
-            .read(|store| -> Result<_, store::Error> {
-                Ok((store.thread(thread_id)?, store.entities(thread_id)?))
+            .read(|store| -> store::Result<_> {
+                Ok((store.records(thread_id)?, store.project(&index.project_id)?))
             })
             .map_err(ThreadError::Store)?;
-        let Some(row) = row.filter(|row| !row.deleted) else {
-            return Err(ThreadError::NotFound);
-        };
-        let projection = Projection::from_rows(entities)
-            .map_err(|error| ThreadError::Store(error.into()))?
-            .ok_or(ThreadError::NotFound)?;
+        let cwd = project.map_or_else(|| self.home.clone(), |project| project.path);
         let handle = actor::spawn(
             self.actor_config.clone(),
-            ThreadModel::load(projection),
-            row.session_file,
-            Some(row.shell),
+            ThreadModel::load(&index.row, records),
+            cwd,
+            index.session_file,
         );
         actors.insert(thread_id.to_owned(), handle.clone());
         Ok(handle)
@@ -528,57 +466,59 @@ impl Inner {
             {
                 return Ok(value);
             }
-            self.actors
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .remove(thread_id);
+            self.forget(thread_id);
         }
         Err(ThreadError::NotFound)
     }
 
-    /// The auto-settle sweep (t3 `ThreadSettlementService`, without pull
-    /// requests). Stored shells pick the threads that look due; each one's
-    /// actor decides again on its live state (and the snooze wake time the
-    /// shell lacks) and settles it with a `server:auto-settle:<id>:<snapshot>`
-    /// receipt, so user changes after the snapshot win.
-    async fn auto_settle(&self, now_ms: i64, after_ms: i64) -> usize {
-        let rows = match self.hub.read(|store| store.threads()) {
-            Ok(rows) => rows,
+    fn forget(&self, thread_id: &str) {
+        self.actors
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(thread_id);
+    }
+
+    fn running(&self, thread_id: &str) -> bool {
+        self.actors
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(thread_id)
+            .is_some_and(|handle| !handle.is_closed())
+    }
+
+    /// The auto-settle sweep (`docs/triage.md` §8): stored rows pick the
+    /// threads that look due; each one's actor decides again on its live
+    /// state and settles it only if it has not changed since the row the
+    /// sweep saw, so user changes win.
+    async fn auto_settle(&self, now: i64, after_ms: i64) -> usize {
+        let threads = match self.hub.read(|store| store.threads()) {
+            Ok(threads) => threads,
             Err(error) => {
                 tracing::error!(%error, "reading threads to auto-settle");
                 return 0;
             }
         };
         let mut settled = 0;
-        for row in rows {
-            if row.archived || row.deleted {
+        for index in threads {
+            let row = &index.row;
+            if triage::auto_settle_at(&row.triage, &Facts::of(row), now, after_ms).is_none() {
                 continue;
             }
-            let Ok(shell) = serde_json::from_value::<ThreadShell>(row.shell) else {
-                continue;
-            };
-            // The snooze wake time only delays settlement, so a thread that
-            // isn't due without it isn't due at all.
-            if triage::auto_settlement_at(&shell, None, now_ms, after_ms).is_none() {
-                continue;
-            }
-            let snapshot_at = shell.updated_at;
-            let result = self
-                .ask(&row.id, |reply| Request::AutoSettle {
-                    now_ms,
+            let seen = row.updated_at.clone();
+            match self
+                .ask(&index.id, |reply| Request::AutoSettle {
+                    now_ms: now,
                     after_ms,
-                    snapshot_at: snapshot_at.clone(),
+                    seen_updated_at: seen.clone(),
                     reply,
                 })
-                .await;
-            match result {
-                Ok(Ok(Some(_))) => settled += 1,
-                Ok(Ok(None)) | Err(ThreadError::NotFound) => {}
-                Ok(Err(Reject(message))) => {
-                    tracing::debug!(thread = %row.id, message, "automatic settlement skipped");
-                }
+                .await
+            {
+                Ok(true) => settled += 1,
+                Ok(false) => tracing::debug!(thread = %index.id, "automatic settlement skipped"),
+                Err(ThreadError::NotFound) => {}
                 Err(ThreadError::Store(error)) => {
-                    tracing::warn!(%error, thread = %row.id, "loading thread to auto-settle");
+                    tracing::warn!(%error, thread = %index.id, "loading thread to auto-settle");
                 }
             }
         }
@@ -586,924 +526,490 @@ impl Inner {
     }
 
     // -----------------------------------------------------------------------
-    // Dispatch
+    // server
     // -----------------------------------------------------------------------
 
-    async fn call(&self, tag: &str, payload: Value) -> Response {
-        if tag == "assets.createUrl"
-            && let Some(response) = self.thread_asset_url(&payload).await
-        {
-            return response;
-        }
-        if let Some(response) = self.attachments.handle(tag, payload.clone()).await {
-            return response;
-        }
-        match tag {
-            "subscribeServerConfig" => self.subscribe_server_config(),
-            "server.getConfig" => {
-                let provider = self.catalog.provider().await;
-                Response::ok((self.config_builder())(provider))
-            }
-            "server.probe" => Response::ok(json!({})),
-            "server.refreshProviders" => self.refresh_providers(payload).await,
-            "server.reportClientActivity" => Response::ok(Value::Null),
-            "server.updateSettings" => Response::fail(to_value(&ServerSettingsError::new(
-                self.data_dir.join("settings.json").to_string_lossy(),
-                ServerSettingsOperation::Normalize,
-            ))),
-            "orchestration.subscribeShell" => Response::Stream(self.shell_stream()),
-            "orchestration.subscribeThread" => match decode::<SubscribeThreadInput>(tag, payload) {
-                Ok(input) => Response::Stream(self.thread_stream(&input.thread_id)),
-                Err(response) => response,
-            },
-            "orchestration.dispatchCommand" => self.dispatch(payload).await,
-            "orchestration.launchThread" => match decode::<ThreadLaunchInput>(tag, payload) {
-                Ok(input) => self.launch(input).await,
-                Err(response) => response,
-            },
-            "orchestration.getThreadProjection" => {
-                match decode::<GetThreadProjectionInput>(tag, payload) {
-                    Ok(input) => match self.projection(&input.thread_id).await {
-                        Ok(projection) => Response::ok(to_value(&projection)),
-                        Err(error) => Response::fail(error),
-                    },
-                    Err(response) => response,
-                }
-            }
-            "orchestration.getArchivedShellSnapshot" => self.archived_snapshot(),
-            "orchestration.getTurnItem" => match decode::<GetTurnItemInput>(tag, payload) {
-                Ok(input) => {
-                    let item =
-                        self.projection(&input.thread_id)
-                            .await
-                            .ok()
-                            .and_then(|projection| {
-                                projection
-                                    .turn_items
-                                    .into_iter()
-                                    .find(|item| item.id == input.item_id)
-                            });
-                    Response::ok(to_value(&GetTurnItemResult { item }))
-                }
-                Err(response) => response,
-            },
-            "orchestration.searchThreads" => self.search_threads(payload),
-            "orchestration.forceStopThread" => match decode::<ForceStopThreadInput>(tag, payload) {
-                Ok(input) => {
-                    let _ = self
-                        .ask(&input.thread_id, |reply| Request::ForceStop { reply })
-                        .await;
-                    Response::ok(to_value(&ForceStopThreadResult {
-                        outcome: ForceStopOutcome::Killed,
-                        shared_with_thread_ids: Vec::new(),
-                    }))
-                }
-                Err(response) => response,
-            },
-            "projects.mutate" => self.mutate_project(payload).await,
-            "filesystem.browse" => match decode::<FilesystemBrowseInput>(tag, payload) {
-                Ok(input) => self.browse(input),
-                Err(response) => response,
-            },
-            PROJECTS_READ_FILE => match decode::<ProjectReadFileInput>(tag, payload) {
-                Ok(input) => blocking(move || files::read_file(&input)).await,
-                Err(response) => response,
-            },
-            PROJECTS_LIST_ENTRIES => match decode::<ProjectListEntriesInput>(tag, payload) {
-                Ok(input) => blocking(move || files::list_entries(&input)).await,
-                Err(response) => response,
-            },
-            PROJECTS_SEARCH_ENTRIES => match decode::<ProjectSearchEntriesInput>(tag, payload) {
-                Ok(input) => {
-                    let (entries, home) = (Arc::clone(&self.entries), self.home.clone());
-                    blocking(move || entries.search(&input, &home)).await
-                }
-                Err(response) => response,
-            },
-            "filesystem.getMetadata" => match decode::<FilesystemGetMetadataInput>(tag, payload) {
-                Ok(input) => Response::ok(json!({"entries": vec![Value::Null; input.paths.len()]})),
-                Err(response) => response,
-            },
-            j3::GET_USAGE => self.usage().await,
-            j3::GET_SUBAGENT_TRANSCRIPT => match decode::<SubagentTranscriptInput>(tag, payload) {
-                Ok(input) => self.subagent_transcript(input).await,
-                Err(response) => response,
-            },
-            t3::git::VCS_REFRESH_STATUS => match decode::<VcsCwdInput>(tag, payload) {
-                Ok(input) => git_response(git::status(&input.cwd).await),
-                Err(response) => response,
-            },
-            t3::git::VCS_PULL => match decode::<VcsCwdInput>(tag, payload) {
-                Ok(input) => git_response(git::pull(&input.cwd).await),
-                Err(response) => response,
-            },
-            t3::git::GIT_RUN_STACKED_ACTION => {
-                match decode::<GitRunStackedActionInput>(tag, payload) {
-                    Ok(input) => Response::Stream(git::run_stacked_action(self.omp.clone(), input)),
-                    Err(response) => response,
-                }
-            }
-            TERMINAL_ATTACH => match decode::<TerminalAttachInput>(tag, payload) {
-                Ok(input) => self.attach_terminal(&input),
-                Err(response) => response,
-            },
-            TERMINAL_OPEN => match decode::<TerminalOpenInput>(tag, payload) {
-                Ok(input) => terminal_response(
-                    self.thread_root(&input.thread_id, &input.terminal_id)
-                        .and_then(|_| self.terminals.open(&input)),
-                ),
-                Err(response) => response,
-            },
-            TERMINAL_WRITE => match decode::<TerminalWriteInput>(tag, payload) {
-                Ok(input) => terminal_response(self.terminals.write(input).await),
-                Err(response) => response,
-            },
-            TERMINAL_RESIZE => match decode::<TerminalResizeInput>(tag, payload) {
-                Ok(input) => terminal_response(self.terminals.resize(&input)),
-                Err(response) => response,
-            },
-            TERMINAL_CLOSE => match decode::<TerminalCloseInput>(tag, payload) {
-                Ok(input) => {
-                    self.terminals.close(&input);
-                    Response::ok(Value::Null)
-                }
-                Err(response) => response,
-            },
-            other => Response::die(format!("{other} is not supported by this server")),
-        }
-    }
-
-    /// `assets.createUrl` for the resources that belong to a thread
-    /// (`tool-output-image`, `workspace-file`); None for the others, which
-    /// the attachment store answers.
-    async fn thread_asset_url(&self, payload: &Value) -> Option<Response> {
-        let tag = payload.pointer("/resource/_tag").and_then(Value::as_str);
-        if !matches!(tag, Some("tool-output-image" | "workspace-file")) {
-            return None;
-        }
-        let resource = payload.get("resource").cloned().unwrap_or(Value::Null);
-        let fail = |tag: &str, extra: Value| {
-            let mut error = json!({"_tag": tag, "resource": resource});
-            if let (Some(error), Value::Object(extra)) = (error.as_object_mut(), extra) {
-                error.extend(extra);
-            }
-            Response::fail(error)
-        };
-        let input = match decode::<AssetCreateUrlInput>("assets.createUrl", payload.clone()) {
-            Ok(input) => input,
-            Err(response) => return Some(response),
-        };
-        Some(match input.resource {
-            AssetResource::ToolOutputImage {
-                thread_id,
-                item_id,
-                index,
-            } => {
-                let attachment_id = self
-                    .projection(&thread_id)
-                    .await
-                    .ok()
-                    .and_then(|projection| {
-                        projection
-                            .turn_items
-                            .into_iter()
-                            .find(|item| item.id == item_id)
-                            .and_then(|item| match item.kind {
-                                TurnItemKind::DynamicTool(tool) => tool.output.flatten(),
-                                _ => None,
-                            })
-                            .and_then(|output| {
-                                tool_output_image(&output, index as usize).map(str::to_owned)
-                            })
-                    });
-                let url = match attachment_id {
-                    Some(id) => self.attachments.attachment_url(&id, None).await,
-                    None => Ok(None),
-                };
-                match url {
-                    Ok(Some(result)) => Response::ok(result),
-                    Ok(None) => fail("AssetWorkspaceAssetNotFoundError", Value::Null),
-                    Err(error) => Response::die(error.to_string()),
-                }
-            }
-            AssetResource::WorkspaceFile { thread_id, path } => {
-                let Some(root) = self.project_root(&thread_id) else {
-                    return Some(fail("AssetWorkspaceContextNotFoundError", Value::Null));
-                };
-                let resolved = tokio::task::spawn_blocking(move || files::image_file(&root, &path))
-                    .await
-                    .map_err(|error| error.to_string());
-                match resolved {
-                    Ok(Ok((path, mime_type))) => {
-                        Response::ok(self.attachments.grant_file(path, mime_type))
-                    }
-                    Ok(Err(files::ImageFileError::OutsideRoot)) => fail(
-                        "AssetWorkspacePathValidationError",
-                        json!({"cause": "the path leaves the project root"}),
-                    ),
-                    Ok(Err(files::ImageFileError::NotImage)) => {
-                        fail("AssetPreviewTypeValidationError", Value::Null)
-                    }
-                    Ok(Err(files::ImageFileError::NotFound(path))) => fail(
-                        "AssetWorkspaceAssetNotFoundError",
-                        json!({"checkedPath": path.to_string_lossy()}),
-                    ),
-                    Err(error) => Response::die(error),
-                }
-            }
-            _ => return None,
-        })
-    }
-
-    /// The workspace root of a live thread's project.
-    fn project_root(&self, thread_id: &str) -> Option<String> {
-        let project_id = self
-            .hub
-            .read(|store| store.thread(thread_id))
-            .ok()
-            .flatten()
-            .filter(|row| !row.deleted)
-            .map(|row| row.project_id)?;
-        self.hub
-            .read(|store| store.project(&project_id))
-            .ok()
-            .flatten()
-            .and_then(|json| serde_json::from_value::<Project>(json).ok())
-            .map(|project| project.workspace_root)
-    }
-
-    /// The workspace root of a live thread's project, where its terminals
-    /// start; an unknown thread is a `TerminalSessionLookupError`.
-    fn thread_root(&self, thread_id: &str, terminal_id: &str) -> Result<String, TerminalError> {
-        self.project_root(thread_id)
-            .ok_or_else(|| TerminalError::session_lookup(thread_id, terminal_id))
-    }
-
-    /// `terminal.attach` for a live thread; a missing session starts in
-    /// the thread's project folder unless the client names a `cwd`.
-    fn attach_terminal(&self, input: &TerminalAttachInput) -> Response {
-        let events = self
-            .thread_root(&input.thread_id, &input.terminal_id)
-            .and_then(|root| self.terminals.attach(input, &root));
-        match events {
-            Ok(events) => Response::Stream(
-                events
-                    .map(|event| StreamItem::Value(to_value(&event)))
-                    .boxed(),
-            ),
-            Err(error) => Response::fail(to_value(&error)),
-        }
-    }
-
-    /// `j3.getUsage`: this host's `omp usage --json`, as a [`UsageSnapshot`].
-    async fn usage(&self) -> Response {
-        let snapshot = match self.omp.usage().await {
-            Ok(stdout) => serde_json::from_slice::<UsageSnapshot>(&stdout)
-                .map_err(|error| format!("unexpected omp usage output: {error}")),
-            Err(error) => Err(error.to_string()),
-        };
-        match snapshot {
-            Ok(snapshot) => Response::ok(to_value(&snapshot)),
-            Err(message) => Response::fail(to_value(&UsageError { message })),
-        }
-    }
-
-    /// `j3.getSubagentTranscript`: the subagent's session file next to the
-    /// thread's, from `fromByte`.
-    async fn subagent_transcript(&self, input: SubagentTranscriptInput) -> Response {
-        let fail = |message: String| Response::fail(to_value(&SubagentTranscriptError { message }));
-        let row = match self.hub.read(|store| store.thread(&input.thread_id)) {
-            Ok(Some(row)) if !row.deleted => row,
-            Ok(_) => return fail(format!("thread {} not found", input.thread_id)),
-            Err(error) => return fail(error.to_string()),
-        };
-        let Some(session_file) = row.session_file else {
-            return fail("the thread has no omp session yet".to_owned());
-        };
-        let Some(path) = transcript::subagent_file(Path::new(&session_file), &input.subagent_id)
-        else {
-            return fail(format!("invalid subagent id {:?}", input.subagent_id));
-        };
-        let from_byte = input.from_byte;
-        match tokio::task::spawn_blocking(move || transcript::read(&path, from_byte)).await {
-            Ok(Ok(transcript)) => Response::ok(to_value(&transcript)),
-            Ok(Err(error)) => fail(format!("cannot read the subagent transcript: {error}")),
-            Err(error) => fail(error.to_string()),
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Server config and providers
-    // -----------------------------------------------------------------------
-
-    /// M1: the snapshot handshake, then provider updates; never ends.
-    fn subscribe_server_config(&self) -> Response {
+    /// `server.watch`: the catalog, then one per change; never ends.
+    pub(crate) fn server_watch(&self) -> BoxStream<'static, StreamEvent> {
         let catalog = Arc::clone(&self.catalog);
         let updates = catalog.subscribe();
-        let config = self.config_builder();
         let first = async move {
-            let provider = match catalog.provider_now() {
-                Some(provider) => provider,
-                None => tokio::time::timeout(CONFIG_WAIT, catalog.provider())
+            let current = match catalog.catalog_now() {
+                Some(current) => current,
+                None => tokio::time::timeout(CATALOG_WAIT, catalog.catalog())
                     .await
                     .unwrap_or_else(|_| catalog.current()),
             };
-            StreamItem::Value(json!({"version": 1, "type": "snapshot", "config": config(provider)}))
+            StreamEvent::Item(encode(&current))
         };
         let live = stream::unfold(updates, |mut updates| async move {
             loop {
                 match updates.recv().await {
-                    Ok(provider) => {
-                        let item = json!({
-                            "version": 1,
-                            "type": "providerStatuses",
-                            "payload": {"providers": [to_value(&provider)]},
-                        });
-                        return Some((StreamItem::Value(item), updates));
-                    }
+                    Ok(catalog) => return Some((StreamEvent::Item(encode(&catalog)), updates)),
                     Err(RecvError::Lagged(_)) => continue,
-                    // The catalog lives as long as the app; never end the
-                    // stream (the client drops the session if it ends).
+                    // The catalog lives as long as the app.
                     Err(RecvError::Closed) => std::future::pending::<()>().await,
                 }
             }
         });
-        Response::Stream(stream::once(first).chain(live).boxed())
+        stream::once(first).chain(live).boxed()
     }
 
-    /// A `'static` builder of `ServerConfig` JSON.
-    fn config_builder(&self) -> impl Fn(ServerProvider) -> Value + Send + 'static {
-        let descriptor = self.descriptor.clone();
-        let home = self.home.clone();
-        let data_dir = self.data_dir.clone();
-        move |provider| {
-            let logs = data_dir.join("logs");
-            let config: ServerConfig = serde_json::from_value(json!({
-                "environment": descriptor,
-                "auth": http::auth_descriptor(),
-                "cwd": home,
-                "keybindingsConfigPath": data_dir.join("keybindings.json").to_string_lossy(),
-                "keybindings": [],
-                "issues": [],
-                "providers": [to_value(&provider)],
-                "availableEditors": [],
-                "observability": {
-                    "logsDirectoryPath": logs.to_string_lossy(),
-                    "localTracingEnabled": false,
-                    "otlpTracesEnabled": false,
-                    "otlpMetricsEnabled": false,
-                    "otlpLogsEnabled": false,
-                },
-                // The contracts treat an instance missing from `providerInstances` as
-                // enabled only for codex/claudeAgent; `omp` (driver pi) must be listed
-                // or clients drop its models (`resolveProjectProviderInstanceEnabled`).
-                "settings": {
-                    "providerInstances": {
-                        "omp": {"driver": "pi", "displayName": "omp", "enabled": true},
-                    },
-                },
-            }))
-            .expect("server config matches ServerConfig");
-            to_value(&config)
+    pub(crate) async fn server_refresh(
+        &self,
+        project_id: Option<&str>,
+        fresh: bool,
+    ) -> Result<Catalog, Error> {
+        let cwd = match project_id {
+            Some(project_id) => Some(self.project(project_id)?.path),
+            None => None,
+        };
+        let (mut catalog, commands) = self.catalog.refresh(cwd.as_deref(), fresh).await;
+        if let Some(project_id) = project_id {
+            catalog.project_commands = BTreeMap::from([(project_id.to_owned(), commands)]);
         }
+        Ok(catalog)
     }
 
-    async fn refresh_providers(&self, payload: Value) -> Response {
-        let input: ServerRefreshProvidersInput =
-            serde_json::from_value(payload).unwrap_or_default();
-        let provider = self
-            .catalog
-            .refresh(
-                input.cwd.as_deref(),
-                input.refresh_models == Some(true),
-                input.fresh == Some(true),
-            )
-            .await;
-        Response::ok(json!({"providers": [to_value(&provider)]}))
+    pub(crate) async fn usage(&self) -> Result<Usage, Error> {
+        crate::usage::usage(&self.omp).await
     }
 
     // -----------------------------------------------------------------------
-    // Streams and snapshots
+    // shell and threads
     // -----------------------------------------------------------------------
 
-    fn shell_stream(&self) -> BoxStream<'static, StreamItem> {
-        let snapshot: SnapshotFn = Arc::new(|store: &Store| {
-            let fail = |error: store::Error| {
-                tracing::error!(%error, "reading shell snapshot");
-                to_value(&OrchestrationV2GetShellSnapshotError::new(
-                    "The thread list could not be read.",
-                ))
-            };
-            let (threads, _archived) = stored_shells(store).map_err(fail)?;
-            let projects = stored_project_shells(store).map_err(fail)?;
-            Ok(to_value(&ShellSnapshot {
-                schema_version: 1,
-                snapshot_sequence: store.high_water(),
-                threads,
-                archived_threads: Vec::new(),
-                projects,
-                older_settled: None,
-            }))
-        });
-        streams::shell_stream(Arc::clone(&self.hub), snapshot)
+    pub(crate) fn shell_watch(&self) -> BoxStream<'static, StreamEvent> {
+        streams::shell_stream(Arc::clone(&self.hub))
     }
 
-    fn thread_stream(&self, thread_id: &str) -> BoxStream<'static, StreamItem> {
-        let id = thread_id.to_owned();
-        let snapshot: SnapshotFn =
-            Arc::new(move |store: &Store| match stored_projection(store, &id) {
-                Ok(Some(projection)) => Ok(to_value(&projection)),
-                Ok(None) => Err(projection_error(&id, "This thread doesn't exist.")),
-                Err(error) => {
-                    tracing::error!(%error, thread = %id, "reading thread snapshot");
-                    Err(projection_error(&id, "The thread could not be read."))
-                }
-            });
-        streams::thread_stream(Arc::clone(&self.hub), thread_id, snapshot)
+    pub(crate) fn thread_watch(&self, thread_id: &str) -> BoxStream<'static, StreamEvent> {
+        streams::thread_stream(Arc::clone(&self.hub), thread_id)
     }
 
-    async fn projection(&self, thread_id: &str) -> Result<ThreadProjection, Value> {
-        let running = self
-            .actors
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(thread_id)
-            .is_some_and(|handle| !handle.is_closed());
-        if running
-            && let Ok(projection) = self
-                .ask(thread_id, |reply| Request::Projection { reply })
+    /// `threads.get`: what is committed once the actor has flushed.
+    pub(crate) async fn thread_get(&self, thread_id: &str) -> Result<ThreadSnapshot, Error> {
+        if self.running(thread_id) {
+            let _ = self.ask(thread_id, |reply| Request::Flush { reply }).await;
+        }
+        self.hub
+            .read(|store| store.snapshot(thread_id))
+            .map_err(storage)?
+            .ok_or_else(|| Error::not_found("thread", thread_id))
+    }
+
+    /// Uploaded attachments by id.
+    pub(crate) async fn attachments(&self, ids: &[String]) -> Result<Vec<Attachment>, Error> {
+        let mut attachments = Vec::with_capacity(ids.len());
+        for id in ids {
+            let attachment = self
+                .attachments
+                .attachment(id)
                 .await
+                .map_err(|error| Error::internal(error.to_string()))?
+                .ok_or_else(|| Error::not_found("attachment", id))?;
+            attachments.push(attachment);
+        }
+        Ok(attachments)
+    }
+
+    pub(crate) async fn create_thread(&self, params: CreateThreadParams) -> Result<Value, Error> {
+        if let Some(command_id) = &params.command_id
+            && let Some(thread_id) = self
+                .hub
+                .read(|store| store.receipt(command_id))
+                .map_err(storage)?
+                .and_then(|result| result.get("threadId")?.as_str().map(str::to_owned))
         {
-            return Ok(projection);
+            let row = self
+                .index(&thread_id)
+                .map_err(|error| error.into_error(&thread_id))?;
+            return Ok(json!({"thread": row.row, "sequence": self.hub.high_water()}));
         }
-        match self.hub.read(|store| stored_projection(store, thread_id)) {
-            Ok(Some(projection)) => Ok(projection),
-            Ok(None) => Err(projection_error(thread_id, "This thread doesn't exist.")),
-            Err(error) => {
-                tracing::error!(%error, "reading projection");
-                Err(projection_error(thread_id, "The thread could not be read."))
-            }
+        let project = self.project(&params.project_id)?;
+        let attachments = self.attachments(&params.attachments).await?;
+        if params.text.trim().is_empty() && attachments.is_empty() {
+            return Err(Error::rejected("The message is empty."));
         }
-    }
-
-    fn archived_snapshot(&self) -> Response {
-        let result = self.hub.read(|store| -> Result<_, store::Error> {
-            let (_, archived) = stored_shells(store)?;
-            Ok(ArchivedShellSnapshot {
-                schema_version: 1,
-                snapshot_sequence: store.high_water(),
-                projects: stored_project_shells(store)?,
-                threads: archived,
-            })
-        });
-        match result {
-            Ok(snapshot) => Response::ok(to_value(&snapshot)),
-            Err(error) => {
-                tracing::error!(%error, "reading archived threads");
-                Response::fail(to_value(&OrchestrationV2GetShellSnapshotError::new(
-                    "The archived threads could not be read.",
-                )))
-            }
-        }
-    }
-
-    fn search_threads(&self, payload: Value) -> Response {
-        let query = payload
-            .get("query")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_lowercase();
-        let limit = payload.get("limit").and_then(Value::as_u64).unwrap_or(20) as usize;
-        let shells = self.hub.read(stored_shells);
-        let matches: Vec<Value> = match shells {
-            Ok((active, archived)) => active
-                .into_iter()
-                .chain(archived)
-                .filter(|shell| !query.is_empty() && shell.title.to_lowercase().contains(&query))
-                .take(limit)
-                .map(|shell| {
-                    json!({
-                        "threadId": shell.id,
-                        "projectId": shell.project_id,
-                        "source": "user",
-                        "snippet": shell.title,
-                        "messageCreatedAt": shell.updated_at,
-                    })
-                })
-                .collect(),
-            Err(_) => Vec::new(),
-        };
-        Response::ok(json!({"matches": matches}))
-    }
-
-    // -----------------------------------------------------------------------
-    // Commands
-    // -----------------------------------------------------------------------
-
-    async fn dispatch(&self, payload: Value) -> Response {
-        let command_id = payload
-            .get("commandId")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
-        let command_type = payload
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
-        let command: OrchestrationV2Command = match serde_json::from_value(payload) {
-            Ok(command) => command,
-            Err(error) => {
-                tracing::debug!(%error, command_type, "undecodable command");
-                return dispatch_error(
-                    &command_id,
-                    &command_type,
-                    "This request could not be read.",
-                );
-            }
-        };
-        if let OrchestrationV2Command::Unknown(_) = command {
-            return dispatch_error(
-                &command_id,
-                &command_type,
-                "This action isn't supported by this server.",
-            );
-        }
-        if let Ok(Some(receipt)) = self.hub.read(|store| store.receipt(&command_id)) {
-            let sequence = receipt.get("sequence").and_then(Value::as_u64).unwrap_or(0);
-            return Response::ok(to_value(&DispatchCommandResult { sequence }));
-        }
-        let thread_id = command.thread_id().unwrap_or_default().to_owned();
-        let is_delete = matches!(command, OrchestrationV2Command::ThreadDelete(_));
-        let result = self
-            .ask(&thread_id, |reply| Request::Dispatch {
-                command: Box::new(command.clone()),
-                reply,
-            })
-            .await;
-        match result {
-            Ok(Ok(sequence)) => {
-                if is_delete {
-                    self.actors
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .remove(&thread_id);
-                    self.terminals.close_thread(&thread_id);
-                }
-                Response::ok(to_value(&DispatchCommandResult { sequence }))
-            }
-            Ok(Err(Reject(message))) => dispatch_error(&command_id, &command_type, &message),
-            Err(ThreadError::NotFound) if is_delete => {
-                Response::ok(to_value(&DispatchCommandResult {
-                    sequence: self.hub.high_water(),
-                }))
-            }
-            Err(ThreadError::NotFound) => {
-                dispatch_error(&command_id, &command_type, "This thread no longer exists.")
-            }
-            Err(ThreadError::Store(error)) => {
-                tracing::error!(%error, "loading thread");
-                dispatch_error(
-                    &command_id,
-                    &command_type,
-                    "The thread could not be loaded.",
-                )
-            }
-        }
-    }
-
-    async fn launch(&self, input: ThreadLaunchInput) -> Response {
-        let fail = |message: &str| {
-            Response::fail(to_value(&OrchestrationV2ThreadLaunchError::new(
-                input.command_id.clone(),
-                input.project_id.clone(),
-                message,
-            )))
-        };
-        let replay = self
-            .hub
-            .read(|store| store.receipt(&input.command_id))
-            .ok()
-            .flatten()
-            .and_then(|receipt| {
-                Some((
-                    receipt.get("threadId")?.as_str()?.to_owned(),
-                    receipt.get("sequence").and_then(Value::as_u64),
-                ))
-            });
-        let existing = input.thread_id.as_ref().filter(|thread_id| {
-            self.hub
-                .read(|store| store.thread(thread_id))
-                .ok()
-                .flatten()
-                .is_some_and(|row| !row.deleted)
-        });
-        if let Some((thread_id, sequence)) =
-            replay.or_else(|| existing.map(|id| (id.clone(), None)))
-        {
-            return match self.projection(&thread_id).await {
-                Ok(projection) => Response::ok(to_value(&ThreadLaunchResult {
-                    thread_id,
-                    projection,
-                    resumed: true,
-                    sequence,
-                })),
-                Err(_) => fail("This thread no longer exists."),
-            };
-        }
-        if !matches!(input.workspace_strategy, WorkspaceStrategy::Root { .. }) {
-            return fail(
-                "Worktrees aren't supported here; start the thread in the project folder.",
-            );
-        }
-        let project: Option<Project> = self
-            .hub
-            .read(|store| store.project(&input.project_id))
-            .ok()
-            .flatten()
-            .and_then(|json| serde_json::from_value(json).ok());
-        let Some(project) = project else {
-            return fail("This project no longer exists.");
-        };
-        let thread_id = input.thread_id.clone().unwrap_or_else(new_id);
-        let creation_source = input.creation_source.unwrap_or(CreationSource::Mobile);
+        let thread_id = new_id();
         let model = ThreadModel::create(NewThread {
             id: thread_id.clone(),
-            project_id: input.project_id.clone(),
-            title: input.title.clone(),
-            model_selection: input.model_selection.clone(),
-            runtime_mode: input.runtime_mode,
-            interaction_mode: input.interaction_mode,
-            created_by: Creator::User,
-            creation_source,
-            cwd: project.workspace_root.clone(),
+            project_id: project.id,
+            title: params.title.clone().unwrap_or_default(),
+            model: params.model.clone(),
+            mode: params.mode.unwrap_or_default(),
         });
-        let initial = input.initial_message.as_ref().map(|message| UserInput {
-            message_id: message.message_id.clone().unwrap_or_else(new_id),
-            text: message.text.clone(),
-            attachments: message.attachments.clone(),
-            context: message.context.clone(),
-            model_selection: input.model_selection.clone(),
-            created_by: Creator::User,
-            creation_source,
-        });
-        let handle = actor::spawn(self.actor_config.clone(), model, None, None);
+        let handle = actor::spawn(self.actor_config.clone(), model, project.path, None);
         self.actors
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(thread_id.clone(), handle.clone());
         let (reply, response) = oneshot::channel();
-        if handle
+        handle
             .send(Request::Launch {
-                command_id: input.command_id.clone(),
-                input: initial.map(Box::new),
-                generate_title: input.generate_title != Some(false),
+                input: UserInput {
+                    text: params.text,
+                    attachments,
+                    model: params.model,
+                },
+                generate_title: params.title.is_none(),
+                command_id: params.command_id,
                 reply,
             })
-            .is_err()
-        {
-            return fail("The thread could not be started.");
-        }
-        match response.await {
-            Ok(Ok((sequence, projection))) => Response::ok(to_value(&ThreadLaunchResult {
-                thread_id,
-                projection,
-                resumed: false,
-                sequence: Some(sequence),
-            })),
-            Ok(Err(Reject(message))) => fail(&message),
-            Err(_) => fail("The thread could not be started."),
-        }
+            .map_err(|_| Error::internal("The thread could not be started."))?;
+        let (sequence, row) = response
+            .await
+            .map_err(|_| Error::internal("The thread could not be started."))??;
+        Ok(json!({"thread": row, "sequence": sequence}))
     }
 
-    // -----------------------------------------------------------------------
-    // Projects
-    // -----------------------------------------------------------------------
-
-    async fn mutate_project(&self, payload: Value) -> Response {
-        let command_id = payload
-            .get("commandId")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
-            .to_owned();
-        let fail = |message: &str| {
-            Response::fail(to_value(&ProjectMutationError::new(
-                command_id.clone(),
-                message,
-            )))
-        };
-        let mutation: ProjectMutation = match serde_json::from_value(payload) {
-            Ok(mutation) => mutation,
-            Err(_) => return fail("This project change could not be read."),
-        };
-        if let Ok(Some(project)) = self.hub.read(|store| store.receipt(&command_id)) {
-            return Response::ok(project);
-        }
-        let now = t3::now_iso();
-        let (project_id, project, removed) = match mutation {
-            ProjectMutation::Create(create) => {
-                if let Ok(Some(existing)) = self.hub.read(|store| store.project(&create.project_id))
-                {
-                    return Response::ok(existing);
-                }
-                let root = expand_home(create.workspace_root.trim(), &self.home);
-                if !root.is_dir() {
-                    if create.create_workspace_root_if_missing == Some(true) {
-                        if std::fs::create_dir_all(&root).is_err() {
-                            return fail("The folder could not be created.");
-                        }
-                    } else {
-                        return fail("That folder doesn't exist on this machine.");
-                    }
-                }
-                let title = if create.title.trim().is_empty() {
-                    root.file_name()
-                        .map(|name| name.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "Project".into())
-                } else {
-                    create.title.trim().to_owned()
-                };
-                let project = json!({
-                    "id": create.project_id,
-                    "title": title,
-                    "workspaceRoot": root.to_string_lossy(),
-                    "defaultModelSelection": create.default_model_selection.flatten(),
-                    "scripts": create.scripts.unwrap_or_default(),
-                    "createdAt": now,
-                    "updatedAt": now,
-                    "deletedAt": null,
-                });
-                (create.project_id, project, false)
-            }
-            ProjectMutation::Update(update) => {
-                let Ok(Some(mut project)) =
-                    self.hub.read(|store| store.project(&update.project_id))
-                else {
-                    return fail("This project no longer exists.");
-                };
-                if let Some(title) = update.title.filter(|title| !title.trim().is_empty()) {
-                    project["title"] = json!(title.trim());
-                }
-                if let Some(root) = update.workspace_root.filter(|root| !root.trim().is_empty()) {
-                    let root = expand_home(root.trim(), &self.home);
-                    if !root.is_dir() {
-                        return fail("That folder doesn't exist on this machine.");
-                    }
-                    project["workspaceRoot"] = json!(root.to_string_lossy());
-                }
-                if let Some(selection) = update.default_model_selection {
-                    project["defaultModelSelection"] = to_value(&selection);
-                }
-                if let Some(scripts) = update.scripts {
-                    project["scripts"] = to_value(&scripts);
-                }
-                if let Some(pinned) = update.pinned {
-                    project["pinnedAt"] = if pinned { json!(now) } else { Value::Null };
-                }
-                if let Some(archived) = update.archived {
-                    project["archivedAt"] = if archived { json!(now) } else { Value::Null };
-                }
-                project["updatedAt"] = json!(now);
-                (update.project_id, project, false)
-            }
-            ProjectMutation::Delete(delete) => {
-                let Ok(Some(project)) = self.hub.read(|store| store.project(&delete.project_id))
-                else {
-                    return Response::ok(json!({
-                        "id": delete.project_id, "title": "Deleted project", "workspaceRoot": "/",
-                        "defaultModelSelection": null, "scripts": [], "createdAt": now,
-                        "updatedAt": now, "deletedAt": now,
-                    }));
-                };
-                let threads: Vec<String> = self
-                    .hub
-                    .read(|store| store.threads())
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|row| row.project_id == delete.project_id)
-                    .map(|row| row.id)
-                    .collect();
-                if !threads.is_empty() && delete.force != Some(true) {
-                    return fail("Delete this project's threads first.");
-                }
-                for thread_id in threads {
-                    let command = OrchestrationV2Command::ThreadDelete(ThreadDeleteCommand {
-                        command_id: format!("{command_id}:{thread_id}"),
-                        thread_id: thread_id.clone(),
-                        only_if_unused: None,
-                    });
-                    let _ = self
-                        .ask(&thread_id, |reply| Request::Dispatch {
-                            command: Box::new(command.clone()),
-                            reply,
-                        })
-                        .await;
-                    self.actors
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .remove(&thread_id);
-                    self.terminals.close_thread(&thread_id);
-                }
-                let mut project = project;
-                project["deletedAt"] = json!(now);
-                project["updatedAt"] = json!(now);
-                (delete.project_id, project, true)
-            }
-        };
-        self.commit_project(&command_id, project_id, project, removed)
-    }
-
-    /// Saves (or removes) a project with its shell item and receipt; the
-    /// response is the `Project`.
-    fn commit_project(
+    /// A thread command (wire.md §5.4–§5.9); its result.
+    pub(crate) async fn thread_command(
         &self,
-        command_id: &str,
-        project_id: String,
-        project: Value,
-        removed: bool,
-    ) -> Response {
-        let Ok(typed) = serde_json::from_value::<Project>(project) else {
-            return Response::fail(to_value(&ProjectMutationError::new(
-                command_id.to_owned(),
-                "The project is invalid.",
-            )));
-        };
-        let json = to_value(&typed);
-        let change = if removed {
-            ShellChange::ProjectRemoved(project_id.clone())
-        } else {
-            let shell: ProjectShell =
-                serde_json::from_value(json.clone()).expect("a Project is a ProjectShell");
-            ShellChange::ProjectUpdated(to_value(&shell))
-        };
-        let result_json = json.clone();
-        let commit = Commit {
-            thread: None,
-            projects: vec![(project_id, (!removed).then(|| json.clone()))],
-            shell: vec![change],
-            receipt: Some((command_id.to_owned(), Box::new(move |_| result_json))),
-        };
-        match self.hub.commit(commit) {
-            Ok(_) => Response::ok(json),
-            Err(error) => {
-                tracing::error!(%error, "saving project");
-                Response::fail(to_value(&ProjectMutationError::new(
-                    command_id.to_owned(),
-                    "The project could not be saved.",
-                )))
+        thread_id: &str,
+        command_id: Option<String>,
+        command: Command,
+    ) -> Result<Value, Error> {
+        if let Some(command_id) = &command_id
+            && let Some(result) = self
+                .hub
+                .read(|store| store.receipt(command_id))
+                .map_err(storage)?
+        {
+            return Ok(result);
+        }
+        let delete = matches!(command, Command::Delete { .. });
+        let result = self
+            .ask(thread_id, |reply| Request::Command {
+                command: command.clone(),
+                command_id: command_id.clone(),
+                reply,
+            })
+            .await;
+        match result {
+            Ok(Ok(result)) => {
+                if delete {
+                    self.forget(thread_id);
+                    self.terminals.close_thread(thread_id);
+                }
+                Ok(result)
             }
+            Ok(Err(error)) => Err(error),
+            // Deleting a missing thread succeeds.
+            Err(ThreadError::NotFound) if delete => Ok(json!({"sequence": self.hub.high_water()})),
+            Err(error) => Err(error.into_error(thread_id)),
         }
     }
 
+    /// `turns.send`'s model: the client's, else the thread's.
+    pub(crate) fn thread_model(&self, thread_id: &str) -> Result<ModelRef, Error> {
+        self.index(thread_id)
+            .map(|index| index.row.model)
+            .map_err(|error| error.into_error(thread_id))
+    }
+
+    pub(crate) async fn transcript(
+        &self,
+        thread_id: &str,
+        subagent_id: &str,
+        from_byte: u64,
+    ) -> Result<TranscriptResult, Error> {
+        let index = self
+            .index(thread_id)
+            .map_err(|error| error.into_error(thread_id))?;
+        let Some(session_file) = index.session_file else {
+            return Err(Error::new(
+                ErrorCode::Unavailable,
+                "The thread has no omp session yet.",
+            ));
+        };
+        let path = transcript::subagent_file(Path::new(&session_file), subagent_id)
+            .ok_or_else(|| Error::not_found("subagent", subagent_id))?;
+        blocking(move || {
+            transcript::read(&path, from_byte).map_err(|error| {
+                Error::new(
+                    ErrorCode::Unavailable,
+                    format!("The subagent transcript can't be read: {error}"),
+                )
+            })
+        })
+        .await
+    }
+
     // -----------------------------------------------------------------------
-    // Filesystem
+    // projects
     // -----------------------------------------------------------------------
 
-    fn browse(&self, input: FilesystemBrowseInput) -> Response {
-        let partial = input.partial_path.trim();
-        let base = input
-            .cwd
-            .as_deref()
-            .map(|cwd| expand_home(cwd, &self.home))
-            .unwrap_or_else(|| PathBuf::from(&self.home));
-        let mut dir = if partial.is_empty() {
-            base
-        } else {
-            let path = expand_home(partial, &self.home);
-            if path.is_absolute() {
-                path
-            } else {
-                base.join(path)
-            }
-        };
-        if !partial.ends_with('/')
-            && !dir.is_dir()
-            && let Some(parent) = dir.parent()
-        {
-            dir = parent.to_owned();
+    pub(crate) fn project(&self, project_id: &str) -> Result<Project, Error> {
+        self.hub
+            .read(|store| store.project(project_id))
+            .map_err(storage)?
+            .ok_or_else(|| Error::not_found("project", project_id))
+    }
+
+    /// The project directory of a thread.
+    fn thread_root(&self, thread_id: &str) -> Result<String, Error> {
+        let index = self
+            .index(thread_id)
+            .map_err(|error| error.into_error(thread_id))?;
+        Ok(self.project(&index.project_id)?.path)
+    }
+
+    /// The stored result of command `command_id`, if it ran before.
+    fn receipt(&self, command_id: Option<&str>) -> Result<Option<Value>, Error> {
+        match command_id {
+            Some(command_id) => self
+                .hub
+                .read(|store| store.receipt(command_id))
+                .map_err(storage),
+            None => Ok(None),
         }
-        let fail = |message: String| {
-            let mut error = FilesystemBrowseError::new(message);
-            error.partial_path = Some(input.partial_path.clone());
-            error.failure = Some(FilesystemBrowseFailure::ReadDirectoryFailed);
-            Response::fail(to_value(&error))
-        };
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(error) => return fail(format!("{} can't be listed: {error}", dir.display())),
-        };
-        let mut listed: Vec<FilesystemBrowseEntry> = entries
-            .filter_map(Result::ok)
-            .filter(|entry| entry.path().is_dir())
-            .map(|entry| FilesystemBrowseEntry {
-                name: entry.file_name().to_string_lossy().into_owned(),
-                full_path: entry.path().to_string_lossy().into_owned(),
+    }
+
+    /// Commits project changes; the command's result, kept for repeats of
+    /// `command_id`.
+    fn commit_projects(
+        &self,
+        projects: Vec<ProjectWrite>,
+        command_id: Option<String>,
+        result: impl Fn(u64) -> Value + Clone + Send + 'static,
+    ) -> Result<Value, Error> {
+        let stored = command_id.map(|id| {
+            let result = result.clone();
+            let stored: ResultFn = Box::new(result);
+            (id, stored)
+        });
+        let sequence = self
+            .hub
+            .commit(Commit {
+                thread: None,
+                projects,
+                result: stored,
             })
+            .map_err(storage)?;
+        Ok(result(sequence))
+    }
+
+    pub(crate) fn create_project(&self, params: CreateProjectParams) -> Result<Value, Error> {
+        if let Some(result) = self.receipt(params.command_id.as_deref())? {
+            return Ok(result);
+        }
+        let root = expand_home(params.path.trim(), &self.home);
+        if !root.is_dir() {
+            return Err(Error::rejected(
+                "That folder doesn't exist on this machine.",
+            ));
+        }
+        let path = root.to_string_lossy().into_owned();
+        let projects = self.hub.read(|store| store.projects()).map_err(storage)?;
+        if projects.iter().any(|project| project.path == path) {
+            return Err(Error::rejected("That folder is already a project."));
+        }
+        let title = match params.title.trim() {
+            "" => root.file_name().map_or_else(
+                || "Project".to_owned(),
+                |name| name.to_string_lossy().into_owned(),
+            ),
+            title => title.to_owned(),
+        };
+        let now = now_iso();
+        let project = Project {
+            id: new_id(),
+            title,
+            path,
+            default_model: params.default_model,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        let value = encode(&project);
+        self.commit_projects(
+            vec![ProjectWrite::Upsert(project)],
+            params.command_id,
+            move |sequence| json!({"project": value, "sequence": sequence}),
+        )
+    }
+
+    pub(crate) fn update_project(&self, params: UpdateProjectParams) -> Result<Value, Error> {
+        if let Some(result) = self.receipt(params.command_id.as_deref())? {
+            return Ok(result);
+        }
+        let mut project = self.project(&params.project_id)?;
+        if let Some(title) = &params.title {
+            let title = title.trim();
+            if title.is_empty() {
+                return Err(Error::rejected("The title can't be empty."));
+            }
+            title.clone_into(&mut project.title);
+        }
+        if let Some(model) = params.default_model {
+            project.default_model = model;
+        }
+        project.updated_at = now_iso();
+        let value = encode(&project);
+        self.commit_projects(
+            vec![ProjectWrite::Upsert(project)],
+            params.command_id,
+            move |sequence| json!({"project": value, "sequence": sequence}),
+        )
+    }
+
+    pub(crate) async fn delete_project(&self, params: DeleteProjectParams) -> Result<Value, Error> {
+        if let Some(result) = self.receipt(params.command_id.as_deref())? {
+            return Ok(result);
+        }
+        self.project(&params.project_id)?;
+        let threads: Vec<String> = self
+            .hub
+            .read(|store| store.threads())
+            .map_err(storage)?
+            .into_iter()
+            .filter(|index| index.project_id == params.project_id)
+            .map(|index| index.id)
             .collect();
-        listed.sort_by_cached_key(|entry| entry.name.to_lowercase());
-        Response::ok(to_value(&FilesystemBrowseResult {
-            parent_path: dir.to_string_lossy().into_owned(),
-            entries: listed,
-        }))
+        if !threads.is_empty() && params.force != Some(true) {
+            return Err(Error::rejected("Delete this project's threads first."));
+        }
+        for thread_id in threads {
+            self.thread_command(
+                &thread_id,
+                None,
+                Command::Delete {
+                    only_if_unused: false,
+                },
+            )
+            .await?;
+        }
+        self.commit_projects(
+            vec![ProjectWrite::Remove(params.project_id)],
+            params.command_id,
+            |sequence| json!({"sequence": sequence}),
+        )
+    }
+
+    pub(crate) async fn browse(&self, partial_path: String) -> Result<BrowseResult, Error> {
+        let home = self.home.clone();
+        blocking(move || files::browse(&home, &partial_path)).await
+    }
+
+    pub(crate) async fn list_entries(
+        &self,
+        project_id: &str,
+        dir: Option<String>,
+    ) -> Result<EntriesResult, Error> {
+        let root = self.project(project_id)?.path;
+        blocking(move || files::list_entries(&root, dir.as_deref())).await
+    }
+
+    pub(crate) async fn search_entries(
+        &self,
+        params: SearchEntriesParams,
+    ) -> Result<EntriesResult, Error> {
+        let root = self.project(&params.project_id)?.path;
+        let entries = Arc::clone(&self.entries);
+        blocking(move || entries.search(&root, &params)).await
+    }
+
+    pub(crate) async fn read_file(
+        &self,
+        project_id: &str,
+        path: String,
+        allow_missing: bool,
+    ) -> Result<ReadFileResult, Error> {
+        let root = self.project(project_id)?.path;
+        blocking(move || files::read_file(&root, &path, allow_missing)).await
+    }
+
+    pub(crate) async fn image_url(
+        &self,
+        project_id: &str,
+        path: String,
+    ) -> Result<ImageUrlResult, Error> {
+        let root = self.project(project_id)?.path;
+        let requested = path.clone();
+        let found = blocking(move || {
+            files::image_file(&root, &requested).map_err(|error| match error {
+                files::ImageFileError::OutsideRoot => {
+                    Error::rejected("The path is outside the project.")
+                }
+                files::ImageFileError::NotImage => Error::new(
+                    ErrorCode::TooLarge,
+                    "Only GIF, JPEG, PNG and WebP images up to 10 MiB can be shown.",
+                )
+                .with_data(json!({"limit": crate::attachments::MAX_IMAGE_BYTES})),
+                files::ImageFileError::NotFound(_) => Error::not_found("file", &requested),
+            })
+        })
+        .await?;
+        let (file, mime_type) = found;
+        let (token, expires_at) = self.attachments.grant_path(file, mime_type);
+        Ok(ImageUrlResult {
+            url: format!("/api/v1/assets/{token}"),
+            expires_at: iso(expires_at as i64),
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // git
+    // -----------------------------------------------------------------------
+
+    pub(crate) async fn git_status(&self, project_id: &str) -> Result<GitStatus, Error> {
+        git::status(&self.project(project_id)?.path).await
+    }
+
+    pub(crate) async fn git_pull(&self, project_id: &str) -> Result<PullResult, Error> {
+        git::pull(&self.project(project_id)?.path).await
+    }
+
+    pub(crate) fn git_run(
+        &self,
+        project_id: &str,
+        action: GitAction,
+        message: Option<String>,
+    ) -> Result<BoxStream<'static, Result<GitRunItem, Error>>, Error> {
+        let cwd = self.project(project_id)?.path;
+        Ok(git::run(self.omp.clone(), cwd, action, message))
+    }
+
+    // -----------------------------------------------------------------------
+    // terminals and attachments
+    // -----------------------------------------------------------------------
+
+    pub(crate) fn terminal_attach(
+        &self,
+        params: &j3_protocol::v2::methods::AttachParams,
+    ) -> Result<BoxStream<'static, StreamEvent>, Error> {
+        let root = self.thread_root(&params.thread_id)?;
+        let items = self.terminals.attach(params, &root)?;
+        Ok(items.map(|item| StreamEvent::Item(encode(&item))).boxed())
+    }
+
+    pub(crate) fn terminals(&self) -> &Terminals {
+        &self.terminals
+    }
+
+    pub(crate) async fn delete_attachment(&self, attachment_id: &str) -> Result<(), Error> {
+        self.attachments
+            .delete(attachment_id)
+            .await
+            .map_err(|error| Error::internal(error.to_string()))
+    }
+
+    /// Declares an upload of `size` bytes; its new id.
+    pub(crate) async fn create_attachment(
+        &self,
+        image: bool,
+        name: &str,
+        mime_type: &str,
+        size: u64,
+    ) -> Result<String, Error> {
+        let kind = if image {
+            AttachmentKind::Image
+        } else {
+            AttachmentKind::File
+        };
+        self.attachments
+            .create(kind, name, mime_type, size)
+            .await
+            .map_err(|error| Error::internal(error.to_string()))
     }
 }

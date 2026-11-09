@@ -1,5 +1,6 @@
 //! The composer headless, on the offline fixtures: what a user sees and sends.
 
+use j3_client::{Status, entities::ThinkingLevel};
 use rune::{ClipboardContent, ClipboardImage, Key, KeyEvent, Mods};
 
 use super::{ComposerKey, draft, fixture::PNG, plain_text};
@@ -324,11 +325,8 @@ fn the_model_picker_stars_without_choosing_and_sets_the_thinking_level() {
     );
     tap(&mut app, "thinking-low");
     let selection = app.rt.state.composer_selection(&key).expect("a selection");
-    assert_eq!(
-        crate::models::selection_level(&selection, "thinking"),
-        Some("low")
-    );
-    tap(&mut app, &format!("model-omp-{sonnet}"));
+    assert_eq!(selection.thinking, Some(ThinkingLevel::Low));
+    tap(&mut app, &format!("model-{sonnet}"));
     assert_eq!(
         app.rt
             .state
@@ -516,13 +514,13 @@ fn arrow_keys_walk_every_picker_row_once_with_a_starred_model() {
     let active = |app: &TestApp| app.rt.state.composers[&key].picker.active;
     assert_eq!(active(&app), Some(1), "the chosen model is highlighted");
     app.settle(30);
-    assert_eq!(highlighted(&app), [format!("model-omp-{OPUS}")]);
+    assert_eq!(highlighted(&app), [format!("model-{OPUS}")]);
     press(&mut app, Key::Down, Mods::default());
     assert_eq!(active(&app), Some(2));
     app.settle(30);
     assert_eq!(
         highlighted(&app),
-        [format!("model-omp-{sonnet}")],
+        [format!("model-{sonnet}")],
         "one copy only"
     );
     press(&mut app, Key::Down, Mods::default());
@@ -560,7 +558,7 @@ fn arrow_keys_walk_every_picker_row_once_with_a_starred_model() {
 }
 
 /// Environment `env`'s state with status `status`.
-fn set_status(app: &mut TestApp, env: &str, status: j3_client::ConnectionStatus) {
+fn set_status(app: &mut TestApp, env: &str, status: Status) {
     let env = env.to_owned();
     app.rt.update(move |s, tx| {
         let mut state = (**s.envs.get(&env).unwrap().state()).clone();
@@ -571,20 +569,19 @@ fn set_status(app: &mut TestApp, env: &str, status: j3_client::ConnectionStatus)
 }
 
 #[test]
-fn workspace_commands_are_asked_for_once_the_environment_is_live() {
-    use j3_client::ConnectionStatus;
+fn project_commands_are_asked_for_once_the_environment_is_live() {
     let (mut app, key) = focused(Scene::NewThread);
     let env = key.env().to_owned();
-    let requested = |app: &TestApp| app.rt.state.composers[&key].workspace_requested;
-    set_status(&mut app, &env, ConnectionStatus::Connecting);
+    let requested = |app: &TestApp| app.rt.state.composers[&key].commands_requested;
+    set_status(&mut app, &env, Status::Connecting);
     app.rt.update(|s, _| {
-        s.composer(&new_thread_key()).workspace_requested = false;
+        s.composer(&new_thread_key()).commands_requested = false;
     });
     app.frame();
     app.frame();
     assert!(!requested(&app), "nothing to ask while connecting");
     // Still focused, no focus change: the poll asks once the environment is live.
-    set_status(&mut app, &env, ConnectionStatus::Live);
+    set_status(&mut app, &env, Status::Connected);
     app.frame();
     assert!(requested(&app));
 }
@@ -618,7 +615,6 @@ fn a_new_thread_without_a_project_has_no_composer() {
 
 #[test]
 fn composers_of_threads_that_are_gone_are_dropped() {
-    use j3_client::ConnectionStatus;
     let (mut app, open) = focused(Scene::Thread);
     let env = open.env().to_owned();
     let gone = ComposerKey::Thread(crate::sidebar::ThreadKey::new(env.clone(), "thr-gone"));
@@ -627,7 +623,7 @@ fn composers_of_threads_that_are_gone_are_dropped() {
         s.composer(&image_key).edit.replace_text("draft");
         s.add_composer_image(&image_key, PNG.to_vec(), None);
     });
-    set_status(&mut app, &env, ConnectionStatus::Live);
+    set_status(&mut app, &env, Status::Connected);
     let s = &app.rt.state;
     assert!(
         !s.composers.contains_key(&gone),

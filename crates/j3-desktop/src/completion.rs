@@ -1,11 +1,11 @@
-//! Completion for the composer: omp slash commands and skills of the
-//! thread's workspace (skills are inserted as `/skill:<name>`), the models
+//! Completion for the composer: omp slash commands (the server's and the
+//! thread's project's) and skills (inserted as `/skill:<name>`), the models
 //! offered by a `^` mention, and the files and directories an `@` reference
 //! names (omp reads `@path` files into the prompt itself on submit).
 
 use std::collections::HashSet;
 
-use j3_protocol::t3::server::{ServerConfig, ServerProviderSkill, ServerProviderSlashCommand};
+use j3_client::methods::{self, CatalogCommand, CatalogSkill};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompletionKind {
@@ -14,8 +14,8 @@ pub enum CompletionKind {
     /// A model for a `^` mention, by slug. Accepted through the mention
     /// token, not [`apply`].
     Model(String),
-    /// A file or directory for an `@` reference, by its path as the server
-    /// shows it (relative to the workspace, or as typed outside it).
+    /// A file or directory for an `@` reference, by its path relative to the
+    /// project.
     Path {
         path: String,
         directory: bool,
@@ -34,73 +34,28 @@ pub struct Completion {
     pub hint: Option<String>,
 }
 
-/// Commands and skills for `cwd`: the provider-wide lists merged with the
-/// workspace snapshot for `cwd`, first occurrence of a name winning.
+/// Commands and skills for one project: its own commands, then the
+/// server's, first occurrence of a name winning, and the server's skills.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Catalog {
-    pub commands: Vec<ServerProviderSlashCommand>,
-    pub skills: Vec<ServerProviderSkill>,
-    /// Whether the server has a workspace snapshot for `cwd`.
-    pub has_workspace: bool,
+    pub commands: Vec<CatalogCommand>,
+    pub skills: Vec<CatalogSkill>,
 }
 
 impl Catalog {
-    pub fn for_workspace(config: &ServerConfig, cwd: &str) -> Self {
-        let mut catalog = Self::default();
-        let mut command_names = HashSet::new();
-        let mut skill_names = HashSet::new();
-        for provider in &config.providers {
-            let snapshot = provider
-                .workspace_snapshots
-                .iter()
-                .flatten()
-                .find(|snapshot| snapshot.cwd == cwd);
-            catalog.has_workspace |= snapshot.is_some();
-            let commands = snapshot
-                .into_iter()
-                .flat_map(|s| &s.slash_commands)
-                .chain(&provider.slash_commands);
-            for command in commands {
-                if command_names.insert(command.name.clone()) {
-                    catalog.commands.push(command.clone());
-                }
-            }
-            let skills = snapshot
-                .into_iter()
-                .flat_map(|s| &s.skills)
-                .chain(&provider.skills);
-            for skill in skills {
-                if skill.enabled
-                    && skill.user_invocable != Some(false)
-                    && skill_names.insert(skill.name.clone())
-                {
-                    catalog.skills.push(skill.clone());
-                }
-            }
-        }
-        catalog
-    }
-
-    /// Adds the commands and skills fetched for this workspace by
-    /// `refresh_workspace`, keeping names already present.
-    pub fn merge(
-        &mut self,
-        commands: &[ServerProviderSlashCommand],
-        skills: &[ServerProviderSkill],
-    ) {
-        self.has_workspace = true;
-        for command in commands {
-            if !self.commands.iter().any(|c| c.name == command.name) {
-                self.commands.push(command.clone());
-            }
-        }
-        for skill in skills {
-            if skill.enabled
-                && skill.user_invocable != Some(false)
-                && !self.skills.iter().any(|s| s.name == skill.name)
-            {
-                self.skills.push(skill.clone());
-            }
+    /// `catalog`'s commands and skills with `project`'s own commands (as
+    /// `server.refresh` returned them) first.
+    pub fn new(catalog: &methods::Catalog, project: &[CatalogCommand]) -> Self {
+        let mut names = HashSet::new();
+        let commands = project
+            .iter()
+            .chain(&catalog.commands)
+            .filter(|command| names.insert(command.name.as_str()))
+            .cloned()
+            .collect();
+        Self {
+            commands,
+            skills: catalog.skills.clone(),
         }
     }
 
@@ -111,16 +66,13 @@ impl Catalog {
         let commands = self.commands.iter().map(|command| Completion {
             kind: CompletionKind::Command,
             label: format!("/{}", command.name),
-            description: command.description.clone(),
-            hint: command.input.as_ref().map(|input| input.hint.clone()),
+            description: non_empty(&command.description),
+            hint: command.hint.clone(),
         });
         let skills = self.skills.iter().map(|skill| Completion {
             kind: CompletionKind::Skill,
             label: format!("/skill:{}", skill.name),
-            description: skill
-                .short_description
-                .clone()
-                .or_else(|| skill.description.clone()),
+            description: non_empty(&skill.description),
             hint: None,
         });
         let mut prefix = Vec::new();
@@ -139,6 +91,10 @@ impl Catalog {
         prefix.extend(contains);
         prefix
     }
+}
+
+fn non_empty(text: &str) -> Option<String> {
+    (!text.trim().is_empty()).then(|| text.to_owned())
 }
 
 /// The query of a slash command being typed: the text is `/` followed by
@@ -239,49 +195,36 @@ pub fn apply(text: &str, completion: &Completion) -> String {
 mod tests {
     use super::*;
 
-    fn config() -> ServerConfig {
-        serde_json::from_value(serde_json::json!({
-            "environment": {"environmentId":"env","label":"mac","platform":{"os":"darwin","arch":"arm64"},
-                "serverVersion":"0.1.0","capabilities":{}},
-            "auth": {"policy":"unsafe-no-auth","bootstrapMethods":[],"sessionMethods":[],"sessionCookieName":"j3"},
-            "cwd":"/", "keybindingsConfigPath":"/k.json", "keybindings":[], "issues":[], "availableEditors":[],
-            "observability":{"logsDirectoryPath":"/l","localTracingEnabled":false,"otlpTracesEnabled":false,"otlpMetricsEnabled":false},
-            "settings":{},
-            "providers":[{"instanceId":"omp","driver":"pi","enabled":true,"installed":true,"version":"1","status":"ready",
-                "auth":{"status":"authenticated"},"checkedAt":"t","models":[],
-                "slashCommands":[{"name":"compact","description":"Compact the context","input":{"hint":"[focus]"}}],
-                "skills":[{"name":"jev","path":"/s/jev","enabled":true,"description":"Calibrated judgments"},
-                          {"name":"off","path":"/s/off","enabled":false}],
-                "workspaceSnapshots":[{"cwd":"/repo","checkedAt":"t",
-                    "slashCommands":[{"name":"review"},{"name":"compact","description":"Workspace compact"}],
-                    "skills":[{"name":"commit","path":"/repo/commit","enabled":true,"shortDescription":"Commit"},
-                              {"name":"internal","path":"/repo/i","enabled":true,"userInvocable":false}]}]}]
+    fn catalog() -> Catalog {
+        let catalog: methods::Catalog = serde_json::from_value(serde_json::json!({
+            "models": [],
+            "commands": [{"name": "compact", "description": "Compact the context", "hint": "[focus]"}],
+            "skills": [{"name": "commit", "description": "Commit"},
+                       {"name": "jev", "description": "Calibrated judgments"}],
+            "status": "ready"
         }))
-        .unwrap()
+        .unwrap();
+        let project: Vec<CatalogCommand> = serde_json::from_value(serde_json::json!([
+            {"name": "review", "description": ""},
+            {"name": "compact", "description": "Project compact"}
+        ]))
+        .unwrap();
+        Catalog::new(&catalog, &project)
     }
 
     #[test]
-    fn merges_provider_and_workspace_lists() {
-        let config = config();
-        let catalog = Catalog::for_workspace(&config, "/repo");
-        assert!(catalog.has_workspace);
+    fn merges_project_and_server_commands() {
+        let catalog = catalog();
         let commands: Vec<_> = catalog.commands.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(commands, ["review", "compact"]);
-        assert_eq!(
-            catalog.commands[1].description.as_deref(),
-            Some("Workspace compact")
-        );
+        assert_eq!(catalog.commands[1].description, "Project compact");
         let skills: Vec<_> = catalog.skills.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(skills, ["commit", "jev"]);
-
-        let elsewhere = Catalog::for_workspace(&config, "/other");
-        assert!(!elsewhere.has_workspace);
-        assert_eq!(elsewhere.commands.len(), 1);
     }
 
     #[test]
     fn completes_prefix_matches_before_substring_matches() {
-        let catalog = Catalog::for_workspace(&config(), "/repo");
+        let catalog = catalog();
         let labels = |query: &str| -> Vec<String> {
             catalog
                 .complete(query)
@@ -296,13 +239,21 @@ mod tests {
         assert_eq!(labels("co"), ["/compact", "/skill:commit"]);
         assert_eq!(labels("skill:j"), ["/skill:jev"]);
         assert_eq!(labels("ev"), ["/review", "/skill:jev"]);
-        // The workspace's own `compact` (no hint) shadows the provider's.
+        assert_eq!(catalog.complete("review")[0].description, None);
+        // The project's own `compact` (no hint) shadows the server's.
         let compact = &catalog.complete("compact")[0];
         assert_eq!(compact.hint, None);
         assert_eq!(compact.kind, CompletionKind::Command);
-        let elsewhere = Catalog::for_workspace(&config(), "/other");
+        let server_only = Catalog::new(
+            &serde_json::from_value(serde_json::json!({
+                "models": [], "skills": [], "status": "ready",
+                "commands": [{"name": "compact", "description": "", "hint": "[focus]"}]
+            }))
+            .unwrap(),
+            &[],
+        );
         assert_eq!(
-            elsewhere.complete("compact")[0].hint.as_deref(),
+            server_only.complete("compact")[0].hint.as_deref(),
             Some("[focus]")
         );
     }

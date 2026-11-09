@@ -76,12 +76,12 @@ pub struct SettingsState {
     pub mono_font: ComboboxState,
     pub speech_model: ComboboxState,
     pub fonts: Fonts,
-    /// Each environment's archived threads, loaded when Settings opens.
+    /// The last unarchive/delete failure of each environment's archive.
     pub archived: Archives,
 }
 
 impl J3 {
-    /// Opens Settings on `page`; each opening loads the archives afresh.
+    /// Opens Settings on `page`; each opening forgets the archive failures shown last time.
     pub fn open_settings(&mut self, page: Page, tx: &mut Tx) {
         self.settings.archived.clear();
         self.settings.zoom_open = false;
@@ -100,31 +100,6 @@ impl J3 {
     pub fn show_settings_page(&mut self, page: Page, _: &mut Tx) {
         self.settings.page = page;
         self.settings.zoom_open = false;
-        self.load_missing_archives();
-    }
-
-    /// While the Archived page shows: loads the archive of any environment listed without
-    /// one (added, or reached for the first time, while the page is open). True when a load
-    /// started.
-    pub(crate) fn poll_settings(&mut self, _: &mut Tx) -> bool {
-        self.load_missing_archives()
-    }
-
-    fn load_missing_archives(&mut self) -> bool {
-        if !self.route.settings || self.settings.page != Page::Archived {
-            return false;
-        }
-        let missing: Vec<String> = self
-            .envs
-            .distinct()
-            .into_iter()
-            .map(|env| env.key().to_owned())
-            .filter(|key| self.settings.archived.get(key).is_none())
-            .collect();
-        for env in &missing {
-            self.load_archived(env);
-        }
-        !missing.is_empty()
     }
 
     /// Leaves Settings (nothing when it isn't open); the sidebar takes focus.

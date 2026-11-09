@@ -25,9 +25,9 @@ use std::{cell::Cell, time::Duration};
 use alacritty_terminal::event::{Event as TermEvent, WindowSize};
 use j3_client::{
     Connection, Error,
-    t3::terminal::{
-        MAX_COLS, MAX_ROWS, TerminalAttachStreamEvent, TerminalSessionSnapshot,
-        TerminalSessionStatus,
+    methods::{
+        AttachParams, TerminalCloseParams, TerminalItem, TerminalResizeParams, TerminalSnapshot,
+        TerminalState, TerminalWriteParams,
     },
 };
 use rune::{TextEdit, TextStyle, Tx};
@@ -40,6 +40,9 @@ pub use view::view;
 
 use crate::{app::J3, sidebar::ThreadKey};
 
+/// The largest grid the server takes (wire limits: cols 1–1000, rows 1–500).
+const MAX_COLS: u16 = 1000;
+const MAX_ROWS: u16 = 500;
 /// How long a size must hold before the server's PTY follows it, in seconds.
 const RESIZE_DEBOUNCE: f64 = 0.12;
 /// Wait before re-attaching after the connection dropped, in seconds.
@@ -90,16 +93,14 @@ impl TerminalStatus {
         })
     }
 
-    fn of(snapshot: &TerminalSessionSnapshot) -> Self {
-        match snapshot.status {
-            TerminalSessionStatus::Starting | TerminalSessionStatus::Running => {
-                TerminalStatus::Running
-            }
-            TerminalSessionStatus::Exited => TerminalStatus::Exited {
+    fn of(snapshot: &TerminalSnapshot) -> Self {
+        match snapshot.state {
+            TerminalState::Running => TerminalStatus::Running,
+            TerminalState::Exited => TerminalStatus::Exited {
                 code: snapshot.exit_code,
                 signal: snapshot.exit_signal,
             },
-            TerminalSessionStatus::Error => {
+            TerminalState::Failed => {
                 TerminalStatus::Failed("The shell could not be started.".to_owned())
             }
         }
@@ -203,7 +204,7 @@ impl Terminal {
         &self.screen
     }
 
-    /// "Terminal 2" for `term-2` (t3's `getTerminalLabel`).
+    /// "Terminal 2" for `term-2`.
     pub fn label(&self) -> String {
         label(&self.id)
     }
@@ -239,7 +240,7 @@ impl Terminal {
     }
 
     /// A fresh screen replaying the session's history; input typed meanwhile goes now.
-    fn reset(&mut self, snapshot: &TerminalSessionSnapshot) {
+    fn reset(&mut self, snapshot: &TerminalSnapshot) {
         self.status = TerminalStatus::of(snapshot);
         self.screen.reset(&snapshot.history);
         let pending = std::mem::take(&mut self.pending);
@@ -440,7 +441,12 @@ impl J3 {
             let connection = env.connection().clone();
             let (thread_id, terminal_id) = (key.thread_id.clone(), id.to_owned());
             self.services.runtime.spawn(async move {
-                if let Err(error) = connection.close_terminal(&thread_id, &terminal_id).await {
+                let params = TerminalCloseParams {
+                    thread_id,
+                    terminal_id: Some(terminal_id.clone()),
+                    delete_history: None,
+                };
+                if let Err(error) = connection.terminal_close(params).await {
                     tracing::debug!(%error, terminal = %terminal_id, "closing terminal");
                 }
             });
@@ -483,12 +489,14 @@ impl J3 {
         let size = terminal.screen.size();
         let (key, id) = (key.clone(), id.to_owned());
         let task = runtime.spawn(async move {
-            let mut session = connection.attach_terminal(
-                &key.thread_id,
-                &id,
-                Some((size.cols, size.rows)),
-                restart,
-            );
+            let mut session = connection.attach_terminal(AttachParams {
+                thread_id: key.thread_id.clone(),
+                terminal_id: id.clone(),
+                cols: Some(size.cols.clamp(1, MAX_COLS)),
+                rows: Some(size.rows.clamp(1, MAX_ROWS)),
+                env: Default::default(),
+                restart: restart.then_some(true),
+            });
             loop {
                 let next = session.next().await;
                 let done = !matches!(next, Some(Ok(_)));
@@ -510,7 +518,7 @@ impl J3 {
         key: &ThreadKey,
         id: &str,
         generation: u64,
-        next: Option<Result<TerminalAttachStreamEvent, Error>>,
+        next: Option<Result<TerminalItem, Error>>,
         tx: &mut Tx,
     ) {
         let now = self.clock.t;
@@ -527,35 +535,40 @@ impl J3 {
             return;
         }
         match next {
-            Some(Ok(event)) => match event {
-                TerminalAttachStreamEvent::Snapshot(snapshot) => terminal.reset(&snapshot.snapshot),
-                TerminalAttachStreamEvent::Restarted(restarted) => {
-                    terminal.reset(&restarted.snapshot)
+            Some(Ok(item)) => match item {
+                TerminalItem::Snapshot(snapshot) | TerminalItem::Restarted(snapshot) => {
+                    terminal.reset(&snapshot)
                 }
-                TerminalAttachStreamEvent::Output(output) => {
+                TerminalItem::Output { data } => {
                     let k = crate::theme::kit(dark, self.prefs.ui());
-                    terminal.feed(&output.data, &Palette::new(&k, dark), cell, zoom);
+                    terminal.feed(&data, &Palette::new(&k, dark), cell, zoom);
                 }
-                TerminalAttachStreamEvent::Exited(exited) => {
+                TerminalItem::Exited {
+                    exit_code,
+                    exit_signal,
+                } => {
                     terminal.status = TerminalStatus::Exited {
-                        code: exited.exit_code,
-                        signal: exited.exit_signal,
+                        code: exit_code,
+                        signal: exit_signal,
                     };
                 }
-                TerminalAttachStreamEvent::Closed(_) => terminal.status = TerminalStatus::Closed,
-                TerminalAttachStreamEvent::Error(error) => {
-                    terminal.status = TerminalStatus::Failed(error.message);
+                TerminalItem::Closed => terminal.status = TerminalStatus::Closed,
+                TerminalItem::Failed { message } => {
+                    terminal.status = TerminalStatus::Failed(message);
                 }
-                TerminalAttachStreamEvent::Cleared(_) => terminal.screen.clear(),
-                TerminalAttachStreamEvent::Activity(_) | TerminalAttachStreamEvent::Unknown(_) => {}
+                TerminalItem::Cleared => terminal.screen.clear(),
             },
             None => {
                 terminal.attach = None;
-                terminal.status = TerminalStatus::Closed;
+                // A failed shell ends the stream; its message stays.
+                if !matches!(terminal.status, TerminalStatus::Failed(_)) {
+                    terminal.status = TerminalStatus::Closed;
+                }
             }
-            Some(Err(Error::Disconnected(_) | Error::Interrupted)) => {
-                // A dropped connection comes back: attach again after a pause.
+            Some(Err(error @ Error::Disconnected)) => {
+                // A dropped connection comes back: say so, and attach again after a pause.
                 terminal.attach = None;
+                terminal.status = TerminalStatus::Failed(error.to_string());
                 terminal.reattach_at = Some(now + REATTACH_DELAY);
                 tx.wake_after(Duration::from_secs_f64(REATTACH_DELAY));
             }
@@ -606,10 +619,13 @@ impl J3 {
             };
             let connection = env.connection().clone();
             self.services.runtime.spawn(async move {
-                if let Err(error) = connection
-                    .resize_terminal(&key.thread_id, &id, size.cols, size.rows)
-                    .await
-                {
+                let params = TerminalResizeParams {
+                    thread_id: key.thread_id.clone(),
+                    terminal_id: id.clone(),
+                    cols: size.cols.clamp(1, MAX_COLS),
+                    rows: size.rows.clamp(1, MAX_ROWS),
+                };
+                if let Err(error) = connection.terminal_resize(params).await {
                     tracing::debug!(%error, terminal = %id, "terminal resize");
                 }
             });
@@ -636,10 +652,12 @@ fn spawn_writer(
                     data.push_str(&more);
                 }
                 for piece in screen::chunks(&data, MAX_WRITE) {
-                    if let Err(error) = connection
-                        .write_terminal(&thread_id, &terminal_id, piece.to_owned())
-                        .await
-                    {
+                    let params = TerminalWriteParams {
+                        thread_id: thread_id.clone(),
+                        terminal_id: terminal_id.clone(),
+                        data: piece.to_owned(),
+                    };
+                    if let Err(error) = connection.terminal_write(params).await {
                         tracing::debug!(%error, terminal = %terminal_id, "terminal write");
                     }
                 }

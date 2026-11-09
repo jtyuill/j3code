@@ -1,19 +1,21 @@
-//! The T3 and herdr sidebars over real threads: shelves, settle-and-advance, pins and
+//! The Inbox and herdr sidebars over real threads: shelves, settle-and-advance, pins and
 //! drag and drop, snoozes, attention order, glyphs, toasts and the goto picker.
 
+use j3_client::methods::SnoozeParams;
 use rune::Key;
 use serde_json::json;
 
 use super::harness::{Harness, primary, primary_shift};
+use crate::sidebar::iso;
 
-/// A thread row's element key (its sidebar row in T3 mode).
+/// A thread row's element key (its sidebar row in Inbox mode).
 fn thread_row(thread_id: &str) -> String {
     format!("thread-local-{thread_id}")
 }
 
 #[test]
-fn t3_sections_settle_and_advance_pin_and_reorder() {
-    let mut app = Harness::start("t3");
+fn inbox_sections_settle_and_advance_pin_and_reorder() {
+    let mut app = Harness::start("inbox");
     let project_id = app.project();
     app.until("the empty list says so", |h| h.has_label("No threads yet"));
 
@@ -24,7 +26,7 @@ fn t3_sections_settle_and_advance_pin_and_reorder() {
     app.until("the three show as Done", |h| {
         ["Alpha, Done", "Beta, Done", "Gamma, Done"]
             .iter()
-            .all(|label| h.in_scope("t3-active", label).is_some())
+            .all(|label| h.in_scope("inbox-active", label).is_some())
     });
     app.until("the rows are newest first", |h| {
         h.rows_in_order(&["Gamma, Done", "Beta, Done", "Alpha, Done"])
@@ -39,7 +41,7 @@ fn t3_sections_settle_and_advance_pin_and_reorder() {
     // ⌘⇧S settles it and moves on to the next unsettled row.
     app.key(primary_shift('s'));
     app.until("Gamma settles and Beta opens", |h| {
-        h.in_scope("t3-settled", "Gamma, Settled").is_some()
+        h.in_scope("inbox-settled", "Gamma, Settled").is_some()
             && h.feed_row("Beta").is_some()
             && h.in_sidebar("Beta")
     });
@@ -47,21 +49,15 @@ fn t3_sections_settle_and_advance_pin_and_reorder() {
     let shelf = app.element("shelf-settled").expect("the Settled shelf");
     assert!(shelf.rect[1] > app.top_of("Alpha, Done"));
     assert_eq!(shelf.label.as_deref(), Some("Settled 1"));
-    let settled = app
-        .connection
-        .state()
-        .borrow()
-        .shell
-        .thread(&gamma)
-        .cloned();
-    assert!(settled.is_some_and(|thread| thread.settled_at.is_some()));
+    let settled = app.shell_thread(&gamma);
+    assert!(settled.is_some_and(|thread| thread.triage.settled_at.is_some()));
 
     // ⌘⇧S on a settled thread un-settles it, in place.
     app.click_sidebar("Gamma, Settled");
     app.until("Gamma opens", |h| h.feed_row("Gamma").is_some());
     app.key(primary_shift('s'));
     app.until("Gamma is back in Active", |h| {
-        h.in_scope("t3-active", "Gamma").is_some()
+        h.in_scope("inbox-active", "Gamma").is_some()
     });
 
     // Pin two threads from the context menu.
@@ -70,7 +66,7 @@ fn t3_sections_settle_and_advance_pin_and_reorder() {
         app.until("the row menu opens", |h| h.has_label("Pin thread"));
         app.click_label("Pin thread");
         app.until(&format!("{label} is pinned"), |h| {
-            h.in_scope("t3-pinned", label).is_some()
+            h.in_scope("inbox-pinned", label).is_some()
         });
     }
     // Keyless pins: the newest first.
@@ -84,24 +80,24 @@ fn t3_sections_settle_and_advance_pin_and_reorder() {
         h.rows_in_order(&["Alpha, Done", "Beta"])
     });
     app.until_shell("Beta gets an order key", &beta, |thread| {
-        thread.pin_order_key.as_ref().is_some_and(Option::is_some)
+        thread.triage.pin_order.is_some()
     });
 
     // Dropping a pinned row on the Settled shelf settles it.
     app.drag_to(&thread_row(&beta), "shelf-settled");
     app.until("Beta settles", |h| {
-        h.in_scope("t3-settled", "Beta, Settled").is_some()
+        h.in_scope("inbox-settled", "Beta, Settled").is_some()
             && h.label_of("shelf-settled").as_deref() == Some("Settled 1")
     });
 }
 
 #[test]
-fn t3_snooze_hides_a_thread_until_it_wakes() {
+fn inbox_snooze_hides_a_thread_until_it_wakes() {
     let mut app = Harness::start("snooze");
     let project_id = app.project();
     let nap = app.completed(&project_id, "Nap");
     app.until("Nap is Done", |h| {
-        h.in_scope("t3-active", "Nap, Done").is_some()
+        h.in_scope("inbox-active", "Nap, Done").is_some()
     });
 
     // Snooze ▸ Custom… for an hour: the row moves to the Snoozed shelf.
@@ -113,8 +109,8 @@ fn t3_snooze_hides_a_thread_until_it_wakes() {
     app.until("the dialog opens", |h| h.exists("dialog-confirm"));
     app.click("dialog-confirm");
     app.until("Nap is snoozed", |h| {
-        h.in_scope("t3-snoozed", "Nap, Snoozed").is_some()
-            && h.in_scope("t3-active", "Nap, Done").is_none()
+        h.in_scope("inbox-snoozed", "Nap, Snoozed").is_some()
+            && h.in_scope("inbox-active", "Nap, Done").is_none()
     });
     assert_eq!(app.label_of("shelf-snoozed").as_deref(), Some("Snoozed 1"));
 
@@ -123,21 +119,25 @@ fn t3_snooze_hides_a_thread_until_it_wakes() {
     app.until("the row menu opens", |h| h.has_label("Wake thread"));
     app.click_label("Wake thread");
     app.until("Nap is awake", |h| {
-        h.in_scope("t3-active", "Nap, Done").is_some()
+        h.in_scope("inbox-active", "Nap, Done").is_some()
     });
 
     // A short snooze hides the row until its wake time, then the sidebar brings it back
     // by itself, marked as woken.
     let wake = time::OffsetDateTime::now_utc() + time::Duration::seconds(3);
     let connection = app.connection.clone();
-    let id = nap.clone();
-    app.block_on(async move { connection.snooze(&id, wake).await })
+    let params = SnoozeParams {
+        thread_id: nap.clone(),
+        until: iso(wake),
+        command_id: None,
+    };
+    app.block_on(async move { connection.triage_snooze(params).await })
         .unwrap();
     app.until("Nap is snoozed", |h| {
-        h.in_scope("t3-snoozed", "Nap, Snoozed").is_some()
+        h.in_scope("inbox-snoozed", "Nap, Snoozed").is_some()
     });
     app.until("Nap wakes by itself", |h| {
-        h.in_scope("t3-active", "Nap, Woke").is_some() && !h.exists("t3-snoozed")
+        h.in_scope("inbox-active", "Nap, Woke").is_some() && !h.exists("inbox-snoozed")
     });
     assert!(time::OffsetDateTime::now_utc() >= wake);
 }

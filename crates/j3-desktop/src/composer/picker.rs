@@ -4,6 +4,7 @@
 //! levels in the footer. Drawn from rune-kit's popover building blocks and `TextInput`, as
 //! `Combobox` is, because its rows are sections with headers, stars and a footer.
 
+use j3_client::entities::ThinkingLevel;
 use rune::{El, Key, TextEdit, Tx, col, el, icon, row, spacer, text};
 use rune_kit::{Placement, TextInput, popover, scrim};
 
@@ -24,9 +25,9 @@ pub(super) struct PickerState {
     pub active: Option<usize>,
 }
 
-/// A shown row: its model and its element key.
+/// A shown row: its model's slug and its element key.
 struct Row {
-    model: (String, String),
+    model: String,
     key: String,
 }
 
@@ -85,7 +86,7 @@ impl J3 {
         picker.open = open;
         picker.search.clear();
         picker.search.focused = open;
-        let current = self.composer_choice(key).map(|c| c.key.clone());
+        let current = self.composer_choice(key).map(|c| c.slug().to_owned());
         let rows = self.picker_rows(key);
         let active = current.and_then(|current| rows.iter().position(|r| r.model == current));
         self.composer(key).picker.active = active;
@@ -102,14 +103,14 @@ impl J3 {
         composer.edit.focused = true;
     }
 
-    /// Chooses the model `(instance, slug)` and closes the menu.
-    pub fn choose_model(&mut self, key: &ComposerKey, model: (String, String)) {
-        self.composer(key).model = Some(model);
+    /// Chooses the model `slug` and closes the menu.
+    pub fn choose_model(&mut self, key: &ComposerKey, slug: String) {
+        self.composer(key).model = Some(slug);
         self.close_picker(key);
     }
 
     /// Chooses thinking `level` for the next submissions.
-    pub fn choose_level(&mut self, key: &ComposerKey, level: String) {
+    pub fn choose_level(&mut self, key: &ComposerKey, level: ThinkingLevel) {
         self.composer(key).level = Some(level);
     }
 
@@ -127,7 +128,7 @@ impl J3 {
             .iter()
             .flat_map(|section| {
                 section.rows.iter().map(|&ix| Row {
-                    model: choices[ix].key.clone(),
+                    model: choices[ix].slug().to_owned(),
                     key: row_key(&choices[ix], section.provider.is_some()),
                 })
             })
@@ -177,7 +178,7 @@ impl J3 {
 /// A row's element key: under Favorites or under its provider.
 fn row_key(choice: &ModelChoice, in_provider_section: bool) -> String {
     if in_provider_section {
-        format!("model-{}-{}", choice.key.0, choice.key.1)
+        format!("model-{}", choice.slug())
     } else {
         format!("model-favorite-{}", choice.slug())
     }
@@ -189,11 +190,10 @@ pub(super) fn view(s: &J3, ui: &mut Ui, key: &ComposerKey) -> El {
     let m = ui.m;
     let choice = s.composer_choice(key);
     let levels = s.composer_levels(key);
-    let level_label = levels.as_ref().and_then(|levels| {
-        let level = levels.chosen.as_deref()?;
-        let (_, label) = levels.options.iter().find(|(id, _)| id == level)?;
-        Some(label.clone())
-    });
+    let level_label = levels
+        .as_ref()
+        .and_then(|levels| levels.chosen)
+        .map(models::level_label);
     let open = s.composers.get(key).is_some_and(|c| c.picker.open);
     let mut trigger = row()
         .key("model-picker")
@@ -241,7 +241,7 @@ fn menu(s: &J3, ui: &mut Ui, key: &ComposerKey) {
     };
     let choices: &[ModelChoice] = s.envs.get(key.env()).map_or(&[], |env| env.models());
     let favorites = &s.prefs.ui().favorite_models;
-    let current = s.composer_choice(key).map(|c| c.key.clone());
+    let current = s.composer_choice(key).map(ModelChoice::slug);
     let picker = &composer.picker;
     let shown = sections(choices, favorites, &picker.search.text);
 
@@ -298,7 +298,7 @@ fn menu(s: &J3, ui: &mut Ui, key: &ComposerKey) {
                 choice,
                 section.provider.is_some(),
                 favorites.iter().any(|f| f == choice.slug()),
-                current.as_ref() == Some(&choice.key),
+                current == Some(choice.slug()),
                 picker.active == Some(shown_ix),
             ));
             shown_ix += 1;
@@ -318,12 +318,7 @@ fn menu(s: &J3, ui: &mut Ui, key: &ComposerKey) {
     {
         body = body
             .child(el().w_full().h(1.0).fill(k.c.border_weak))
-            .child(level_chips(
-                ui,
-                key,
-                &levels.options,
-                levels.chosen.as_deref(),
-            ));
+            .child(level_chips(ui, key, &levels.options, levels.chosen));
     }
     let close = key.clone();
     ui.layer.push(scrim("model-menu-scrim", move |s: &mut J3| {
@@ -412,7 +407,7 @@ fn model_row(
         );
     }
     let choose = key.clone();
-    let model = choice.key.clone();
+    let model = slug;
     item.child(spacer())
         .child(star)
         .child(
@@ -423,14 +418,19 @@ fn model_row(
 }
 
 /// The footer: "Thinking" and one chip per level, the chosen one highlighted.
-fn level_chips(ui: &Ui, key: &ComposerKey, levels: &[(String, String)], level: Option<&str>) -> El {
+fn level_chips(
+    ui: &Ui,
+    key: &ComposerKey,
+    levels: &[ThinkingLevel],
+    chosen: Option<ThinkingLevel>,
+) -> El {
     let k = ui.k;
-    let chips = levels.iter().map(|(id, label)| {
-        let selected = level == Some(id.as_str());
+    let chips = levels.iter().map(|&level| {
+        let selected = chosen == Some(level);
         let choose = key.clone();
-        let chosen = id.clone();
+        let label = models::level_label(level);
         row()
-            .key(format!("thinking-{id}"))
+            .key(format!("thinking-{}", models::level_id(level)))
             .role("button")
             .label(label)
             .checked(selected)
@@ -448,7 +448,7 @@ fn level_chips(ui: &Ui, key: &ComposerKey, levels: &[(String, String)], level: O
             } else {
                 k.c.text_base
             }))
-            .on_press(move |s: &mut J3| s.choose_level(&choose, chosen.clone()))
+            .on_press(move |s: &mut J3| s.choose_level(&choose, level))
     });
     row()
         .key("thinking-levels")

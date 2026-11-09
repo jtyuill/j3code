@@ -2,9 +2,7 @@
 //! tree with nested expanded directories, a git-ignored `target/`, an empty directory and
 //! `src/syntax.rs` previewed.
 
-use j3_client::t3::project::{
-    ProjectEntry, ProjectEntryKind, ProjectListEntriesResult, ProjectReadFileResult,
-};
+use j3_client::methods::{EntriesResult, Entry, EntryKind, ReadFileResult};
 
 use super::{Effect, FilePane, preview::Body};
 use crate::{app::J3, sidebar::ThreadKey};
@@ -38,29 +36,29 @@ pub fn language(path: &str) -> &'static str {
 }
 "#;
 
-fn dir(path: &str) -> ProjectEntry {
-    ProjectEntry {
+fn dir(path: &str) -> Entry {
+    Entry {
         path: path.to_owned(),
-        kind: ProjectEntryKind::Directory,
+        kind: EntryKind::Dir,
         ignored: None,
     }
 }
 
-fn file(path: &str) -> ProjectEntry {
-    ProjectEntry {
+fn file(path: &str) -> Entry {
+    Entry {
         path: path.to_owned(),
-        kind: ProjectEntryKind::File,
+        kind: EntryKind::File,
         ignored: None,
     }
 }
 
-fn ignored(mut entry: ProjectEntry) -> ProjectEntry {
+fn ignored(mut entry: Entry) -> Entry {
     entry.ignored = Some(true);
     entry
 }
 
 /// The listings, by directory, in the server's order (directories first).
-pub fn listings() -> Vec<(&'static str, Vec<ProjectEntry>)> {
+pub fn listings() -> Vec<(&'static str, Vec<Entry>)> {
     vec![
         (
             "",
@@ -110,10 +108,10 @@ pub fn listings() -> Vec<(&'static str, Vec<ProjectEntry>)> {
     ]
 }
 
-/// A pane over `cwd` titled `project` with the fixture listings loaded and `expanded`
-/// open; `loading` are expanded and still waiting for their listing.
-pub fn pane(cwd: &str, project: &str, expanded: &[&str], loading: &[&str]) -> FilePane {
-    let mut pane = FilePane::new(cwd.to_owned(), project.to_owned(), 16.0);
+/// A pane over project `project_id` titled `project` with the fixture listings loaded and
+/// `expanded` open; `loading` are expanded and still waiting for their listing.
+pub fn pane(project_id: &str, project: &str, expanded: &[&str], loading: &[&str]) -> FilePane {
+    let mut pane = FilePane::new(project_id.to_owned(), project.to_owned(), 16.0);
     for (dir, entries) in listings() {
         if !dir.is_empty() && !expanded.contains(&dir) {
             continue;
@@ -124,7 +122,7 @@ pub fn pane(cwd: &str, project: &str, expanded: &[&str], loading: &[&str]) -> Fi
         let Effect::Load { request, .. } = pane.begin_load(dir) else {
             unreachable!("begin_load lists");
         };
-        let result = ProjectListEntriesResult {
+        let result = EntriesResult {
             entries,
             truncated: false,
         };
@@ -141,7 +139,7 @@ pub fn pane(cwd: &str, project: &str, expanded: &[&str], loading: &[&str]) -> Fi
 /// the tree focused.
 pub fn install(s: &mut J3, key: &ThreadKey) {
     let mut pane = pane(
-        "/home/jacob/repos/j3code",
+        "j3code",
         "j3code",
         &[
             "crates",
@@ -154,12 +152,12 @@ pub fn install(s: &mut J3, key: &ThreadKey) {
     let Effect::Read { request, .. } = pane.begin_read(PREVIEW_PATH.to_owned()) else {
         unreachable!("begin_read reads");
     };
-    let read = ProjectReadFileResult {
-        relative_path: PREVIEW_PATH.to_owned(),
-        contents: PREVIEW.to_owned(),
-        byte_length: PREVIEW.len() as u64,
+    let read = ReadFileResult {
+        path: PREVIEW_PATH.to_owned(),
+        text: PREVIEW.to_owned(),
+        size: PREVIEW.len() as u64,
         truncated: false,
-        exists: Some(true),
+        exists: true,
     };
     pane.file_read(PREVIEW_PATH, request, Body::read(PREVIEW_PATH, Ok(read)));
     pane.selected = Some(PREVIEW_PATH.to_owned());

@@ -84,9 +84,16 @@ fn new_thread_launches_from_the_composer_and_streams_the_reply() {
     // The launch carried the composer's model (the one the fake omp lists).
     let state = app.connection.state();
     let state = state.borrow();
-    let thread = state.shell.threads_of(&project_id)[0];
-    assert_eq!(thread.model_selection.instance_id, "omp");
-    assert_eq!(thread.model_selection.model, MODEL);
+    let thread = state
+        .shell
+        .threads
+        .values()
+        .find(|thread| thread.project_id == project_id)
+        .expect("the launched thread");
+    assert_eq!(
+        format!("{}/{}", thread.model.provider, thread.model.id),
+        MODEL
+    );
 }
 
 #[test]

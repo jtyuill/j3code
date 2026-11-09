@@ -3,7 +3,7 @@
 //! omp's editor does), in a rune-kit `PopupList` above the field. The field keeps focus; ↑ ↓
 //! Tab Enter Escape reach it through `draft::composer_key`.
 
-use j3_client::t3::project::ProjectEntryKind;
+use j3_client::methods::{EntryKind, SearchEntriesParams};
 use rune::{Align, Side, Tx, text};
 use rune_kit::{PopupItem, PopupList};
 
@@ -39,7 +39,7 @@ impl J3 {
         let (text, cursor) = (composer.edit.text.clone(), composer.edit.focus);
         let (a, b) = composer.edit.range();
         if a == b
-            && mention::allowed(&text)
+            && j3_text::mention::allowed(&text)
             && let Some(path) = completion::path_query(&text, cursor)
         {
             self.search_paths(key, path.query.to_owned());
@@ -59,7 +59,7 @@ impl J3 {
         composer.completion_ix = 0;
     }
 
-    /// Asks `key`'s environment for the entries `@query` names in its workspace, unless that
+    /// Asks `key`'s environment for the entries `@query` names in its project, unless that
     /// answer shows or is on its way. The menu keeps the paths it shows until the answer
     /// replaces them.
     fn search_paths(&mut self, key: &ComposerKey, query: String) {
@@ -72,17 +72,26 @@ impl J3 {
         }
         composer.path_query = Some(query.clone());
         let target = self.composer_target(key);
-        let connection = target
+        let search = target
             .env
-            .filter(|env| env.is_live() && !target.cwd.is_empty())
-            .map(|env| env.connection().clone());
-        let Some(connection) = connection else {
+            .filter(|env| env.is_live())
+            .zip(target.project_id)
+            .map(|(env, project_id)| (env.connection().clone(), project_id));
+        let Some((connection, project_id)) = search else {
             self.composer(key).completions.clear();
             return;
         };
-        let (cwd, key) = (target.cwd, key.clone());
+        let params = SearchEntriesParams {
+            project_id,
+            query: query.clone(),
+            limit: Some(KEPT as u32),
+            kind: None,
+            images_only: None,
+        };
+        let key = key.clone();
         self.spawn(async move {
-            let found = connection.search_entries(&cwd, &query, KEPT as u64).await;
+            let project_id = params.project_id.clone();
+            let found = connection.projects_search_entries(params).await;
             move |s: &mut J3, tx: &mut Tx| {
                 let Some(composer) = s.composers.get_mut(&key) else {
                     return;
@@ -95,12 +104,12 @@ impl J3 {
                         .entries
                         .into_iter()
                         .map(|entry| {
-                            let directory = entry.kind == ProjectEntryKind::Directory;
+                            let directory = entry.kind == EntryKind::Dir;
                             completion::path_completion(entry.path, directory)
                         })
                         .collect(),
                     Err(e) => {
-                        tracing::debug!("searching {cwd} for @{query}: {e}");
+                        tracing::debug!("searching project {project_id} for @{query}: {e}");
                         Vec::new()
                     }
                 };
@@ -112,7 +121,7 @@ impl J3 {
 
     /// The models a `^` mention being typed at `cursor` offers.
     fn model_completions(&self, key: &ComposerKey, text: &str, cursor: usize) -> Vec<Completion> {
-        let Some((_, query)) = mention::query_at(text, cursor) else {
+        let Some((_, query)) = j3_text::mention::query_at(text, cursor) else {
             return Vec::new();
         };
         let Some(env) = self.envs.get(key.env()) else {
@@ -193,7 +202,7 @@ impl J3 {
             return;
         };
         let edit = &mut self.composer(key).edit;
-        let Some((range, _)) = mention::query_at(&edit.text, edit.focus) else {
+        let Some((range, _)) = j3_text::mention::query_at(&edit.text, edit.focus) else {
             return;
         };
         edit.replace_with_pill(range, draft::mention_id(slug), &label);

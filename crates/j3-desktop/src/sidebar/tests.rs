@@ -1,10 +1,14 @@
-//! The sidebar's shell logic, and headless runs over the fixture scenes: T3's order and
+//! The sidebar's shell logic, and headless runs over the fixture scenes: the Inbox's order and
 //! settle-and-advance, the row context menu, drag and drop, the clock, herdr's ordering and
 //! glyphs, and the goto picker.
 
 use std::{sync::Arc, time::Duration};
 
-use j3_client::workflow::{AgentOrder, AgentStatus, StatusIndicators};
+use j3_client::{
+    entities::{ThreadStatus, TurnStatus, TurnSummary},
+    herdr::{AgentOrder, AgentStatus, StatusIndicators},
+    inbox::Section,
+};
 use rune::{Key, KeyEvent, Mods};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
@@ -128,7 +132,7 @@ fn plain(key: Key) -> KeyEvent {
 }
 
 #[test]
-fn t3_lists_pinned_then_active_by_return_and_navigation_wraps() {
+fn inbox_lists_pinned_then_active_by_return_and_navigation_wraps() {
     let mut app = scene(Scene::Thread, UiSettings::default());
     let order = app.rt.state.thread_order();
     let ids: Vec<&str> = order.iter().map(|k| k.thread_id.as_str()).collect();
@@ -137,11 +141,12 @@ fn t3_lists_pinned_then_active_by_return_and_navigation_wraps() {
         [
             "thr-release",
             OPEN_THREAD,
+            // Waiting on an approval since its turn was requested 8 minutes ago.
+            "thr-acl",
             "thr-dictation",
             "thr-math",
             "thr-layout",
             "thr-caddy",
-            "thr-acl",
             "thr-tokens",
         ],
         "collapsed shelves show none of their rows"
@@ -180,15 +185,13 @@ fn rows_say_their_status_and_collapsed_shelves_keep_the_open_thread() {
 #[test]
 fn settle_and_advance_follows_the_sidebar_order() {
     let mut app = scene(Scene::Thread, UiSettings::default());
+    open(&mut app, local("thr-dictation"));
     dispatch(&mut app, Action::SettleThread);
     assert_eq!(
         sent(&mut app),
-        [(local(OPEN_THREAD), ThreadCommand::Settle)]
+        [(local("thr-dictation"), ThreadCommand::Settle)]
     );
-    assert_eq!(
-        app.rt.state.route.main,
-        Main::Thread(local("thr-dictation"))
-    );
+    assert_eq!(app.rt.state.route.main, Main::Thread(local("thr-math")));
 
     // From the last row it wraps to the first that isn't settled or snoozed.
     open(&mut app, local("thr-tokens"));
@@ -348,16 +351,10 @@ fn time_moves_rows_by_itself() {
 
     // A thread snoozed for three seconds wakes on its own and says so.
     let mut state = (**app.rt.state.envs.get(LOCAL_KEY).unwrap().state()).clone();
-    let math = state
-        .shell
-        .threads
-        .iter_mut()
-        .find(|thread| thread.id == "thr-math")
-        .unwrap();
-    let iso = |at: OffsetDateTime| at.format(&Rfc3339).unwrap();
+    let math = state.shell.threads.get_mut("thr-math").unwrap();
     let now = app.rt.state.clock.now;
-    math.snoozed_until = Some(Some(iso(now + time::Duration::seconds(3))));
-    math.snoozed_at = Some(Some(iso(now)));
+    math.triage.snoozed_until = Some(iso(now + time::Duration::seconds(3)));
+    math.triage.snoozed_at = Some(iso(now));
     app.rt.update(move |s, _| {
         s.envs
             .get_mut(LOCAL_KEY)
@@ -382,6 +379,60 @@ fn time_moves_rows_by_itself() {
     app.settle(5);
     let wait = app.rt.state.sidebar.tick_at.unwrap() - app.rt.state.clock.t;
     assert!(wait <= 1.0, "a working timer shows ({wait})");
+}
+
+#[test]
+fn settle_is_not_offered_for_a_running_thread() {
+    let mut app = scene(Scene::Fixtures, UiSettings::default());
+    let now = app.rt.state.clock.now;
+    let mut state = (**app.rt.state.envs.get(LOCAL_KEY).unwrap().state()).clone();
+    let math = state.shell.threads.get_mut("thr-math").unwrap();
+    // Pinned, so it stays in the list (a pinned thread is never on the Working shelf).
+    math.status = ThreadStatus::Running;
+    math.active_turn_id = Some("turn-running".into());
+    math.pending_request = None;
+    math.latest_turn = Some(TurnSummary {
+        id: "turn-running".into(),
+        status: TurnStatus::Running,
+        requested_at: iso(now),
+        started_at: Some(iso(now)),
+        ended_at: None,
+        error_kind: None,
+    });
+    math.triage.pinned_at = Some(iso(now));
+    math.triage.settled = None;
+    math.triage.snoozed_until = None;
+    app.rt.update(move |s, _| {
+        s.envs
+            .get_mut(LOCAL_KEY)
+            .unwrap()
+            .set_state(Arc::new(state));
+    });
+    app.settle(5);
+    let math = local("thr-math");
+    let rows = app.rt.state.inbox_rows();
+    let row = rows.row(&math).expect("the running thread is listed");
+    assert_eq!(row.section, Section::Pinned);
+    assert!(!row.settleable);
+
+    // No hover Settle.
+    let (x, y) = app.rt.find(&math.element_id("thread")).unwrap();
+    app.rt.pointer_move(x, y);
+    app.settle(5);
+    assert!(app.rt.find(&math.element_id("row-action")).is_none());
+
+    // No menu Settle.
+    right_click(&mut app, &math.element_id("thread"));
+    assert!(labelled(&app, "Unpin thread").is_some(), "the menu is open");
+    assert!(labelled(&app, "Settle thread").is_none());
+    app.rt.update(|s, _| s.close_row_menu());
+    app.settle(5);
+
+    // ⌘⇧S leaves it be.
+    open(&mut app, math.clone());
+    dispatch(&mut app, Action::SettleThread);
+    assert!(sent(&mut app).is_empty());
+    assert_eq!(app.rt.state.route.main, Main::Thread(math));
 }
 
 #[test]
@@ -431,7 +482,7 @@ fn up_and_down_move_through_the_sidebar_once_it_has_the_keyboard() {
     app.key(plain(Key::Down));
     assert_eq!(
         app.rt.state.route.main,
-        Main::Thread(local("thr-dictation"))
+        Main::Thread(ThreadKey::new(SHIELDY_URL, "thr-acl"))
     );
     app.key(plain(Key::Up));
     app.key(plain(Key::Up));
@@ -485,8 +536,8 @@ fn herdr_orders_agents_and_rolls_up_spaces() {
     grouped.dedup();
     assert_eq!(
         grouped,
-        ["j3code", "rune", "infra"],
-        "by space, in project order"
+        ["rune", "j3code", "infra"],
+        "by space, projects oldest first"
     );
 
     // A space opens its most urgent agent.
@@ -558,13 +609,13 @@ fn only_the_sidebar_rows_take_the_sidebar_keys() {
 fn rows_are_built_once_per_change() {
     let mut app = scene(Scene::Fixtures, UiSettings::default());
     let s = &app.rt.state;
-    let rows = s.t3_rows();
+    let rows = s.inbox_rows();
     assert!(
-        Rc::ptr_eq(&rows, &s.t3_rows()),
+        Rc::ptr_eq(&rows, &s.inbox_rows()),
         "the view and navigation share one build"
     );
     let _ = s.thread_order();
-    assert!(Rc::ptr_eq(&rows, &s.t3_rows()));
+    assert!(Rc::ptr_eq(&rows, &s.inbox_rows()));
     app.rt.update(|s, _| {
         s.set_project_filter(Some(ProjectKey {
             env: LOCAL_KEY.into(),
@@ -573,7 +624,7 @@ fn rows_are_built_once_per_change() {
     });
     app.settle(5);
     assert!(
-        !Rc::ptr_eq(&rows, &app.rt.state.t3_rows()),
+        !Rc::ptr_eq(&rows, &app.rt.state.inbox_rows()),
         "a new filter rebuilds them"
     );
 }
@@ -614,7 +665,7 @@ fn menus_close_when_the_list_is_hidden_and_keep_their_place_on_zoom() {
         .update(|s, tx| s.update_ui(|ui| ui.workflow = Workflow::Herdr, tx));
     app.settle(5);
     app.rt
-        .update(|s, tx| s.update_ui(|ui| ui.workflow = Workflow::T3, tx));
+        .update(|s, tx| s.update_ui(|ui| ui.workflow = Workflow::Inbox, tx));
     app.settle(5);
     assert!(!app.rt.state.sidebar.filter_menu);
     assert!(app.rt.find("project-filter-menu-menu").is_none());

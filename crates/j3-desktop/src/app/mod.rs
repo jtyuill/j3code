@@ -274,7 +274,6 @@ pub fn poll(s: &mut J3, t: f64, tx: &mut Tx) -> bool {
     changed |= s.poll_sidebar(tx);
     changed |= s.poll_feed(tx);
     changed |= s.poll_new_thread(tx);
-    changed |= s.poll_settings(tx);
     changed |= s.poll_thread(tx);
     changed |= s.poll_git(tx);
     changed |= s.poll_terminals(tx);

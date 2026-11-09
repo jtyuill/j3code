@@ -1,4 +1,4 @@
-//! The git workflow (`vcs.refreshStatus`, `vcs.pull`, `git.runStackedAction`)
+//! The git workflow (`git.status`, `git.pull`, `git.run`)
 //! against real temporary repositories with a bare remote, and a fake omp
 //! for `omp commit` and pull request text.
 
@@ -9,12 +9,15 @@ use std::{
 };
 
 use futures_util::StreamExt;
-use j3_core::{git, omp::OmpLauncher, rpc::StreamItem, store::random_hex};
-use j3_protocol::t3::git::{
-    GitActionProgress, GitActionProgressEvent, GitCommitStepStatus, GitManagerServiceError,
-    GitPrStepStatus, GitPushStepStatus, GitRunStackedActionInput, GitRunStackedActionResult,
-    GitStackedAction, GitToastCta, VcsChangeRequestState, VcsPullStatus, VcsWorkingTreeFile,
+use j3_core::{git, omp::OmpLauncher, store::random_hex};
+use j3_protocol::v2::{
+    envelope::{Error, ErrorCode},
+    methods::{
+        GitAction, GitFile, GitNext, GitPhase, GitRunItem, GitRunResult, PullRequestState,
+        PullStatus,
+    },
 };
+use serde_json::json;
 
 /// A temporary directory removed on drop.
 struct TempDir(PathBuf);
@@ -86,52 +89,44 @@ fn commit_all(dir: &Path, message: &str) {
     git(dir, &["commit", "-m", message]);
 }
 
-fn input(cwd: &Path, action: GitStackedAction, message: Option<&str>) -> GitRunStackedActionInput {
-    GitRunStackedActionInput {
-        action_id: "action-1".into(),
-        cwd: cwd.to_str().unwrap().to_owned(),
-        action,
-        commit_message: message.map(str::to_owned),
-        feature_branch: None,
-        file_paths: None,
+/// What `git.run` streamed: the phases, then the result or the error.
+struct Run {
+    phases: Vec<GitPhase>,
+    outcome: Result<GitRunResult, Error>,
+}
+
+impl Run {
+    fn finished(&self) -> &GitRunResult {
+        self.outcome.as_ref().expect("the action finishes")
+    }
+
+    fn error(&self) -> &Error {
+        self.outcome.as_ref().expect_err("the action fails")
     }
 }
 
-/// The stream's events and, when it failed, its error.
-async fn run(
-    omp: OmpLauncher,
-    input: GitRunStackedActionInput,
-) -> (Vec<GitActionProgressEvent>, Option<GitManagerServiceError>) {
-    let items: Vec<StreamItem> = git::run_stacked_action(omp, input).collect().await;
-    let mut events = Vec::new();
-    let mut failure = None;
+async fn run(omp: OmpLauncher, cwd: &Path, action: GitAction, message: Option<&str>) -> Run {
+    let items: Vec<_> = git::run(
+        omp,
+        cwd.to_str().unwrap().to_owned(),
+        action,
+        message.map(str::to_owned),
+    )
+    .collect()
+    .await;
+    let mut phases = Vec::new();
+    let mut outcome = None;
     for item in items {
-        assert!(failure.is_none(), "nothing follows a failure");
+        assert!(outcome.is_none(), "nothing follows the result or the error");
         match item {
-            StreamItem::Value(value) => events.push(serde_json::from_value(value).unwrap()),
-            StreamItem::Fail(error) => failure = Some(serde_json::from_value(error).unwrap()),
+            Ok(GitRunItem::Phase { phase }) => phases.push(phase),
+            Ok(GitRunItem::Finished { result }) => outcome = Some(Ok(result)),
+            Err(error) => outcome = Some(Err(error)),
         }
     }
-    (events, failure)
-}
-
-fn labels(events: &[GitActionProgressEvent]) -> Vec<String> {
-    events
-        .iter()
-        .map(|event| match &event.progress {
-            GitActionProgress::ActionStarted { .. } => "started".to_owned(),
-            GitActionProgress::PhaseStarted { label, .. } => label.clone(),
-            GitActionProgress::ActionFinished { .. } => "finished".to_owned(),
-            GitActionProgress::ActionFailed { message, .. } => format!("failed: {message}"),
-            other => format!("{other:?}"),
-        })
-        .collect()
-}
-
-fn finished(events: &[GitActionProgressEvent]) -> GitRunStackedActionResult {
-    match &events.last().unwrap().progress {
-        GitActionProgress::ActionFinished { result } => (**result).clone(),
-        other => panic!("expected action_finished, got {other:?}"),
+    Run {
+        phases,
+        outcome: outcome.expect("the stream ends with a result or an error"),
     }
 }
 
@@ -167,35 +162,29 @@ async fn status_of_a_dirty_repo() {
 
     let status = git::status(work.to_str().unwrap()).await.unwrap();
     assert!(status.is_repo);
-    assert!(status.has_primary_remote);
-    assert!(status.is_default_ref);
-    assert_eq!(status.ref_name.as_deref(), Some("main"));
+    assert!(status.has_remote);
+    assert!(status.on_default_branch);
+    assert_eq!(status.branch.as_deref(), Some("main"));
     assert!(!status.has_upstream);
-    assert_eq!((status.ahead_count, status.behind_count), (1, 0));
-    assert!(status.has_working_tree_changes);
+    assert_eq!((status.ahead, status.behind), (1, 0));
+    assert!(status.dirty);
     assert_eq!(
-        status.working_tree.files,
+        status.files,
         [
-            VcsWorkingTreeFile {
+            GitFile {
                 path: "a.txt".into(),
-                insertions: 2,
+                additions: 2,
                 deletions: 1
             },
-            VcsWorkingTreeFile {
+            GitFile {
                 path: "new.txt".into(),
-                insertions: 3,
+                additions: 3,
                 deletions: 0
             },
         ]
     );
-    assert_eq!(
-        (
-            status.working_tree.insertions,
-            status.working_tree.deletions
-        ),
-        (5, 1)
-    );
-    assert_eq!(status.pr, None);
+    assert_eq!((status.additions, status.deletions), (5, 1));
+    assert_eq!(status.pull_request, None);
 
     let plain = TempDir::new();
     let status = git::status(plain.0.to_str().unwrap()).await.unwrap();
@@ -211,10 +200,10 @@ async fn status_before_the_first_commit() {
     write(&work, "a.txt", "one\n");
     git(&work, &["add", "a.txt"]);
     let status = git::status(work.to_str().unwrap()).await.unwrap();
-    assert_eq!(status.ref_name.as_deref(), Some("main"));
-    assert_eq!(status.ahead_count, 0);
-    assert_eq!(status.working_tree.files.len(), 1);
-    assert_eq!(status.working_tree.insertions, 1);
+    assert_eq!(status.branch.as_deref(), Some("main"));
+    assert_eq!(status.ahead, 0);
+    assert_eq!(status.files.len(), 1);
+    assert_eq!(status.additions, 1);
 }
 
 #[tokio::test]
@@ -223,58 +212,38 @@ async fn commit_push_sets_the_upstream_then_skips_when_up_to_date() {
     let (work, remote) = repo(&root);
     write(&work, "a.txt", "hello\n");
 
-    let (events, failure) = run(
+    let run1 = run(
         no_omp(),
-        input(
-            &work,
-            GitStackedAction::CommitPush,
-            Some("Add a\n\nbody line"),
-        ),
+        &work,
+        GitAction::CommitPush,
+        Some("Add a\n\nbody line"),
     )
     .await;
-    assert!(failure.is_none(), "{failure:?}");
-    assert_eq!(
-        labels(&events),
-        ["started", "Committing...", "Pushing...", "finished"]
-    );
-    let result = finished(&events);
-    assert_eq!(result.commit.status, GitCommitStepStatus::Created);
-    assert_eq!(result.commit.subject.as_deref(), Some("Add a"));
-    let sha = result.commit.commit_sha.clone().unwrap();
+    assert_eq!(run1.phases, [GitPhase::Commit, GitPhase::Push]);
+    let result = run1.finished();
+    let sha = git(&work, &["rev-parse", "HEAD"]);
     assert_eq!(
         git(&work, &["log", "-1", "--format=%B"]),
         "Add a\n\nbody line"
     );
-    assert_eq!(result.push.status, GitPushStepStatus::Pushed);
-    assert_eq!(result.push.set_upstream, Some(true));
-    assert_eq!(result.push.upstream_branch.as_deref(), Some("origin/main"));
     assert_eq!(git(&remote, &["rev-parse", "main"]), sha);
-    assert_eq!(
-        result.toast.title,
-        format!("Pushed {} to origin/main", &sha[..7])
-    );
-    assert_eq!(result.toast.description.as_deref(), Some("Add a"));
-    assert_eq!(result.toast.cta, GitToastCta::None);
+    assert_eq!(result.title, format!("Pushed {} to origin/main", &sha[..7]));
+    assert_eq!(result.description.as_deref(), Some("Add a"));
+    assert_eq!(result.next, None);
 
     let status = git::status(work.to_str().unwrap()).await.unwrap();
     assert!(status.has_upstream);
-    assert_eq!((status.ahead_count, status.behind_count), (0, 0));
+    assert_eq!((status.ahead, status.behind), (0, 0));
 
-    let (events, failure) = run(no_omp(), input(&work, GitStackedAction::Push, None)).await;
-    assert!(failure.is_none(), "{failure:?}");
-    assert_eq!(labels(&events), ["started", "Pushing...", "finished"]);
-    let result = finished(&events);
-    assert_eq!(result.push.status, GitPushStepStatus::SkippedUpToDate);
-    assert_eq!(result.toast.title, "Done");
+    let up_to_date = run(no_omp(), &work, GitAction::Push, None).await;
+    assert_eq!(up_to_date.phases, [GitPhase::Push]);
+    assert_eq!(up_to_date.finished().title, "Done");
 
     // An existing upstream: plain push of a new local commit.
     write(&work, "b.txt", "b\n");
     commit_all(&work, "Add b");
-    let (events, failure) = run(no_omp(), input(&work, GitStackedAction::Push, None)).await;
-    assert!(failure.is_none(), "{failure:?}");
-    let result = finished(&events);
-    assert_eq!(result.push.status, GitPushStepStatus::Pushed);
-    assert_eq!(result.push.set_upstream, Some(false));
+    let pushed = run(no_omp(), &work, GitAction::Push, None).await;
+    assert_eq!(pushed.finished().title, "Pushed to origin/main");
     assert_eq!(
         git(&remote, &["rev-parse", "main"]),
         git(&work, &["rev-parse", "HEAD"])
@@ -288,17 +257,12 @@ async fn commit_without_changes_is_skipped() {
     write(&work, "a.txt", "a\n");
     commit_all(&work, "Initial");
 
-    let (events, failure) = run(
-        no_omp(),
-        input(&work, GitStackedAction::Commit, Some("Nothing")),
-    )
-    .await;
-    assert!(failure.is_none(), "{failure:?}");
-    assert_eq!(labels(&events), ["started", "finished"]);
-    let result = finished(&events);
-    assert_eq!(result.commit.status, GitCommitStepStatus::SkippedNoChanges);
-    assert_eq!(result.toast.title, "Done");
-    assert_eq!(result.toast.cta, GitToastCta::None);
+    let skipped = run(no_omp(), &work, GitAction::Commit, Some("Nothing")).await;
+    assert!(skipped.phases.is_empty());
+    let result = skipped.finished();
+    assert_eq!(result.title, "Done");
+    assert_eq!(result.description, None);
+    assert_eq!(result.next, None);
 }
 
 #[tokio::test]
@@ -309,31 +273,24 @@ async fn push_from_a_detached_head_fails() {
     commit_all(&work, "Initial");
     git(&work, &["checkout", "--detach"]);
 
-    let (events, failure) = run(no_omp(), input(&work, GitStackedAction::Push, None)).await;
-    let message = "Git manager failed in runStackedAction: Cannot push from detached HEAD.";
-    assert_eq!(
-        labels(&events),
-        ["started".to_owned(), format!("failed: {message}")]
-    );
-    let failure = failure.expect("the stream fails");
-    assert!(matches!(
-        failure,
-        GitManagerServiceError::GitManagerError { .. }
-    ));
-    assert_eq!(failure.message(), message);
+    let failed = run(no_omp(), &work, GitAction::Push, None).await;
+    assert!(failed.phases.is_empty());
+    let error = failed.error();
+    assert_eq!(error.code, ErrorCode::Rejected);
+    assert_eq!(error.message, "Cannot push from detached HEAD.");
+    assert_eq!(error.data, None, "no phase was running");
 }
 
 #[tokio::test]
-async fn feature_branches_are_refused() {
+async fn pull_from_a_detached_head_is_refused() {
     let root = TempDir::new();
     let (work, _) = repo(&root);
-    let mut feature = input(&work, GitStackedAction::Commit, None);
-    feature.feature_branch = Some(true);
-    let (_, failure) = run(no_omp(), feature).await;
-    assert_eq!(
-        failure.unwrap().message(),
-        "Git manager failed in runStackedAction: Feature branches are not supported by this server."
-    );
+    write(&work, "a.txt", "a\n");
+    commit_all(&work, "Initial");
+    git(&work, &["checkout", "--detach"]);
+    let error = git::pull(work.to_str().unwrap()).await.unwrap_err();
+    assert_eq!(error.code, ErrorCode::Rejected);
+    assert_eq!(error.message, "Cannot pull from detached HEAD.");
 }
 
 #[tokio::test]
@@ -343,13 +300,15 @@ async fn pull_requests_need_a_github_remote() {
     write(&work, "a.txt", "a\n");
     commit_all(&work, "Initial");
     let status = git::status(work.to_str().unwrap()).await.unwrap();
-    assert_eq!(status.source_control_provider, None);
+    assert!(!status.github);
 
-    let (events, failure) = run(no_omp(), input(&work, GitStackedAction::CreatePr, None)).await;
-    assert_eq!(events.len(), 2, "started, failed");
+    let failed = run(no_omp(), &work, GitAction::Pr, None).await;
+    assert!(failed.phases.is_empty());
+    let error = failed.error();
+    assert_eq!(error.code, ErrorCode::Rejected);
     assert_eq!(
-        failure.unwrap().message(),
-        "Git manager failed in runStackedAction: Pull requests need a GitHub remote; this repository has none."
+        error.message,
+        "Pull requests need a GitHub remote; this repository has none."
     );
 }
 
@@ -445,12 +404,8 @@ async fn a_github_remote_adds_the_provider_and_the_branch_pull_request() {
     let cwd = work.to_str().unwrap();
 
     let status = git::status(cwd).await.unwrap();
-    let provider = status.source_control_provider.expect("a GitHub remote");
-    assert_eq!(
-        (provider.kind.as_str(), provider.name.as_str()),
-        ("github", "GitHub")
-    );
-    assert_eq!(status.pr, None, "the default branch has no PR");
+    assert!(status.github, "a GitHub remote");
+    assert_eq!(status.pull_request, None, "the default branch has no PR");
     assert!(gh_calls(&work).is_empty(), "and gh is not asked");
 
     git(&work, &["checkout", "-b", "feature"]);
@@ -461,15 +416,10 @@ async fn a_github_remote_adds_the_provider_and_the_branch_pull_request() {
 
     let status = git::status(cwd).await.unwrap();
     let pr = status
-        .pr
+        .pull_request
         .expect("the open PR wins over the older merged one");
-    assert_eq!(pr.number, 9);
-    assert_eq!(pr.state, VcsChangeRequestState::Open);
-    assert_eq!(pr.is_draft, Some(true));
-    assert_eq!(
-        (pr.base_ref.as_str(), pr.head_ref.as_str()),
-        ("main", "feature")
-    );
+    assert_eq!(pr.url, "https://github.com/acme/widgets/pull/9");
+    assert_eq!(pr.state, PullRequestState::Open);
     let calls = gh_calls(&work);
     assert_eq!(calls.len(), 1, "{calls:?}");
     assert!(
@@ -499,42 +449,21 @@ async fn create_pr_pushes_then_opens_a_pull_request_with_omp_text() {
         r#"{"title": "Add the f file.", "body": "- adds f.txt"}"#,
     );
 
-    let (events, failure) = run(omp, input(&work, GitStackedAction::CreatePr, None)).await;
-    assert!(failure.is_none(), "{failure:?}");
-    assert_eq!(
-        labels(&events),
-        [
-            "started",
-            "Pushing...",
-            "Looking for a pull request...",
-            "Generating PR content...",
-            "Creating pull request...",
-            "finished"
-        ]
-    );
-    let result = finished(&events);
-    assert_eq!(result.push.status, GitPushStepStatus::Pushed);
+    let created = run(omp, &work, GitAction::Pr, None).await;
+    assert_eq!(created.phases, [GitPhase::Push, GitPhase::Pr]);
     assert_eq!(
         git(&remote, &["rev-parse", "feature"]),
         git(&work, &["rev-parse", "HEAD"])
     );
-    assert_eq!(result.pr.status, GitPrStepStatus::Created);
-    assert_eq!(result.pr.number, Some(12));
+    let result = created.finished();
+    assert_eq!(result.title, "Created PR #12");
+    assert_eq!(result.description.as_deref(), Some("Add the f file"));
     assert_eq!(
-        result.pr.url.as_deref(),
-        Some("https://github.com/acme/widgets/pull/12")
-    );
-    assert_eq!(result.pr.base_branch.as_deref(), Some("main"));
-    assert_eq!(result.pr.head_branch.as_deref(), Some("feature"));
-    assert_eq!(result.pr.title.as_deref(), Some("Add the f file"));
-    assert_eq!(result.toast.title, "Created PR #12");
-    assert_eq!(result.toast.description.as_deref(), Some("Add the f file"));
-    assert_eq!(
-        result.toast.cta,
-        GitToastCta::OpenPr {
+        result.next,
+        Some(GitNext::OpenPr {
             label: "View PR".into(),
             url: "https://github.com/acme/widgets/pull/12".into()
-        }
+        })
     );
     let calls = gh_calls(&work);
     let create = calls.iter().find(|c| c.starts_with("pr create")).unwrap();
@@ -547,23 +476,31 @@ async fn create_pr_pushes_then_opens_a_pull_request_with_omp_text() {
 #[tokio::test]
 async fn commit_push_pr_commits_pushes_and_reuses_an_open_pull_request() {
     let root = TempDir::new();
-    let (work, _) = github_repo(&root);
+    let (work, remote) = github_repo(&root);
     git(&work, &["checkout", "-b", "feature"]);
     write(&work, "f.txt", "f\n");
     std::fs::write(gh_state(&work, "list.json"), PR_JSON).unwrap();
 
-    let (events, failure) = run(
-        no_omp(),
-        input(&work, GitStackedAction::CommitPushPr, Some("Add f")),
-    )
-    .await;
-    assert!(failure.is_none(), "{failure:?}");
-    let result = finished(&events);
-    assert_eq!(result.commit.status, GitCommitStepStatus::Created);
-    assert_eq!(result.push.status, GitPushStepStatus::Pushed);
-    assert_eq!(result.pr.status, GitPrStepStatus::OpenedExisting);
-    assert_eq!(result.pr.number, Some(9));
-    assert_eq!(result.toast.title, "Opened PR #9");
+    let reused = run(no_omp(), &work, GitAction::CommitPushPr, Some("Add f")).await;
+    assert_eq!(
+        reused.phases,
+        [GitPhase::Commit, GitPhase::Push, GitPhase::Pr]
+    );
+    assert_eq!(git(&work, &["log", "-1", "--format=%s"]), "Add f");
+    assert_eq!(
+        git(&remote, &["rev-parse", "feature"]),
+        git(&work, &["rev-parse", "HEAD"])
+    );
+    let result = reused.finished();
+    assert_eq!(result.title, "Opened PR #9");
+    assert_eq!(result.description.as_deref(), Some("Add widgets"));
+    assert_eq!(
+        result.next,
+        Some(GitNext::OpenPr {
+            label: "View PR".into(),
+            url: "https://github.com/acme/widgets/pull/9".into()
+        })
+    );
     assert!(
         !gh_calls(&work).iter().any(|c| c.starts_with("pr create")),
         "no second PR"
@@ -576,33 +513,26 @@ async fn a_pushed_feature_branch_offers_to_create_the_pull_request() {
     let (work, _) = github_repo(&root);
     git(&work, &["checkout", "-b", "feature"]);
     write(&work, "f.txt", "f\n");
-    let (events, failure) = run(
-        no_omp(),
-        input(&work, GitStackedAction::CommitPush, Some("Add f")),
-    )
-    .await;
-    assert!(failure.is_none(), "{failure:?}");
-    let result = finished(&events);
-    assert_eq!(result.pr.status, GitPrStepStatus::SkippedNotRequested);
-    match result.toast.cta {
-        GitToastCta::RunAction { label, action } => {
-            assert_eq!(label, "Create PR");
-            assert_eq!(action.kind, GitStackedAction::CreatePr);
-        }
-        other => panic!("expected a Create PR button, got {other:?}"),
-    }
+    let pushed = run(no_omp(), &work, GitAction::CommitPush, Some("Add f")).await;
+    assert_eq!(pushed.phases, [GitPhase::Commit, GitPhase::Push]);
+    assert_eq!(
+        pushed.finished().next,
+        Some(GitNext::Run {
+            label: "Create PR".into(),
+            action: GitAction::Pr
+        })
+    );
 
     // On the default branch there is nothing to open a PR from.
     git(&work, &["checkout", "main"]);
     write(&work, "m.txt", "m\n");
-    let (events, _) = run(
-        no_omp(),
-        input(&work, GitStackedAction::CommitPush, Some("Add m")),
-    )
-    .await;
-    assert_eq!(finished(&events).toast.cta, GitToastCta::None);
-    let (_, failure) = run(no_omp(), input(&work, GitStackedAction::CreatePr, None)).await;
-    assert!(failure.unwrap().message().contains("default branch"));
+    let pushed = run(no_omp(), &work, GitAction::CommitPush, Some("Add m")).await;
+    assert_eq!(pushed.finished().next, None);
+    let refused = run(no_omp(), &work, GitAction::Pr, None).await;
+    let error = refused.error();
+    assert_eq!(error.code, ErrorCode::Rejected);
+    assert!(error.message.contains("default branch"), "{error:?}");
+    assert_eq!(error.data, Some(json!({"phase": "pr"})));
 }
 
 #[tokio::test]
@@ -619,20 +549,16 @@ async fn gh_failures_surface_with_gh_s_own_message() {
     )
     .unwrap();
     let omp = fake_omp(&root, r#"{"title": "t", "body": ""}"#);
-    let (events, failure) = run(omp, input(&work, GitStackedAction::CreatePr, None)).await;
-    let message = failure.expect("the action fails").message().to_owned();
-    assert!(message.contains("gh auth login"), "{message}");
-    assert!(
-        matches!(
-            events.last().unwrap().progress,
-            GitActionProgress::ActionFailed { .. }
-        ),
-        "the stream reports the failure"
-    );
+    let failed = run(omp, &work, GitAction::Pr, None).await;
+    assert_eq!(failed.phases, [GitPhase::Push, GitPhase::Pr]);
+    let error = failed.error();
+    assert_eq!(error.code, ErrorCode::Unavailable);
+    assert!(error.message.contains("gh auth login"), "{error:?}");
+    assert_eq!(error.data, Some(json!({"phase": "pr"})));
     // Status never fails because of gh: it just has no PR.
     git(&work, &["push", "-u", "origin", "feature"]);
     let status = git::status(work.to_str().unwrap()).await.unwrap();
-    assert_eq!(status.pr, None);
+    assert_eq!(status.pull_request, None);
 }
 
 #[tokio::test]
@@ -657,43 +583,31 @@ async fn generated_commits_are_made_by_omp_commit() {
         ),
     );
     write(&work, "greet.txt", "hi\n");
-    write(&work, "other.txt", "not selected\n");
-    let mut selected = input(&work, GitStackedAction::Commit, None);
-    selected.file_paths = Some(vec!["greet.txt".into()]);
+    write(&work, "other.txt", "also staged\n");
 
-    let (events, failure) = run(omp, selected).await;
-    assert!(failure.is_none(), "{failure:?}");
-    assert_eq!(
-        labels(&events),
-        [
-            "started",
-            "Generating commit message...",
-            "Resolving model...",
-            "Starting commit agent...",
-            "Creating commit...",
-            "finished"
-        ]
-    );
+    let committed = run(omp, &work, GitAction::Commit, None).await;
+    assert_eq!(committed.phases, [GitPhase::Commit]);
     assert_eq!(std::fs::read_to_string(args).unwrap(), "commit\n");
-    let result = finished(&events);
-    assert_eq!(result.commit.status, GitCommitStepStatus::Created);
+    let result = committed.finished();
+    let sha = git(&work, &["rev-parse", "HEAD"]);
+    assert_eq!(result.title, format!("Committed {}", &sha[..7]));
     assert_eq!(
-        result.commit.subject.as_deref(),
+        result.description.as_deref(),
         Some("feat(greet): add greeting")
     );
-    let sha = result.commit.commit_sha.unwrap();
-    assert_eq!(sha, git(&work, &["rev-parse", "HEAD"]));
-    assert_eq!(result.toast.title, format!("Committed {}", &sha[..7]));
-    assert!(matches!(
-        result.toast.cta,
-        GitToastCta::RunAction { ref label, action } if label == "Push" && action.kind == GitStackedAction::Push
-    ));
-    // omp committed what j3 staged: only the selected file.
+    assert_eq!(
+        result.next,
+        Some(GitNext::Run {
+            label: "Push".into(),
+            action: GitAction::Push
+        })
+    );
+    // omp committed what j3 staged: everything.
     assert_eq!(
         git(&work, &["show", "--name-only", "--format=", "HEAD"]),
-        "greet.txt"
+        "greet.txt\nother.txt"
     );
-    assert_eq!(git(&work, &["status", "--porcelain"]), "?? other.txt");
+    assert_eq!(git(&work, &["status", "--porcelain"]), "");
 }
 
 #[tokio::test]
@@ -710,29 +624,25 @@ async fn omp_commit_failures_are_the_action_s_error() {
         "echo '● Creating commit...'\n\
          printf '✗ Commit failed:\\n    pre-commit: lint failed\\n' >&2\nexit 1\n",
     );
-    let (events, failure) = run(omp, input(&work, GitStackedAction::Commit, None)).await;
-    let failure = failure.unwrap();
+    let failed = run(omp, &work, GitAction::Commit, None).await;
+    assert_eq!(failed.phases, [GitPhase::Commit]);
+    let error = failed.error();
+    assert_eq!(error.code, ErrorCode::Unavailable);
     assert!(
-        matches!(failure, GitManagerServiceError::GitCommandError { ref operation, .. } if operation == "OmpCommit.commit"),
-        "{failure:?}"
+        error.message.contains("pre-commit: lint failed"),
+        "{error:?}"
     );
-    assert!(
-        failure.message().contains("pre-commit: lint failed"),
-        "{failure:?}"
-    );
-    assert!(matches!(
-        events.last().unwrap().progress,
-        GitActionProgress::ActionFailed { phase: Some(_), .. }
-    ));
+    assert_eq!(error.data, Some(json!({"phase": "commit"})));
 
     // omp exiting cleanly without a commit is a failure too.
     let omp = omp_script(&root, "echo 'No changes to commit.' >&2\n");
-    let (_, failure) = run(omp, input(&work, GitStackedAction::Commit, None)).await;
-    let failure = failure.unwrap();
+    let failed = run(omp, &work, GitAction::Commit, None).await;
+    let error = failed.error();
     assert!(
-        failure.message().contains("omp commit made no commit"),
-        "{failure:?}"
+        error.message.contains("omp commit made no commit"),
+        "{error:?}"
     );
+    assert_eq!(error.data, Some(json!({"phase": "commit"})));
 }
 
 #[tokio::test]
@@ -760,9 +670,8 @@ async fn pull_request_text_falls_back_from_commit_to_smol_to_default() {
         ),
     );
 
-    let (events, failure) = run(omp, input(&work, GitStackedAction::CreatePr, None)).await;
-    assert!(failure.is_none(), "{failure:?}");
-    assert_eq!(finished(&events).pr.title.as_deref(), Some("Add f"));
+    let created = run(omp, &work, GitAction::Pr, None).await;
+    assert_eq!(created.finished().description.as_deref(), Some("Add f"));
     assert_eq!(
         std::fs::read_to_string(&tried).unwrap(),
         "pi/commit\npi/smol\npi/default\n"
@@ -778,10 +687,11 @@ async fn pull_fast_forwards() {
     let cwd = work.to_str().unwrap();
 
     let error = git::pull(cwd).await.unwrap_err();
-    assert!(matches!(
-        *error,
-        GitManagerServiceError::GitManagerError { .. }
-    ));
+    assert_eq!(error.code, ErrorCode::Rejected);
+    assert_eq!(
+        error.message,
+        "Current branch has no upstream configured. Push with upstream first."
+    );
 
     git(&work, &["push", "-u", "origin", "main"]);
     let other = root.0.join("other");
@@ -796,14 +706,14 @@ async fn pull_fast_forwards() {
     git(&work, &["fetch"]);
 
     let status = git::status(cwd).await.unwrap();
-    assert_eq!((status.ahead_count, status.behind_count), (0, 1));
+    assert_eq!((status.ahead, status.behind), (0, 1));
 
     let pulled = git::pull(cwd).await.unwrap();
-    assert_eq!(pulled.status, VcsPullStatus::Pulled);
-    assert_eq!(pulled.ref_name, "main");
-    assert_eq!(pulled.upstream_ref.as_deref(), Some("origin/main"));
+    assert_eq!(pulled.status, PullStatus::Pulled);
+    assert_eq!(pulled.branch, "main");
+    assert_eq!(pulled.upstream.as_deref(), Some("origin/main"));
     assert!(work.join("b.txt").exists());
 
     let again = git::pull(cwd).await.unwrap();
-    assert_eq!(again.status, VcsPullStatus::SkippedUpToDate);
+    assert_eq!(again.status, PullStatus::UpToDate);
 }

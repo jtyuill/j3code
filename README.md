@@ -10,9 +10,9 @@ A native desktop and mobile client for running [Oh My Pi](https://github.com/can
 - **One agent.** `omp` is the only harness. Threads are ordinary omp sessions, so `omp --resume` sees them.
 - **Native desktop.** Rust + [Rune](https://github.com/anomalyco/rune), not Electron. macOS (arm64) and Linux (x86_64).
 - **Rust server.** `j3-core` is embedded in the desktop app and also ships headless as `j3-server`.
-- **iOS client.** A trimmed Expo app that talks to the same server.
+- **iOS client.** A SwiftUI app over the same Rust protocol client (UniFFI), talking to the same server.
 
-Forked from [t3code](https://github.com/pingdotgg/t3code). See [PLAN.md](PLAN.md) for design decisions and [docs/protocol](docs/protocol) for the wire format.
+See [PLAN.md](PLAN.md) for design decisions and [docs/protocol/wire.md](docs/protocol/wire.md) for the wire protocol.
 
 ## Screenshots
 
@@ -49,21 +49,23 @@ Screenshots are rendered headlessly from the offline fixture scenes in `crates/j
 
 | Path | Contents |
 |---|---|
-| `crates/j3-protocol` | Wire types: Effect RPC envelopes and t3 contract types |
+| `crates/j3-protocol` | Wire types of the j3 protocol |
 | `crates/j3-core` | Server library: omp driver, thread engine, SQLite store, HTTP/WebSocket |
 | `crates/j3-server` | Headless server binary |
 | `crates/j3-client` | Protocol client and state reducers (UI-agnostic) |
 | `crates/j3-desktop` | Rune desktop app (binary `j3`) |
-| `apps/mobile` | iOS app |
-| `packages/`, `tests/conformance` | Shared TypeScript packages and a protocol conformance client |
-| `contrib/` | systemd unit, macOS app bundler |
+| `crates/j3-text` | Message text preparation (UI-agnostic): TeX math, magic keywords, `^model` mentions |
+| `crates/j3-mobile` | UniFFI bindings over the v2 client and `j3-text`, for the iOS app |
+| `apps/ios` | SwiftUI iOS app |
+| `contrib/` | systemd unit, macOS app bundler, iOS XCFramework build |
 
 ## Requirements
 
 - [`omp`](https://github.com/can1357/oh-my-pi) installed and logged in on every machine that runs agents
 - Rust 1.88+ and CMake (the desktop builds whisper.cpp for dictation)
 - Linux desktop builds: `pkg-config`, `glslc`, and the GUI and audio libraries listed in [`ci.yml`](.github/workflows/ci.yml)
-- Optional: Nix (`nix develop`, or direnv via `.envrc`, provides the toolchain, the mold linker and libraries), Node 26 + pnpm for the TypeScript packages
+- Optional: Nix (`nix develop`, or direnv via `.envrc`, provides the toolchain, the mold linker and libraries)
+- iOS app: a Mac with Xcode, XcodeGen and the `aarch64-apple-ios`/`aarch64-apple-ios-sim` Rust targets
 
 ## Build and run
 
@@ -82,13 +84,13 @@ macOS app bundle: `contrib/macos/bundle.sh`.
 
 ### iOS
 
-See [`apps/mobile/README.md`](apps/mobile/README.md).
+See [`apps/ios/README.md`](apps/ios/README.md).
 
 ## Test
 
 ```sh
 cargo test --workspace
-pnpm install && pnpm typecheck && pnpm test
+contrib/check-provenance.sh
 ```
 
 Tests that need a live `omp` are `#[ignore]`d. See [CONTRIBUTING.md](CONTRIBUTING.md).

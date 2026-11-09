@@ -3,9 +3,9 @@
 
 use std::sync::Arc;
 
-use j3_protocol::t3::{
-    git::{VcsChangeRequest, VcsChangeRequestState, VcsPullResult, VcsPullStatus, VcsStatusResult},
-    orchestration::RunStatus,
+use j3_client::{
+    entities::TurnStatus,
+    methods::{GitStatus, PullRequest, PullRequestState, PullResult, PullStatus},
 };
 
 use super::{commit, fixtures, pulled};
@@ -16,17 +16,17 @@ use crate::app::{
 
 #[test]
 fn pull_outcomes_read_as_toasts() {
-    let pull = |status| VcsPullResult {
+    let pull = |status| PullResult {
         status,
-        ref_name: "main".into(),
-        upstream_ref: None,
+        branch: "main".into(),
+        upstream: None,
     };
     assert_eq!(
-        pulled(&pull(VcsPullStatus::Pulled)),
+        pulled(&pull(PullStatus::Pulled)),
         ("Pulled", "Updated main from upstream".to_owned())
     );
     assert_eq!(
-        pulled(&pull(VcsPullStatus::SkippedUpToDate)),
+        pulled(&pull(PullStatus::UpToDate)),
         (
             "Already up to date",
             "main is already synchronized.".to_owned()
@@ -38,28 +38,22 @@ fn pull_outcomes_read_as_toasts() {
 fn the_commit_dialog_offers_what_the_branch_allows() {
     let feature = fixtures::status();
     assert_eq!(commit::offers(feature.clone()), (true, true));
-    let default = VcsStatusResult {
-        is_default_ref: true,
+    let default = GitStatus {
+        on_default_branch: true,
         ..feature.clone()
     };
     assert_eq!(commit::offers(default), (false, true));
-    let with_pr = VcsStatusResult {
-        pr: Some(VcsChangeRequest {
-            number: 7,
-            title: "Files".into(),
+    let with_pr = GitStatus {
+        pull_request: Some(PullRequest {
             url: "https://github.com/o/r/pull/7".into(),
-            base_ref: "main".into(),
-            head_ref: "rune-desktop-filesgit".into(),
-            state: VcsChangeRequestState::Open,
-            is_draft: None,
-            updated_at: None,
+            state: PullRequestState::Open,
         }),
         ..feature.clone()
     };
     assert_eq!(commit::offers(with_pr), (false, true));
-    let local = VcsStatusResult {
-        source_control_provider: None,
-        has_primary_remote: false,
+    let local = GitStatus {
+        github: false,
+        has_remote: false,
         has_upstream: false,
         ..feature
     };
@@ -132,7 +126,10 @@ fn the_control_shows_for_a_repository_and_opens_the_commit_dialog() {
     // Not a repository: nothing shows.
     let hide = key.clone();
     app.rt.update(move |s, _| {
-        s.git.get_mut(&hide).unwrap().status = Some(VcsStatusResult::not_a_repo());
+        s.git.get_mut(&hide).unwrap().status = Some(GitStatus {
+            is_repo: false,
+            ..fixtures::status()
+        });
     });
     app.frame();
     assert!(app.rt.find("git-quick-action").is_none());
@@ -165,14 +162,17 @@ fn the_end_of_a_run_rereads_the_status_and_a_failed_read_keeps_the_last() {
         "the fixture thread is mid-run"
     );
     assert!(app.rt.find("git-quick-action").is_some());
-    // The run ends: the next poll rereads the status.
+    // The turn ends: the next poll rereads the status.
     let ended = key.clone();
     app.rt.update(move |s, _| {
         let thread = s.threads.get_mut(&ended).unwrap();
         let mut state = (*thread.state).clone();
-        for run in &mut state.projection.as_mut().unwrap().runs {
-            if run.status.is_active() {
-                run.status = RunStatus::Completed;
+        if let Some(thread) = state.thread.as_mut() {
+            thread.active_turn_id = None;
+        }
+        for turn in &mut state.turns {
+            if matches!(turn.status, TurnStatus::Running | TurnStatus::Waiting) {
+                turn.status = TurnStatus::Completed;
             }
         }
         thread.state = Arc::new(state);

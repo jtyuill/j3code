@@ -4,17 +4,21 @@
 
 use std::hash::{DefaultHasher, Hash, Hasher};
 
-use j3_client::t3::orchestration::{Subagent, SubagentStatus};
-use j3_protocol::j3::TranscriptEntry;
+use j3_client::{
+    ThreadView,
+    entities::{Item, ItemStatus, SubagentItem},
+    methods::TranscriptEntry,
+};
+use j3_text::math;
 use rune::{
     Color, Cx, El, Icon, KeyEvent, ScrollSpec, TextStyle, Tx, col, icon, memo, row, spacer, text,
 };
 use rune_kit::{Button, ButtonVariant, ControlSize, Kit, Markdown, Spinner};
 
-use super::{AgentHub, TRANSCRIPT_KEY, roster};
+use super::{AgentHub, TRANSCRIPT_KEY, is_running, roster};
 use crate::{
     app::{J3, Ui},
-    icons, math, mention,
+    icons, mention,
     sidebar::ThreadKey,
     theme::Status,
 };
@@ -45,7 +49,7 @@ pub fn view(s: &J3, _cx: &mut Cx<J3>, ui: &mut Ui, key: &ThreadKey) -> El {
 }
 
 /// "Agents" and the count, the rows, and the key hints.
-fn roster_column(k: &Kit, key: &ThreadKey, hub: &AgentHub, state: &j3_client::ThreadState) -> El {
+fn roster_column(k: &Kit, key: &ThreadKey, hub: &AgentHub, state: &ThreadView) -> El {
     let roster = roster(state);
     let count = match roster.len() {
         1 => "1 agent".to_owned(),
@@ -57,8 +61,8 @@ fn roster_column(k: &Kit, key: &ThreadKey, hub: &AgentHub, state: &j3_client::Th
         .gap(2.0)
         .px(8.0)
         .pb(8.0);
-    for subagent in roster {
-        rows = rows.child(roster_row(k, key, hub, subagent));
+    for (item, subagent) in roster {
+        rows = rows.child(roster_row(k, key, hub, item, subagent));
     }
     col()
         .key("hub-roster-column")
@@ -108,20 +112,26 @@ fn roster_column(k: &Kit, key: &ThreadKey, hub: &AgentHub, state: &j3_client::Th
 }
 
 /// One roster row: glyph, id and status, then title and live progress.
-fn roster_row(k: &Kit, key: &ThreadKey, hub: &AgentHub, subagent: &Subagent) -> El {
-    let selected = hub.selected.as_deref() == Some(subagent.id.as_str());
+fn roster_row(
+    k: &Kit,
+    key: &ThreadKey,
+    hub: &AgentHub,
+    item: &Item,
+    subagent: &SubagentItem,
+) -> El {
+    let selected = hub.selected.as_deref() == Some(subagent.subagent_id.as_str());
     let title = subagent_title(subagent);
-    let status = crate::feed::subagent_status_label(subagent.status);
+    let status = crate::feed::subagent_status_label(item.status);
     let secondary = if selected {
         k.c.text_base
     } else {
         k.c.text_muted
     };
-    let (select_key, id) = (key.clone(), subagent.id.clone());
-    let mut item = col()
-        .key(format!("hub-agent-{}", subagent.id))
+    let (select_key, id) = (key.clone(), subagent.subagent_id.clone());
+    let mut row_el = col()
+        .key(format!("hub-agent-{}", subagent.subagent_id))
         .role("button")
-        .label(format!("{}, {title}, {status}", subagent.id))
+        .label(format!("{}, {title}, {status}", subagent.subagent_id))
         .w_full()
         .gap(2.0)
         .px(8.0)
@@ -133,9 +143,9 @@ fn roster_row(k: &Kit, key: &ThreadKey, hub: &AgentHub, subagent: &Subagent) -> 
                 .w_full()
                 .gap(8.0)
                 .center_y()
-                .child(status_glyph(k, subagent.status, 14.0))
+                .child(status_glyph(k, item.status, 14.0))
                 .child(
-                    text(&subagent.id)
+                    text(&subagent.subagent_id)
                         .font(k.ty.text_small_medium)
                         .color(k.c.text_base)
                         .truncate()
@@ -150,12 +160,8 @@ fn roster_row(k: &Kit, key: &ThreadKey, hub: &AgentHub, subagent: &Subagent) -> 
                 .color(k.c.text_base)
                 .truncate(),
         );
-    if let Some(progress) = subagent
-        .progress
-        .as_ref()
-        .filter(|_| subagent.status.is_active())
-    {
-        item = item.child(
+    if let Some(progress) = subagent.progress.as_ref().filter(|_| is_running(item)) {
+        row_el = row_el.child(
             text(progress)
                 .font(k.ty.text_xsmall)
                 .color(secondary)
@@ -163,23 +169,23 @@ fn roster_row(k: &Kit, key: &ThreadKey, hub: &AgentHub, subagent: &Subagent) -> 
         );
     }
     if selected {
-        item.fill(k.c.layer_02)
+        row_el.fill(k.c.layer_02)
     } else {
-        k.interactive(item)
+        k.interactive(row_el)
     }
 }
 
 /// The selected subagent: header, then its transcript (or what j3 knows without one).
-fn detail(s: &J3, ui: &Ui, key: &ThreadKey, hub: &AgentHub, state: &j3_client::ThreadState) -> El {
+fn detail(s: &J3, ui: &Ui, key: &ThreadKey, hub: &AgentHub, state: &ThreadView) -> El {
     let k = ui.k;
-    let Some(subagent) = hub.selected.as_ref().and_then(|id| state.subagent(id)) else {
+    let Some((item, subagent)) = hub.selected.as_ref().and_then(|id| state.subagent(id)) else {
         return col().key("hub-detail").grow(1.0).center().child(
             text("No subagents")
                 .font(k.ty.text_small)
                 .color(k.c.text_muted),
         );
     };
-    let active = subagent.status.is_active();
+    let active = is_running(item);
     let model = subagent.model.as_deref().map(|model| {
         // The catalog's label when the slug is listed.
         s.envs
@@ -187,11 +193,17 @@ fn detail(s: &J3, ui: &Ui, key: &ThreadKey, hub: &AgentHub, state: &j3_client::T
             .and_then(|env| mention::find_choice(env.models(), model))
             .map_or_else(|| model.to_owned(), |choice| choice.label.text().to_owned())
     });
-    let meta = [Some(subagent.id.clone()), model, subagent.progress.clone()]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join(" · ");
+    let agent = Some(subagent.agent.clone()).filter(|agent| !agent.trim().is_empty());
+    let meta = [
+        Some(subagent.subagent_id.clone()),
+        agent,
+        model,
+        subagent.progress.clone(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" · ");
     let mut header = row()
         .key("hub-detail-header")
         .w_full()
@@ -200,7 +212,7 @@ fn detail(s: &J3, ui: &Ui, key: &ThreadKey, hub: &AgentHub, state: &j3_client::T
         .py(8.0)
         .center_y()
         .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_muted)
-        .child(status_glyph(k, subagent.status, 16.0))
+        .child(status_glyph(k, item.status, 16.0))
         .child(
             col()
                 .grow(1.0)
@@ -236,13 +248,13 @@ fn detail(s: &J3, ui: &Ui, key: &ThreadKey, hub: &AgentHub, state: &j3_client::T
         .gap(12.0)
         .px(16.0)
         .py(12.0);
-    match hub.transcript(&subagent.id) {
+    match hub.transcript(&subagent.subagent_id) {
         Some(transcript) if transcript.loaded => {
             if transcript.entries.is_empty() {
                 body = body.child(note(k, "Nothing in the transcript yet"));
             }
             for (ix, entry) in transcript.entries.iter().enumerate() {
-                let id = format!("{}/{ix}", subagent.id);
+                let id = format!("{}/{ix}", subagent.subagent_id);
                 body = body.child(entry_view(s, ui, key, hub, entry, id));
             }
         }
@@ -327,12 +339,15 @@ fn entry_view(
         TranscriptEntry::ToolCall {
             name,
             intent,
-            arguments,
-            ..
+            input,
         } => {
             let title = match intent {
                 Some(intent) => format!("{name} · {intent}"),
                 None => name.clone(),
+            };
+            let arguments = match input {
+                serde_json::Value::String(text) => text.clone(),
+                other => serde_json::to_string_pretty(other).unwrap_or_else(|_| other.to_string()),
             };
             tool_row(
                 k,
@@ -341,17 +356,16 @@ fn entry_view(
                 &id,
                 &icons::SQUARE_TERMINAL,
                 title,
-                arguments,
+                &arguments,
                 false,
             )
         }
         TranscriptEntry::ToolResult {
             name,
             text: body,
-            is_error,
-            ..
+            failed,
         } => {
-            let glyph = if *is_error {
+            let glyph = if *failed {
                 &icons::CIRCLE_X
             } else {
                 &icons::CHECK
@@ -364,7 +378,7 @@ fn entry_view(
                 glyph,
                 format!("{name} result"),
                 body,
-                *is_error,
+                *failed,
             )
         }
         TranscriptEntry::Error { text: body } => text(body)
@@ -504,28 +518,29 @@ fn labelled(k: &Kit, label: &str, body: &str) -> El {
         .child(text(body).font(k.ty.text_small).color(k.c.text_base).wrap())
 }
 
-/// The subagent's title, else its assignment's first line.
-pub fn subagent_title(subagent: &Subagent) -> String {
-    subagent
-        .title
-        .clone()
-        .filter(|title| !title.trim().is_empty())
-        .unwrap_or_else(|| crate::feed::one_line(&subagent.prompt))
+/// The subagent's title: omp's short description of its task, else its assignment's first
+/// line, else its agent.
+pub fn subagent_title(subagent: &SubagentItem) -> String {
+    let first_line = |text: &str| crate::feed::one_line(text.lines().next().unwrap_or_default());
+    [
+        subagent.description.as_deref(),
+        Some(subagent.prompt.as_str()),
+    ]
+    .into_iter()
+    .flatten()
+    .map(first_line)
+    .find(|title| !title.is_empty())
+    .unwrap_or_else(|| subagent.agent.clone())
 }
 
-/// The status glyph: running, done, failed, stopped or idle.
-fn status_glyph(k: &Kit, status: SubagentStatus, size: f32) -> El {
+/// The status glyph: running, done, failed or stopped.
+fn status_glyph(k: &Kit, status: ItemStatus, size: f32) -> El {
     let palette = Status::of(k);
     let (glyph, color): (&'static Icon, Color) = match status {
-        SubagentStatus::Pending | SubagentStatus::Running | SubagentStatus::Waiting => {
-            (&icons::LOADER_CIRCLE, k.c.icon_accent)
-        }
-        SubagentStatus::Completed => (&icons::CIRCLE_CHECK, palette.success),
-        SubagentStatus::Failed => (&icons::CIRCLE_X, palette.danger),
-        SubagentStatus::Cancelled | SubagentStatus::Interrupted => {
-            (&icons::CIRCLE_SLASH, palette.warning)
-        }
-        SubagentStatus::Idle => (&icons::CIRCLE, palette.muted),
+        ItemStatus::Running => (&icons::LOADER_CIRCLE, k.c.icon_accent),
+        ItemStatus::Completed => (&icons::CIRCLE_CHECK, palette.success),
+        ItemStatus::Failed => (&icons::CIRCLE_X, palette.danger),
+        ItemStatus::Cancelled => (&icons::CIRCLE_SLASH, palette.warning),
     };
     icon(glyph, size).color(color)
 }

@@ -108,8 +108,13 @@ fn a_project_with_threads_is_not_removed() {
     let threads = app.rt.state.envs.get("local").map_or(0, |env| {
         env.state()
             .shell
-            .threads_of(crate::app::fixtures::J3CODE_PROJECT)
-            .len()
+            .threads
+            .values()
+            .filter(|thread| {
+                thread.project_id == crate::app::fixtures::J3CODE_PROJECT
+                    && thread.archived_at.is_none()
+            })
+            .count()
     });
     let toast = app
         .rt
@@ -149,13 +154,10 @@ fn archived_threads_list_and_ask_before_deleting() {
 }
 
 #[test]
-fn an_environment_added_while_archived_shows_loads_its_archive() {
+fn an_environment_added_while_archived_shows_gets_its_group() {
     use std::sync::Arc;
 
-    use crate::{
-        archived::Listing,
-        environment::{Environment, EnvironmentKind},
-    };
+    use crate::environment::{Environment, EnvironmentKind};
 
     let mut app = TestApp::with_scene(Scene::SettingsArchived);
     app.frame();
@@ -172,10 +174,5 @@ fn an_environment_added_while_archived_shows_loads_its_archive() {
         ));
     });
     app.settle(60);
-    let archive = app.rt.state.settings.archived.get(url);
-    assert!(
-        archive.is_some_and(|a| !matches!(a.listing, Listing::Loading)),
-        "the new environment's archive was asked for and answered"
-    );
     assert!(app.rt.find(&format!("archived-{url}")).is_some());
 }

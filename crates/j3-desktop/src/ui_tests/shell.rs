@@ -2,12 +2,12 @@
 
 use std::sync::Arc;
 
-use j3_client::ConnectionStatus;
+use j3_client::Status;
 use rune::Key;
 use serde_json::{Value, json};
 
 use super::{
-    harness::{Harness, bottom, primary, serve, temp_dir, top},
+    harness::{Harness, bottom, create_project, primary, serve, temp_dir, top},
     omp::install_fake_omp,
 };
 use crate::{
@@ -40,13 +40,13 @@ fn the_titlebar_and_text_measure_frame_the_thread() {
     let toggle = app.element("sidebar-toggle").expect("the sidebar toggle");
     assert!(toggle.rect[0] >= lights, "{:?}", toggle.rect);
     assert!(bottom(&toggle) <= row);
-    let header = app.element("t3-header").expect("the T3 header");
+    let header = app.element("inbox-header").expect("the Inbox header");
     assert_eq!(top(&header), row);
     let filter = app.element("project-filter").expect("the project filter");
     assert!(top(&filter) >= row && bottom(&filter) <= bottom(&header));
-    let list = app.element("t3-list").expect("the T3 list");
+    let list = app.element("inbox-list").expect("the Inbox list");
     assert!(top(&list) >= bottom(&header));
-    // T3's header offers adding a project next to the new-thread button.
+    // The Inbox header offers adding a project next to the new-thread button.
     assert!(app.exists("add-project"));
     // The conversation uses the (tighter) default measure.
     let composer = app.element("composer").expect("the composer");
@@ -99,15 +99,17 @@ fn usage_shows_the_model_provider_refreshes_on_press_and_keeps_the_cache_on_fail
     });
 
     app.click("usage");
-    // Only the model's provider (opencode-go, report 1) is listed.
+    // Only the model's provider (opencode-go, account 1) is listed.
     app.until("the popover lists the provider", |h| {
         h.exists("usage-local-1-0")
     });
     assert!(!app.exists("usage-local-0-0"));
     let cached: Value = serde_json::from_slice(&std::fs::read(&cache).unwrap()).unwrap();
     assert_eq!(
-        cached["local"]["reports"][1]["limits"][0]["amount"]["usedFraction"],
-        0.78
+        cached["local"]["accounts"][1]["limits"][0]["used"]
+            .as_f64()
+            .map(f64::round),
+        Some(78.0)
     );
 
     // A failed refresh shows its error next to the cached snapshot.
@@ -124,15 +126,15 @@ fn usage_shows_the_model_provider_refreshes_on_press_and_keeps_the_cache_on_fail
 #[test]
 fn settings_switch_the_workflow_and_persist() {
     let mut app = Harness::start("settings");
-    // T3 is the default.
-    app.until("the T3 list shows", |h| h.exists("t3-list"));
+    // Inbox is the default.
+    app.until("the Inbox list shows", |h| h.exists("inbox-list"));
     assert!(!app.exists("herdr-spaces"));
     assert!(app.exists("project-filter"));
 
     // ⌘, opens Settings over the window; herdr is one click away.
     app.key(primary(','));
     app.until("Settings opens", |h| h.exists("close-settings"));
-    assert!(!app.exists("t3-list"));
+    assert!(!app.exists("inbox-list"));
     app.click("workflow-herdr");
     app.until_config("herdr is saved", |config| {
         config["ui"]["workflow"] == "herdr"
@@ -149,21 +151,23 @@ fn settings_switch_the_workflow_and_persist() {
     // Escape leaves Settings onto the herdr sidebar.
     app.press(Key::Escape);
     app.until("the herdr sidebar shows", |h| {
-        !h.exists("close-settings") && h.exists("herdr-spaces") && !h.exists("t3-list")
+        !h.exists("close-settings") && h.exists("herdr-spaces") && !h.exists("inbox-list")
     });
 
-    // And back to T3 with the Done button.
+    // And back to Inbox with the Done button.
     app.key(primary(','));
-    app.until("Settings opens", |h| h.exists("workflow-t3"));
-    app.click("workflow-t3");
-    app.until_config("T3 is saved", |config| config["ui"]["workflow"] == "t3");
+    app.until("Settings opens", |h| h.exists("workflow-inbox"));
+    app.click("workflow-inbox");
+    app.until_config("Inbox is saved", |config| {
+        config["ui"]["workflow"] == "inbox"
+    });
     app.click("close-settings");
-    app.until("the T3 list shows", |h| h.exists("t3-list"));
+    app.until("the Inbox list shows", |h| h.exists("inbox-list"));
 
     // What was saved is what the next launch loads.
     let path = app.config_dir.join("desktop.json");
     let preferences = Preferences::load(Some(path), "test-host");
-    assert_eq!(preferences.ui().workflow, Workflow::T3);
+    assert_eq!(preferences.ui().workflow, Workflow::Inbox);
     assert!(!preferences.ui().working_shelf);
     assert!(!preferences.ui().sounds);
 }
@@ -200,7 +204,7 @@ fn a_remote_that_is_the_local_server_is_listed_once() {
         live.iter().all(|connection| {
             let state = connection.state();
             let state = state.borrow();
-            state.status == ConnectionStatus::Live && state.shell.loaded
+            state.status == Status::Connected && state.shell.synced
         })
     });
     // A project on each server: the local one is listed once, not again under the twin;
@@ -208,7 +212,7 @@ fn a_remote_that_is_the_local_server_is_listed_once() {
     app.project();
     let remote = connections[2].clone();
     let dir = app.project_dir.to_string_lossy().into_owned();
-    app.block_on(async move { remote.create_project("Remote", &dir).await })
+    app.block_on(async move { create_project(&remote, "Remote", dir).await })
         .unwrap();
     app.until("both spaces show", |h| {
         h.in_sidebar("Demo, unknown") && h.in_sidebar("Remote, unknown")

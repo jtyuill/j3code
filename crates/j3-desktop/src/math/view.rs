@@ -1,11 +1,11 @@
 //! Chat markdown as an element: rune-kit's `Markdown` with math typeset (spec §6.2, §6.5).
 //!
-//! Display formulas are images `Markdown` draws ([`super::prepare`]). Formulas inside a line
-//! are drawn in the line: a top-level paragraph that holds one is drawn here as a rich text
-//! styled the way `Markdown` styles a paragraph, each formula a typeset image set in its line
-//! with [`El::inline_icon`] before a word joiner standing in its place. Elsewhere (lists,
+//! Display formulas are images `Markdown` draws ([`j3_text::math::prepare`]). Formulas inside
+//! a line are drawn in the line: a top-level paragraph that holds one is drawn here as a rich
+//! text styled the way `Markdown` styles a paragraph, each formula a typeset image set in its
+//! line with [`El::inline_icon`] before a word joiner standing in its place. Elsewhere (lists,
 //! quotes, tables) `Markdown` can only draw text, so a formula there reads as its Unicode
-//! approximation (see [`super::inline`]).
+//! approximation (see [`j3_text::math::inline`]).
 //!
 //! Markdown images (`![](…)`) come from the thread's server through `J3::image`. A part whose
 //! images are still arriving draws again when they are ready: [`Doc::wait`] collects the
@@ -18,16 +18,14 @@ use std::{
     rc::Rc,
 };
 
+use j3_text::math::{Formula, SCALE, inline, padded, parse_src, prepare};
 use rune::{Color, El, Image, InlineIcon, Link, LinkPaint, Span, TextStyle, col, el, memo, rich};
 use rune_kit::{
     Kit, Markdown,
     markdown::{Block, Inline, Style, parse_cached},
 };
 
-use super::{
-    Formula, Key, MATH_SCALE, SVG_EM, Typeset, Typesetter, inline, pack, parse_src, prepare,
-    ratex_color,
-};
+use super::{Typeset, Typesetter};
 use crate::{app::J3, environment::ImageRef, images::ImageLoad};
 
 /// Inter's ascent and descent per em: Rune centres an inline image on the letters of the word
@@ -77,9 +75,9 @@ enum Built {
     },
 }
 
-/// The parts of `text` and the images they draw, read through `s` for thread `thread_id` on
+/// The parts of `text` and the images they draw, read through `s` for a thread of project `project_id` on
 /// environment `env`.
-pub fn doc(s: &J3, env: &str, thread_id: &str, text: &str, look: Look) -> Doc {
+pub fn doc(s: &J3, env: &str, project_id: &str, text: &str, look: Look) -> Doc {
     let parts = parts(text, look.math);
     let mut doc = Doc {
         parts: Vec::with_capacity(parts.len()),
@@ -103,7 +101,7 @@ pub fn doc(s: &J3, env: &str, thread_id: &str, text: &str, look: Look) -> Doc {
                             )?;
                             Some((image, look.scale))
                         }),
-                        None => match s.image(env, &ImageRef::markdown(&src, thread_id)) {
+                        None => match s.image(env, &ImageRef::markdown(&src, project_id)) {
                             ImageLoad::Loaded(image) => {
                                 let density = s.images.density(&image);
                                 Some((image, density))
@@ -466,10 +464,7 @@ impl Typesetter {
         font_size: f32,
         scale: f32,
     ) -> Option<(rune::Pixels, f32)> {
-        let color = ratex_color(color);
-        let key: Key = (formula.key(), pack(color));
-        self.typeset(key, formula, color);
-        let typeset = self.entries.get_mut(&key)?.1.as_mut()?;
+        let typeset = self.typeset(formula, color)?;
         Some(typeset.inline(cache, font_size, scale))
     }
 }
@@ -481,7 +476,7 @@ impl Typeset {
         font_size: f32,
         scale: f32,
     ) -> (rune::Pixels, f32) {
-        let em = font_size * MATH_SCALE;
+        let em = font_size * SCALE;
         // The letters' centre above the baseline, in the formula's em.
         let centre = (ASCENT - DESCENT) / 2.0 * font_size / em;
         let lift = self.height - self.depth - 2.0 * centre;
@@ -506,23 +501,6 @@ impl Typeset {
     }
 }
 
-/// `svg`, a formula `width` by `height` em, with `top` and `bottom` em of room added.
-fn padded(svg: &[u8], width: f32, height: f32, top: f32, bottom: f32) -> Vec<u8> {
-    let body = svg
-        .iter()
-        .position(|&b| b == b'>')
-        .map_or(svg, |end| &svg[end + 1..]);
-    let unit = SVG_EM as f32;
-    let (w, h) = (width * unit, (height + top + bottom) * unit);
-    let mut out = format!(
-        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 {} {w} {h}" width="{w}pt" height="{h}pt">"#,
-        -top * unit,
-    )
-    .into_bytes();
-    out.extend_from_slice(body);
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -539,16 +517,6 @@ mod tests {
         assert_eq!(gap(&para, &heading), 24.0);
         assert_eq!(gap(&heading, &para), 10.0);
         assert_eq!(gap(&para, &list), 12.0);
-    }
-
-    #[test]
-    fn padding_moves_the_formula_down_in_its_box() {
-        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 20" width="40pt" height="20pt"><path d="M0 0"/></svg>"#;
-        let out = String::from_utf8(padded(svg, 1.0, 0.5, 0.25, 0.0)).unwrap();
-        assert_eq!(
-            out,
-            r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -10 40 30" width="40pt" height="30pt"><path d="M0 0"/></svg>"#
-        );
     }
 
     #[test]

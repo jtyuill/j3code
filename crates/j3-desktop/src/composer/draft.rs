@@ -50,10 +50,10 @@ fn overlaps(taken: &[Range<usize>], range: &Range<usize>) -> bool {
 /// The magic keywords drawn with their gradient: standalone prose occurrences that a
 /// character follows (so `orchestrate` doesn't flicker while it is the last word), outside
 /// the chips.
-pub(crate) fn keyword_tokens(edit: &TextEdit) -> Vec<keywords::Found> {
+pub(crate) fn keyword_tokens(edit: &TextEdit) -> Vec<j3_text::keywords::Found> {
     let text = &edit.text;
     let pills = pill_ranges(edit);
-    keywords::find(text)
+    j3_text::keywords::find(text)
         .into_iter()
         .filter(|found| found.range.end < text.len() && !overlaps(&pills, &found.range))
         .collect()
@@ -124,7 +124,7 @@ pub(super) fn sync_mentions(edit: &mut TextEdit, choices: &[ModelChoice]) -> boo
     if edit.preedit.is_some() {
         return false;
     }
-    if !mention::allowed(&edit.text) {
+    if !j3_text::mention::allowed(&edit.text) {
         let chips: Vec<(Range<usize>, String)> = edit
             .pills()
             .filter_map(|(range, id)| Some((range, format!("^{}", id.strip_prefix("model:")?))))
@@ -135,7 +135,7 @@ pub(super) fn sync_mentions(edit: &mut TextEdit, choices: &[ModelChoice]) -> boo
         return !chips.is_empty();
     }
     let taken = pill_ranges(edit);
-    let wrap: Vec<(Range<usize>, String, String)> = mention::mentions(&edit.text)
+    let wrap: Vec<(Range<usize>, String, String)> = j3_text::mention::mentions(&edit.text)
         .into_iter()
         .filter(|m| m.range.end < edit.text.len() && !overlaps(&taken, &m.range))
         .filter_map(|m| {

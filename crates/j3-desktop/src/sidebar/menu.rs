@@ -1,13 +1,13 @@
-//! A T3 row's context menu (spec §4.3): t3's thread action menu (`buildThreadActionMenuItems`,
-//! threadActionMenu.logic.ts:117-216) without what j3 lacks (branches, guests, regeneration,
-//! copy, project settings). One menu is open at a time, at the secondary press.
+//! An Inbox row's context menu (spec §4.3, `docs/triage.md` §6.3): pin, settle (only where
+//! the server accepts it), snooze or wake, rename, mark unread, auto-settle, archive and
+//! delete. One menu is open at a time, at the secondary press.
 
-use j3_client::workflow::{TimeZone, pick_snooze_preset, resolve_snooze_presets};
+use j3_client::inbox::{Section, TimeZone, pick_snooze_preset, snooze_presets};
 use rune::{El, PointerPress, Tx};
 use rune_kit::{Kit, Menu, MenuEntry, MenuItem};
 use time::OffsetDateTime;
 
-use super::{ThreadCommand, ThreadKey, t3::T3Row};
+use super::{InboxRow, ThreadCommand, ThreadKey};
 use crate::{app::J3, dialogs::Dialog};
 
 /// The open row menu: whose, where (layer points: the press's window point over the zoom
@@ -59,9 +59,9 @@ impl J3 {
     fn snooze_preset(&mut self, key: &ThreadKey, id: &str) {
         let zone = TimeZone::system();
         let now = self.clock.now;
-        let shown = resolve_snooze_presets(now, &zone);
+        let shown = snooze_presets(now, &zone);
         if let Some(preset) = pick_snooze_preset(&shown, id, now, &zone) {
-            self.menu_command(key, ThreadCommand::Snooze(preset.snoozed_until));
+            self.menu_command(key, ThreadCommand::Snooze(preset.until));
         } else {
             self.close_row_menu();
         }
@@ -69,7 +69,13 @@ impl J3 {
 }
 
 /// The menu for `row`, opened by `menu`, into `layer`. Returns its (empty) anchor element.
-pub fn build(row: &T3Row, menu: &RowMenu, now: OffsetDateTime, k: &Kit, layer: &mut Vec<El>) -> El {
+pub fn build(
+    row: &InboxRow,
+    menu: &RowMenu,
+    now: OffsetDateTime,
+    k: &Kit,
+    layer: &mut Vec<El>,
+) -> El {
     let key = &row.key;
     let command = |label: &str, command: ThreadCommand| {
         let key = key.clone();
@@ -84,13 +90,14 @@ pub fn build(row: &T3Row, menu: &RowMenu, now: OffsetDateTime, k: &Kit, layer: &
             command("Unpin thread", ThreadCommand::Unpin)
         } else {
             command("Pin thread", ThreadCommand::Pin(None))
-        })
-        .item(if row.settled {
-            command("Un-settle thread", ThreadCommand::Unsettle)
-        } else {
-            command("Settle thread", ThreadCommand::Settle)
         });
-    m = if row.section == j3_client::workflow::T3Section::Snoozed {
+    // Settle shows only where the server accepts it (`docs/triage.md` §12.1(3)).
+    if row.settled {
+        m = m.item(command("Un-settle thread", ThreadCommand::Unsettle));
+    } else if row.settleable {
+        m = m.item(command("Settle thread", ThreadCommand::Settle));
+    }
+    m = if row.section == Section::Snoozed {
         m.item(command("Wake thread", ThreadCommand::Wake))
     } else if row.snoozable {
         m.item(
@@ -144,7 +151,7 @@ pub fn build(row: &T3Row, menu: &RowMenu, now: OffsetDateTime, k: &Kit, layer: &
 /// dialog).
 fn snooze_entries(key: &ThreadKey, now: OffsetDateTime) -> Vec<MenuEntry> {
     let zone = TimeZone::system();
-    let mut entries: Vec<MenuEntry> = resolve_snooze_presets(now, &zone)
+    let mut entries: Vec<MenuEntry> = snooze_presets(now, &zone)
         .into_iter()
         .map(|preset| {
             let key = key.clone();

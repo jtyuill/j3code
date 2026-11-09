@@ -4,9 +4,9 @@
 
 use std::{ops::Range, sync::Arc, time::Duration};
 
-use j3_client::t3::{
-    assets::AssetResource,
-    orchestration::{RunStatus, TurnItemKind, UserMessageInputIntent},
+use j3_client::{
+    entities::{Delivery, ItemKind, TurnStatus},
+    methods::ImageUrlParams,
 };
 use rune::{ElementInfo, Key, KeyEvent, Mods};
 use serde_json::json;
@@ -98,11 +98,11 @@ fn a_pending_question_is_answered_from_its_card() {
         serde_json::to_value(&responses[0]).unwrap(),
         json!({"type": "extension_ui_response", "id": "ui-1", "value": "beta"})
     );
-    app.until_thread("the run continues", &thread_id, |state| {
-        state.pending_user_inputs().is_empty()
+    app.until_thread("the turn continues", &thread_id, |state| {
+        state.open_requests().next().is_none()
             && state
-                .active_run()
-                .is_some_and(|run| run.status == RunStatus::Running)
+                .active_turn()
+                .is_some_and(|turn| turn.status == TurnStatus::Running)
     });
     app.until("the card goes", |h| {
         !h.exists("question-card") && h.in_sidebar("Ask me, Working")
@@ -137,15 +137,15 @@ fn enter_queues_while_running_and_the_queued_message_can_steer() {
     // Enter queues the (trimmed) draft; it does not steer the running turn.
     app.press(Key::Enter);
     app.until_thread("the message is queued", &thread_id, |state| {
-        state.queued_runs().len() == 1
+        state.queue.len() == 1
     });
     let queued = {
         let handle = app.connection.thread(&thread_id);
         let state = handle.state();
         let state = state.borrow();
-        let queued = &state.queued_runs()[0];
+        let queued = &state.queue[0];
         assert_eq!(queued.text, "queue me");
-        queued.run.id.clone()
+        queued.id.clone()
     };
     let row = format!("queued-{queued}");
     app.until("the queue panel lists it", |h| {
@@ -163,11 +163,10 @@ fn enter_queues_while_running_and_the_queued_message_can_steer() {
     app.click(&format!("steer-{queued}"));
     app.until_called("steer:queue me");
     app.until_thread("the message steers", &thread_id, |state| {
-        state.queued_runs().is_empty()
-            && state.feed().iter().any(|row| {
-                matches!(&row.item.kind, TurnItemKind::UserMessage(m)
-                    if m.input_intent == UserMessageInputIntent::PromotedQueuedToSteer
-                        && m.text == "queue me")
+        state.queue.is_empty()
+            && state.items.iter().any(|item| {
+                matches!(&item.kind, ItemKind::User(user)
+                    if user.delivery == Delivery::Steer && user.text == "queue me")
             })
     });
 }
@@ -181,8 +180,8 @@ fn stop_interrupts_the_run() {
     // The Stop button.
     app.click("send-message");
     app.until_called("abort");
-    app.until_thread("the run ends", &thread_id, |state| {
-        state.active_run().is_none()
+    app.until_thread("the turn ends", &thread_id, |state| {
+        state.active_turn().is_none()
     });
     app.until("the button offers Send", |h| {
         !h.stoppable()
@@ -200,15 +199,14 @@ fn stop_interrupts_the_run() {
     app.key(primary('.'));
     app.until("the run stops", |h| !h.stoppable());
     assert_eq!(app.script.count("abort"), 2);
-    app.until_thread("two runs were interrupted", &thread_id, |state| {
-        state.active_run().is_none()
-            && state.projection.as_ref().is_some_and(|p| {
-                p.runs
-                    .iter()
-                    .filter(|run| run.status == RunStatus::Interrupted)
-                    .count()
-                    == 2
-            })
+    app.until_thread("two turns were stopped", &thread_id, |state| {
+        state.active_turn().is_none()
+            && state
+                .turns
+                .iter()
+                .filter(|turn| turn.status == TurnStatus::Stopped)
+                .count()
+                == 2
     });
 }
 
@@ -323,8 +321,8 @@ fn tool_and_host_images_come_from_the_threads_server() {
     let project_id = app.project();
     let thread_id = app.open_running_thread(&project_id, "look");
 
-    // A tool that returns an image: the row draws it, fetched from the server as a
-    // `tool-output-image` asset.
+    // A tool that returns an image: the row draws it, fetched from the server as an
+    // attachment.
     app.script
         .emit(json!({"type": "tool_execution_start", "toolCallId": "c1",
         "toolName": "read", "args": {"path": "plot.png"}}));
@@ -337,19 +335,40 @@ fn tool_and_host_images_come_from_the_threads_server() {
     );
     app.until("the image shows", |h| h.has_label("Tool output image"));
 
-    // Markdown images name files on the thread's host (`workspace-file`): images in the
-    // project are served; other files and escapes are not.
-    let fetch = |path: &str| {
-        let connection = app.connection.clone();
-        let resource = AssetResource::WorkspaceFile {
-            thread_id: thread_id.clone(),
-            path: path.to_owned(),
-        };
+    let image = app
+        .connection
+        .thread(&thread_id)
+        .state()
+        .borrow()
+        .items
+        .iter()
+        .find_map(|item| match &item.kind {
+            ItemKind::Tool(tool) => tool.output.as_ref()?.images.first().cloned(),
+            _ => None,
+        })
+        .expect("the tool's output image");
+    let get = |url: String| {
         app.block_on(async move {
-            let url = connection.resource_url(resource).await.ok()?;
             let response = reqwest::get(url).await.ok()?.error_for_status().ok()?;
             Some(response.bytes().await.ok()?.to_vec())
         })
+    };
+    assert_eq!(
+        get(app.connection.attachment_url(&image.attachment_id)),
+        Some(png.clone())
+    );
+
+    // Markdown images name files in the thread's project on its host
+    // (`projects.imageUrl`, project-relative): images in the project are served; other
+    // files and escapes are not.
+    let fetch = |path: &str| {
+        let connection = app.connection.clone();
+        let params = ImageUrlParams {
+            project_id: project_id.clone(),
+            path: path.to_owned(),
+        };
+        let url = app.block_on(async move { connection.projects_image_url(params).await });
+        get(app.connection.url(&url.ok()?.url))
     };
     assert_eq!(fetch("plot.png"), Some(png));
     assert_eq!(fetch("notes.txt"), None);

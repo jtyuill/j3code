@@ -1,7 +1,7 @@
-//! T3's drag and drop (spec §4.3): every row outside Working drags; a card with its title
-//! follows the pointer, and the drop target under it (a row, the drag-only Pinned / Active
-//! boundaries, the Settled header or the Settled shelf) lights up. A drop runs the commands
-//! `T3Rows::plan` makes from `j3_client::workflow::plan_drop`.
+//! The Inbox's drag and drop (spec §4.3, `docs/triage.md` §6.4): every row outside Working
+//! drags; a card with its title follows the pointer, and the drop target under it (a row, the
+//! drag-only Pinned / Active boundaries, the Settled header or the Settled shelf) lights up. A
+//! drop runs the commands `InboxRows::plan` makes from `j3_client::inbox::plan_drop`.
 //!
 //! Drop targets report where they are drawn (`El::on_drawn_layout_tx`, live only), so a drop
 //! finds what is under the pointer in window points, whatever the zoom or scroll.
@@ -9,20 +9,20 @@
 use rune::{Drag, El, Phase, Tx, row, text};
 use rune_kit::Kit;
 
-use super::{T3Rows, ThreadKey, t3::T3Row};
+use super::{InboxRow, InboxRows, ThreadKey};
 use crate::app::J3;
 
 /// Pointer travel (points) before a press on a row becomes a drag.
 const DRAG_START: f32 = 4.0;
 
-/// The drop target of the Pinned boundary (t3's `PinnedHeader` slot).
+/// The drop target of the Pinned boundary (the `PinnedHeader` slot).
 pub const DROP_PINNED: &str = "drop-pinned";
-/// The drop target of the Active boundary (t3's `PinnedDivider` slot).
+/// The drop target of the Active boundary (the `PinnedDivider` slot).
 pub const DROP_ACTIVE: &str = "drop-active";
 /// The Settled shelf's header.
 pub const SHELF_SETTLED: &str = "shelf-settled";
-/// The Settled shelf's rows and empty space (t3's `SettledPlaceholder`).
-pub const SETTLED_LIST: &str = "t3-settled";
+/// The Settled shelf's rows and empty space (the `SettledPlaceholder` slot).
+pub const SETTLED_LIST: &str = "inbox-settled";
 
 /// A row being dragged.
 #[derive(Debug, Clone)]
@@ -33,10 +33,10 @@ pub struct DragState {
     pub pointer: [f32; 2],
 }
 
-impl T3Rows {
+impl InboxRows {
     /// The list slot drop target `target` (an element key) stands for, if it takes this drop.
     pub fn target_slot(&self, target: &str) -> Option<usize> {
-        use j3_client::workflow::ListMarker;
+        use j3_client::inbox::ListMarker;
         match target {
             DROP_PINNED => self.marker_index(ListMarker::PinnedHeader),
             DROP_ACTIVE => self.marker_index(ListMarker::PinnedDivider),
@@ -53,7 +53,7 @@ impl T3Rows {
 impl J3 {
     /// The drop target under the dragged row's pointer: the smallest drawn target that holds
     /// it and takes drops now.
-    pub fn drop_target_under(&self, rows: &T3Rows) -> Option<String> {
+    pub fn drop_target_under(&self, rows: &InboxRows) -> Option<String> {
         let drag = self.sidebar.drag.as_ref()?;
         let [x, y] = drag.pointer;
         self.sidebar
@@ -70,7 +70,7 @@ impl J3 {
         let Some(drag) = self.sidebar.drag.clone() else {
             return;
         };
-        let rows = self.t3_rows();
+        let rows = self.inbox_rows();
         let commands = self
             .drop_target_under(&rows)
             .and_then(|target| rows.target_slot(&target))
@@ -94,7 +94,7 @@ pub fn drop_target(e: El, target: String, over: bool, k: &Kit) -> El {
 }
 
 /// Makes row `r` draggable.
-pub fn draggable(e: El, r: &T3Row) -> El {
+pub fn draggable(e: El, r: &InboxRow) -> El {
     let key = r.key.clone();
     let title = r.title.clone();
     e.on_drag(move |s: &mut J3, d: &mut Drag, tx: &mut Tx| match d.phase {

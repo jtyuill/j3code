@@ -1,36 +1,38 @@
-//! Terminal sessions (t3's `TerminalManager`,
-//! `apps/server/src/terminal/Manager.ts`): one login shell per (thread,
-//! terminal id) in a PTY on this host, so a thread's terminal runs where its
-//! agent does. Output is kept in a capped history; `terminal.attach` replays
-//! it as a `snapshot` and then streams live events to every attached client.
-//! Sessions outlive their clients and end on `terminal.close`, when their
-//! thread is deleted, or when the server shuts down.
+//! Terminals (wire.md §5.11): one login shell per (thread, terminal id) in a
+//! PTY on this host, started in the thread's project directory, so a
+//! thread's terminal runs where its agent does. Output is kept in a capped
+//! history; `terminal.attach` replays it as a `snapshot` and then streams
+//! live items to every attached client. Sessions outlive their clients and
+//! end on `terminal.close`, when their thread is deleted, or when the server
+//! shuts down.
 //!
 //! Each shell's PTY is read on its own OS thread, never on the runtime.
 
 use std::{
     borrow::Cow,
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     io::{Read, Write},
     path::Path,
     sync::{Arc, Mutex, MutexGuard, PoisonError},
 };
 
 use futures_util::stream::{self, BoxStream, StreamExt};
-use j3_protocol::t3::{
-    now_iso,
-    terminal::{
-        MAX_COLS, MAX_ROWS, TerminalAttachInput, TerminalAttachSnapshot, TerminalAttachStreamEvent,
-        TerminalCloseInput, TerminalEnv, TerminalError, TerminalErrorEvent, TerminalEventBase,
-        TerminalExited, TerminalNotice, TerminalOpenInput, TerminalOutput, TerminalResizeInput,
-        TerminalRestarted, TerminalSessionSnapshot, TerminalSessionStatus, TerminalWriteInput,
-    },
+use j3_protocol::v2::envelope::{Error, ErrorCode};
+use j3_protocol::v2::methods::{
+    AttachParams, TerminalCloseParams, TerminalItem, TerminalResizeParams, TerminalSnapshot,
+    TerminalState, TerminalWriteParams,
 };
 use portable_pty::{Child, ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tokio::sync::mpsc;
 
-/// Most history a session keeps (t3's `DEFAULT_MAX_TERMINAL_BUFFER_BYTES`).
+/// Most history a session keeps.
 pub const MAX_HISTORY_BYTES: usize = 512 * 1024;
+/// Widest terminal a client may ask for.
+const MAX_COLS: u16 = 1000;
+/// Tallest terminal a client may ask for.
+const MAX_ROWS: u16 = 500;
+/// Most characters one `terminal.write` sends.
+const MAX_WRITE_CHARS: usize = 65_536;
 /// Size of a shell started without one.
 const DEFAULT_SIZE: PtySize = PtySize {
     rows: 24,
@@ -42,7 +44,7 @@ const DEFAULT_SIZE: PtySize = PtySize {
 const READ_CHUNK: usize = 16 * 1024;
 
 type Key = (String, String);
-type Subscriber = mpsc::UnboundedSender<TerminalAttachStreamEvent>;
+type Subscriber = mpsc::UnboundedSender<TerminalItem>;
 
 /// Every terminal session of the server.
 #[derive(Default)]
@@ -51,19 +53,16 @@ pub struct Terminals {
 }
 
 struct Session {
-    thread_id: String,
     terminal_id: String,
     state: Mutex<State>,
 }
 
 struct State {
     cwd: String,
-    status: TerminalSessionStatus,
-    pid: Option<u32>,
+    status: TerminalState,
     history: History,
     exit_code: Option<i64>,
     exit_signal: Option<i64>,
-    updated_at: String,
     size: PtySize,
     process: Option<Process>,
     /// Bumped for every spawned shell, so a replaced shell's late output
@@ -92,29 +91,23 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// t3's `getTerminalLabel`: `term-3` is "Terminal 3".
-fn label(terminal_id: &str) -> String {
-    match terminal_id.strip_prefix("term-") {
-        Some(n) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => {
-            format!("Terminal {n}")
-        }
-        _ => terminal_id.chars().take(128).collect(),
-    }
+fn unavailable(message: impl Into<String>) -> Error {
+    Error::new(ErrorCode::Unavailable, message)
 }
 
-/// `cols`/`rows` clamped to the contract's ranges.
-fn pty_size(cols: u16, rows: u16) -> PtySize {
-    PtySize {
-        rows: rows.clamp(1, MAX_ROWS),
-        cols: cols.clamp(1, MAX_COLS),
+/// `cols`/`rows` as a PTY size; `bad_request` outside 1–1000 × 1–500.
+fn pty_size(cols: u16, rows: u16) -> Result<PtySize, Error> {
+    if !(1..=MAX_COLS).contains(&cols) || !(1..=MAX_ROWS).contains(&rows) {
+        return Err(Error::bad_request(format!(
+            "A terminal is 1–{MAX_COLS} columns by 1–{MAX_ROWS} rows, not {cols}×{rows}."
+        )));
+    }
+    Ok(PtySize {
+        rows,
+        cols,
         pixel_width: 0,
         pixel_height: 0,
-    }
-}
-
-/// The size an attach or open asks for: both `cols` and `rows`, or none.
-fn requested_size(cols: Option<u16>, rows: Option<u16>) -> Option<PtySize> {
-    Some(pty_size(cols?, rows?))
+    })
 }
 
 /// The user's login shell.
@@ -125,55 +118,35 @@ fn shell() -> String {
         .unwrap_or_else(|| "/bin/sh".to_owned())
 }
 
-fn check_cwd(cwd: &str) -> Result<(), TerminalError> {
+fn check_cwd(cwd: &str) -> Result<(), Error> {
     match std::fs::metadata(Path::new(cwd)) {
         Ok(meta) if meta.is_dir() => Ok(()),
-        Ok(_) => Err(TerminalError::cwd_not_directory(cwd)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            Err(TerminalError::cwd_not_found(cwd))
-        }
-        Err(error) => Err(TerminalError::cwd_stat(cwd, error.to_string())),
+        Ok(_) => Err(unavailable(format!("{cwd} is not a directory."))),
+        Err(error) => Err(unavailable(format!("{cwd}: {error}"))),
     }
 }
 
 impl Session {
-    fn base(&self) -> TerminalEventBase {
-        TerminalEventBase {
-            thread_id: self.thread_id.clone(),
-            terminal_id: self.terminal_id.clone(),
-            sequence: None,
-        }
-    }
-
-    fn snapshot(&self, state: &State) -> TerminalSessionSnapshot {
-        TerminalSessionSnapshot {
-            thread_id: self.thread_id.clone(),
-            terminal_id: self.terminal_id.clone(),
-            cwd: state.cwd.clone(),
-            worktree_path: None,
-            status: state.status,
-            pid: state.pid,
+    fn snapshot(state: &State) -> TerminalSnapshot {
+        TerminalSnapshot {
             history: state.history.text.clone(),
+            state: state.status,
             exit_code: state.exit_code,
             exit_signal: state.exit_signal,
-            label: label(&self.terminal_id),
-            updated_at: state.updated_at.clone(),
-            sequence: None,
         }
     }
 
-    /// Starts a shell in `state.cwd`. On failure the session is left in
-    /// `error` with the reason returned.
-    fn spawn(self: &Arc<Self>, state: &mut State, env: Option<&TerminalEnv>) -> Result<(), String> {
+    /// Starts a shell in `state.cwd`. On failure the session is left
+    /// `failed` with the reason returned.
+    fn spawn(
+        self: &Arc<Self>,
+        state: &mut State,
+        env: &BTreeMap<String, String>,
+    ) -> Result<(), String> {
         let result = self.try_spawn(state, env);
-        state.updated_at = now_iso();
         if let Err(message) = &result {
-            state.status = TerminalSessionStatus::Error;
-            state.pid = None;
-            tracing::warn!(
-                thread = %self.thread_id, terminal = %self.terminal_id, %message,
-                "starting terminal"
-            );
+            state.status = TerminalState::Failed;
+            tracing::warn!(terminal = %self.terminal_id, %message, "starting terminal");
         }
         result
     }
@@ -181,7 +154,7 @@ impl Session {
     fn try_spawn(
         self: &Arc<Self>,
         state: &mut State,
-        env: Option<&TerminalEnv>,
+        env: &BTreeMap<String, String>,
     ) -> Result<(), String> {
         let pty = native_pty_system()
             .openpty(state.size)
@@ -191,7 +164,7 @@ impl Session {
         command.cwd(&state.cwd);
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
-        for (key, value) in env.into_iter().flatten() {
+        for (key, value) in env {
             command.env(key, value);
         }
         let child = pty
@@ -214,8 +187,7 @@ impl Session {
             writer: Arc::new(Mutex::new(writer)),
             killer: Some(child.clone_killer()),
         });
-        state.status = TerminalSessionStatus::Running;
-        state.pid = child.process_id();
+        state.status = TerminalState::Running;
         state.exit_code = None;
         state.exit_signal = None;
         let session = Arc::clone(self);
@@ -257,17 +229,14 @@ impl Session {
         if let Some(mut process) = state.process.take() {
             process.killer = None;
         }
-        state.status = TerminalSessionStatus::Exited;
-        state.pid = None;
+        state.status = TerminalState::Exited;
         state.exit_code = exit_code;
         state.exit_signal = exit_signal;
-        state.updated_at = now_iso();
-        let event = TerminalAttachStreamEvent::Exited(TerminalExited {
-            base: self.base(),
+        let item = TerminalItem::Exited {
             exit_code,
             exit_signal,
-        });
-        broadcast(&mut state.subscribers, event);
+        };
+        broadcast(&mut state.subscribers, item);
     }
 
     fn output(&self, generation: u64, data: String) {
@@ -279,11 +248,7 @@ impl Session {
             return;
         }
         state.history.push(&data);
-        let event = TerminalAttachStreamEvent::Output(TerminalOutput {
-            base: self.base(),
-            data,
-        });
-        broadcast(&mut state.subscribers, event);
+        broadcast(&mut state.subscribers, TerminalItem::Output { data });
     }
 
     /// Hangs the shell up and ends every attached stream with `closed`.
@@ -291,8 +256,7 @@ impl Session {
         let mut state = lock(&self.state);
         state.generation += 1;
         state.process = None;
-        let event = TerminalAttachStreamEvent::Closed(TerminalNotice { base: self.base() });
-        broadcast(&mut state.subscribers, event);
+        broadcast(&mut state.subscribers, TerminalItem::Closed);
         state.subscribers.clear();
     }
 
@@ -307,14 +271,13 @@ impl Session {
                 .map_err(|error| error.to_string())?;
         }
         state.size = size;
-        state.updated_at = now_iso();
         Ok(())
     }
 }
 
-/// Sends `event` to every subscriber, dropping detached ones.
-fn broadcast(subscribers: &mut Vec<Subscriber>, event: TerminalAttachStreamEvent) {
-    subscribers.retain(|subscriber| subscriber.send(event.clone()).is_ok());
+/// Sends `item` to every subscriber, dropping detached ones.
+fn broadcast(subscribers: &mut Vec<Subscriber>, item: TerminalItem) {
+    subscribers.retain(|subscriber| subscriber.send(item.clone()).is_ok());
 }
 
 /// Waits for the shell and returns its exit code or terminating signal.
@@ -333,41 +296,29 @@ fn wait(child: &mut dyn Child) -> (Option<i64>, Option<i64>) {
     }
 }
 
-/// When a session's shell is started.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Start {
-    /// Only when the session does not exist yet.
-    IfMissing,
-    /// Also when its shell exited or failed to start.
-    IfNotRunning,
-}
-
 impl Terminals {
     pub fn new() -> Self {
         Self::default()
     }
 
     /// The session for the key, starting its shell in `cwd` when it does
-    /// not exist or (with [`Start::IfNotRunning`]) is not running; a
-    /// running one is resized to `size`. Returns the session and why its
-    /// shell failed to start, if it did. Starts happen under the sessions
-    /// lock, so one key never gets two shells.
+    /// not exist or (with `restart`) is not running; a running one is
+    /// resized to `size`. Returns the session and why its shell failed to
+    /// start, if it did. Starts happen under the sessions lock, so one key
+    /// never gets two shells.
     fn ensure(
         &self,
-        thread_id: &str,
-        terminal_id: &str,
+        params: &AttachParams,
         cwd: &str,
         size: Option<PtySize>,
-        env: Option<&TerminalEnv>,
-        start: Start,
-    ) -> Result<(Arc<Session>, Option<String>), TerminalError> {
+    ) -> Result<(Arc<Session>, Option<String>), Error> {
         let mut sessions = lock(&self.sessions);
-        let key = (thread_id.to_owned(), terminal_id.to_owned());
+        let key = (params.thread_id.clone(), params.terminal_id.clone());
         if let Some(session) = sessions.get(&key) {
             let session = Arc::clone(session);
             drop(sessions);
             let mut state = lock(&session.state);
-            if start == Start::IfMissing || state.process.is_some() {
+            if params.restart != Some(true) || state.process.is_some() {
                 if let Some(size) = size {
                     let _ = Session::resize(&mut state, size);
                 }
@@ -379,127 +330,92 @@ impl Terminals {
             if let Some(size) = size {
                 state.size = size;
             }
-            let failure = session.spawn(&mut state, env).err();
-            let event = TerminalAttachStreamEvent::Restarted(TerminalRestarted {
-                base: session.base(),
-                snapshot: session.snapshot(&state),
-            });
-            broadcast(&mut state.subscribers, event);
+            let failure = session.spawn(&mut state, &params.env).err();
+            let item = TerminalItem::Restarted(Session::snapshot(&state));
+            broadcast(&mut state.subscribers, item);
+            if let Some(message) = &failure {
+                let message = message.clone();
+                broadcast(&mut state.subscribers, TerminalItem::Failed { message });
+                state.subscribers.clear();
+            }
             drop(state);
             return Ok((session, failure));
         }
         check_cwd(cwd)?;
         let session = Arc::new(Session {
-            thread_id: thread_id.to_owned(),
-            terminal_id: terminal_id.to_owned(),
+            terminal_id: params.terminal_id.clone(),
             state: Mutex::new(State {
                 cwd: cwd.to_owned(),
-                status: TerminalSessionStatus::Starting,
-                pid: None,
+                status: TerminalState::Running,
                 history: History::new(MAX_HISTORY_BYTES),
                 exit_code: None,
                 exit_signal: None,
-                updated_at: now_iso(),
                 size: size.unwrap_or(DEFAULT_SIZE),
                 process: None,
                 generation: 0,
                 subscribers: Vec::new(),
             }),
         });
-        let failure = session.spawn(&mut lock(&session.state), env).err();
+        let failure = session.spawn(&mut lock(&session.state), &params.env).err();
         sessions.insert(key, Arc::clone(&session));
         Ok((session, failure))
     }
 
-    /// `terminal.attach`: a `snapshot` of the session, then its live
-    /// events. A missing session starts in `input.cwd`, else in
-    /// `default_cwd`; an exited one restarts when `restartIfNotRunning`.
-    /// The stream ends after `closed`.
+    /// `terminal.attach`: a `snapshot` of the session, then its live items;
+    /// the stream ends after `closed` or `failed`. A missing session starts
+    /// its shell in `cwd` (the project directory); an exited one restarts
+    /// when `params.restart`. `cols` and `rows` size the shell only when
+    /// both are given.
     pub fn attach(
         &self,
-        input: &TerminalAttachInput,
-        default_cwd: &str,
-    ) -> Result<BoxStream<'static, TerminalAttachStreamEvent>, TerminalError> {
-        let cwd = input.cwd.as_deref().unwrap_or(default_cwd);
-        let start = if input.restart_if_not_running == Some(true) {
-            Start::IfNotRunning
-        } else {
-            Start::IfMissing
+        params: &AttachParams,
+        cwd: &str,
+    ) -> Result<BoxStream<'static, TerminalItem>, Error> {
+        let size = match (params.cols, params.rows) {
+            (Some(cols), Some(rows)) => Some(pty_size(cols, rows)?),
+            _ => None,
         };
-        let (session, failure) = self.ensure(
-            &input.thread_id,
-            &input.terminal_id,
-            cwd,
-            requested_size(input.cols, input.rows),
-            input.env.as_ref(),
-            start,
-        )?;
-        let (subscriber, events) = mpsc::unbounded_channel();
-        let mut first = vec![];
-        {
-            let mut state = lock(&session.state);
-            first.push(TerminalAttachStreamEvent::Snapshot(
-                TerminalAttachSnapshot {
-                    snapshot: session.snapshot(&state),
-                },
-            ));
-            if let Some(message) = failure {
-                first.push(TerminalAttachStreamEvent::Error(TerminalErrorEvent {
-                    base: session.base(),
-                    message,
-                }));
-            }
-            state.subscribers.push(subscriber);
+        let (session, failure) = self.ensure(params, cwd, size)?;
+        let mut state = lock(&session.state);
+        let snapshot = TerminalItem::Snapshot(Session::snapshot(&state));
+        if let Some(message) = failure {
+            let first = [snapshot, TerminalItem::Failed { message }];
+            return Ok(stream::iter(first).boxed());
         }
-        let live = stream::unfold(events, |mut events| async move {
-            let event = events.recv().await?;
-            Some((event, events))
+        let (subscriber, items) = mpsc::unbounded_channel();
+        state.subscribers.push(subscriber);
+        drop(state);
+        let live = stream::unfold(Some(items), |items| async move {
+            let mut items = items?;
+            let item = items.recv().await?;
+            let last = matches!(item, TerminalItem::Closed | TerminalItem::Failed { .. });
+            Some((item, (!last).then_some(items)))
         });
-        Ok(stream::iter(first).chain(live).boxed())
+        Ok(stream::once(async { snapshot }).chain(live).boxed())
     }
 
-    /// `terminal.open`: starts the session (or restarts it when it is not
-    /// running) and returns its snapshot.
-    pub fn open(
-        &self,
-        input: &TerminalOpenInput,
-    ) -> Result<TerminalSessionSnapshot, TerminalError> {
-        let (session, _) = self.ensure(
-            &input.thread_id,
-            &input.terminal_id,
-            &input.cwd,
-            requested_size(input.cols, input.rows),
-            input.env.as_ref(),
-            Start::IfNotRunning,
-        )?;
-        let state = lock(&session.state);
-        Ok(session.snapshot(&state))
-    }
-
-    fn session(&self, thread_id: &str, terminal_id: &str) -> Result<Arc<Session>, TerminalError> {
+    fn session(&self, thread_id: &str, terminal_id: &str) -> Result<Arc<Session>, Error> {
         lock(&self.sessions)
             .get(&(thread_id.to_owned(), terminal_id.to_owned()))
             .cloned()
-            .ok_or_else(|| TerminalError::session_lookup(thread_id, terminal_id))
+            .ok_or_else(|| Error::not_found("terminal", terminal_id))
     }
 
-    /// `terminal.write`: sends `data` to the shell, off the runtime (a full
-    /// PTY blocks the write).
-    pub async fn write(&self, input: TerminalWriteInput) -> Result<(), TerminalError> {
-        let session = self.session(&input.thread_id, &input.terminal_id)?;
-        let (writer, pid) = {
-            let state = lock(&session.state);
-            match &state.process {
-                Some(process) => (Arc::clone(&process.writer), state.pid.unwrap_or_default()),
-                None => {
-                    return Err(TerminalError::not_running(
-                        &input.thread_id,
-                        &input.terminal_id,
-                    ));
-                }
-            }
+    /// `terminal.write`: sends `data` (1–65,536 characters) to the shell,
+    /// off the runtime (a full PTY blocks the write).
+    pub async fn write(&self, params: TerminalWriteParams) -> Result<(), Error> {
+        let chars = params.data.chars().count();
+        if !(1..=MAX_WRITE_CHARS).contains(&chars) {
+            return Err(Error::bad_request(format!(
+                "Terminal input is 1–{MAX_WRITE_CHARS} characters, not {chars}."
+            )));
+        }
+        let session = self.session(&params.thread_id, &params.terminal_id)?;
+        let writer = match &lock(&session.state).process {
+            Some(process) => Arc::clone(&process.writer),
+            None => return Err(unavailable("The terminal's shell is not running.")),
         };
-        let data = input.data;
+        let data = params.data;
         let written = tokio::task::spawn_blocking(move || {
             let mut writer = lock(&writer);
             writer.write_all(data.as_bytes())?;
@@ -508,55 +424,35 @@ impl Terminals {
         .await;
         match written {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => Err(TerminalError::write(
-                input.thread_id,
-                input.terminal_id,
-                pid,
-                error.to_string(),
-            )),
-            Err(error) => Err(TerminalError::write(
-                input.thread_id,
-                input.terminal_id,
-                pid,
-                error.to_string(),
-            )),
+            Ok(Err(error)) => Err(unavailable(format!("writing the terminal: {error}"))),
+            Err(error) => Err(unavailable(format!("writing the terminal: {error}"))),
         }
     }
 
     /// `terminal.resize`.
-    pub fn resize(&self, input: &TerminalResizeInput) -> Result<(), TerminalError> {
-        let session = self.session(&input.thread_id, &input.terminal_id)?;
+    pub fn resize(&self, params: &TerminalResizeParams) -> Result<(), Error> {
+        let size = pty_size(params.cols, params.rows)?;
+        let session = self.session(&params.thread_id, &params.terminal_id)?;
         let mut state = lock(&session.state);
         if state.process.is_none() {
-            return Err(TerminalError::not_running(
-                &input.thread_id,
-                &input.terminal_id,
-            ));
+            return Err(unavailable("The terminal's shell is not running."));
         }
-        let size = pty_size(input.cols, input.rows);
-        Session::resize(&mut state, size).map_err(|cause| {
-            TerminalError::resize(
-                &input.thread_id,
-                &input.terminal_id,
-                state.pid.unwrap_or_default(),
-                (size.cols, size.rows),
-                cause,
-            )
-        })
+        Session::resize(&mut state, size)
+            .map_err(|cause| unavailable(format!("resizing the terminal: {cause}")))
     }
 
     /// `terminal.close`: one terminal, or every terminal of the thread
-    /// without a `terminalId`. Closing an unknown terminal is not an error.
-    pub fn close(&self, input: &TerminalCloseInput) {
-        match &input.terminal_id {
+    /// without a `terminalId`. Closing an unknown terminal succeeds.
+    pub fn close(&self, params: &TerminalCloseParams) {
+        match &params.terminal_id {
             Some(terminal_id) => {
-                let key = (input.thread_id.clone(), terminal_id.clone());
+                let key = (params.thread_id.clone(), terminal_id.clone());
                 let removed = lock(&self.sessions).remove(&key);
                 if let Some(session) = removed {
                     session.close();
                 }
             }
-            None => self.close_thread(&input.thread_id),
+            None => self.close_thread(&params.thread_id),
         }
     }
 
@@ -735,10 +631,177 @@ mod tests {
         assert!(history.text.chars().all(|c| c == 'é'));
     }
 
+    fn attach_params(restart: bool) -> AttachParams {
+        AttachParams {
+            thread_id: "t1".into(),
+            terminal_id: "term-1".into(),
+            cols: Some(80),
+            rows: Some(24),
+            env: BTreeMap::from([("J3_MARK".to_owned(), "marked".to_owned())]),
+            restart: Some(restart),
+        }
+    }
+
+    fn write_params(data: &str) -> TerminalWriteParams {
+        TerminalWriteParams {
+            thread_id: "t1".into(),
+            terminal_id: "term-1".into(),
+            data: data.into(),
+        }
+    }
+
+    /// Items until one matches, with the output seen on the way.
+    async fn until(
+        items: &mut BoxStream<'static, TerminalItem>,
+        done: impl Fn(&TerminalItem, &str) -> bool,
+    ) -> TerminalItem {
+        let mut output = String::new();
+        let wait = async {
+            loop {
+                let item = items.next().await.expect("stream ended");
+                if let TerminalItem::Output { data } = &item {
+                    output.push_str(data);
+                }
+                if done(&item, &output) {
+                    return item;
+                }
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(20), wait)
+            .await
+            .expect("terminal item timed out")
+    }
+
+    #[tokio::test]
+    async fn attach_write_resize_exit_restart_close() {
+        let terminals = Terminals::new();
+        let cwd = std::env::temp_dir();
+        let cwd = cwd.to_str().unwrap();
+
+        let mut items = terminals.attach(&attach_params(false), cwd).unwrap();
+        let Some(TerminalItem::Snapshot(first)) = items.next().await else {
+            panic!("snapshot first");
+        };
+        assert_eq!(first.state, TerminalState::Running);
+
+        terminals
+            .write(write_params("echo $J3_MARK-$((40+2))\n"))
+            .await
+            .unwrap();
+        until(&mut items, |_, output| output.contains("marked-42")).await;
+
+        let resize = |cols, rows| TerminalResizeParams {
+            thread_id: "t1".into(),
+            terminal_id: "term-1".into(),
+            cols,
+            rows,
+        };
+        terminals.resize(&resize(100, 30)).unwrap();
+        terminals.write(write_params("stty size\n")).await.unwrap();
+        until(&mut items, |_, output| output.contains("30 100")).await;
+        assert_eq!(
+            terminals.resize(&resize(0, 30)).unwrap_err().code,
+            ErrorCode::BadRequest
+        );
+        assert_eq!(
+            terminals.resize(&resize(80, 501)).unwrap_err().code,
+            ErrorCode::BadRequest
+        );
+        let unknown = TerminalResizeParams {
+            terminal_id: "term-9".into(),
+            ..resize(80, 24)
+        };
+        assert_eq!(
+            terminals.resize(&unknown).unwrap_err().code,
+            ErrorCode::NotFound
+        );
+        let empty = terminals.write(write_params("")).await.unwrap_err();
+        assert_eq!(empty.code, ErrorCode::BadRequest);
+        let huge = "x".repeat(MAX_WRITE_CHARS + 1);
+        assert_eq!(
+            terminals.write(write_params(&huge)).await.unwrap_err().code,
+            ErrorCode::BadRequest
+        );
+
+        terminals.write(write_params("exit 3\n")).await.unwrap();
+        let exited = until(&mut items, |item, _| {
+            matches!(item, TerminalItem::Exited { .. })
+        })
+        .await;
+        assert_eq!(
+            exited,
+            TerminalItem::Exited {
+                exit_code: Some(3),
+                exit_signal: None
+            }
+        );
+        assert_eq!(
+            terminals.write(write_params("x")).await.unwrap_err().code,
+            ErrorCode::Unavailable
+        );
+
+        // A second client gets the history replayed.
+        let mut replay = terminals.attach(&attach_params(false), cwd).unwrap();
+        let Some(TerminalItem::Snapshot(snapshot)) = replay.next().await else {
+            panic!("snapshot first");
+        };
+        assert_eq!(snapshot.state, TerminalState::Exited);
+        assert_eq!(snapshot.exit_code, Some(3));
+        assert!(snapshot.history.contains("marked-42"));
+
+        // Restarting keeps the history and tells attached clients.
+        let mut restarted = terminals.attach(&attach_params(true), cwd).unwrap();
+        let Some(TerminalItem::Snapshot(snapshot)) = restarted.next().await else {
+            panic!("snapshot first");
+        };
+        assert_eq!(snapshot.state, TerminalState::Running);
+        let Some(TerminalItem::Restarted(snapshot)) = items.next().await else {
+            panic!("restarted");
+        };
+        assert_eq!(snapshot.state, TerminalState::Running);
+        assert!(snapshot.history.contains("marked-42"));
+        terminals
+            .write(write_params("echo again-$((1+1))\n"))
+            .await
+            .unwrap();
+        until(&mut restarted, |_, output| output.contains("again-2")).await;
+
+        terminals.close(&TerminalCloseParams {
+            thread_id: "t1".into(),
+            terminal_id: None,
+            delete_history: None,
+        });
+        for mut stream in [items, replay, restarted] {
+            until(&mut stream, |item, _| *item == TerminalItem::Closed).await;
+            assert!(stream.next().await.is_none(), "stream ends after closed");
+        }
+        assert_eq!(
+            terminals.write(write_params("x")).await.unwrap_err().code,
+            ErrorCode::NotFound
+        );
+        // Closing an unknown terminal succeeds.
+        terminals.close(&TerminalCloseParams {
+            thread_id: "t1".into(),
+            terminal_id: Some("term-9".into()),
+            delete_history: None,
+        });
+    }
+
     #[test]
-    fn labels_follow_t3() {
-        assert_eq!(label("term-1"), "Terminal 1");
-        assert_eq!(label("term-12"), "Terminal 12");
-        assert_eq!(label("scratch"), "scratch");
+    fn attach_refuses_bad_sizes_and_missing_folders() {
+        let terminals = Terminals::new();
+        let mut params = attach_params(false);
+        params.cols = Some(1001);
+        let cwd = std::env::temp_dir();
+        let error = terminals
+            .attach(&params, cwd.to_str().unwrap())
+            .err()
+            .unwrap();
+        assert_eq!(error.code, ErrorCode::BadRequest);
+        let error = terminals
+            .attach(&attach_params(false), "/nonexistent/j3-terminal")
+            .err()
+            .unwrap();
+        assert_eq!(error.code, ErrorCode::Unavailable);
     }
 }

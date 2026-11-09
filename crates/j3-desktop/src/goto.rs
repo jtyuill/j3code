@@ -4,7 +4,7 @@
 //! ↑↓ move the selection, Enter jumps to the agent and closes. `Dialog::Goto` draws [`body`];
 //! the picker's state lives in `s.sidebar.goto`.
 
-use j3_client::workflow::AgentStatus;
+use j3_client::herdr::{AgentStatus, StatusIndicators};
 use rune::{Cx, El, Key, KeyEvent, Mods, ScrollSpec, Tx, col, row, spacer, text};
 use rune_kit::{Kit, TextInput};
 
@@ -279,7 +279,7 @@ fn entry(
     ix: usize,
     selected: bool,
     current: bool,
-    indicators: j3_client::workflow::StatusIndicators,
+    indicators: StatusIndicators,
     k: &Kit,
 ) -> El {
     let c = &k.c;

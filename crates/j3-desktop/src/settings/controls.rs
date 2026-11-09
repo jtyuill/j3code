@@ -1,6 +1,6 @@
 //! The building blocks Settings and the dialogs lay their forms out with: titled groups of
 //! setting rows (title and description beside a control), segmented choices whose segments
-//! carry the old button ids (`workflow-t3`, `snooze-unit-hours`, …), and number steppers.
+//! carry the old button ids (`workflow-inbox`, `snooze-unit-hours`, …), and number steppers.
 
 use rune::{El, Shadow, TextStyle, Tx, col, el, row, text};
 use rune_kit::{ControlSize, IconButton, IconButtonVariant, Kit};
@@ -281,7 +281,7 @@ mod tests {
 
     #[test]
     fn segment_keys_follow_the_old_button_ids() {
-        assert_eq!(segment_key("workflow", "T3"), "workflow-t3");
+        assert_eq!(segment_key("workflow", "Inbox"), "workflow-inbox");
         assert_eq!(
             segment_key("agent-order", "By space"),
             "agent-order-by-space"

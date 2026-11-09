@@ -1,25 +1,30 @@
 //! The connection supervisor: one task per [`crate::Connection`] that
-//! connects, keeps the server config, shell and subscribed threads current,
-//! and reconnects with backoff, forever.
+//! connects, keeps the catalog, shell and watched threads current, and
+//! reconnects with backoff until closed.
 //!
-//! Per attempt (ios-surface §1.1): `GET /.well-known/t3/environment` (protocol
-//! 2 required), WebSocket `/ws?…&orchestrationProtocol=2`, the
-//! `subscribeServerConfig` handshake (first item is the config snapshot), then
-//! `orchestration.subscribeShell` and one `orchestration.subscribeThread` per
-//! subscribed thread. Resubscriptions pass `afterSequence` when state is
-//! already loaded; items at or below the applied sequence are dropped and
-//! snapshots replace state wholesale.
+//! Per attempt: `GET /api/v1/info` (protocol [`PROTOCOL`] required), the
+//! WebSocket `/api/v1/ws?protocol=2`, `server.watch` (its first item is the
+//! catalog), then `shell.watch` and one `threads.watch` per watched thread.
+//! Resubscriptions pass `after` = the applied sequence when state is loaded
+//! (wire.md §6.2).
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
-
-use j3_protocol::t3::{
-    environment::{ExecutionEnvironmentDescriptor, ORCHESTRATION_PROTOCOL_VERSION},
-    methods::{SubscribeShellInput, SubscribeThreadInput},
-    orchestration::{ShellStreamItem, ThreadStreamItem},
-    server::{ServerConfig, ServerConfigStreamEvent, SubscribeServerConfigInput},
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
 };
-use reqwest::Url;
-use serde::de::DeserializeOwned;
+
+use j3_protocol::v2::{
+    PROTOCOL,
+    envelope::ErrorCode,
+    methods::{self, Catalog, WatchParams, WatchThreadParams},
+    streams::{ShellItem, ThreadItem},
+};
+use reqwest::{StatusCode, Url};
+use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use tokio::{
     sync::{mpsc, oneshot, watch},
@@ -29,9 +34,9 @@ use tokio::{
 use tracing::{debug, info, warn};
 
 use crate::{
-    ConnectionState, ConnectionStatus, Error, ShellState, ThreadState, ThreadSync,
-    rpc::{RpcStream, Session},
-    shell::apply_config,
+    ConnectionState, Error, Info, Status, ThreadSync, ThreadView,
+    rpc::{Failure, RpcStream, Session},
+    state::Cursor,
 };
 
 /// Reconnect backoff: 1 s doubling to 30 s.
@@ -39,7 +44,7 @@ const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// A connection that lasted this long resets the backoff.
 const STABLE_AFTER: Duration = Duration::from_secs(30);
-const DESCRIPTOR_TIMEOUT: Duration = Duration::from_secs(10);
+const INFO_TIMEOUT: Duration = Duration::from_secs(10);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 /// Resubscribing a failed stream on a live socket: 250 ms doubling to 30 s.
 const RESUBSCRIBE_MIN: Duration = Duration::from_millis(250);
@@ -64,13 +69,36 @@ pub(crate) struct Shared {
     pub(crate) http: reqwest::Client,
     pub(crate) state: watch::Sender<Arc<ConnectionState>>,
     pub(crate) session: watch::Sender<SessionSlot>,
+    /// A shell snapshot was applied, so `shell.sequence` can resume.
+    shell_loaded: AtomicBool,
 }
 
 impl Shared {
+    pub(crate) fn new(http_base: String, runtime: tokio::runtime::Handle) -> Self {
+        let base = Url::parse(&http_base)
+            .map_err(|e| format!("invalid server URL {http_base:?}: {e}"))
+            .and_then(|url| match url.scheme() {
+                "http" | "https" => Ok(url),
+                scheme => Err(format!(
+                    "invalid server URL {http_base:?}: expected http or https, not {scheme}"
+                )),
+            });
+        Self {
+            http_base,
+            base,
+            runtime,
+            http: reqwest::Client::new(),
+            state: watch::Sender::new(Arc::new(ConnectionState::default())),
+            session: watch::Sender::new(SessionSlot::Down),
+            shell_loaded: AtomicBool::new(false),
+        }
+    }
+
     pub(crate) fn update(&self, change: impl FnOnce(&mut ConnectionState)) {
         self.state.send_modify(|state| change(Arc::make_mut(state)));
     }
 
+    /// `path` (absolute, e.g. `/api/v1/info`) on the server.
     pub(crate) fn url(&self, path: &str) -> Result<Url, Error> {
         let base = self.base.as_ref().map_err(|e| Error::Http(e.clone()))?;
         base.join(path)
@@ -80,37 +108,24 @@ impl Shared {
     /// The live session, waiting up to [`CALL_WAIT`] for one.
     pub(crate) async fn ready_session(&self) -> Result<Session, Error> {
         let mut slots = self.session.subscribe();
-        let slot = match tokio::time::timeout(
-            CALL_WAIT,
-            slots.wait_for(|slot| !matches!(slot, SessionSlot::Down)),
-        )
-        .await
-        {
-            Ok(Ok(slot)) => slot.clone(),
-            Ok(Err(_)) => SessionSlot::Closed,
-            Err(_) => {
-                let reason = match &self.state.borrow().status {
-                    ConnectionStatus::Reconnecting { error, .. } => error.clone(),
-                    _ => format!("could not reach {}", self.http_base),
-                };
-                return Err(Error::Disconnected(reason));
-            }
-        };
-        match slot {
-            SessionSlot::Up(session) => Ok(session),
-            SessionSlot::Closed => Err(Error::Closed),
-            SessionSlot::Down => unreachable!("waited for a non-Down slot"),
+        let ready = slots.wait_for(|slot| !matches!(slot, SessionSlot::Down));
+        match tokio::time::timeout(CALL_WAIT, ready).await {
+            Ok(Ok(slot)) => match &*slot {
+                SessionSlot::Up(session) => Ok(session.clone()),
+                SessionSlot::Down | SessionSlot::Closed => Err(Error::Disconnected),
+            },
+            Ok(Err(_)) | Err(_) => Err(Error::Disconnected),
         }
     }
 }
 
 pub(crate) enum Command {
-    Subscribe {
+    Watch {
         thread_id: String,
         generation: u64,
-        state: watch::Sender<Arc<ThreadState>>,
+        state: watch::Sender<Arc<ThreadView>>,
     },
-    Unsubscribe {
+    Unwatch {
         thread_id: String,
         generation: u64,
     },
@@ -119,7 +134,7 @@ pub(crate) enum Command {
 
 struct Slot {
     generation: u64,
-    state: watch::Sender<Arc<ThreadState>>,
+    state: watch::Sender<Arc<ThreadView>>,
     task: Option<JoinHandle<()>>,
 }
 
@@ -161,13 +176,15 @@ pub(crate) async fn run(shared: Arc<Shared>, mut commands: mpsc::UnboundedReceiv
             }
         };
 
-        let error = match result {
+        let delay = match result {
             Ok(connected) => {
                 let connected_at = Instant::now();
                 let mut socket = supervisor.go_live(connected);
                 let reason = loop {
                     tokio::select! {
-                        reason = &mut socket => break reason.unwrap_or_else(|e| format!("socket task failed: {e}")),
+                        reason = &mut socket => {
+                            break reason.unwrap_or_else(|e| format!("socket task failed: {e}"));
+                        }
                         command = commands.recv() => {
                             if let Flow::Stop(ack) = supervisor.command(command) {
                                 return supervisor.stop(ack);
@@ -180,24 +197,20 @@ pub(crate) async fn run(shared: Arc<Shared>, mut commands: mpsc::UnboundedReceiv
                     failures = 0;
                 }
                 info!(base = %supervisor.shared.http_base, %reason, "disconnected");
-                reason
+                supervisor.reconnecting(&mut failures, reason)
             }
-            Err(error) => {
+            Err(Failure::Failed(error)) => {
                 debug!(base = %supervisor.shared.http_base, %error, "connecting failed");
-                error
+                supervisor.reconnecting(&mut failures, error)
+            }
+            Err(Failure::Incompatible(message)) => {
+                warn!(base = %supervisor.shared.http_base, %message, "incompatible server");
+                supervisor
+                    .shared
+                    .update(|state| state.status = Status::Incompatible { message });
+                BACKOFF_MAX
             }
         };
-
-        failures = failures.saturating_add(1);
-        supervisor.shared.update(|state| {
-            state.status = ConnectionStatus::Reconnecting {
-                attempt: failures,
-                error,
-            }
-        });
-        let delay = BACKOFF_MIN
-            .saturating_mul(1 << (failures - 1).min(5))
-            .min(BACKOFF_MAX);
         let sleep = tokio::time::sleep(delay);
         tokio::pin!(sleep);
         loop {
@@ -214,11 +227,22 @@ pub(crate) async fn run(shared: Arc<Shared>, mut commands: mpsc::UnboundedReceiv
 }
 
 impl Supervisor {
+    /// Publishes a failed attempt; the delay before the next.
+    fn reconnecting(&self, failures: &mut u32, error: String) -> Duration {
+        *failures = failures.saturating_add(1);
+        let attempt = *failures;
+        self.shared
+            .update(|state| state.status = Status::Reconnecting { attempt, error });
+        BACKOFF_MIN
+            .saturating_mul(1 << (attempt - 1).min(5))
+            .min(BACKOFF_MAX)
+    }
+
     fn command(&mut self, command: Option<Command>) -> Flow {
         match command {
             None => Flow::Stop(None),
             Some(Command::Close(ack)) => Flow::Stop(Some(ack)),
-            Some(Command::Subscribe {
+            Some(Command::Watch {
                 thread_id,
                 generation,
                 state,
@@ -227,9 +251,9 @@ impl Supervisor {
                     if let Some(task) = previous.task {
                         task.abort();
                     }
-                    // The handle was dropped and reopened before the
-                    // unsubscribe arrived: carry the state over.
-                    if state.borrow().projection.is_none() {
+                    // The handle was dropped and reopened before the unwatch
+                    // arrived: carry the state over.
+                    if state.borrow().thread.is_none() {
                         state.send_replace(previous.state.borrow().clone());
                     }
                 }
@@ -247,7 +271,7 @@ impl Supervisor {
                 );
                 Flow::Continue
             }
-            Some(Command::Unsubscribe {
+            Some(Command::Unwatch {
                 thread_id,
                 generation,
             }) => {
@@ -271,44 +295,44 @@ impl Supervisor {
         let Connected {
             session,
             socket,
-            descriptor,
-            config,
-            config_stream,
+            info,
+            catalog,
+            catalog_stream,
         } = connected;
-        let changed_environment = self
+        let other_server = self
             .shared
             .state
             .borrow()
-            .descriptor
+            .info
             .as_ref()
-            .is_some_and(|known| known.environment_id != descriptor.environment_id);
-        if changed_environment {
-            // A different server answers at this address: nothing carried over
-            // applies to it.
-            warn!(base = %self.shared.http_base, "the server's environment id changed");
+            .is_some_and(|known| known.server_id != info.server_id);
+        if other_server {
+            // A different server answers at this address: nothing carried
+            // over applies to it.
+            warn!(base = %self.shared.http_base, "the server id changed");
+            self.shared.shell_loaded.store(false, Ordering::Relaxed);
             for slot in self.slots.values() {
                 let thread_id = slot.state.borrow().thread_id.clone();
                 slot.state
-                    .send_replace(Arc::new(ThreadState::new(thread_id)));
+                    .send_replace(Arc::new(ThreadView::new(thread_id)));
             }
         }
         self.shared.update(|state| {
-            if changed_environment {
-                state.shell = ShellState::default();
-                state.workspaces.clear();
+            if other_server {
+                state.shell = Default::default();
             }
-            state.descriptor = Some(descriptor);
-            state.config = Some(config);
-            state.status = ConnectionStatus::Synchronizing;
-            state.shell.synchronized = false;
+            state.info = Some(info);
+            state.catalog = Some(catalog);
+            state.status = Status::Connected;
+            state.shell.synced = false;
         });
         self.shared
             .session
             .send_replace(SessionSlot::Up(session.clone()));
         let tasks = vec![
-            tokio::spawn(run_config(
+            tokio::spawn(run_catalog(
                 session.clone(),
-                config_stream,
+                catalog_stream,
                 Arc::clone(&self.shared),
             )),
             tokio::spawn(run_shell(session.clone(), Arc::clone(&self.shared))),
@@ -321,45 +345,50 @@ impl Supervisor {
         socket
     }
 
-    fn go_down(&mut self) {
+    fn end_live(&mut self) {
         if let Some(live) = self.live.take() {
             live.session.close();
             for task in live.tasks {
                 task.abort();
             }
         }
-        self.shared.session.send_replace(SessionSlot::Down);
         for slot in self.slots.values_mut() {
             if let Some(task) = slot.task.take() {
                 task.abort();
             }
-            slot.state.send_if_modified(|state| {
-                if state.sync == ThreadSync::Live {
-                    Arc::make_mut(state).sync = ThreadSync::Synchronizing;
+        }
+    }
+
+    fn go_down(&mut self) {
+        self.end_live();
+        self.shared.session.send_replace(SessionSlot::Down);
+        for slot in self.slots.values() {
+            slot.state.send_if_modified(|view| {
+                if view.sync == ThreadSync::Synced {
+                    Arc::make_mut(view).sync = ThreadSync::Loading;
                     true
                 } else {
                     false
                 }
             });
         }
-        self.shared.update(|state| state.shell.synchronized = false);
+        self.shared.state.send_if_modified(|state| {
+            if state.shell.synced {
+                Arc::make_mut(state).shell.synced = false;
+                true
+            } else {
+                false
+            }
+        });
     }
 
     fn stop(mut self, ack: Option<oneshot::Sender<()>>) {
-        if let Some(live) = self.live.take() {
-            live.session.close();
-            for task in live.tasks {
-                task.abort();
-            }
-        }
-        for slot in self.slots.values_mut() {
-            if let Some(task) = slot.task.take() {
-                task.abort();
-            }
-        }
+        self.end_live();
         self.shared.session.send_replace(SessionSlot::Closed);
-        self.shared
-            .update(|state| state.status = ConnectionStatus::Closed);
+        self.shared.update(|state| {
+            state.status = Status::Closed;
+            state.shell.synced = false;
+        });
         if let Some(ack) = ack {
             let _ = ack.send(());
         }
@@ -369,97 +398,106 @@ impl Supervisor {
 struct Connected {
     session: Session,
     socket: JoinHandle<String>,
-    descriptor: ExecutionEnvironmentDescriptor,
-    config: ServerConfig,
-    config_stream: RpcStream,
+    info: Info,
+    catalog: Catalog,
+    catalog_stream: RpcStream,
 }
 
-/// One connection attempt, through the config handshake.
-async fn connect(shared: Arc<Shared>) -> Result<Connected, String> {
-    let descriptor = fetch_descriptor(&shared).await?;
-    let version = descriptor.orchestration_protocol_version.unwrap_or(1);
-    if version != ORCHESTRATION_PROTOCOL_VERSION {
-        return Err(format!(
-            "{} speaks orchestration protocol {version}; this client needs {ORCHESTRATION_PROTOCOL_VERSION}",
-            shared.http_base
-        ));
-    }
-    let socket_url = socket_url(shared.base.as_ref().map_err(Clone::clone)?);
-    let (session, socket) = Session::connect(socket_url.as_str()).await?;
+/// One connection attempt, through the first catalog.
+async fn connect(shared: Arc<Shared>) -> Result<Connected, Failure> {
+    let info = fetch_info(&shared).await?;
+    let base = shared
+        .base
+        .as_ref()
+        .map_err(|e| Failure::Failed(e.clone()))?;
+    let (session, socket) = Session::connect(socket_url(base).as_str()).await?;
     let handshake = async {
-        let input = SubscribeServerConfigInput {
-            workspace_snapshots_on_demand: Some(true),
-            ..Default::default()
-        };
         let mut stream = session
-            .stream("subscribeServerConfig", encode(&input))
+            .stream(methods::SERVER_WATCH, Value::Object(Default::default()))
             .map_err(|e| e.to_string())?;
         let first = loop {
             match stream.next().await {
-                Some(Ok(values)) => {
-                    if let Some(first) = values.into_iter().next() {
+                Some(Ok(items)) => {
+                    if let Some(first) = items.into_iter().next() {
                         break first;
                     }
                 }
-                Some(Err(e)) => return Err(format!("server config: {e}")),
-                None => return Err("the server config stream ended".to_owned()),
+                Some(Err(e)) => return Err(format!("server.watch: {e}")),
+                None => return Err("server.watch ended before the catalog".to_owned()),
             }
         };
-        let event: ServerConfigStreamEvent = decode(first, "server config")?;
-        let ServerConfigStreamEvent::Snapshot(snapshot) = event else {
-            return Err("the server config stream did not start with a snapshot".to_owned());
-        };
-        if snapshot.config.environment.environment_id != descriptor.environment_id {
-            return Err(format!(
-                "{} reports two environment ids ({} over HTTP, {} over the socket)",
-                shared.http_base,
-                descriptor.environment_id,
-                snapshot.config.environment.environment_id
-            ));
-        }
-        Ok((snapshot.config, stream))
+        let catalog: Catalog = decode(first, "catalog").map_err(|e| e.to_string())?;
+        Ok((catalog, stream))
     };
     match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake).await {
-        Ok(Ok((config, config_stream))) => Ok(Connected {
+        Ok(Ok((catalog, catalog_stream))) => Ok(Connected {
             session,
             socket,
-            descriptor,
-            config,
-            config_stream,
+            info,
+            catalog,
+            catalog_stream,
         }),
         Ok(Err(error)) => {
             session.close();
-            Err(error)
+            Err(Failure::Failed(error))
         }
         Err(_) => {
             session.close();
-            Err("the server did not send its config in time".to_owned())
+            Err(Failure::Failed(
+                "the server did not send its catalog in time".to_owned(),
+            ))
         }
     }
 }
 
-async fn fetch_descriptor(shared: &Shared) -> Result<ExecutionEnvironmentDescriptor, String> {
+/// `GET /api/v1/info`; a server without it, or with another `protocol`, is
+/// incompatible.
+async fn fetch_info(shared: &Shared) -> Result<Info, Failure> {
     let url = shared
-        .url("/.well-known/t3/environment")
-        .map_err(|e| e.to_string())?;
+        .url("/api/v1/info")
+        .map_err(|e| Failure::Failed(e.to_string()))?;
     let response = shared
         .http
         .get(url.clone())
-        .timeout(DESCRIPTOR_TIMEOUT)
+        .timeout(INFO_TIMEOUT)
         .send()
         .await
-        .map_err(|e| format!("could not reach {}: {e}", shared.http_base))?;
+        .map_err(|e| Failure::Failed(format!("could not reach {}: {e}", shared.http_base)))?;
     let status = response.status();
-    if !status.is_success() {
-        return Err(format!("{url} answered {status}"));
+    if status == StatusCode::NOT_FOUND {
+        return Err(Failure::Incompatible(format!(
+            "{} does not speak j3 protocol {PROTOCOL} (no /api/v1/info); update the server.",
+            shared.http_base
+        )));
     }
-    response
+    if !status.is_success() {
+        return Err(Failure::Failed(format!("{url} answered {status}")));
+    }
+    let body: Value = response
         .json()
         .await
-        .map_err(|e| format!("{url} sent an unexpected descriptor: {e}"))
+        .map_err(|e| Failure::Failed(format!("{url} sent unexpected data: {e}")))?;
+    let protocol = body.get("protocol").and_then(Value::as_u64);
+    if protocol != Some(u64::from(PROTOCOL)) {
+        let speaks = protocol.map_or_else(
+            || "an unknown protocol".to_owned(),
+            |p| format!("protocol {p}"),
+        );
+        return Err(Failure::Incompatible(format!(
+            "{} speaks j3 {speaks}; this app needs protocol {PROTOCOL}. Update the {}.",
+            shared.http_base,
+            if protocol.is_some_and(|p| p > u64::from(PROTOCOL)) {
+                "app"
+            } else {
+                "server"
+            },
+        )));
+    }
+    serde_json::from_value(body)
+        .map_err(|e| Failure::Failed(format!("{url} sent an unexpected info body: {e}")))
 }
 
-/// `ws[s]://host[:port]/ws?clientSurface=desktop&orchestrationProtocol=2`.
+/// `ws[s]://host[:port]/api/v1/ws?protocol=2`.
 fn socket_url(base: &Url) -> Url {
     let mut url = base.clone();
     let scheme = if base.scheme() == "https" {
@@ -469,21 +507,60 @@ fn socket_url(base: &Url) -> Url {
     };
     url.set_scheme(scheme)
         .expect("http(s) URLs can switch to ws(s)");
-    url.set_path("/ws");
-    url.set_query(Some(&format!(
-        "clientSurface=desktop&orchestrationProtocol={ORCHESTRATION_PROTOCOL_VERSION}"
-    )));
+    url.set_path("/api/v1/ws");
+    url.set_query(Some(&format!("protocol={PROTOCOL}")));
     url.set_fragment(None);
     url
 }
 
-pub(crate) fn encode<T: serde::Serialize>(value: &T) -> Value {
+pub(crate) fn encode<T: Serialize>(value: &T) -> Value {
     serde_json::to_value(value).expect("wire types always encode")
 }
 
-fn decode<T: DeserializeOwned>(value: Value, what: &str) -> Result<T, String> {
-    serde_json::from_value(value).map_err(|e| format!("{what}: {e}"))
+pub(crate) fn decode<T: DeserializeOwned>(value: Value, what: &str) -> Result<T, Error> {
+    serde_json::from_value(value).map_err(|e| Error::Decode(format!("{what}: {e}")))
 }
+
+/// Decodes a batch of stream items. An item whose `type` this build does not
+/// know (a newer server) is skipped; a known one that fails to decode fails
+/// the batch.
+fn decode_items<T: DeserializeOwned>(
+    values: Vec<Value>,
+    known: &[&str],
+    what: &str,
+) -> Result<Vec<T>, Error> {
+    let mut items = Vec::with_capacity(values.len());
+    for value in values {
+        let kind = value.get("type").and_then(Value::as_str);
+        if !kind.is_some_and(|kind| known.contains(&kind)) {
+            debug!(?kind, "skipping an unknown {what}");
+            continue;
+        }
+        items.push(decode(value, what)?);
+    }
+    Ok(items)
+}
+
+const SHELL_ITEMS: &[&str] = &[
+    "snapshot",
+    "synced",
+    "project",
+    "project.removed",
+    "thread",
+    "thread.removed",
+];
+
+const THREAD_ITEMS: &[&str] = &[
+    "snapshot",
+    "synced",
+    "thread",
+    "turn",
+    "item",
+    "item.delta",
+    "request",
+    "queue",
+    "thread.removed",
+];
 
 fn resubscribe_delay(failures: u32) -> Duration {
     RESUBSCRIBE_MIN
@@ -491,27 +568,24 @@ fn resubscribe_delay(failures: u32) -> Duration {
         .min(RESUBSCRIBE_MAX)
 }
 
-/// Keeps `config` current after the handshake. The stream lives as long as
+/// Keeps `catalog` current after the handshake. The stream lives as long as
 /// the socket; if it ends, the session is dropped and reconnected.
-async fn run_config(session: Session, mut stream: RpcStream, shared: Arc<Shared>) {
+async fn run_catalog(session: Session, mut stream: RpcStream, shared: Arc<Shared>) {
     let reason = loop {
         match stream.next().await {
-            Some(Ok(values)) => {
-                let events: Result<Vec<ServerConfigStreamEvent>, _> = values
-                    .into_iter()
-                    .map(|value| decode(value, "server config"))
-                    .collect();
-                match events {
-                    Ok(events) => shared.update(|state| {
-                        for event in events {
-                            apply_config(&mut state.config, event);
-                        }
-                    }),
-                    Err(error) => break error,
+            Some(Ok(items)) => {
+                // Each item is a whole catalog; the last one wins.
+                let Some(last) = items.into_iter().next_back() else {
+                    continue;
+                };
+                match decode::<Catalog>(last, "catalog") {
+                    Ok(catalog) => shared.update(|state| state.catalog = Some(catalog)),
+                    Err(error) => break error.to_string(),
                 }
             }
-            Some(Err(e)) => break format!("server config: {e}"),
-            None => break "the server config stream ended".to_owned(),
+            Some(Err(Error::Disconnected)) => return,
+            Some(Err(e)) => break format!("server.watch: {e}"),
+            None => break "server.watch ended".to_owned(),
         }
     };
     warn!(base = %shared.http_base, %reason, "dropping the session");
@@ -522,54 +596,50 @@ async fn run_config(session: Session, mut stream: RpcStream, shared: Arc<Shared>
 async fn run_shell(session: Session, shared: Arc<Shared>) {
     let mut failures = 0;
     loop {
-        let input = {
-            let state = shared.state.borrow();
-            SubscribeShellInput {
-                after_sequence: state.shell.loaded.then_some(state.shell.snapshot_sequence),
-                request_completion_marker: Some(true),
-                ..Default::default()
-            }
-        };
-        shared.update(|state| {
-            state.shell.synchronized = false;
-            state.status = ConnectionStatus::Synchronizing;
-        });
-        let Ok(mut stream) = session.stream("orchestration.subscribeShell", encode(&input)) else {
+        let after = shared
+            .shell_loaded
+            .load(Ordering::Relaxed)
+            .then(|| shared.state.borrow().shell.sequence);
+        let mut cursor = Cursor::resume(after);
+        let Ok(mut stream) = session.stream(methods::SHELL_WATCH, encode(&WatchParams { after }))
+        else {
             return;
         };
         let error = loop {
-            match stream.next().await {
+            let items = match stream.next().await {
                 Some(Ok(values)) => {
-                    let items: Result<Vec<ShellStreamItem>, _> = values
-                        .into_iter()
-                        .map(|value| decode(value, "shell item"))
-                        .collect();
-                    let items = match items {
+                    match decode_items::<ShellItem>(values, SHELL_ITEMS, "shell item") {
                         Ok(items) => items,
-                        Err(error) => break Error::Decode(error),
-                    };
-                    failures = 0;
-                    shared.state.send_if_modified(|state| {
-                        let state = Arc::make_mut(state);
-                        let mut changed = false;
-                        for item in items {
-                            changed |= state.shell.apply(item);
-                        }
-                        if state.shell.synchronized && state.status != ConnectionStatus::Live {
-                            state.status = ConnectionStatus::Live;
-                            changed = true;
-                        }
-                        changed
-                    });
+                        Err(error) => break error,
+                    }
                 }
                 Some(Err(error)) => break error,
-                None => break Error::Decode("the shell stream ended".into()),
+                None => break Error::Decode("shell.watch ended".into()),
+            };
+            failures = 0;
+            let mut loaded = false;
+            shared.state.send_if_modified(|state| {
+                let shell = &mut Arc::make_mut(state).shell;
+                let mut changed = false;
+                for item in items {
+                    loaded |= matches!(item, ShellItem::Snapshot(_));
+                    changed |= shell.apply(&mut cursor, item);
+                }
+                changed
+            });
+            if loaded {
+                shared.shell_loaded.store(true, Ordering::Relaxed);
             }
         };
-        if matches!(error, Error::Disconnected(_)) {
+        if error == Error::Disconnected {
             return;
         }
         warn!(base = %shared.http_base, %error, "shell subscription failed");
+        shared.state.send_if_modified(|state| {
+            let changed = state.shell.synced;
+            Arc::make_mut(state).shell.synced = false;
+            changed
+        });
         tokio::time::sleep(resubscribe_delay(failures)).await;
         failures += 1;
     }
@@ -577,78 +647,67 @@ async fn run_shell(session: Session, shared: Arc<Shared>) {
 
 fn spawn_thread(
     session: &Session,
-    state: &watch::Sender<Arc<ThreadState>>,
+    state: &watch::Sender<Arc<ThreadView>>,
 ) -> Option<JoinHandle<()>> {
-    if state.borrow().sync == ThreadSync::Deleted {
+    if state.borrow().sync == ThreadSync::Missing {
         return None;
     }
     Some(tokio::spawn(run_thread(session.clone(), state.clone())))
 }
 
 /// Keeps one thread current; resubscribes on a failed stream; stops once the
-/// thread is deleted.
-async fn run_thread(session: Session, state: watch::Sender<Arc<ThreadState>>) {
+/// thread is missing.
+async fn run_thread(session: Session, state: watch::Sender<Arc<ThreadView>>) {
     let mut failures = 0;
     loop {
-        let input = {
-            let current = state.borrow();
-            SubscribeThreadInput {
-                thread_id: current.thread_id.clone(),
-                after_sequence: current.projection.is_some().then_some(current.sequence),
-                request_completion_marker: Some(true),
-                accept_bounded_snapshot: None,
-                accept_deferred_work: None,
-                accept_compact_turn_items: None,
-                accept_deduped_bodies: None,
-                accept_compact_ids: None,
+        let params = {
+            let view = state.borrow();
+            WatchThreadParams {
+                thread_id: view.thread_id.clone(),
+                after: view.thread.is_some().then_some(view.sequence),
             }
         };
-        state.send_if_modified(|current| {
-            if current.projection.is_some() && current.sync != ThreadSync::Synchronizing {
-                Arc::make_mut(current).sync = ThreadSync::Synchronizing;
-                true
-            } else {
-                false
-            }
-        });
-        let Ok(mut stream) = session.stream("orchestration.subscribeThread", encode(&input)) else {
+        let mut cursor = Cursor::resume(params.after);
+        let Ok(mut stream) = session.stream(methods::THREADS_WATCH, encode(&params)) else {
             return;
         };
-        let mut awaiting = true;
         let error = loop {
-            match stream.next().await {
+            let items = match stream.next().await {
                 Some(Ok(values)) => {
-                    let items: Result<Vec<ThreadStreamItem>, _> = values
-                        .into_iter()
-                        .map(|value| decode(value, "thread item"))
-                        .collect();
-                    let items = match items {
+                    match decode_items::<ThreadItem>(values, THREAD_ITEMS, "thread item") {
                         Ok(items) => items,
-                        Err(error) => break Error::Decode(error),
-                    };
-                    failures = 0;
-                    state.send_if_modified(|current| {
-                        let current = Arc::make_mut(current);
-                        let mut changed = false;
-                        for item in items {
-                            changed |= current.apply(item, &mut awaiting);
-                        }
-                        changed
-                    });
-                    if state.borrow().sync == ThreadSync::Deleted {
-                        return;
+                        Err(error) => break error,
                     }
                 }
                 Some(Err(error)) => break error,
-                None => break Error::Decode("the thread stream ended".into()),
+                None => break Error::Decode("threads.watch ended".into()),
+            };
+            failures = 0;
+            state.send_if_modified(|view| {
+                let view = Arc::make_mut(view);
+                let mut changed = false;
+                for item in items {
+                    changed |= view.apply(&mut cursor, item);
+                }
+                changed
+            });
+            if state.borrow().sync == ThreadSync::Missing {
+                return;
             }
         };
-        if matches!(error, Error::Disconnected(_)) {
-            return;
+        match &error {
+            Error::Disconnected => return,
+            Error::Server(server) if server.code == ErrorCode::NotFound => {
+                state.send_modify(|view| Arc::make_mut(view).sync = ThreadSync::Missing);
+                return;
+            }
+            _ => {}
         }
-        warn!(%error, thread = %state.borrow().thread_id, "thread subscription failed");
-        state.send_modify(|current| {
-            Arc::make_mut(current).sync = ThreadSync::Failed(error.to_string());
+        warn!(%error, thread = %params.thread_id, "thread subscription failed");
+        state.send_modify(|view| {
+            Arc::make_mut(view).sync = ThreadSync::Error {
+                message: error.to_string(),
+            };
         });
         tokio::time::sleep(resubscribe_delay(failures)).await;
         failures += 1;

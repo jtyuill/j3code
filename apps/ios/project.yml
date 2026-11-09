@@ -1,0 +1,108 @@
+# XcodeGen spec for the j3 iOS app. Generate the project with
+# `xcodegen generate` in this directory (apps/ios/README.md); the generated
+# J3Code.xcodeproj is not committed.
+#
+# The app links target/ios/J3MobileFFI.xcframework and compiles
+# target/ios/swift/j3_mobile.swift, both made by
+# contrib/ios/build-xcframework.sh.
+name: J3Code
+options:
+  bundleIdPrefix: dev.jacobyuill
+  deploymentTarget:
+    iOS: "18.0"
+  createIntermediateGroups: true
+  generateEmptyDirectories: true
+settings:
+  base:
+    DEVELOPMENT_TEAM: 8NY34B669X
+    CODE_SIGN_STYLE: Automatic
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+    DEAD_CODE_STRIPPING: YES
+    # The Rust simulator slice is aarch64-apple-ios-sim only.
+    EXCLUDED_ARCHS[sdk=iphonesimulator*]: x86_64
+targets:
+  J3Code:
+    type: application
+    platform: iOS
+    sources:
+      - path: J3Code
+      - path: ../../target/ios/swift/j3_mobile.swift
+        group: Generated
+        optional: true
+    dependencies:
+      - framework: ../../target/ios/J3MobileFFI.xcframework
+        embed: false
+    info:
+      path: J3Code/Info.plist
+      properties:
+        CFBundleDisplayName: j3
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        CFBundleURLTypes:
+          - CFBundleURLName: dev.jacobyuill.j3code
+            CFBundleURLSchemes: [j3code]
+        LSApplicationQueriesSchemes: []
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: true
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        # j3 servers speak plain HTTP on loopback and the tailnet (wire.md §1).
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+          NSAllowsLocalNetworking: true
+        NSLocalNetworkUsageDescription: j3 connects to the j3 servers you add.
+        ITSAppUsesNonExemptEncryption: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.jacobyuill.j3code
+        PRODUCT_NAME: J3Code
+        TARGETED_DEVICE_FAMILY: "1,2"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        SUPPORTS_MACCATALYST: NO
+  J3CodeTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: J3CodeTests
+    dependencies:
+      - target: J3Code
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.jacobyuill.j3code.tests
+        GENERATE_INFOPLIST_FILE: YES
+  J3CodeUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: J3CodeUITests
+    dependencies:
+      - target: J3Code
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.jacobyuill.j3code.uitests
+        GENERATE_INFOPLIST_FILE: YES
+schemes:
+  J3Code:
+    build:
+      targets:
+        J3Code: all
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - J3CodeTests
+        - J3CodeUITests
+    archive:
+      config: Release

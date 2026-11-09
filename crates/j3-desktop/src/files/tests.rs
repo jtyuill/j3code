@@ -3,11 +3,11 @@
 
 use j3_client::{
     Error,
-    t3::project::{ProjectListEntriesResult, ProjectReadFileResult},
+    envelope::{self, ErrorCode},
+    methods::{EntriesResult, ReadFileResult},
 };
 use rune::{Key, KeyEvent, Mods};
 use rune_kit::syntax::{Paint, Syntax};
-use serde_json::json;
 
 use super::{
     Effect, FilePane, fixtures,
@@ -85,7 +85,7 @@ fn rows_follow_listings_with_notes_and_inherited_ignores() {
     let Effect::Load { request, .. } = pane.begin_load("docs") else {
         unreachable!()
     };
-    let truncated = ProjectListEntriesResult {
+    let truncated = EntriesResult {
         entries: fixtures::listings()[1].1.clone(),
         truncated: true,
     };
@@ -94,7 +94,7 @@ fn rows_follow_listings_with_notes_and_inherited_ignores() {
     let Effect::Load { request, .. } = pane.begin_load("crates/j3-desktop") else {
         unreachable!()
     };
-    pane.listed("crates/j3-desktop", request, Err(Error::Closed));
+    pane.listed("crates/j3-desktop", request, Err(Error::Disconnected));
     assert!(pane.rows.iter().any(|row| matches!(
         row,
         Row::Note { dir, note: Note::Failed(_), key, .. }
@@ -114,12 +114,12 @@ fn an_answer_to_an_older_request_is_dropped() {
     else {
         unreachable!()
     };
-    pane.listed("", first, Err(Error::Closed));
+    pane.listed("", first, Err(Error::Disconnected));
     assert_eq!(shown(&pane), ["[: Loading]"]);
     pane.listed(
         "",
         second,
-        Ok(ProjectListEntriesResult {
+        Ok(EntriesResult {
             entries: Vec::new(),
             truncated: false,
         }),
@@ -165,7 +165,7 @@ fn arrows_move_over_entries_expand_enter_collapse_and_climb() {
     pane.listed(
         "crates",
         request,
-        Ok(ProjectListEntriesResult {
+        Ok(EntriesResult {
             entries: fixtures::listings()[1].1.clone(),
             truncated: false,
         }),
@@ -225,25 +225,24 @@ fn a_highlight_ending_on_a_newline_stays_on_its_line() {
 
 #[test]
 fn reads_become_code_or_notices() {
-    let file = |contents: &str, byte_length, truncated| ProjectReadFileResult {
-        relative_path: "a.rs".into(),
-        contents: contents.into(),
-        byte_length,
+    let file = |text: &str, size, truncated| ReadFileResult {
+        path: "a.rs".into(),
+        text: text.into(),
+        size,
         truncated,
-        exists: Some(true),
+        exists: true,
     };
     let Body::Text(_) = Body::read("a.rs", Ok(file("fn main() {}\n", 13, false))) else {
         panic!("text")
     };
-    let binary = Error::Rejected {
-        tag: None,
-        message: "binary".into(),
-        error: json!({"failure": "binary_file"}),
-    };
+    let binary = Error::Server(envelope::Error::new(
+        ErrorCode::Rejected,
+        "Workspace file 'logo.png' is binary and cannot be previewed as text.",
+    ));
     assert!(matches!(Body::read("logo.png", Err(binary)), Body::Binary));
     assert!(matches!(
-        Body::read("a.rs", Err(Error::Closed)),
-        Body::Failed(e) if e == Error::Closed.to_string()
+        Body::read("a.rs", Err(Error::Disconnected)),
+        Body::Failed(e) if e == Error::Disconnected.to_string()
     ));
     let big = "x".repeat(3 * 1024 + 410);
     let mut pane = FilePane::new("/p".into(), "p".into(), 16.0);

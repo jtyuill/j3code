@@ -3,7 +3,7 @@
 
 use std::borrow::Cow;
 
-use j3_client::t3::project::ProjectEntryKind;
+use j3_client::methods::EntryKind;
 use rune::{
     Color, El, GrowthSpec, Icon, Key, KeyEvent, ScrollSpec, TextStyle, Tx, col, el, row, text,
     text_input,
@@ -97,7 +97,7 @@ impl FilePane {
             return;
         };
         for entry in &listing.entries {
-            let directory = entry.kind == ProjectEntryKind::Directory;
+            let directory = entry.kind == EntryKind::Dir;
             let ignored = ignored || entry.ignored == Some(true);
             rows.push(Row::Entry {
                 key: row_key(&entry.path),

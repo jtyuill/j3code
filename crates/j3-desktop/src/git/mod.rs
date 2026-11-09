@@ -1,7 +1,7 @@
-//! The header's git control (spec §8.7), ported from t3's `GitActionsControl`: the thread
-//! project's repository status, a quick action button with a menu (Commit…, Push, Pull, and on
-//! GitHub Create PR / View PR), the commit dialog, and outcome toasts. It follows the open
-//! thread's project root and rereads the status when the root changes, when the thread's run
+//! The header's git control (spec §8.7): the thread project's repository status, a quick
+//! action button with a menu (Commit…, Push, Pull, and on GitHub Create PR / View PR), the
+//! commit dialog, and outcome toasts. It follows the open thread's project and rereads the
+//! status when the project changes, when the thread's turn
 //! ends and every 30 s. Hidden unless a status loaded and the project is a repository, or
 //! an action is running.
 //!
@@ -16,11 +16,9 @@ mod view;
 
 use std::time::Duration;
 
-use j3_client::{
-    GitActionUpdate,
-    t3::git::{
-        GitStackedAction, GitToast, GitToastCta, VcsPullResult, VcsPullStatus, VcsStatusResult,
-    },
+use j3_client::methods::{
+    GitAction, GitNext, GitRunItem, GitRunParams, GitRunResult, GitStatus, ProjectParams,
+    PullResult, PullStatus,
 };
 use rune::{TextEdit, Tx};
 
@@ -38,10 +36,11 @@ const POLL_INTERVAL: f64 = 30.0;
 /// One thread's git control.
 #[derive(Default)]
 pub struct GitControl {
-    /// The thread's project directory, once the shell knows it.
-    cwd: Option<String>,
-    /// The latest status read of `cwd`; `None` until one succeeds. A failed read keeps it.
-    pub status: Option<VcsStatusResult>,
+    /// The thread's project id, once the shell knows it.
+    project_id: Option<String>,
+    /// The latest status read of the project; `None` until one succeeds. A failed read keeps
+    /// it.
+    pub status: Option<GitStatus>,
     /// An action is running; the control is busy while set.
     running: bool,
     /// A status read is in flight.
@@ -70,26 +69,26 @@ impl GitControl {
 const WORKING_LABEL: &str = "Working...";
 
 /// The toast for a pull's outcome: its title and description.
-fn pulled(pull: &VcsPullResult) -> (&'static str, String) {
+fn pulled(pull: &PullResult) -> (&'static str, String) {
     match pull.status {
-        VcsPullStatus::Pulled => (
+        PullStatus::Pulled => (
             "Pulled",
             format!(
                 "Updated {} from {}",
-                pull.ref_name,
-                pull.upstream_ref.as_deref().unwrap_or("upstream")
+                pull.branch,
+                pull.upstream.as_deref().unwrap_or("upstream")
             ),
         ),
-        VcsPullStatus::SkippedUpToDate => (
+        PullStatus::UpToDate => (
             "Already up to date",
-            format!("{} is already synchronized.", pull.ref_name),
+            format!("{} is already synchronized.", pull.branch),
         ),
     }
 }
 
 impl J3 {
-    /// Before every frame: follows the open thread's project root and rereads its status on
-    /// a new root, at the end of a run and every [`POLL_INTERVAL`] seconds.
+    /// Before every frame: follows the open thread's project and rereads its status on a new
+    /// project, at the end of a turn and every [`POLL_INTERVAL`] seconds.
     pub(crate) fn poll_git(&mut self, tx: &mut Tx) -> bool {
         let Main::Thread(key) = &self.route.main else {
             return false;
@@ -98,14 +97,15 @@ impl J3 {
             return false;
         };
         let shell = &env.state().shell;
-        let root = shell
-            .thread(&key.thread_id)
-            .and_then(|thread| shell.project(&thread.project_id))
-            .map(|project| project.workspace_root.as_str());
+        let project = shell
+            .threads
+            .get(&key.thread_id)
+            .filter(|thread| shell.projects.contains_key(&thread.project_id))
+            .map(|thread| thread.project_id.as_str());
         let running = self
             .threads
             .get(key)
-            .is_some_and(|thread| thread.state.active_run().is_some());
+            .is_some_and(|thread| thread.state.active_turn().is_some());
         if !self.git.contains_key(key) {
             self.git.insert(key.clone(), GitControl::default());
         }
@@ -115,13 +115,13 @@ impl J3 {
         let t = self.clock.t;
         let mut changed = false;
         let mut refresh = git.next_poll.is_none_or(|at| t >= at);
-        if git.cwd.as_deref() != root {
-            git.cwd = root.map(str::to_owned);
+        if git.project_id.as_deref() != project {
+            git.project_id = project.map(str::to_owned);
             git.status = None;
             changed = true;
             refresh = true;
         }
-        // A finished run may have changed files.
+        // A finished turn may have changed files.
         refresh |= git.run_active && !running;
         git.run_active = running;
         if refresh {
@@ -137,7 +137,7 @@ impl J3 {
         changed
     }
 
-    /// Reads `key`'s status again (`vcs.refreshStatus`). A read asked for while one is in
+    /// Reads `key`'s status again (`git.status`). A read asked for while one is in
     /// flight runs once that one ends.
     pub fn refresh_git(&mut self, key: &ThreadKey) {
         let Some(connection) = self.envs.get(&key.env).map(|env| env.connection().clone()) else {
@@ -147,7 +147,7 @@ impl J3 {
         let Some(git) = self.git.get_mut(key) else {
             return;
         };
-        let Some(cwd) = git.cwd.clone() else {
+        let Some(project_id) = git.project_id.clone() else {
             return;
         };
         if git.refreshing {
@@ -158,7 +158,12 @@ impl J3 {
         git.next_poll = Some(t + POLL_INTERVAL);
         let key = key.clone();
         self.spawn(async move {
-            let result = connection.git_status(&cwd).await;
+            let result = connection
+                .git_status(ProjectParams {
+                    project_id: project_id.clone(),
+                    command_id: None,
+                })
+                .await;
             move |s: &mut J3, _: &mut Tx| {
                 let Some(git) = s.git.get_mut(&key) else {
                     return;
@@ -167,11 +172,11 @@ impl J3 {
                 // A failed read keeps the last good status: one missed poll (a busy
                 // repository mid-commit, say) must not hide the control.
                 match result {
-                    Ok(status) if git.cwd.as_deref() == Some(cwd.as_str()) => {
+                    Ok(status) if git.project_id.as_deref() == Some(project_id.as_str()) => {
                         git.status = Some(status);
                     }
                     Ok(_) => {}
-                    Err(e) => tracing::debug!("git status of {cwd}: {e}"),
+                    Err(e) => tracing::debug!("git status of {project_id}: {e}"),
                 }
                 if std::mem::take(&mut git.refresh_again) {
                     s.refresh_git(&key);
@@ -180,39 +185,40 @@ impl J3 {
         });
     }
 
-    /// Runs a stacked action in `key`'s project; its phases label the button and its outcome
-    /// is a toast. `commit_message` `None` lets the server write one.
-    pub fn run_git_action(
-        &mut self,
-        key: &ThreadKey,
-        action: GitStackedAction,
-        commit_message: Option<String>,
-    ) {
+    /// Runs a stacked action in `key`'s project; its outcome is a toast. `message` `None`
+    /// lets the server write one.
+    pub fn run_git_action(&mut self, key: &ThreadKey, action: GitAction, message: Option<String>) {
         let Some(connection) = self.envs.get(&key.env).map(|env| env.connection().clone()) else {
             return;
         };
         let Some(git) = self.git.get_mut(key) else {
             return;
         };
-        let Some(cwd) = git.cwd.clone().filter(|_| !git.busy()) else {
+        let Some(project_id) = git.project_id.clone().filter(|_| !git.busy()) else {
             return;
         };
         git.running = true;
-        let mut run = connection.run_git_action(&cwd, action, commit_message);
+        let mut run = connection.git_run(GitRunParams {
+            project_id,
+            action,
+            message,
+            command_id: None,
+        });
         let (inbox, key) = (self.inbox.clone(), key.clone());
         self.services.runtime.spawn(async move {
             let outcome = loop {
                 match run.next().await {
                     // The button shows one fixed label; phases are not shown.
-                    Some(GitActionUpdate::Progress(_)) => {}
-                    Some(GitActionUpdate::Finished(outcome)) => break outcome,
-                    None => break Err(j3_client::Error::Closed),
+                    Some(Ok(GitRunItem::Phase { .. })) => {}
+                    Some(Ok(GitRunItem::Finished { result })) => break Ok(result),
+                    Some(Err(e)) => break Err(e),
+                    None => break Err(j3_client::Error::Disconnected),
                 }
             };
             inbox.post(move |s: &mut J3, _: &mut Tx| {
                 s.git_finished(&key);
                 match outcome {
-                    Ok(result) => s.git_toast(&key, result.toast),
+                    Ok(result) => s.git_toast(&key, result),
                     Err(e) => {
                         s.toasts.error(e.to_string());
                     }
@@ -221,7 +227,7 @@ impl J3 {
         });
     }
 
-    /// Pulls (`vcs.pull`) and reports the outcome.
+    /// Pulls (`git.pull`) and reports the outcome.
     pub fn git_pull(&mut self, key: &ThreadKey) {
         let Some(connection) = self.envs.get(&key.env).map(|env| env.connection().clone()) else {
             return;
@@ -229,13 +235,18 @@ impl J3 {
         let Some(git) = self.git.get_mut(key) else {
             return;
         };
-        let Some(cwd) = git.cwd.clone().filter(|_| !git.busy()) else {
+        let Some(project_id) = git.project_id.clone().filter(|_| !git.busy()) else {
             return;
         };
         git.running = true;
         let key = key.clone();
         self.spawn(async move {
-            let outcome = connection.pull(&cwd).await;
+            let outcome = connection
+                .git_pull(ProjectParams {
+                    project_id,
+                    command_id: None,
+                })
+                .await;
             move |s: &mut J3, _: &mut Tx| {
                 s.git_finished(&key);
                 match outcome {
@@ -258,7 +269,7 @@ impl J3 {
             .git
             .get(key)
             .and_then(|git| git.status.as_ref())
-            .and_then(|status| status.pr.as_ref())
+            .and_then(|status| status.pull_request.as_ref())
             && let Err(e) = tx.open_url(&pr.url)
         {
             self.toasts.error(format!("Couldn’t open {}: {e}", pr.url));
@@ -275,26 +286,26 @@ impl J3 {
 
     /// The server's success toast. Its call to action becomes the toast's button: "View PR"
     /// opens the pull request; a follow-up (Push after Commit, Create PR after a push) runs.
-    fn git_toast(&mut self, key: &ThreadKey, toast: GitToast) {
-        let mut note = Toast::new(ToastKind::Success, toast.title);
-        if let Some(description) = toast.description {
+    fn git_toast(&mut self, key: &ThreadKey, result: GitRunResult) {
+        let mut note = Toast::new(ToastKind::Success, result.title);
+        if let Some(description) = result.description {
             note = note.description(description);
         }
-        note = match toast.cta {
-            GitToastCta::RunAction { label, action } => {
+        note = match result.next {
+            Some(GitNext::Run { label, action }) => {
                 let key = key.clone();
                 note.action(label, move |s: &mut J3, _: &mut Tx| {
-                    s.run_git_action(&key, action.kind, None)
+                    s.run_git_action(&key, action, None)
                 })
             }
-            GitToastCta::OpenPr { label, url } => {
+            Some(GitNext::OpenPr { label, url }) => {
                 note.action(label, move |s: &mut J3, tx: &mut Tx| {
                     if let Err(e) = tx.open_url(&url) {
                         s.toasts.error(format!("Couldn’t open {url}: {e}"));
                     }
                 })
             }
-            GitToastCta::None => note,
+            None => note,
         };
         self.toasts.push(note);
     }

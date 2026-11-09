@@ -6,7 +6,7 @@ use rune_kit::{
     Button, ButtonVariant, Checkbox, ControlSize, Kit, RadioGroup, RadioItem, TextInput,
 };
 
-use super::{Item, Nav, QuestionCard, Questionnaire};
+use super::{Item, MISSING, Nav, QuestionCard, Questionnaire};
 use crate::{
     app::{J3, Ui},
     icons,
@@ -19,7 +19,8 @@ use crate::{
 pub fn card(ui: &Ui, key: &ThreadKey, card: &QuestionCard) -> El {
     let k = ui.k;
     let warning = Status::of(k).warning;
-    let mut header = row()
+    let dismiss_key = key.clone();
+    let header = row()
         .key("question-header")
         .w_full()
         .gap(8.0)
@@ -30,18 +31,15 @@ pub fn card(ui: &Ui, key: &ThreadKey, card: &QuestionCard) -> El {
                 .font(k.ty.text_xsmall_medium)
                 .color(warning),
         )
-        .child(spacer());
-    if card.dismissible {
-        let key = key.clone();
-        header = header.child(
+        .child(spacer())
+        .child(
             Button::new("Dismiss")
                 .variant(ButtonVariant::Ghost)
                 .control_size(ControlSize::Small)
-                .on_press(move |s: &mut J3| s.dismiss_question(&key))
+                .on_press(move |s: &mut J3| s.dismiss_question(&dismiss_key))
                 .build(k)
                 .key("dismiss-question"),
         );
-    }
     let body = match &card.form {
         Ok(form) => questionnaire(k, key, form),
         Err(problem) => text(format!("This question can’t be shown: {problem}"))
@@ -101,7 +99,7 @@ fn questionnaire(k: &Kit, key: &ThreadKey, form: &Questionnaire) -> El {
                 .width(None)
                 .placeholder("Type an answer…")
                 .label("Custom answer")
-                .invalid(item.problem.is_some())
+                .invalid(item.missing)
                 .on_edit(move |s: &mut J3| {
                     chrome_edit(s, &edit_key, |chrome| {
                         chrome
@@ -124,9 +122,9 @@ fn questionnaire(k: &Kit, key: &ThreadKey, form: &Questionnaire) -> El {
                 .key(format!("question-input-{}", item.id)),
         );
     }
-    if let Some(problem) = item.problem {
+    if item.missing {
         body = body.child(
-            text(problem.message())
+            text(MISSING)
                 .key("question-problem")
                 .font(k.ty.text_xsmall)
                 .color(Status::of(k).danger),
@@ -156,7 +154,7 @@ fn choices(k: &Kit, key: &ThreadKey, ix: usize, item: &Item) -> El {
         return list;
     }
     // The title above names the group; RadioGroup's own label would repeat it.
-    let mut group = RadioGroup::new().invalid(item.problem.is_some());
+    let mut group = RadioGroup::new().invalid(item.missing);
     for choice in &item.choices {
         let (key, value) = (key.clone(), choice.value.clone());
         let mut radio = RadioItem::new(&choice.label, item.is_chosen(&choice.value));
@@ -171,7 +169,7 @@ fn choices(k: &Kit, key: &ThreadKey, ix: usize, item: &Item) -> El {
     group.build(k).key("question-choices")
 }
 
-/// Previous, then Skip (optional questions), then Next or Submit at the trailing end.
+/// Previous, then Next or Submit at the trailing end.
 fn actions(k: &Kit, key: &ThreadKey, form: &Questionnaire) -> El {
     let button = |label: &str, id: &str, variant: ButtonVariant, nav: Nav| {
         let key = key.clone();
@@ -192,14 +190,6 @@ fn actions(k: &Kit, key: &ThreadKey, form: &Questionnaire) -> El {
         ));
     }
     bar = bar.child(spacer());
-    if !form.items[form.current()].required {
-        bar = bar.child(button(
-            "Skip",
-            "question-skip",
-            ButtonVariant::Outline,
-            Nav::Skip,
-        ));
-    }
     if form.is_last() {
         bar.child(button(
             "Submit",

@@ -1,19 +1,23 @@
-//! The question card (spec §5.2, item 3): omp's first pending `ask` as a questionnaire, one
-//! question at a time, above the composer.
+//! The question card (spec §5.2, item 3): omp's first open request (`ask`, `select`,
+//! `confirm`, `input`, `editor`) as a questionnaire, one question at a time, above the
+//! composer.
 //!
 //! The questionnaire follows the old gpui-kit `Questionnaire`: single-choice questions are
 //! radios (picking one confirms it after a moment: the next question, or submit on the last),
-//! multi-choice questions are checkboxes, and a question with `allowCustomAnswer` (or no
-//! options) has a free-form field that, typed into, replaces a single choice. Questions are
-//! required unless `required` is `false`; Next and Submit refuse an unanswered required
-//! question ("Choose an answer to continue.") and ask for an unanswered optional one to be
-//! skipped. Submitting maps the answers through [`build_answers`] to `connection.answer`.
+//! multi-choice questions are checkboxes, and a question with `allowOther` (or no options)
+//! has a free-form field, prefilled with its `default`, that, typed into, replaces a single
+//! choice. Every question needs an answer: Next and Submit refuse an unanswered one ("Choose
+//! an answer to continue."). Submitting maps the answers through [`build_answers`] to
+//! `requests.answer`; Dismiss sends `requests.dismiss`.
 
 mod view;
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 
-use j3_client::{Answer, PendingUserInput, t3::orchestration::UserInputQuestion};
+use j3_client::{
+    entities::{Answer, Question, Request},
+    methods::{AnswerParams, DismissParams},
+};
 use rune::{TextEdit, Tx};
 
 pub use view::card;
@@ -23,41 +27,23 @@ use crate::{app::J3, sidebar::ThreadKey};
 /// How long a picked single choice shows before it confirms (seconds).
 const CONFIRM_DELAY: f64 = 0.15;
 
-/// The card for one pending request.
+/// What an unanswered question says when Next or Submit is tried.
+pub const MISSING: &str = "Choose an answer to continue.";
+
+/// The card for one open request.
 pub struct QuestionCard {
     pub request_id: String,
-    questions: Vec<UserInputQuestion>,
-    /// omp accepts a dismissal (the request can be answered by a message instead).
-    pub dismissible: bool,
+    questions: Vec<Question>,
     /// The questionnaire, or why these questions can't be one.
     pub form: Result<Questionnaire, String>,
 }
 
 impl QuestionCard {
-    pub fn new(pending: &PendingUserInput<'_>) -> Self {
+    pub fn new(request: &Request) -> Self {
         Self {
-            request_id: pending.request.id.clone(),
-            questions: pending.questions.to_vec(),
-            dismissible: pending.dismissible,
-            form: Questionnaire::new(pending.questions),
-        }
-    }
-}
-
-/// Why an item refuses to move on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Problem {
-    /// A required question has no answer.
-    Required,
-    /// An optional question has no answer and was not skipped.
-    Unanswered,
-}
-
-impl Problem {
-    pub fn message(self) -> &'static str {
-        match self {
-            Problem::Required => "Choose an answer to continue.",
-            Problem::Unanswered => "Choose an answer or skip this question.",
+            request_id: request.id.clone(),
+            questions: request.questions.clone(),
+            form: Questionnaire::new(&request.questions),
         }
     }
 }
@@ -73,7 +59,7 @@ pub enum Step {
     Submit,
 }
 
-/// One choice of a question: `option.value`, else its label.
+/// One choice of a question; its label is also what the answer carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Choice {
     pub value: String,
@@ -89,44 +75,46 @@ pub struct Item {
     pub description: String,
     pub choices: Vec<Choice>,
     pub multiple: bool,
-    pub required: bool,
     /// The free-form answer field.
     pub input: Option<TextEdit>,
     /// Chosen values, in the order they were picked.
     chosen: Vec<String>,
-    skipped: bool,
     /// Next or Submit was tried: the error follows the answer from now on.
     attempted: bool,
-    pub problem: Option<Problem>,
+    /// Next or Submit found no answer.
+    pub missing: bool,
 }
 
 impl Item {
-    fn new(question: &UserInputQuestion) -> Self {
-        let custom = question.allow_custom_answer == Some(true) || question.options.is_empty();
-        let choices = question
+    /// The item for `question`; its `default` is the chosen option it names, else the
+    /// field's text.
+    fn new(question: &Question) -> Self {
+        let custom = question.allow_other || question.options.is_empty();
+        let choices: Vec<Choice> = question
             .options
             .iter()
             .map(|option| Choice {
-                value: option.value.clone().unwrap_or_else(|| option.label.clone()),
+                value: option.label.clone(),
                 label: option.label.clone(),
-                description: (!option.description.trim().is_empty()
-                    && option.description != option.label)
-                    .then(|| option.description.clone()),
+                description: option
+                    .description
+                    .clone()
+                    .filter(|d| !d.trim().is_empty() && *d != option.label),
             })
             .collect();
+        let default = question.default.as_deref().filter(|d| !d.is_empty());
+        let picked = default.filter(|d| choices.iter().any(|choice| choice.value == *d));
+        let typed = default.filter(|_| picked.is_none()).unwrap_or_default();
         Self {
             id: question.id.clone(),
-            title: question.question.clone(),
-            description: question.header.clone(),
+            title: question.text.clone(),
+            description: question.header.clone().unwrap_or_default(),
             choices,
-            multiple: question.multi_select == Some(true),
-            required: question.required != Some(false),
-            input: custom
-                .then(|| TextEdit::new(question.initial_answer.clone().unwrap_or_default())),
-            chosen: Vec::new(),
-            skipped: false,
+            multiple: question.multiple,
+            input: custom.then(|| TextEdit::new(typed)),
+            chosen: picked.into_iter().map(str::to_owned).collect(),
             attempted: false,
-            problem: None,
+            missing: false,
         }
     }
 
@@ -165,22 +153,13 @@ impl Item {
 
     /// Checks the answer; true when it may move on.
     fn validate(&mut self) -> bool {
-        if self.skipped {
-            self.problem = None;
-            return true;
-        }
         self.attempted = true;
-        self.problem = (!self.is_answered()).then_some(if self.required {
-            Problem::Required
-        } else {
-            Problem::Unanswered
-        });
-        self.problem.is_none()
+        self.missing = !self.is_answered();
+        !self.missing
     }
 
     /// The answer changed: an error shown keeps up with it.
     fn answer_changed(&mut self) {
-        self.skipped = false;
         if self.attempted {
             self.validate();
         }
@@ -197,7 +176,7 @@ pub struct Questionnaire {
 
 impl Questionnaire {
     /// The questionnaire for `questions`, or why they can't be shown.
-    pub fn new(questions: &[UserInputQuestion]) -> Result<Self, String> {
+    pub fn new(questions: &[Question]) -> Result<Self, String> {
         let items: Vec<Item> = questions.iter().map(Item::new).collect();
         if let Some(problem) = schema_problem(&items) {
             return Err(problem);
@@ -304,21 +283,6 @@ impl Questionnaire {
         Step::Moved
     }
 
-    /// Skips an optional question (its answer is dropped).
-    pub fn skip(&mut self) -> Step {
-        let item = &mut self.items[self.current];
-        if item.required {
-            return Step::Stay;
-        }
-        item.chosen.clear();
-        if let Some(input) = &mut item.input {
-            input.clear();
-        }
-        item.skipped = true;
-        item.problem = None;
-        self.confirm_current()
-    }
-
     /// Validates every question; the first one missing an answer becomes current.
     pub fn submit(&mut self) -> Step {
         self.confirm_at = None;
@@ -346,8 +310,7 @@ impl Questionnaire {
     }
 }
 
-/// Why questions cannot become a questionnaire: a repeated question id or a repeated choice
-/// value.
+/// Why questions cannot become a questionnaire: a repeated question id or a repeated choice.
 fn schema_problem(items: &[Item]) -> Option<String> {
     let mut ids = HashSet::new();
     for item in items {
@@ -369,35 +332,31 @@ fn schema_problem(items: &[Item]) -> Option<String> {
     None
 }
 
-/// Wire answers from questionnaire results: `answer_of(question id)` gives the chosen values
-/// and any typed answer. Multi-select questions send all values; single answers prefer the
-/// typed text.
+/// Wire answers (wire.md §5.6) from questionnaire results, in question order:
+/// `answer_of(question id)` gives the chosen labels and any typed answer. A question with
+/// options answers its chosen labels in `values` and the typed text in `other`; one without
+/// (`input`, `editor`) answers the text in `values`. Unanswered questions are left out.
 pub fn build_answers(
-    questions: &[UserInputQuestion],
+    questions: &[Question],
     answer_of: impl Fn(&str) -> Option<(Vec<String>, Option<String>)>,
-) -> BTreeMap<String, Answer> {
-    let mut answers = BTreeMap::new();
-    for question in questions {
-        let Some((choices, freeform)) = answer_of(&question.id) else {
-            continue;
-        };
-        let freeform = freeform.filter(|text| !text.trim().is_empty());
-        let answer = if question.multi_select == Some(true) {
-            let mut values = choices;
-            values.extend(freeform);
-            if values.is_empty() {
-                continue;
-            }
-            Answer::Many(values)
-        } else {
-            match freeform.or_else(|| choices.into_iter().next()) {
-                Some(value) => Answer::One(value),
-                None => continue,
-            }
-        };
-        answers.insert(question.id.clone(), answer);
-    }
-    answers
+) -> Vec<Answer> {
+    questions
+        .iter()
+        .filter_map(|question| {
+            let (choices, typed) = answer_of(&question.id)?;
+            let typed = typed.filter(|text| !text.trim().is_empty());
+            let (values, other) = if question.options.is_empty() {
+                (typed.into_iter().collect(), None)
+            } else {
+                (choices, typed)
+            };
+            (!values.is_empty() || other.is_some()).then(|| Answer {
+                question_id: question.id.clone(),
+                values,
+                other,
+            })
+        })
+        .collect()
 }
 
 /// A questionnaire navigation from its buttons or a field's Enter.
@@ -405,7 +364,6 @@ pub fn build_answers(
 pub enum Nav {
     Previous,
     Next,
-    Skip,
     Submit,
     Confirm,
 }
@@ -444,7 +402,7 @@ impl J3 {
         }
     }
 
-    /// Previous / Next / Skip / Submit, or Enter in a field.
+    /// Previous / Next / Submit, or Enter in a field.
     pub fn navigate_question(&mut self, key: &ThreadKey, nav: Nav) {
         let Some(form) = self.questionnaire(key) else {
             return;
@@ -452,7 +410,6 @@ impl J3 {
         let step = match nav {
             Nav::Previous => form.previous(),
             Nav::Next => form.advance(),
-            Nav::Skip => form.skip(),
             Nav::Submit => form.submit(),
             Nav::Confirm => form.confirm_current(),
         };
@@ -484,7 +441,7 @@ impl J3 {
         }
     }
 
-    /// Sends `key`'s card answers (`connection.answer`).
+    /// Sends `key`'s card answers (`requests.answer`).
     fn answer_question(&mut self, key: &ThreadKey) {
         let Some(card) = self
             .threads
@@ -496,20 +453,23 @@ impl J3 {
         let Ok(form) = &card.form else {
             return;
         };
-        let answers = build_answers(&card.questions, |id| form.answer_of(id));
-        let request_id = card.request_id.clone();
+        let params = AnswerParams {
+            thread_id: key.thread_id.clone(),
+            request_id: card.request_id.clone(),
+            answers: build_answers(&card.questions, |id| form.answer_of(id)),
+            command_id: None,
+        };
         let Some(connection) = self.thread_connection(key) else {
             return;
         };
-        let thread_id = key.thread_id.clone();
         self.run_command(
             "answer the question",
-            async move { connection.answer(&thread_id, &request_id, answers).await },
+            async move { connection.requests_answer(params).await },
             |_, _, _| {},
         );
     }
 
-    /// Dismisses `key`'s pending question (`connection.dismiss`).
+    /// Dismisses `key`'s open request (`requests.dismiss`).
     pub fn dismiss_question(&mut self, key: &ThreadKey) {
         let Some(card) = self
             .threads
@@ -518,14 +478,17 @@ impl J3 {
         else {
             return;
         };
-        let request_id = card.request_id.clone();
+        let params = DismissParams {
+            thread_id: key.thread_id.clone(),
+            request_id: card.request_id.clone(),
+            command_id: None,
+        };
         let Some(connection) = self.thread_connection(key) else {
             return;
         };
-        let thread_id = key.thread_id.clone();
         self.run_command(
             "dismiss the question",
-            async move { connection.dismiss(&thread_id, &request_id).await },
+            async move { connection.requests_dismiss(params).await },
             |_, _, _| {},
         );
     }
@@ -535,62 +498,64 @@ impl J3 {
 mod tests {
     use super::*;
 
-    fn question(id: &str, multi: bool) -> UserInputQuestion {
+    fn question(id: &str, options: &[&str], multiple: bool, other: bool) -> Question {
+        let options: Vec<_> = options
+            .iter()
+            .map(|label| serde_json::json!({"label": label}))
+            .collect();
         serde_json::from_value(serde_json::json!({
-            "id": id, "header": "H", "question": "Q?", "options": [], "multiSelect": multi
+            "id": id, "header": "H", "text": "Q?", "options": options,
+            "multiple": multiple, "allowOther": other
         }))
         .unwrap()
     }
 
-    fn choice_question(id: &str, options: &[&str], multi: bool, custom: bool) -> UserInputQuestion {
-        let options: Vec<_> = options
-            .iter()
-            .map(|label| serde_json::json!({"label": label, "description": ""}))
-            .collect();
-        serde_json::from_value(serde_json::json!({
-            "id": id, "header": "H", "question": "Q?", "options": options,
-            "multiSelect": multi, "allowCustomAnswer": custom
-        }))
-        .unwrap()
+    fn answer(id: &str, values: &[&str], other: Option<&str>) -> Answer {
+        Answer {
+            question_id: id.into(),
+            values: values.iter().map(|v| (*v).to_owned()).collect(),
+            other: other.map(str::to_owned),
+        }
     }
 
     #[test]
-    fn answers_follow_question_shape() {
+    fn answers_follow_wire_shapes() {
         let questions = [
-            question("color", false),
-            question("tools", true),
-            question("skip", false),
+            question("color", &["red", "blue"], false, true),
+            question("tools", &["a", "b"], true, true),
+            question("name", &[], false, false),
+            question("skip", &[], false, false),
         ];
         let answers = build_answers(&questions, |id| match id {
             "color" => Some((vec!["red".into()], None)),
             "tools" => Some((vec!["a".into(), "b".into()], Some("c".into()))),
+            "name" => Some((vec![], Some("Ada".into()))),
             "skip" => Some((vec![], Some("  ".into()))),
             _ => None,
         });
         assert_eq!(
             answers,
-            BTreeMap::from([
-                ("color".to_owned(), Answer::One("red".into())),
-                (
-                    "tools".to_owned(),
-                    Answer::Many(vec!["a".into(), "b".into(), "c".into()])
-                ),
-            ])
+            [
+                answer("color", &["red"], None),
+                answer("tools", &["a", "b"], Some("c")),
+                answer("name", &["Ada"], None),
+            ]
         );
-        let typed = build_answers(&questions[..1], |_| {
-            Some((vec!["red".into()], Some("teal".into())))
-        });
-        assert_eq!(typed["color"], Answer::One("teal".into()));
+        let typed = build_answers(&questions[..1], |_| Some((vec![], Some("teal".into()))));
+        assert_eq!(typed, [answer("color", &[], Some("teal"))]);
     }
 
     #[test]
-    fn repeated_ids_or_values_cannot_be_shown() {
-        let twice = [question("a", false), question("a", true)];
+    fn repeated_ids_or_choices_cannot_be_shown() {
+        let twice = [
+            question("a", &[], false, false),
+            question("a", &[], true, false),
+        ];
         assert_eq!(
             Questionnaire::new(&twice).err().as_deref(),
             Some("question “a” appears twice")
         );
-        let dup = [choice_question("pick", &["x", "x"], false, false)];
+        let dup = [question("pick", &["x", "x"], false, false)];
         assert_eq!(
             Questionnaire::new(&dup).err().as_deref(),
             Some("question “pick” offers “x” twice")
@@ -598,17 +563,17 @@ mod tests {
     }
 
     #[test]
-    fn required_questions_block_until_answered() {
+    fn questions_block_until_answered() {
         let questions = [
-            choice_question("one", &["a", "b"], false, false),
-            choice_question("two", &["x", "y"], true, false),
+            question("one", &["a", "b"], false, false),
+            question("two", &["x", "y"], true, false),
         ];
         let mut form = Questionnaire::new(&questions).unwrap();
         assert_eq!(form.advance(), Step::Stay);
-        assert_eq!(form.items[0].problem, Some(Problem::Required));
+        assert!(form.items[0].missing);
         // A first pick waits a moment, then confirms; the error clears with the answer.
         assert_eq!(form.choose(0, "a", 1.0), Step::Stay);
-        assert_eq!(form.items[0].problem, None);
+        assert!(!form.items[0].missing);
         assert_eq!(form.confirm_due(1.1), None);
         assert_eq!(form.confirm_due(1.2), Some(Step::Moved));
         assert_eq!(form.current(), 1);
@@ -628,7 +593,7 @@ mod tests {
 
     #[test]
     fn typed_answers_replace_a_single_choice() {
-        let questions = [choice_question("pick", &["a", "b"], false, true)];
+        let questions = [question("pick", &["a", "b"], false, true)];
         let mut form = Questionnaire::new(&questions).unwrap();
         form.choose(0, "a", 0.0);
         form.items[0].input.as_mut().unwrap().replace_text("teal");
@@ -646,36 +611,14 @@ mod tests {
     }
 
     #[test]
-    fn optional_questions_can_be_skipped() {
-        let mut optional = choice_question("maybe", &["a"], false, false);
-        optional.required = Some(false);
-        let questions = [optional, choice_question("last", &["z"], false, false)];
-        let mut form = Questionnaire::new(&questions).unwrap();
-        assert_eq!(form.advance(), Step::Stay);
-        assert_eq!(form.items[0].problem, Some(Problem::Unanswered));
-        assert_eq!(form.skip(), Step::Moved);
-        assert_eq!(
-            form.skip(),
-            Step::Stay,
-            "required questions cannot be skipped"
-        );
-        assert_eq!(form.submit(), Step::Stay);
-        assert_eq!(form.items[1].problem, Some(Problem::Required));
-        form.choose(1, "z", 0.0);
-        assert_eq!(form.confirm_due(1.0), Some(Step::Submit));
-        let answers = build_answers(&questions, |id| form.answer_of(id));
-        assert_eq!(
-            answers,
-            BTreeMap::from([("last".to_owned(), Answer::One("z".into()))])
-        );
-    }
-
-    #[test]
-    fn initial_answers_fill_the_field() {
-        let mut typed = choice_question("name", &[], false, false);
-        typed.initial_answer = Some("Ada".into());
-        let mut form = Questionnaire::new(&[typed]).unwrap();
+    fn defaults_pick_their_option_or_fill_the_field() {
+        let mut typed = question("name", &[], false, false);
+        typed.default = Some("Ada".into());
+        let mut picked = question("size", &["S", "M"], false, true);
+        picked.default = Some("M".into());
+        let mut form = Questionnaire::new(&[typed, picked]).unwrap();
         assert_eq!(form.submit(), Step::Submit);
         assert_eq!(form.answer_of("name"), Some((vec![], Some("Ada".into()))));
+        assert_eq!(form.answer_of("size"), Some((vec!["M".into()], None)));
     }
 }

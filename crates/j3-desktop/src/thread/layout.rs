@@ -96,7 +96,8 @@ fn chat(s: &J3, cx: &mut Cx<J3>, ui: &mut Ui, key: &ThreadKey) -> El {
                 .question
                 .as_ref()
                 .map(|card| question::card(ui, key, card)),
-            state.goal().map(|goal| goal::chip(ui, key, goal)),
+            goal::current(state.thread.as_ref().and_then(|t| t.goal.as_ref()))
+                .map(|goal| goal::chip(ui, key, goal)),
         ]
         .into_iter()
         .flatten()

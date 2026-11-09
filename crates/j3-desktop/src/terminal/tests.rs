@@ -112,7 +112,7 @@ fn toggling_opens_a_focused_terminal_and_hiding_returns_to_the_composer() {
     // Offline, the attach fails at once: the strip says why and offers Restart.
     assert_eq!(
         terminal(&app.rt.state, "term-1").status(),
-        &TerminalStatus::Failed(Error::Closed.to_string())
+        &TerminalStatus::Failed(Error::Disconnected.to_string())
     );
     assert!(app.rt.find("terminal-status").is_some());
     assert!(app.rt.find("terminal-restart").is_some());
@@ -224,12 +224,8 @@ fn keys_and_pastes_reach_the_shell_and_wait_for_the_snapshot() {
         let generation = terminal(s, "term-1").generation;
         let snapshot = serde_json::from_value(serde_json::json!({
             "type": "snapshot",
-            "snapshot": {
-                "threadId": "thr-feed-renderer", "terminalId": "term-1", "cwd": "/tmp",
-                "worktreePath": null, "status": "running", "pid": 7,
-                "history": "$ echo hi\r\nhi\r\n$ ", "exitCode": null, "exitSignal": null,
-                "label": "bash", "updatedAt": "2026-11-07T16:30:00Z"
-            }
+            "history": "$ echo hi\r\nhi\r\n$ ",
+            "state": "running"
         }))
         .unwrap();
         s.terminal_attached(&key(), "term-1", generation, Some(Ok(snapshot)), tx);
@@ -296,7 +292,7 @@ fn a_dropped_connection_attaches_again_after_two_seconds() {
             &key(),
             "term-1",
             generation,
-            Some(Err(Error::Disconnected("lost".into()))),
+            Some(Err(Error::Disconnected)),
             tx,
         )
     });

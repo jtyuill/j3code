@@ -1,26 +1,23 @@
 //! Offline fixtures and the window's named scenes (`--scene NAME`, `AppSpec::scenes`): two
-//! live environments — the local one and the remote `shieldy` — with a server config, three
-//! projects and fifteen threads across every sidebar state, plus one open thread whose feed
-//! holds every turn item kind the feed renders, all timed relative to [`NOW`].
+//! live environments — the local one and the remote `shieldy` — each with its server info and
+//! catalog, three projects and fifteen threads across every Inbox state (plus three archived
+//! ones), and one open thread whose view holds every item kind the feed renders, all timed
+//! relative to [`NOW`].
+//!
+//! The data is protocol v2 as a j3 server sends it (`docs/protocol/wire.md` §4): wire JSON
+//! decoded through the protocol types, so a fixture that drifts from the wire fails to load.
 //!
 //! Nothing here touches the network: each environment runs over
 //! [`Connection::offline`], whose calls fail at once, and `setup` opens no environments
 //! when a scene installed these. Tests install a scene with [`install`]
 //! (`TestApp::with_scene`).
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::sync::Arc;
 
 use j3_client::{
-    Connection, ConnectionState, ConnectionStatus, ShellState, ThreadState, ThreadSync,
-    WorkspaceCommands,
-    t3::{
-        self,
-        filesystem::FilesystemBrowseEntry,
-        methods::ArchivedShellSnapshot,
-        orchestration::{ThreadProjection, ThreadShell},
-        project::ProjectShell,
-        server::{ServerConfig, ServerProviderSkill, ServerProviderSlashCommand},
-    },
+    Connection, ConnectionState, Info, Shell, Status, ThreadSync, ThreadView,
+    entities::{Item, Project, Thread},
+    methods::{BrowseEntry, Catalog},
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -28,7 +25,6 @@ use time::{Duration, OffsetDateTime, macros::datetime};
 
 use super::{Clock, J3, Main};
 use crate::{
-    archived::Listing,
     dialogs::{Dialog, FolderListing, FolderSiblings},
     environment::{Environment, EnvironmentKind, Environments, LOCAL_KEY},
     environments::{DesktopConfig, RemoteEnvironment},
@@ -36,7 +32,7 @@ use crate::{
     new_thread::NewThreadState,
     preferences::Preferences,
     settings::Page,
-    sidebar::ThreadKey,
+    sidebar::{ThreadKey, iso},
     ui_settings::{UiSettings, Workflow},
 };
 
@@ -54,7 +50,7 @@ pub const OPEN_THREAD: &str = "thr-feed-renderer";
 /// A named starting state of the window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scene {
-    /// The populated sidebar (T3 workflow) and the empty main pane.
+    /// The populated sidebar (Inbox workflow) and the empty main pane.
     Fixtures,
     /// [`OPEN_THREAD`] open.
     Thread,
@@ -67,7 +63,7 @@ pub enum Scene {
     /// The new-thread composer focused with a draft: a model chip, a magic keyword, a pasted
     /// image and ghost text.
     Composer,
-    /// Settings on Archived threads, with the local archive loaded (shieldy's empty).
+    /// Settings on Archived threads (the local shell's three; shieldy has none).
     SettingsArchived,
     /// The Add project dialog over the sidebar, listing `~/repos/` on the local device.
     AddProject,
@@ -176,23 +172,21 @@ pub fn install(s: &mut J3, scene: Scene) {
     s.envs = Environments::default();
     let runtime = s.services.runtime.clone();
     let local_url = s.services.local_url().to_owned();
-    s.envs.push(Environment::with_state(
+    s.envs.push(environment(
         LOCAL_KEY,
         LOCAL_LABEL,
         EnvironmentKind::Local(LocalServerStatus::Serving(vec![
             ([127, 0, 0, 1], 3780).into(),
         ])),
         Connection::offline(local_url, runtime.clone()),
-        Arc::new(local_state()),
-        None,
+        local_state(),
     ));
-    s.envs.push(Environment::with_state(
+    s.envs.push(environment(
         SHIELDY_URL,
         "shieldy",
         EnvironmentKind::Remote,
         Connection::offline(SHIELDY_URL, runtime),
-        Arc::new(shieldy_state()),
-        None,
+        shieldy_state(),
     ));
     match scene {
         Scene::Fixtures => {}
@@ -246,52 +240,29 @@ pub fn install(s: &mut J3, scene: Scene) {
         }
         Scene::SettingsArchived => {
             s.settings.page = Page::Archived;
-            s.settings
-                .archived
-                .set(LOCAL_KEY, Listing::Loaded(archived_snapshot()));
-            let empty = ArchivedShellSnapshot {
-                threads: Vec::new(),
-                projects: Vec::new(),
-                ..archived_snapshot()
-            };
-            s.settings.archived.set(SHIELDY_URL, Listing::Loaded(empty));
             s.route.settings = true;
         }
         Scene::AddProject => s.dialogs.open = Some(add_project_dialog()),
     }
 }
 
-/// Three archived local threads, not in archive order.
-pub fn archived_snapshot() -> ArchivedShellSnapshot {
-    let archived = |minutes: i64| json!({"archivedAt": ago(minutes)});
-    ArchivedShellSnapshot {
-        schema_version: 1,
-        snapshot_sequence: 1,
-        projects: local_state().shell.projects,
-        threads: vec![
-            row(
-                "thr-archived-week",
-                J3CODE_PROJECT,
-                "Try GPUI's text system for the feed",
-                60 * 24 * 9,
-                archived(60 * 24 * 7),
-            ),
-            row(
-                "thr-archived-old",
-                "prj-rune",
-                "Sketch the settings layout",
-                60 * 24 * 40,
-                archived(60 * 24 * 30),
-            ),
-            row(
-                "thr-archived-recent",
-                J3CODE_PROJECT,
-                "Profile the sidebar's drag reordering",
-                60 * 5,
-                archived(90),
-            ),
-        ],
-    }
+/// An environment over `connection` showing `state`, with the project slash commands its
+/// catalog carries already fetched (so nothing asks the offline server for them).
+fn environment(
+    key: &str,
+    label: &str,
+    kind: EnvironmentKind,
+    connection: Connection,
+    state: ConnectionState,
+) -> Environment {
+    let commands = state
+        .catalog
+        .as_ref()
+        .map(|catalog| catalog.project_commands.clone())
+        .unwrap_or_default();
+    let mut env = Environment::with_state(key, label, kind, connection, Arc::new(state), None);
+    env.set_project_commands(commands);
+    env
 }
 
 /// The Add project dialog on the local device with `~/repos/` listed.
@@ -301,18 +272,18 @@ fn add_project_dialog() -> Dialog {
         picker.path.replace_text("~/repos/");
         picker.path.set_caret(picker.path.text.len());
         picker.title.replace_text("repos");
-        let entry = |name: &str| FilesystemBrowseEntry {
+        let entry = |name: &str| BrowseEntry {
             name: name.to_owned(),
-            full_path: format!("/home/jacob/repos/{name}"),
+            path: format!("/home/jacob/repos/{name}"),
         };
-        let entries: Vec<FilesystemBrowseEntry> = [
+        let entries: Vec<BrowseEntry> = [
             "dotfiles",
             "herdr",
             "j3code",
             "j3code-wt",
             "omp",
+            "opencode",
             "rune",
-            "t3code",
         ]
         .map(entry)
         .into();
@@ -329,33 +300,55 @@ fn add_project_dialog() -> Dialog {
 }
 
 // ---------------------------------------------------------------------------
-// Time
+// Time and JSON
 // ---------------------------------------------------------------------------
 
-fn iso(at: OffsetDateTime) -> String {
-    t3::iso_from_unix_ms(at.unix_timestamp() * 1_000)
-}
-
-/// `minutes` before [`NOW`].
+/// `minutes` before [`NOW`], as a wire timestamp.
 pub fn ago(minutes: i64) -> String {
     iso(NOW - Duration::minutes(minutes))
 }
 
-/// `minutes` after [`NOW`].
+/// `minutes` after [`NOW`], as a wire timestamp.
 pub fn from_now(minutes: i64) -> String {
     iso(NOW + Duration::minutes(minutes))
+}
+
+/// `seconds` before [`NOW`], as a wire timestamp.
+fn seconds_ago(seconds: i64) -> String {
+    iso(NOW - Duration::seconds(seconds))
 }
 
 fn decode<T: DeserializeOwned>(what: &str, value: Value) -> T {
     serde_json::from_value(value).unwrap_or_else(|e| panic!("fixture {what} decodes: {e}"))
 }
 
-/// `base` with `patch`'s keys set.
-fn patched(mut base: Value, patch: Value) -> Value {
-    if let (Some(base), Value::Object(patch)) = (base.as_object_mut(), patch) {
-        base.extend(patch);
-    }
+/// `base` with `patch` merged in: objects key by key, `null` removing a key, any other value
+/// replacing it.
+fn merged(mut base: Value, patch: Value) -> Value {
+    merge(&mut base, patch);
     base
+}
+
+fn merge(base: &mut Value, patch: Value) {
+    match (base, patch) {
+        (Value::Object(base), Value::Object(patch)) => {
+            for (key, value) in patch {
+                if value.is_null() {
+                    base.remove(&key);
+                    continue;
+                }
+                if let Some(slot) = base.get_mut(&key)
+                    && slot.is_object()
+                    && value.is_object()
+                {
+                    merge(slot, value);
+                    continue;
+                }
+                base.insert(key, value);
+            }
+        }
+        (base, patch) => *base = patch,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -383,176 +376,87 @@ pub fn shieldy_state() -> ConnectionState {
 }
 
 fn connection_state(
-    environment_id: &str,
-    label: &str,
-    projects: Vec<ProjectShell>,
-    threads: Vec<ThreadShell>,
+    server_id: &str,
+    name: &str,
+    projects: Vec<Project>,
+    threads: Vec<Thread>,
 ) -> ConnectionState {
-    let workspaces: BTreeMap<String, WorkspaceCommands> = projects
-        .iter()
-        .map(|project| {
-            let commands = WorkspaceCommands {
-                slash_commands: slash_commands(),
-                skills: skills(),
-            };
-            (project.workspace_root.clone(), commands)
-        })
-        .collect();
+    let project_ids: Vec<String> = projects.iter().map(|p| p.id.clone()).collect();
     ConnectionState {
-        status: ConnectionStatus::Live,
-        descriptor: Some(decode("descriptor", descriptor(environment_id, label))),
-        config: Some(server_config(environment_id, label)),
-        shell: ShellState {
-            loaded: true,
-            synchronized: true,
-            snapshot_sequence: 4_210,
-            projects,
-            threads,
-            archived_threads: Vec::new(),
+        status: Status::Connected,
+        info: Some(Info {
+            server_id: server_id.to_owned(),
+            name: name.to_owned(),
+            protocol: 2,
+            version: "0.9.0".to_owned(),
+            capabilities: ["terminal", "git", "files", "usage", "goals"]
+                .map(String::from)
+                .into(),
+            platform: "linux".to_owned(),
+            home: "/home/jacob".to_owned(),
+        }),
+        catalog: Some(catalog(&project_ids)),
+        shell: Shell {
+            sequence: 4_210,
+            synced: true,
+            projects: projects.into_iter().map(|p| (p.id.clone(), p)).collect(),
+            threads: threads.into_iter().map(|t| (t.id.clone(), t)).collect(),
         },
-        workspaces,
     }
 }
 
-fn descriptor(environment_id: &str, label: &str) -> Value {
-    json!({
-        "environmentId": environment_id, "label": label,
-        "platform": {"os": "linux", "arch": "x64"},
-        "serverVersion": "0.9.0", "orchestrationProtocolVersion": 2,
-        "capabilities": {"repositoryIdentity": true, "attachmentUploads": true}
-    })
-}
-
-fn project(id: &str, title: &str, root: &str, created_minutes_ago: i64) -> ProjectShell {
+fn project(id: &str, title: &str, path: &str, created_minutes_ago: i64) -> Project {
     decode(
         "project",
         json!({
-            "id": id, "title": title, "workspaceRoot": root,
-            "defaultModelSelection": null, "scripts": [],
+            "id": id, "title": title, "path": path,
             "createdAt": ago(created_minutes_ago), "updatedAt": ago(created_minutes_ago)
         }),
     )
 }
 
-/// A `Thinking` select over `off` and `levels`, `default` preselected.
-fn thinking(levels: &[&str], default: &str) -> Value {
-    let options: Vec<Value> = std::iter::once("off")
-        .chain(levels.iter().copied())
-        .map(|id| {
-            let mut label = id.to_owned();
-            label[..1].make_ascii_uppercase();
-            let mut option = json!({"id": id, "label": label});
-            if id == default {
-                option["isDefault"] = json!(true);
-            }
-            option
-        })
-        .collect();
-    json!({"optionDescriptors": [
-        {"type": "select", "id": "thinking", "label": "Thinking", "options": options}
-    ]})
-}
-
-fn model(slug: &str, name: &str, capabilities: Value) -> Value {
-    let provider = slug.split_once('/').map_or(slug, |(provider, _)| provider);
-    json!({
-        "slug": slug, "name": name, "subProvider": provider, "isCustom": false,
-        "capabilities": capabilities
-    })
-}
-
-/// The server config j3 sends: one `omp` provider whose models come from Anthropic and
-/// OpenAI (grouped by provider in the picker), with thinking levels, slash commands and
-/// skills.
-pub fn server_config(environment_id: &str, label: &str) -> ServerConfig {
-    let levels = ["low", "medium", "high"];
-    let openai_levels = ["minimal", "low", "medium", "high"];
-    let mut opus = model(
-        "anthropic/claude-opus-4-5",
-        "Claude Opus 4.5",
-        thinking(&levels, "high"),
-    );
-    opus["isDefault"] = json!(true);
-    let models = json!([
-        opus,
-        model(
-            "anthropic/claude-sonnet-4-5",
-            "Claude Sonnet 4.5",
-            thinking(&levels, "medium")
-        ),
-        model(
-            "anthropic/claude-haiku-4-5",
-            "Claude Haiku 4.5",
-            json!({"optionDescriptors": []})
-        ),
-        model(
-            "openai/gpt-5.1",
-            "GPT-5.1",
-            thinking(&openai_levels, "medium")
-        ),
-        model(
-            "openai/gpt-5.1-codex",
-            "GPT-5.1 Codex",
-            thinking(&openai_levels, "high")
-        ),
-        model(
-            "openai/gpt-5-mini",
-            "GPT-5 mini",
-            json!({"optionDescriptors": []})
-        ),
-    ]);
+/// The catalog j3 sends: models from Anthropic and OpenAI (grouped by provider in the
+/// picker), with thinking levels, slash commands and skills. `projects` have had their own
+/// slash commands fetched (they have none beyond omp's).
+pub fn catalog(projects: &[String]) -> Catalog {
+    let levels = json!(["off", "low", "medium", "high"]);
+    let openai_levels = json!(["off", "minimal", "low", "medium", "high"]);
+    let project_commands: serde_json::Map<String, Value> =
+        projects.iter().map(|id| (id.clone(), json!([]))).collect();
     decode(
-        "server config",
+        "catalog",
         json!({
-            "environment": descriptor(environment_id, label),
-            "auth": {"policy": "remote-reachable", "bootstrapMethods": [], "sessionMethods": [],
-                     "sessionCookieName": "j3"},
-            "cwd": "/home/jacob", "keybindingsConfigPath": "/home/jacob/.config/j3/keybindings.json",
-            "keybindings": [], "issues": [], "availableEditors": [],
-            "observability": {"logsDirectoryPath": "/home/jacob/.local/share/j3/logs",
-                              "localTracingEnabled": false, "otlpTracesEnabled": false,
-                              "otlpMetricsEnabled": false},
-            "settings": {},
-            "providers": [{
-                "instanceId": "omp", "driver": "pi", "displayName": "omp",
-                "enabled": true, "installed": true, "version": null, "status": "ready",
-                "auth": {"status": "authenticated"}, "checkedAt": ago(30),
-                "models": models,
-                "slashCommands": slash_commands(),
-                "skills": skills()
-            }]
+            "models": [
+                {"provider": "anthropic", "id": "claude-opus-4-5", "name": "Claude Opus 4.5",
+                 "thinking": levels, "default": true},
+                {"provider": "anthropic", "id": "claude-sonnet-4-5", "name": "Claude Sonnet 4.5",
+                 "thinking": levels},
+                {"provider": "anthropic", "id": "claude-haiku-4-5", "name": "Claude Haiku 4.5"},
+                {"provider": "openai", "id": "gpt-5.1", "name": "GPT-5.1",
+                 "thinking": openai_levels},
+                {"provider": "openai", "id": "gpt-5.1-codex", "name": "GPT-5.1 Codex",
+                 "thinking": openai_levels},
+                {"provider": "openai", "id": "gpt-5-mini", "name": "GPT-5 mini"}
+            ],
+            "skills": [
+                {"name": "unslop", "description": "Rewrite text so it reads like a person wrote it"},
+                {"name": "visualize", "description": "Turn an idea into a diagram or plot"},
+                {"name": "reverse-engineer-anything",
+                 "description": "Investigate binaries, firmware and runtime evidence"}
+            ],
+            "commands": [
+                {"name": "compact", "description": "Summarize the conversation to free context",
+                 "hint": "focus instructions"},
+                {"name": "model", "description": "Switch the model for this thread"},
+                {"name": "plan", "description": "Draft a plan before making changes"},
+                {"name": "review", "description": "Review the working tree changes",
+                 "hint": "base branch"},
+                {"name": "goal", "description": "Set a goal the agent works towards",
+                 "hint": "objective"}
+            ],
+            "projectCommands": project_commands,
+            "status": "ready"
         }),
-    )
-}
-
-pub fn slash_commands() -> Vec<ServerProviderSlashCommand> {
-    decode(
-        "slash commands",
-        json!([
-            {"name": "compact", "description": "Summarize the conversation to free context",
-             "input": {"hint": "focus instructions"}},
-            {"name": "model", "description": "Switch the model for this thread"},
-            {"name": "plan", "description": "Draft a plan before making changes"},
-            {"name": "review", "description": "Review the working tree changes",
-             "input": {"hint": "base branch"}},
-            {"name": "goal", "description": "Set a goal the agent works towards",
-             "input": {"hint": "objective"}}
-        ]),
-    )
-}
-
-pub fn skills() -> Vec<ServerProviderSkill> {
-    decode(
-        "skills",
-        json!([
-            {"name": "unslop", "description": "Rewrite text so it reads like a person wrote it",
-             "path": "skill://unslop", "enabled": true, "userInvocable": true},
-            {"name": "visualize", "description": "Turn an idea into a diagram or plot",
-             "path": "skill://visualize", "enabled": true, "userInvocable": true},
-            {"name": "reverse-engineer-anything",
-             "description": "Investigate binaries, firmware and runtime evidence",
-             "path": "skill://reverse-engineer-anything", "enabled": true, "userInvocable": true}
-        ]),
     )
 }
 
@@ -560,90 +464,89 @@ pub fn skills() -> Vec<ServerProviderSkill> {
 // Thread rows
 // ---------------------------------------------------------------------------
 
-fn selection(slug: &str, level: Option<&str>) -> Value {
-    match level {
-        Some(level) => json!({"instanceId": "omp", "model": slug,
-                              "options": [{"id": "thinking", "value": level}]}),
-        None => json!({"instanceId": "omp", "model": slug}),
-    }
-}
-
 fn opus() -> Value {
-    selection("anthropic/claude-opus-4-5", Some("high"))
+    json!({"provider": "anthropic", "id": "claude-opus-4-5", "thinking": "high"})
 }
 
 fn codex() -> Value {
-    selection("openai/gpt-5.1-codex", Some("high"))
+    json!({"provider": "openai", "id": "gpt-5.1-codex", "thinking": "high"})
 }
 
-/// A thread row created `created` minutes ago whose last run completed then and was seen,
-/// with `patch` applied.
-fn row(id: &str, project: &str, title: &str, created: i64, patch: Value) -> ThreadShell {
+/// A thread row created `created` minutes ago whose last turn completed three minutes later
+/// and was seen, with `patch` merged in.
+fn row(id: &str, project: &str, title: &str, created: i64, patch: Value) -> Thread {
     let base = json!({
-        "createdBy": "user", "creationSource": "web",
         "id": id, "projectId": project, "title": title,
-        "providerInstanceId": "omp", "modelSelection": opus(),
-        "runtimeMode": "full-access", "interactionMode": "default",
-        "branch": "main", "worktreePath": null,
-        "lineage": {"parentThreadId": null, "relationshipToParent": null, "rootThreadId": id},
-        "forkedFrom": null,
-        "activeProviderThreadId": format!("pt-{id}"),
-        "latestRunId": format!("run-{id}"),
-        "latestRunRequestedAt": ago(created),
-        "latestRunStartedAt": ago(created),
-        "latestRunCompletedAt": ago(created - 3),
-        "activeRunId": null,
-        "status": "completed",
-        "pendingRuntimeRequest": null,
-        "latestVisibleMessage": {"id": format!("msg-{id}"), "role": "assistant",
-                                 "text": "Done. The changes are in the working tree.",
-                                 "updatedAt": ago(created - 3)},
-        "latestUserMessageAt": ago(created),
-        "hasActionableProposedPlan": false,
-        "itemCount": 24, "visibleItemCount": 18,
         "createdAt": ago(created), "updatedAt": ago(created - 3),
-        "archivedAt": null, "settledOverride": null, "settledAt": null,
-        "lastVisitedAt": ago(created - 4),
-        "deletedAt": null
+        "status": "idle", "model": opus(), "mode": "default", "queued": 0,
+        "lastMessage": {"role": "assistant", "text": "Done. The changes are in the working tree.",
+                        "at": ago(created - 3)},
+        "latestTurn": {"id": format!("turn-{id}"), "status": "completed",
+                       "requestedAt": ago(created), "startedAt": ago(created),
+                       "endedAt": ago(created - 3)},
+        "latestUserMessageAt": ago(created),
+        "triage": {"visitedAt": ago(created - 4), "bumpedAt": ago(created - 3)}
     });
-    decode("thread row", patched(base, patch))
+    decode("thread row", merged(base, patch))
 }
 
-/// A run that started `minutes` ago and is still running.
+/// A turn that started `minutes` ago and is still running.
 fn running(id: &str, minutes: i64) -> Value {
     json!({
-        "status": "running", "activeRunId": format!("run-{id}"),
-        "activityRunStatus": "running", "activityRunStartedAt": ago(minutes),
-        "latestRunRequestedAt": ago(minutes), "latestRunStartedAt": ago(minutes),
-        "latestRunCompletedAt": null, "latestUserMessageAt": ago(minutes),
-        "updatedAt": ago(0), "lastVisitedAt": ago(minutes)
+        "status": "running", "activeTurnId": format!("turn-{id}"),
+        "latestTurn": {"status": "running", "requestedAt": ago(minutes),
+                       "startedAt": ago(minutes), "endedAt": null},
+        "latestUserMessageAt": ago(minutes),
+        "lastMessage": {"role": "user", "text": "Go ahead.", "at": ago(minutes)},
+        "updatedAt": ago(0),
+        "triage": {"visitedAt": ago(minutes), "bumpedAt": ago(minutes)}
     })
 }
 
-fn local_threads() -> Vec<ThreadShell> {
+/// A latest turn that ended `minutes` ago, seen `visited` minutes ago.
+fn finished(minutes: i64, visited: i64) -> Value {
+    json!({
+        "latestTurn": {"endedAt": ago(minutes)},
+        "lastMessage": {"at": ago(minutes)},
+        "updatedAt": ago(minutes),
+        "triage": {"visitedAt": ago(visited), "bumpedAt": ago(minutes)}
+    })
+}
+
+/// A latest turn that failed `minutes` ago with `kind`, seen `visited` minutes ago.
+fn failed(minutes: i64, visited: i64, kind: &str) -> Value {
+    merged(
+        finished(minutes, visited),
+        json!({"status": "failed", "latestTurn": {"status": "failed", "errorKind": kind}}),
+    )
+}
+
+/// The open thread's last message: a steer into its running turn.
+const STEER: &str = "Run the 240 Hz pass on the external monitor, not the laptop panel.";
+const OPEN_TITLE: &str = "Port the feed renderer to Rune";
+
+fn local_threads() -> Vec<Thread> {
     let j3 = J3CODE_PROJECT;
     let rune = "prj-rune";
+    let archived = |minutes: i64| json!({"archivedAt": ago(minutes)});
     vec![
         // Waiting on the user's answer, with a queued message and a goal (the open thread).
         row(
             OPEN_THREAD,
             j3,
-            "Port the feed renderer to Rune",
+            OPEN_TITLE,
             55,
             json!({
-                "status": "waiting", "latestRunId": "run-3", "activeRunId": "run-3",
-                "activeProviderThreadId": "pt-feed",
-                "activityRunStatus": "waiting", "activityRunStartedAt": ago(6),
-                "latestRunRequestedAt": ago(6), "latestRunStartedAt": ago(6),
-                "latestRunCompletedAt": null, "latestUserMessageAt": ago(1),
-                "pendingRuntimeRequest": {"id": "req-anchor", "kind": "user_input",
-                                          "createdAt": ago(2), "blocking": true},
-                "latestVisibleMessage": {"id": "msg-3", "role": "user",
-                                         "text": "Keep the anchor, and orchestrate a bench run on both displays.",
-                                         "updatedAt": ago(6)},
+                "status": "waiting", "model": codex(), "activeTurnId": "turn-3",
+                "pendingRequest": {"id": "req-anchor", "kind": "ask", "openedAt": ago(2)},
+                "queued": 1,
+                "lastMessage": {"role": "user", "text": STEER, "at": ago(3)},
+                "latestTurn": {"id": "turn-3", "status": "waiting", "requestedAt": ago(6),
+                               "startedAt": ago(6), "endedAt": null},
+                "latestUserMessageAt": ago(3),
                 "goal": goal(),
-                "itemCount": 27, "visibleItemCount": 25,
-                "updatedAt": ago(2), "lastVisitedAt": ago(2)
+                "updatedAt": ago(1),
+                "triage": {"visitedAt": ago(2), "bumpedAt": ago(1)}
             }),
         ),
         // Working.
@@ -652,11 +555,7 @@ fn local_threads() -> Vec<ThreadShell> {
             j3,
             "Sidebar drag and drop between shelves",
             48,
-            patched(
-                running("thr-sidebar-dnd", 4),
-                json!({"modelSelection": codex(),
-                                                          "branch": "sidebar-dnd"}),
-            ),
+            merged(running("thr-sidebar-dnd", 4), json!({"model": codex()})),
         ),
         // Failed, not seen since.
         row(
@@ -664,12 +563,7 @@ fn local_threads() -> Vec<ThreadShell> {
             j3,
             "Dictation drops the first word",
             95,
-            json!({
-                "status": "failed", "latestRunCompletedAt": ago(9),
-                "lastError": "omp exited unexpectedly (exit code 1)",
-                "lastErrorClass": "provider_error",
-                "updatedAt": ago(9), "lastVisitedAt": ago(30)
-            }),
+            failed(9, 30, "crashed"),
         ),
         // Pinned, finished and seen.
         row(
@@ -677,10 +571,10 @@ fn local_threads() -> Vec<ThreadShell> {
             j3,
             "Release checklist for 0.9",
             60 * 24 * 3,
-            json!({
-                "pinnedAt": ago(60 * 24 * 3), "pinOrderKey": "a0",
-                "latestRunCompletedAt": ago(180), "updatedAt": ago(180), "lastVisitedAt": ago(170)
-            }),
+            merged(
+                finished(180, 170),
+                json!({"triage": {"pinnedAt": ago(60 * 24 * 3), "pinOrder": "a0"}}),
+            ),
         ),
         // Finished and unread.
         row(
@@ -688,9 +582,7 @@ fn local_threads() -> Vec<ThreadShell> {
             j3,
             "Typeset display math in markdown",
             70,
-            json!({
-                "latestRunCompletedAt": ago(12), "updatedAt": ago(12), "lastVisitedAt": ago(40)
-            }),
+            finished(12, 40),
         ),
         // Settled.
         row(
@@ -698,9 +590,7 @@ fn local_threads() -> Vec<ThreadShell> {
             j3,
             "Zoom shortcuts on Linux",
             60 * 24 * 2 + 30,
-            json!({
-                "settledOverride": "settled", "settledAt": ago(60 * 24 * 2)
-            }),
+            json!({"triage": {"settled": "settled", "settledAt": ago(60 * 24 * 2)}}),
         ),
         // Snoozed for three hours.
         row(
@@ -708,9 +598,7 @@ fn local_threads() -> Vec<ThreadShell> {
             j3,
             "Follow up on the notarization ticket",
             75,
-            json!({
-                "snoozedUntil": from_now(180), "snoozedAt": ago(60)
-            }),
+            json!({"triage": {"snoozedUntil": from_now(180), "snoozedAt": ago(60)}}),
         ),
         // Working, on GPT-5.1 Codex.
         row(
@@ -718,10 +606,7 @@ fn local_threads() -> Vec<ThreadShell> {
             rune,
             "Momentum scrolling stutters at 120 Hz",
             40,
-            patched(
-                running("thr-scroll", 15),
-                json!({"modelSelection": codex()}),
-            ),
+            merged(running("thr-scroll", 15), json!({"model": codex()})),
         ),
         // Finished a day ago and seen.
         row(
@@ -737,17 +622,34 @@ fn local_threads() -> Vec<ThreadShell> {
             rune,
             "Refactor the flex layout pass",
             130,
-            json!({
-                "status": "failed", "latestRunCompletedAt": ago(20),
-                "lastError": "You have reached your usage limit.",
-                "lastErrorClass": "usage_limit", "usageLimitResetAt": from_now(120),
-                "updatedAt": ago(20), "lastVisitedAt": ago(18)
-            }),
+            failed(20, 18, "usage_limit"),
+        ),
+        // Archived: newest archived first, recent, week, old.
+        row(
+            "thr-archived-week",
+            j3,
+            "Try GPUI's text system for the feed",
+            60 * 24 * 9,
+            archived(60 * 24 * 7),
+        ),
+        row(
+            "thr-archived-old",
+            rune,
+            "Sketch the settings layout",
+            60 * 24 * 40,
+            archived(60 * 24 * 30),
+        ),
+        row(
+            "thr-archived-recent",
+            j3,
+            "Profile the sidebar's drag reordering",
+            60 * 5,
+            archived(90),
         ),
     ]
 }
 
-fn shieldy_threads() -> Vec<ThreadShell> {
+fn shieldy_threads() -> Vec<Thread> {
     let infra = "prj-infra";
     vec![
         // Working.
@@ -758,19 +660,21 @@ fn shieldy_threads() -> Vec<ThreadShell> {
             30,
             running("thr-backup", 22),
         ),
-        // Waiting on an approval.
+        // Waiting on a confirmation.
         row(
             "thr-acl",
             infra,
             "Tailscale ACL for the new runners",
             35,
             json!({
-                "status": "waiting", "activeRunId": "run-thr-acl",
-                "activityRunStatus": "waiting", "activityRunStartedAt": ago(8),
-                "latestRunCompletedAt": null,
-                "pendingRuntimeRequest": {"id": "req-acl", "kind": "command",
-                                          "createdAt": ago(5), "blocking": true},
-                "updatedAt": ago(5), "lastVisitedAt": ago(8)
+                "status": "waiting", "activeTurnId": "turn-thr-acl",
+                "pendingRequest": {"id": "req-acl", "kind": "confirm",
+                                   "title": "Apply the ACL change?", "openedAt": ago(5)},
+                "latestTurn": {"status": "waiting", "requestedAt": ago(8),
+                               "startedAt": ago(8), "endedAt": null},
+                "latestUserMessageAt": ago(8),
+                "updatedAt": ago(5),
+                "triage": {"visitedAt": ago(8), "bumpedAt": ago(5)}
             }),
         ),
         // Finished and unread.
@@ -779,10 +683,10 @@ fn shieldy_threads() -> Vec<ThreadShell> {
             infra,
             "Caddy TLS renewal failing",
             50,
-            json!({
-                "modelSelection": selection("openai/gpt-5.1", Some("medium")),
-                "latestRunCompletedAt": ago(25), "updatedAt": ago(25), "lastVisitedAt": ago(45)
-            }),
+            merged(
+                finished(25, 45),
+                json!({"model": {"provider": "openai", "id": "gpt-5.1", "thinking": "medium"}}),
+            ),
         ),
         // Settled.
         row(
@@ -790,9 +694,7 @@ fn shieldy_threads() -> Vec<ThreadShell> {
             infra,
             "Grafana dashboard for omp latency",
             60 * 24 * 5,
-            json!({
-                "settledOverride": "settled", "settledAt": ago(60 * 24 * 4)
-            }),
+            json!({"triage": {"settled": "settled", "settledAt": ago(60 * 24 * 4)}}),
         ),
         // Snoozed until tomorrow morning.
         row(
@@ -800,17 +702,14 @@ fn shieldy_threads() -> Vec<ThreadShell> {
             infra,
             "Disk pressure alerts on shieldy",
             200,
-            json!({
-                "snoozedUntil": from_now(16 * 60 + 30), "snoozedAt": ago(150)
-            }),
+            json!({"triage": {"snoozedUntil": from_now(16 * 60 + 30), "snoozedAt": ago(150)}}),
         ),
     ]
 }
 
 fn goal() -> Value {
     json!({"objective": "Feed renders every turn item kind on Rune with no scroll jumps",
-           "status": "active", "tokensUsed": 48_210, "tokenBudget": 200_000,
-           "timeUsedSeconds": 1_260})
+           "state": "active", "tokensUsed": 48_210, "budget": 200_000})
 }
 
 // ---------------------------------------------------------------------------
@@ -851,551 +750,506 @@ pub fn hold(anchor: &Anchor, before: f32, after: f32) -> f32 {
 ![Frame time before and after](data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='240'%20height='72'%3E%3Crect%20x='0'%20y='8'%20width='220'%20height='22'%20rx='4'%20fill='%23e5484d'/%3E%3Crect%20x='0'%20y='42'%20width='68'%20height='22'%20rx='4'%20fill='%2330a46c'/%3E%3C/svg%3E)
 "#;
 
-/// The open thread's live state: a feed with every rendered turn item kind, a run waiting
-/// on a two-question `ask`, a queued message, a goal and an active todo plan.
-pub fn thread_state() -> ThreadState {
-    ThreadState {
+const ANCHOR_RS: &str = "//! Keeps the feed still while rows above the viewport change height.\n\n/// The row the viewport is pinned to and its offset from the top.\npub struct Anchor {\n    pub row: usize,\n    pub offset: f32,\n}\n\n/// Keeps `anchor` at the same screen offset across a relayout.\npub fn hold(anchor: &Anchor, before: f32, after: f32) -> f32 {\n    let drift = after - before;\n    anchor.offset - drift\n}\n";
+
+/// The open thread's live state: a feed with every rendered item kind, a turn waiting on a
+/// two-question `ask`, a queued message, a goal and an active todo list.
+pub fn thread_state() -> ThreadView {
+    let thread = local_threads()
+        .into_iter()
+        .find(|thread| thread.id == OPEN_THREAD)
+        .expect("the open thread's row");
+    ThreadView {
         thread_id: OPEN_THREAD.to_owned(),
-        sync: ThreadSync::Live,
+        sync: ThreadSync::Synced,
         sequence: 312,
-        projection: Some(projection()),
+        thread: Some(thread),
+        turns: decode(
+            "turns",
+            json!([
+                turn("turn-1", 1, "completed", opus(), 52, Some(27)),
+                turn("turn-2", 2, "stopped", codex(), 20, Some(18)),
+                turn("turn-3", 3, "waiting", codex(), 6, None)
+            ]),
+        ),
+        items: feed_items(),
+        requests: vec![decode("request", request())],
+        queue: vec![decode(
+            "queue entry",
+            json!({
+                "id": "queue-1", "threadId": OPEN_THREAD, "position": 1,
+                "text": "Then write the changelog entry.", "model": codex(),
+                "createdAt": ago(1)
+            }),
+        )],
     }
 }
 
-/// One feed item of the open thread: `(run, status, minutes ago, seconds long, title,
-/// type-specific body)`.
-type FeedItem = (
-    &'static str,
-    &'static str,
-    i64,
-    i64,
-    Option<&'static str>,
-    Value,
-);
+fn turn(
+    id: &str,
+    ordinal: u32,
+    status: &str,
+    model: Value,
+    requested: i64,
+    ended: Option<i64>,
+) -> Value {
+    let mut turn = json!({
+        "id": id, "threadId": OPEN_THREAD, "ordinal": ordinal, "status": status,
+        "model": model, "requestedAt": ago(requested), "startedAt": ago(requested)
+    });
+    if let Some(ended) = ended {
+        turn["endedAt"] = json!(ago(ended));
+    }
+    turn
+}
+
+/// The open `ask` of turn 3: two questions, the second multiple choice.
+fn request() -> Value {
+    json!({
+        "id": "req-anchor", "threadId": OPEN_THREAD, "turnId": "turn-3",
+        "kind": "ask", "status": "open", "openedAt": ago(2),
+        "questions": [
+            {"id": "anchor", "header": "Anchor",
+             "text": "Where should the feed stay anchored while a reply streams?",
+             "options": [
+                 {"label": "Bottom", "description": "Follow new output as it arrives (recommended)"},
+                 {"label": "Top of the reply", "description": "Keep the start of the reply in view"},
+                 {"label": "Where I left it", "description": "Never scroll on its own"}
+             ],
+             "allowOther": true},
+            {"id": "displays", "header": "Displays",
+             "text": "Which refresh rates should the bench cover?",
+             "options": [
+                 {"label": "60 Hz", "description": "The laptop panel"},
+                 {"label": "120 Hz", "description": "ProMotion"},
+                 {"label": "240 Hz", "description": "The external monitor"}
+             ],
+             "multiple": true}
+        ]
+    })
+}
+
+/// One feed item of the open thread: `(turn, status, seconds before NOW it started, seconds
+/// long (None while running), kind and its fields)`.
+type FeedItem = (&'static str, &'static str, i64, Option<i64>, Value);
+
+/// A tool item's fields: `name`, omp's intent (also its `i` argument), its arguments and
+/// output.
+fn tool(call: &str, name: &str, intent: Option<&str>, mut input: Value, output: Value) -> Value {
+    if let Some(intent) = intent {
+        input["i"] = json!(intent);
+    }
+    let mut tool = json!({"kind": "tool", "callId": call, "name": name, "input": input});
+    if let Some(intent) = intent {
+        tool["intent"] = json!(intent);
+    }
+    tool["output"] = output;
+    tool
+}
+
+/// `tool` with a structured `detail`.
+fn tool_with(
+    call: &str,
+    name: &str,
+    intent: Option<&str>,
+    input: Value,
+    output: Value,
+    detail: Value,
+) -> Value {
+    let mut tool = tool(call, name, intent, input, output);
+    tool["detail"] = detail;
+    tool
+}
 
 /// The open thread's feed items, in order.
-fn feed_items() -> Vec<FeedItem> {
-    let image = json!({"type": "image", "id": "att-feed-jump", "name": "feed-jump.png",
-                       "mimeType": "image/png", "sizeBytes": 184_320});
-    vec![
-        // Run 1: the investigation, completed.
+fn feed_items() -> Vec<Item> {
+    const M: i64 = 60;
+    let screenshot = json!({"id": "att-feed-jump", "name": "feed-jump.png",
+                            "mimeType": "image/png", "size": 184_320});
+    let items: Vec<FeedItem> = vec![
+        // Turn 1: the investigation, completed.
         (
-            "run-1",
+            "turn-1",
             "completed",
-            52,
-            0,
-            None,
+            52 * M,
+            Some(0),
             json!({
-                "type": "user_message", "createdBy": "user", "creationSource": "web",
-                "messageId": "msg-1", "inputIntent": "turn_start",
-                "text": "Use ^anthropic/claude-opus-4-5 and ultrathink this: why does the feed jump while a long reply streams in? Screenshot attached.",
-                "attachments": [image]
+                "kind": "user", "delivery": "prompt", "attachments": [screenshot],
+                "text": "Use ^anthropic/claude-opus-4-5 and ultrathink this: why does the feed jump while a long reply streams in? Screenshot attached."
             }),
         ),
         (
-            "run-1",
+            "turn-1",
             "completed",
-            52,
-            18,
-            None,
+            52 * M - 2,
+            Some(18),
             json!({
-                "type": "reasoning", "streaming": false,
+                "kind": "thinking",
                 "text": "The jump lines up with each streamed chunk. The virtual list keeps its scroll offset fixed, but the rows **above** the viewport are remeasured when the reply grows, so the content under the viewport shifts.\n\nCheck where `remeasure_items` runs and whether the anchor is the first or last visible row."
             }),
         ),
         (
-            "run-1",
+            "turn-1",
             "completed",
-            51,
-            1,
-            Some("Finding where rows are remeasured"),
-            json!({
-                "type": "file_search", "pattern": "remeasure",
-                "results": [
-                    {"fileName": "crates/j3-desktop/src/thread/mod.rs", "line": 142, "preview": "        self.remeasure(&changed);"},
-                    {"fileName": "crates/j3-desktop/src/thread/mod.rs", "line": 188, "preview": "    fn remeasure(&mut self, rows: &[usize]) {"},
-                    {"fileName": "crates/j3-desktop/src/feed.rs", "line": 61, "preview": "/// Rows whose item changed are remeasured; the rest keep their height."}
-                ]
-            }),
+            51 * M,
+            Some(1),
+            tool_with(
+                "call-grep",
+                "grep",
+                Some("Finding where rows are remeasured"),
+                json!({"pattern": "remeasure", "path": "crates/j3-desktop/src"}),
+                json!({"text": "# crates/j3-desktop/src/\n## thread/mod.rs#6163\n*142:        self.remeasure(&changed);\n*188:    fn remeasure(&mut self, rows: &[usize]) {\n## feed.rs#1F0A\n*61:/// Rows whose item changed are remeasured; the rest keep their height."}),
+                json!({"type": "search", "pattern": "remeasure", "matches": [
+                    {"path": "crates/j3-desktop/src/thread/mod.rs", "line": 142,
+                     "text": "        self.remeasure(&changed);"},
+                    {"path": "crates/j3-desktop/src/thread/mod.rs", "line": 188,
+                     "text": "    fn remeasure(&mut self, rows: &[usize]) {"},
+                    {"path": "crates/j3-desktop/src/feed.rs", "line": 61,
+                     "text": "/// Rows whose item changed are remeasured; the rest keep their height."}
+                ]}),
+            ),
         ),
         (
-            "run-1",
+            "turn-1",
             "completed",
-            50,
-            1,
-            Some("Reading the thread view"),
-            json!({
-                "type": "dynamic_tool", "toolName": "read",
-                "input": {"path": "crates/j3-desktop/src/thread/mod.rs:125-131"},
-                "output": "[crates/j3-desktop/src/thread/mod.rs#6163]\n125:pub fn view(s: &J3, cx: &mut Cx<J3>, ui: &mut Ui, key: &ThreadKey) -> El {\n126:    let k = ui.k;\n127:    let note = |message: String| {\n128:        el().key(\"feed-note\")\n129:            .w_full()\n130:            .grow(1.0)\n131:            .center()"
-            }),
+            50 * M,
+            Some(1),
+            tool(
+                "call-read",
+                "read",
+                Some("Reading the thread view"),
+                json!({"path": "crates/j3-desktop/src/thread/mod.rs:125-131"}),
+                json!({"text": "[crates/j3-desktop/src/thread/mod.rs#6163]\n125:pub fn view(s: &J3, cx: &mut Cx<J3>, ui: &mut Ui, key: &ThreadKey) -> El {\n126:    let k = ui.k;\n127:    let note = |message: String| {\n128:        el().key(\"feed-note\")\n129:            .w_full()\n130:            .grow(1.0)\n131:            .center()"}),
+            ),
         ),
         (
-            "run-1",
+            "turn-1",
             "completed",
-            49,
-            3,
-            Some("Searching for scroll anchoring"),
-            json!({
-                "type": "web_search", "patterns": ["virtual list scroll anchoring streaming content"],
-                "results": [
+            49 * M,
+            Some(3),
+            tool_with(
+                "call-web",
+                "web_search",
+                Some("Searching for scroll anchoring"),
+                json!({"query": "virtual list scroll anchoring streaming content"}),
+                json!({"text": "Scroll anchoring keeps the visible content stable when content above it changes size: anchor to the last fully visible message and correct the offset after layout."}),
+                json!({"type": "web_search", "query": "virtual list scroll anchoring streaming content",
+                       "results": [
                     {"title": "CSS Scroll Anchoring", "url": "https://drafts.csswg.org/css-scroll-anchoring/",
                      "snippet": "Scroll anchoring aims to keep the visible content stable when content above it changes size."},
                     {"title": "Building a chat list that does not jump", "url": "https://blog.example.dev/chat-scroll",
                      "snippet": "Anchor to the last fully visible message and correct the offset after layout."},
                     {"title": "Virtualized lists and dynamic heights", "url": "https://github.com/anomalyco/rune/discussions/412",
                      "snippet": "Measure once, then correct by the delta of rows above the viewport."}
-                ]
-            }),
+                ]}),
+            ),
         ),
         (
-            "run-1",
-            "failed",
-            48,
-            4,
-            None,
-            json!({
-                "type": "error",
-                "failure": {"class": "provider_error", "message": "overloaded_error: Overloaded",
-                            "code": "529", "retryable": true},
-                "retry": {"attempt": 2, "maxAttempts": 5, "retryDelayMs": 4_000}
-            }),
-        ),
-        (
-            "run-1",
+            "turn-1",
             "completed",
-            46,
-            38,
-            Some("Running the feed tests"),
+            48 * M,
+            Some(4),
             json!({
-                "type": "command_execution", "input": "cargo test -p j3-desktop feed",
-                "output": "   Compiling j3-desktop v0.9.0 (/home/jacob/repos/j3code/crates/j3-desktop)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 31.84s\n     Running unittests src/lib.rs (target/debug/deps/j3_desktop-5c1f0e2a9b7d4e31)\n\nrunning 14 tests\ntest feed::tests::ages_are_compact ... ok\ntest feed::tests::diff_lines_split_omp_and_unified_forms ... ok\ntest feed::tests::dynamic_tools_get_their_omp_titles ... ok\ntest feed::tests::edits_writes_and_searches_read_like_omp ... ok\n\ntest result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 212 filtered out; finished in 0.04s\n",
-                "exitCode": 0
+                "kind": "notice", "level": "warning",
+                "text": "overloaded_error: Overloaded (529). Retrying in 4 s, attempt 2 of 5."
             }),
         ),
         (
-            "run-1",
+            "turn-1",
             "completed",
-            45,
-            24,
-            Some("Linting with clippy"),
-            json!({
-                "type": "command_execution", "input": "cargo clippy -p j3-desktop --all-targets -- -D warnings",
-                "output": "    Checking j3-desktop v0.9.0 (/home/jacob/repos/j3code/crates/j3-desktop)\nerror: unused variable: `delta`\n  --> crates/j3-desktop/src/thread/anchor.rs:18:9\n   |\n18 |     let delta = after - before;\n   |         ^^^^^ help: if this is intentional, prefix it with an underscore: `_delta`\n   |\n   = note: `-D unused-variables` implied by `-D warnings`\n\nerror: could not compile `j3-desktop` (lib) due to 1 previous error\n",
-                "exitCode": 101, "outputIndicatesFailure": true
-            }),
+            46 * M,
+            Some(38),
+            tool_with(
+                "call-test",
+                "bash",
+                Some("Running the feed tests"),
+                json!({"command": "cargo test -p j3-desktop feed"}),
+                json!({"exitCode": 0, "text": "   Compiling j3-desktop v0.9.0 (/home/jacob/repos/j3code/crates/j3-desktop)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 31.84s\n     Running unittests src/lib.rs (target/debug/deps/j3_desktop-5c1f0e2a9b7d4e31)\n\nrunning 14 tests\ntest feed::tests::ages_are_compact ... ok\ntest feed::tests::diff_lines_split_omp_and_unified_forms ... ok\ntest feed::tests::dynamic_tools_get_their_omp_titles ... ok\ntest feed::tests::edits_writes_and_searches_read_like_omp ... ok\n\ntest result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 212 filtered out; finished in 0.04s\n"}),
+                json!({"type": "command", "command": "cargo test -p j3-desktop feed"}),
+            ),
         ),
         (
-            "run-1",
+            "turn-1",
             "completed",
-            43,
-            1,
-            None,
-            json!({
-                "type": "file_change", "fileName": "crates/j3-desktop/src/thread/mod.rs",
-                "additions": 6, "deletions": 2,
-                "diffStr": "@@ -139,8 +139,12 @@\n 139|        let changed = self.changed_rows(&state);\n-140|        self.remeasure(&changed);\n-141|        self.scroll.keep_offset();\n+140|        let anchor = self.scroll.last_visible();\n+141|        let before = self.scroll.offset_of(anchor);\n+142|        self.remeasure(&changed);\n+143|        let after = self.scroll.offset_of(anchor);\n+144|        self.scroll.shift(anchor::hold(&anchor, before, after));\n+145|        self.scroll.settle();\n 146|    }"
-            }),
+            45 * M,
+            Some(24),
+            tool_with(
+                "call-clippy",
+                "bash",
+                Some("Linting with clippy"),
+                json!({"command": "cargo clippy -p j3-desktop --all-targets -- -D warnings"}),
+                json!({"exitCode": 101, "text": "    Checking j3-desktop v0.9.0 (/home/jacob/repos/j3code/crates/j3-desktop)\nerror: unused variable: `delta`\n  --> crates/j3-desktop/src/thread/anchor.rs:18:9\n   |\n18 |     let delta = after - before;\n   |         ^^^^^ help: if this is intentional, prefix it with an underscore: `_delta`\n   |\n   = note: `-D unused-variables` implied by `-D warnings`\n\nerror: could not compile `j3-desktop` (lib) due to 1 previous error\n"}),
+                json!({"type": "command", "command": "cargo clippy -p j3-desktop --all-targets -- -D warnings"}),
+            ),
         ),
         (
-            "run-1",
+            "turn-1",
             "completed",
-            42,
-            1,
-            None,
-            json!({
-                "type": "dynamic_tool", "toolName": "write",
-                "input": {"path": "crates/j3-desktop/src/thread/anchor.rs",
-                          "content": "//! Keeps the feed still while rows above the viewport change height.\n\n/// The row the viewport is pinned to and its offset from the top.\npub struct Anchor {\n    pub row: usize,\n    pub offset: f32,\n}\n\n/// Keeps `anchor` at the same screen offset across a relayout.\npub fn hold(anchor: &Anchor, before: f32, after: f32) -> f32 {\n    let drift = after - before;\n    anchor.offset - drift\n}\n"},
-                "output": "Wrote crates/j3-desktop/src/thread/anchor.rs (13 lines)"
-            }),
+            43 * M,
+            Some(1),
+            tool_with(
+                "call-edit-scroll",
+                "edit",
+                None,
+                json!({"input": "[crates/j3-desktop/src/thread/mod.rs#6163]\nPUT 140.=141:\n+        let anchor = self.scroll.last_visible();\n+        let before = self.scroll.offset_of(anchor);\n+        self.remeasure(&changed);\n+        let after = self.scroll.offset_of(anchor);\n+        self.scroll.shift(anchor::hold(&anchor, before, after));\n+        self.scroll.settle();\n"}),
+                json!({"text": "Applied 1 edit to crates/j3-desktop/src/thread/mod.rs"}),
+                json!({"type": "file_change", "path": "crates/j3-desktop/src/thread/mod.rs",
+                       "additions": 6, "deletions": 2,
+                       "diff": " 139|        let changed = self.changed_rows(&state);\n-140|        self.remeasure(&changed);\n-141|        self.scroll.keep_offset();\n+140|        let anchor = self.scroll.last_visible();\n+141|        let before = self.scroll.offset_of(anchor);\n+142|        self.remeasure(&changed);\n+143|        let after = self.scroll.offset_of(anchor);\n+144|        self.scroll.shift(anchor::hold(&anchor, before, after));\n+145|        self.scroll.settle();\n 146|    }"}),
+            ),
         ),
         (
-            "run-1",
+            "turn-1",
             "completed",
-            41,
-            1,
-            None,
-            json!({
-                "type": "dynamic_tool", "toolName": "edit",
-                "input": {"path": "crates/j3-desktop/src/thread/mod.rs",
-                          "input": "[crates/j3-desktop/src/thread/mod.rs#6163]\nPUT <8:\n+mod anchor;\n+"},
-                "output": "Applied 1 edit to crates/j3-desktop/src/thread/mod.rs"
-            }),
+            42 * M,
+            Some(1),
+            tool_with(
+                "call-write",
+                "write",
+                None,
+                json!({"path": "crates/j3-desktop/src/thread/anchor.rs", "content": ANCHOR_RS}),
+                json!({"text": "Wrote crates/j3-desktop/src/thread/anchor.rs (13 lines)"}),
+                json!({"type": "file_change", "path": "crates/j3-desktop/src/thread/anchor.rs",
+                       "content": ANCHOR_RS}),
+            ),
         ),
         (
-            "run-1",
+            "turn-1",
             "completed",
-            40,
-            2,
-            None,
-            json!({
-                "type": "dynamic_tool", "toolName": "eval",
-                "input": {"language": "py", "title": "Comparing frame times",
-                          "code": "before = [6.9, 6.7, 6.8]\nafter = [2.2, 2.0, 2.1]\nprint(f\"{sum(before)/3:.1f} ms -> {sum(after)/3:.1f} ms\")"},
-                "output": "6.8 ms -> 2.1 ms"
-            }),
+            41 * M,
+            Some(1),
+            tool_with(
+                "call-edit-mod",
+                "edit",
+                None,
+                json!({"input": "[crates/j3-desktop/src/thread/mod.rs#6163]\nPUT <8:\n+mod anchor;\n"}),
+                json!({"text": "Applied 1 edit to crates/j3-desktop/src/thread/mod.rs"}),
+                json!({"type": "file_change", "path": "crates/j3-desktop/src/thread/mod.rs",
+                       "additions": 1, "deletions": 0, "diff": "+8|mod anchor;"}),
+            ),
         ),
         (
-            "run-1",
+            "turn-1",
             "completed",
-            39,
-            0,
-            None,
-            json!({
-                "type": "todo_list", "planId": "plan-feed",
-                "explanation": "Fix the jump, then guard it with a bench.",
-                "steps": todo_steps()
-            }),
+            40 * M,
+            Some(2),
+            tool(
+                "call-eval",
+                "eval",
+                None,
+                json!({"language": "py", "title": "Comparing frame times",
+                       "code": "before = [6.9, 6.7, 6.8]\nafter = [2.2, 2.0, 2.1]\nprint(f\"{sum(before)/3:.1f} ms -> {sum(after)/3:.1f} ms\")"}),
+                json!({"text": "6.8 ms -> 2.1 ms"}),
+            ),
         ),
         (
-            "run-1",
+            "turn-1",
             "completed",
-            38,
-            2,
-            None,
-            json!({
-                "type": "dynamic_tool", "toolName": "task",
-                "input": {"agent": "task", "tasks": [
-                    {"name": "AuditScroll", "task": "Find every place the feed changes its scroll offset"},
-                    {"name": "BenchFeed", "task": "Measure frame time while a 4,000-line reply streams"}
+            40 * M - 30,
+            Some(1),
+            tool(
+                "call-plot",
+                "read",
+                Some("Viewing the frame-time plot"),
+                json!({"path": "benches/out/frame-times.png"}),
+                json!({"text": "Read image file [image/png]",
+                       "images": [{"attachmentId": "att-frame-times", "mimeType": "image/png"}]}),
+            ),
+        ),
+        (
+            "turn-1",
+            "completed",
+            39 * M,
+            Some(0),
+            json!({"kind": "todo", "phases": [
+                {"name": "Fix the jump", "tasks": [
+                    {"text": "Find where rows are remeasured", "status": "completed"},
+                    {"text": "Anchor the scroll to the last visible row", "status": "completed"}
                 ]},
-                "output": "Started 2 agents: AuditScroll, BenchFeed"
-            }),
+                {"name": "Guard it with a bench", "tasks": [
+                    {"text": "Bench frame time while streaming", "status": "in_progress"},
+                    {"text": "Write the changelog entry", "status": "pending"}
+                ]}
+            ]}),
         ),
         (
-            "run-1",
+            "turn-1",
             "completed",
-            37,
-            140,
-            None,
+            38 * M,
+            Some(2),
+            tool(
+                "call-task",
+                "task",
+                None,
+                json!({"agent": "task", "tasks": [
+                    {"name": "AuditScroll", "task": "Find every place the feed changes its scroll offset"},
+                    {"name": "ProfileGpu", "task": "Profile GPU time per frame while a reply streams"}
+                ]}),
+                json!({"text": "Started 2 agents: AuditScroll, ProfileGpu"}),
+            ),
+        ),
+        (
+            "turn-1",
+            "completed",
+            37 * M,
+            Some(140),
             json!({
-                "type": "subagent", "subagentId": "sa-audit", "origin": "provider_native",
-                "driver": "pi", "providerInstanceId": "omp", "childThreadId": null,
+                "kind": "subagent", "subagentId": "sa-audit", "agent": "task", "description": "Audit scroll writers",
+                "model": "anthropic/claude-sonnet-4-5",
                 "prompt": "Find every place the feed changes its scroll offset and list them with file:line.",
                 "progress": "Checked 9 call sites",
                 "result": "Three writers: `thread/mod.rs:144` (anchor shift), `thread/mod.rs:201` (jump to bottom on send) and `rune_kit::MessageScroller::follow`. Only the first runs while streaming."
             }),
         ),
         (
-            "run-1",
-            "completed",
-            34,
-            2,
-            None,
+            "turn-1",
+            "failed",
+            37 * M,
+            Some(45),
             json!({
-                "type": "dynamic_tool", "toolName": "mcp__github__search_issues",
-                "input": {"query": "scroll jump is:open repo:anomalyco/rune"},
-                "output": "#412 Virtualized lists and dynamic heights (open)\n#398 MessageScroller jumps when a row above grows (open)"
+                "kind": "subagent", "subagentId": "sa-profile", "agent": "task", "description": "ProfileGpu",
+                "model": "anthropic/claude-sonnet-4-5",
+                "prompt": "Profile GPU time per frame while a 4,000-line reply streams.",
+                "progress": "Opening the GPU counters",
+                "result": "GPU counters are not readable over SSH on this machine."
             }),
         ),
         (
-            "run-1",
+            "turn-1",
             "completed",
-            31,
-            25,
-            None,
-            json!({
-                "type": "assistant_message", "messageId": "msg-1a", "text": ANSWER, "streaming": false
-            }),
-        ),
-        // Between runs.
-        (
-            "run-1",
-            "completed",
-            29,
-            0,
-            None,
-            json!({
-                "type": "system_notice", "message": "Model changed to GPT-5.1 Codex · thinking high"
-            }),
+            34 * M,
+            Some(2),
+            tool(
+                "call-issues",
+                "mcp__github__search_issues",
+                None,
+                json!({"query": "scroll jump is:open repo:anomalyco/rune"}),
+                json!({"text": "#412 Virtualized lists and dynamic heights (open)\n#398 MessageScroller jumps when a row above grows (open)"}),
+            ),
         ),
         (
-            "run-1",
+            "turn-1",
             "completed",
-            28,
-            12,
-            None,
+            31 * M,
+            Some(25),
+            json!({"kind": "text", "text": ANSWER}),
+        ),
+        (
+            "turn-1",
+            "completed",
+            29 * M,
+            Some(0),
+            json!({"kind": "notice", "level": "info",
+                   "text": "Model changed to GPT-5.1 Codex · thinking high"}),
+        ),
+        (
+            "turn-1",
+            "completed",
+            28 * M,
+            Some(12),
             json!({
-                "type": "compaction", "driver": "pi",
+                "kind": "compaction",
                 "summary": "Investigated the feed jump, anchored the scroll to the last visible row and added a bench.",
-                "beforeTokenCount": 182_340, "afterTokenCount": 24_120
+                "tokensBefore": 182_340
             }),
         ),
-        // Run 2: stopped by the user.
+        // Turn 2: stopped by the user.
         (
-            "run-2",
+            "turn-2",
             "completed",
-            20,
-            0,
-            None,
-            json!({
-                "type": "user_message", "createdBy": "user", "creationSource": "web",
-                "messageId": "msg-2", "inputIntent": "turn_start",
-                "text": "Also try it on the 240 Hz display.", "attachments": []
-            }),
+            20 * M,
+            Some(0),
+            json!({"kind": "user", "delivery": "prompt",
+                   "text": "Also try it on the 240 Hz display."}),
         ),
         (
-            "run-2",
-            "interrupted",
-            19,
-            40,
-            None,
-            json!({
-                "type": "reasoning", "streaming": false,
-                "text": "The 240 Hz display is on the other machine; I need the bench binary there first."
-            }),
+            "turn-2",
+            "cancelled",
+            19 * M,
+            Some(40),
+            json!({"kind": "thinking",
+                   "text": "The 240 Hz display is on the other machine; I need the bench binary there first."}),
         ),
         (
-            "run-2",
+            "turn-2",
             "completed",
-            18,
-            0,
-            None,
-            json!({
-                "type": "run_interrupt_request", "message": "Stop"
-            }),
+            18 * M,
+            Some(0),
+            json!({"kind": "stop", "requestedAt": ago(18), "stoppedAt": ago(18)}),
         ),
+        // Turn 3: active, waiting on the user's answer.
         (
-            "run-2",
+            "turn-3",
             "completed",
-            18,
-            0,
-            None,
-            json!({
-                "type": "run_interrupt_result", "message": "Stopped by the user."
-            }),
+            6 * M,
+            Some(0),
+            json!({"kind": "user", "delivery": "prompt",
+                   "text": "Keep the anchor, and orchestrate a bench run on both displays."}),
         ),
-        // Run 3: active, waiting on the user's answer.
         (
-            "run-3",
+            "turn-3",
             "completed",
-            6,
-            0,
-            None,
-            json!({
-                "type": "user_message", "createdBy": "user", "creationSource": "web",
-                "messageId": "msg-3", "inputIntent": "turn_start",
-                "text": "Keep the anchor, and orchestrate a bench run on both displays.",
-                "attachments": []
-            }),
+            6 * M - 5,
+            Some(0),
+            merged(json!({"kind": "goal"}), goal()),
         ),
         (
-            "run-3",
+            "turn-3",
             "running",
-            5,
-            0,
+            5 * M,
             None,
             json!({
-                "type": "subagent", "subagentId": "sa-bench", "origin": "provider_native",
-                "driver": "pi", "providerInstanceId": "omp", "childThreadId": null,
+                "kind": "subagent", "subagentId": "sa-bench", "agent": "task", "description": "BenchFeed",
+                "model": "anthropic/claude-sonnet-4-5",
                 "prompt": "Measure frame time while a 4,000-line reply streams, at 60, 120 and 240 Hz.",
-                "progress": "120 Hz: 2.1 ms median, running 240 Hz", "result": null
+                "progress": "120 Hz: 2.1 ms median, running 240 Hz"
             }),
         ),
         (
-            "run-3",
+            "turn-3",
             "running",
-            4,
-            0,
-            Some("Building the bench for shieldy"),
-            json!({
-                "type": "command_execution", "input": "cargo build --release -p j3-desktop --benches",
-                "output": "   Compiling rune v0.9.0\n   Compiling rune-kit v0.9.0\n   Compiling j3-client v0.9.0 (/home/jacob/repos/j3code/crates/j3-client)\n   Compiling j3-desktop v0.9.0 (/home/jacob/repos/j3code/crates/j3-desktop)\n"
-            }),
+            4 * M,
+            None,
+            tool_with(
+                "call-bench",
+                "bash",
+                Some("Building the bench for shieldy"),
+                json!({"command": "cargo build --release -p j3-desktop --benches"}),
+                json!({"text": "   Compiling rune v0.9.0\n   Compiling rune-kit v0.9.0\n   Compiling j3-client v0.9.0 (/home/jacob/repos/j3code/crates/j3-client)\n   Compiling j3-desktop v0.9.0 (/home/jacob/repos/j3code/crates/j3-desktop)\n"}),
+                json!({"type": "command", "command": "cargo build --release -p j3-desktop --benches"}),
+            ),
         ),
         (
-            "run-3",
-            "waiting",
-            2,
-            0,
-            None,
-            json!({
-                "type": "user_input_request", "requestId": "req-anchor",
-                "questions": [
-                    {"id": "anchor", "header": "Anchor",
-                     "question": "Where should the feed stay anchored while a reply streams?",
-                     "options": [
-                         {"label": "Bottom", "description": "Follow new output as it arrives (recommended)"},
-                         {"label": "Top of the reply", "description": "Keep the start of the reply in view"},
-                         {"label": "Where I left it", "description": "Never scroll on its own"}
-                     ],
-                     "allowCustomAnswer": true},
-                    {"id": "displays", "header": "Displays",
-                     "question": "Which refresh rates should the bench cover?",
-                     "options": [
-                         {"label": "60 Hz", "description": "The laptop panel"},
-                         {"label": "120 Hz", "description": "ProMotion"},
-                         {"label": "240 Hz", "description": "The external monitor"}
-                     ],
-                     "multiSelect": true}
-                ]
-            }),
+            "turn-3",
+            "completed",
+            3 * M,
+            Some(0),
+            json!({"kind": "user", "delivery": "steer", "text": STEER}),
         ),
-        // Run 4: queued behind run 3 (shown in the queue card, hidden in the feed).
-        (
-            "run-4",
-            "pending",
-            1,
-            0,
-            None,
-            json!({
-                "type": "user_message", "createdBy": "user", "creationSource": "web",
-                "messageId": "msg-4", "inputIntent": "queued_turn",
-                "text": "Then write the changelog entry.", "attachments": []
-            }),
-        ),
-    ]
-}
-
-fn todo_steps() -> Value {
-    json!([
-        {"id": "s1", "text": "Find where rows are remeasured", "status": "completed"},
-        {"id": "s2", "text": "Anchor the scroll to the last visible row", "status": "completed"},
-        {"id": "s3", "text": "Bench frame time while streaming", "status": "running"},
-        {"id": "s4", "text": "Write the changelog entry", "status": "pending"}
-    ])
-}
-
-fn turn_item(ordinal: usize, item: &FeedItem) -> Value {
-    let (run, status, minutes, seconds, title, body) = item;
-    let started = NOW - Duration::minutes(*minutes);
-    let completed = matches!(*status, "completed" | "failed" | "interrupted")
-        .then(|| iso(started + Duration::seconds(*seconds)));
-    let base = json!({
-        "id": format!("item-{ordinal}"), "threadId": OPEN_THREAD,
-        "runId": run, "nodeId": format!("node-{run}"),
-        "providerThreadId": "pt-feed", "providerTurnId": null, "nativeItemRef": null,
-        "parentItemId": null, "ordinal": ordinal, "status": status, "title": title,
-        "startedAt": iso(started), "completedAt": completed,
-        "updatedAt": completed.clone().unwrap_or_else(|| iso(started))
-    });
-    patched(base, body.clone())
-}
-
-fn run(id: &str, ordinal: u64, status: &str, requested: i64, completed: Option<i64>) -> Value {
-    json!({
-        "id": id, "threadId": OPEN_THREAD, "ordinal": ordinal,
-        "providerInstanceId": "omp", "modelSelection": codex(),
-        "providerThreadId": "pt-feed", "userMessageId": format!("msg-{ordinal}"),
-        "rootNodeId": format!("node-{id}"), "activeAttemptId": null, "status": status,
-        "queuePosition": (status == "queued").then_some(1),
-        "requestedAt": ago(requested),
-        "startedAt": (status != "queued").then(|| ago(requested)),
-        "completedAt": completed.map(ago),
-        "checkpointId": null, "contextHandoffId": null
-    })
-}
-
-fn message(ordinal: u64, run: &str, text: &str, minutes: i64) -> Value {
-    json!({
-        "createdBy": "user", "creationSource": "web", "id": format!("msg-{ordinal}"),
-        "threadId": OPEN_THREAD, "runId": run, "nodeId": format!("node-{run}"),
-        "role": "user", "text": text, "attachments": [], "streaming": false,
-        "createdAt": ago(minutes), "updatedAt": ago(minutes)
-    })
-}
-
-fn subagent(id: &str, title: &str, status: &str, started: i64, item: &Value) -> Value {
-    json!({
-        "id": id, "threadId": OPEN_THREAD, "runId": item["runId"], "parentNodeId": item["nodeId"],
-        "origin": "provider_native", "createdBy": "agent", "driver": "pi",
-        "providerInstanceId": "omp", "providerThreadId": null, "childThreadId": null,
-        "nativeTaskRef": null, "prompt": item["prompt"], "title": title,
-        "model": "anthropic/claude-sonnet-4-5", "status": status, "progress": item["progress"],
-        "result": item["result"], "startedAt": ago(started),
-        "completedAt": item["completedAt"], "updatedAt": item["updatedAt"]
-    })
-}
-
-fn projection() -> ThreadProjection {
-    let items: Vec<Value> = feed_items()
-        .iter()
+    ];
+    items
+        .into_iter()
         .enumerate()
-        .map(|(ix, item)| turn_item(ix + 1, item))
-        .collect();
-    let find = |subagent_id: &str| {
-        items
-            .iter()
-            .find(|item| item["subagentId"] == subagent_id)
-            .cloned()
-            .unwrap_or_default()
-    };
-    let visible: Vec<Value> = items
-        .iter()
-        .enumerate()
-        .map(|(ix, item)| {
-            json!({"position": ix + 1, "visibility": "local", "sourceThreadId": OPEN_THREAD,
-                   "sourceItemId": item["id"], "item": item})
+        .map(|(ix, (turn, status, started, seconds, kind))| {
+            let mut item = json!({
+                "id": format!("item-{}", ix + 1), "threadId": OPEN_THREAD, "turnId": turn,
+                "ordinal": ix + 1, "status": status, "startedAt": seconds_ago(started)
+            });
+            if let Some(seconds) = seconds {
+                item["endedAt"] = json!(seconds_ago(started - seconds));
+            }
+            decode("feed item", merged(item, kind))
         })
-        .collect();
-    decode(
-        "thread projection",
-        json!({
-            "thread": {
-                "createdBy": "user", "creationSource": "web", "id": OPEN_THREAD,
-                "projectId": J3CODE_PROJECT, "title": "Port the feed renderer to Rune",
-                "providerInstanceId": "omp", "modelSelection": codex(),
-                "runtimeMode": "full-access", "interactionMode": "default",
-                "branch": "feed-anchor", "worktreePath": null,
-                "activeProviderThreadId": "pt-feed",
-                "lineage": {"parentThreadId": null, "relationshipToParent": null,
-                            "rootThreadId": OPEN_THREAD},
-                "forkedFrom": null, "createdAt": ago(55), "updatedAt": ago(1),
-                "archivedAt": null, "lastVisitedAt": ago(2), "deletedAt": null
-            },
-            "runs": [
-                run("run-1", 1, "completed", 52, Some(31)),
-                run("run-2", 2, "interrupted", 20, Some(18)),
-                run("run-3", 3, "waiting", 6, None),
-                run("run-4", 4, "queued", 1, None)
-            ],
-            "attempts": [], "nodes": [],
-            "subagents": [
-                subagent("sa-audit", "AuditScroll", "completed", 37, &find("sa-audit")),
-                subagent("sa-bench", "BenchFeed", "running", 5, &find("sa-bench"))
-            ],
-            "providerSessions": [],
-            "providerThreads": [{
-                "id": "pt-feed", "driver": "pi", "providerInstanceId": "omp",
-                "providerSessionId": null, "appThreadId": OPEN_THREAD, "ownerNodeId": null,
-                "nativeThreadRef": null, "nativeConversationHeadRef": null, "status": "active",
-                "firstRunOrdinal": 1, "lastRunOrdinal": 3, "handoffIds": [], "forkedFrom": null,
-                "goal": goal(), "createdAt": ago(55), "updatedAt": ago(2)
-            }],
-            "providerTurns": [],
-            "runtimeRequests": [{
-                "id": "req-anchor", "nodeId": "node-run-3", "providerTurnId": null,
-                "nativeRequestRef": null, "kind": "user_input", "status": "pending",
-                "responseCapability": {"type": "message"},
-                "createdAt": ago(2), "resolvedAt": null
-            }],
-            "messages": [
-                message(1, "run-1", "Use ^anthropic/claude-opus-4-5 and ultrathink this: why does the feed jump while a long reply streams in? Screenshot attached.", 52),
-                message(2, "run-2", "Also try it on the 240 Hz display.", 20),
-                message(3, "run-3", "Keep the anchor, and orchestrate a bench run on both displays.", 6),
-                message(4, "run-4", "Then write the changelog entry.", 1)
-            ],
-            "plans": [{
-                "id": "plan-feed", "threadId": OPEN_THREAD, "runId": "run-1",
-                "nodeId": "node-run-1", "status": "active", "kind": "todo_list",
-                "steps": todo_steps(),
-                "explanation": "Fix the jump, then guard it with a bench."
-            }],
-            "turnItems": items,
-            "checkpointScopes": [], "checkpoints": [], "contextHandoffs": [],
-            "contextTransfers": [],
-            "visibleTurnItems": visible,
-            "updatedAt": ago(1)
-        }),
-    )
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use j3_client::{
-        t3::orchestration::TurnItemKind,
-        workflow::{AgentStatus, T3Section, ThreadStatus, agent_status, t3_section, thread_status},
+        EnvThread,
+        entities::{Delivery, ItemKind, ItemStatus, ToolDetail},
+        herdr::{AgentStatus, agent_status},
+        inbox::{self, Section},
     };
 
     use super::*;
@@ -1408,100 +1262,148 @@ mod tests {
     }
 
     #[test]
-    fn the_open_thread_covers_every_rendered_turn_item_kind() {
+    fn the_open_thread_covers_every_rendered_item_kind() {
         let state = thread_state();
         let kinds: Vec<&str> = state
-            .feed()
+            .items
             .iter()
-            .map(|row| match &row.item.kind {
-                TurnItemKind::UserMessage(_) => "user_message",
-                TurnItemKind::AssistantMessage(_) => "assistant_message",
-                TurnItemKind::Reasoning(_) => "reasoning",
-                TurnItemKind::TodoList(_) => "todo_list",
-                TurnItemKind::UserInputRequest(_) => "user_input_request",
-                TurnItemKind::FileChange(_) => "file_change",
-                TurnItemKind::CommandExecution(_) => "command_execution",
-                TurnItemKind::FileSearch(_) => "file_search",
-                TurnItemKind::WebSearch(_) => "web_search",
-                TurnItemKind::DynamicTool(_) => "dynamic_tool",
-                TurnItemKind::RunInterruptRequest(_) => "run_interrupt_request",
-                TurnItemKind::RunInterruptResult(_) => "run_interrupt_result",
-                TurnItemKind::SystemNotice(_) => "system_notice",
-                TurnItemKind::Error(_) => "error",
-                TurnItemKind::Compaction(_) => "compaction",
-                TurnItemKind::Subagent(_) => "subagent",
-                TurnItemKind::Unknown(_) => "unknown",
+            .map(|item| match &item.kind {
+                ItemKind::User(user) if user.delivery == Delivery::Steer => "steer",
+                ItemKind::User(user) if !user.attachments.is_empty() => "user with image",
+                ItemKind::User(_) => "user",
+                ItemKind::Text(_) => "text",
+                ItemKind::Thinking(_) => "thinking",
+                ItemKind::Tool(tool) => match &tool.detail {
+                    Some(ToolDetail::Command { .. }) => "command",
+                    Some(ToolDetail::FileChange { diff: Some(_), .. }) => "edit",
+                    Some(ToolDetail::FileChange {
+                        content: Some(_), ..
+                    }) => "write",
+                    Some(ToolDetail::FileChange { .. }) => "file change",
+                    Some(ToolDetail::Search { .. }) => "search",
+                    Some(ToolDetail::WebSearch { .. }) => "web search",
+                    Some(ToolDetail::Unknown) => "unknown tool",
+                    None if tool.output.as_ref().is_some_and(|o| !o.images.is_empty()) => {
+                        "image output"
+                    }
+                    None => "plain tool",
+                },
+                ItemKind::Todo(_) => "todo",
+                ItemKind::Subagent(_) => "subagent",
+                ItemKind::Goal(_) => "goal",
+                ItemKind::Compaction(_) => "compaction",
+                ItemKind::Notice(_) => "notice",
+                ItemKind::Stop(_) => "stop",
+                ItemKind::Unknown => "unknown",
             })
             .collect();
         for kind in [
-            "user_message",
-            "assistant_message",
-            "reasoning",
-            "todo_list",
-            "user_input_request",
-            "file_change",
-            "command_execution",
-            "file_search",
-            "web_search",
-            "dynamic_tool",
-            "run_interrupt_result",
-            "system_notice",
-            "error",
-            "compaction",
+            "user with image",
+            "user",
+            "steer",
+            "text",
+            "thinking",
+            "command",
+            "edit",
+            "write",
+            "search",
+            "web search",
+            "image output",
+            "plain tool",
+            "todo",
             "subagent",
+            "goal",
+            "compaction",
+            "notice",
+            "stop",
         ] {
             assert!(kinds.contains(&kind), "the feed has a {kind}");
         }
-        assert_eq!(state.queued_runs().len(), 1);
+        assert!(!kinds.contains(&"unknown"));
+        assert_eq!(state.queue.len(), 1);
+        assert_eq!(state.queue[0].text, "Then write the changelog entry.");
+        let requests: Vec<_> = state.open_requests().collect();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].questions.len(), 2);
+        assert!(requests[0].questions[1].multiple);
+        let thread = state.thread.as_ref().unwrap();
+        assert_eq!(thread.title, OPEN_TITLE);
+        assert!(thread.goal.is_some());
         assert_eq!(
-            state.queued_runs()[0].text,
-            "Then write the changelog entry."
+            thread.pending_request.as_ref().map(|r| r.id.as_str()),
+            Some(requests[0].id.as_str())
         );
-        let questions = state.pending_user_inputs();
-        assert_eq!(questions.len(), 1);
-        assert_eq!(questions[0].questions.len(), 2);
-        assert!(state.goal().is_some());
-        assert_eq!(state.latest_todo().map(|todo| todo.steps.len()), Some(4));
-        assert_eq!(state.active_run().map(|run| run.id.as_str()), Some("run-3"));
-        assert_eq!(state.subagents().len(), 2);
+        let (_, todo) = state.latest_todo().unwrap();
+        let tasks: Vec<_> = todo.phases.iter().flat_map(|phase| &phase.tasks).collect();
+        assert_eq!(tasks.len(), 4);
+        assert_eq!(
+            state.active_turn().map(|turn| turn.id.as_str()),
+            Some("turn-3")
+        );
+        let subagents: Vec<ItemStatus> = state.subagents().map(|(item, _)| item.status).collect();
+        assert_eq!(
+            subagents,
+            [
+                ItemStatus::Completed,
+                ItemStatus::Failed,
+                ItemStatus::Running
+            ]
+        );
+        let mut ordinals: Vec<u64> = state.items.iter().map(|item| item.ordinal).collect();
+        ordinals.dedup();
+        assert_eq!(ordinals.len(), state.items.len());
     }
 
     #[test]
     fn the_sidebar_fixtures_span_every_status_and_section() {
         let local = local_state();
         let shieldy = shieldy_state();
-        let threads: Vec<&ThreadShell> = local
+        let threads: Vec<&Thread> = local
             .shell
             .threads
-            .iter()
-            .chain(&shieldy.shell.threads)
+            .values()
+            .chain(shieldy.shell.threads.values())
             .collect();
-        let statuses: Vec<ThreadStatus> = threads.iter().map(|t| thread_status(t)).collect();
+        let archived: Vec<&str> = threads
+            .iter()
+            .filter(|thread| !inbox::is_listed(thread))
+            .map(|thread| thread.id.as_str())
+            .collect();
+        assert_eq!(archived.len(), 3);
+        let listed: Vec<&Thread> = threads
+            .into_iter()
+            .filter(|thread| inbox::is_listed(thread))
+            .collect();
+        assert_eq!(listed.len(), 15);
+
+        let statuses: Vec<inbox::Status> = listed.iter().map(|t| inbox::status(t)).collect();
         for status in [
-            ThreadStatus::Working,
-            ThreadStatus::Input,
-            ThreadStatus::Approval,
-            ThreadStatus::Failed,
-            ThreadStatus::Limited,
-            ThreadStatus::Ready,
+            inbox::Status::Input,
+            inbox::Status::Working,
+            inbox::Status::Limited,
+            inbox::Status::Failed,
+            inbox::Status::Ready,
         ] {
             assert!(statuses.contains(&status), "a thread is {status:?}");
         }
-        let sections: Vec<Option<T3Section>> =
-            threads.iter().map(|t| t3_section(t, NOW, true)).collect();
+        assert!(
+            listed.iter().any(|t| inbox::is_unread(t)),
+            "a thread is unread"
+        );
+        let sections: Vec<Section> = listed
+            .iter()
+            .map(|t| inbox::section(t, NOW, true, true))
+            .collect();
         for section in [
-            T3Section::Pinned,
-            T3Section::Active,
-            T3Section::Working,
-            T3Section::Snoozed,
-            T3Section::Settled,
+            Section::Pinned,
+            Section::Active,
+            Section::Working,
+            Section::Snoozed,
+            Section::Settled,
         ] {
-            assert!(
-                sections.contains(&Some(section)),
-                "a thread is in {section:?}"
-            );
+            assert!(sections.contains(&section), "a thread is in {section:?}");
         }
-        let agents: Vec<AgentStatus> = threads.iter().map(|t| agent_status(t)).collect();
+        let agents: Vec<AgentStatus> = listed.iter().map(|t| agent_status(t)).collect();
         for status in [
             AgentStatus::Working,
             AgentStatus::Blocked,
@@ -1510,9 +1412,24 @@ mod tests {
         ] {
             assert!(agents.contains(&status), "an agent is {status:?}");
         }
+        let layout = inbox::layout(
+            listed
+                .iter()
+                .map(|thread| EnvThread {
+                    environment: LOCAL_KEY,
+                    thread,
+                })
+                .collect(),
+            NOW,
+            true,
+            |_| true,
+        );
+        assert_eq!(layout.pinned.len(), 1);
+        assert!(layout.next_wake_at.is_some());
+
         assert_eq!(local.shell.projects.len() + shieldy.shell.projects.len(), 3);
-        let config = local.config.as_ref().unwrap();
-        let choices = crate::models::model_choices(config);
+        let catalog = local.catalog.as_ref().unwrap();
+        let choices = crate::models::model_choices(catalog);
         let providers: Vec<&str> = crate::models::by_provider(&choices)
             .into_iter()
             .map(|(provider, _)| provider)

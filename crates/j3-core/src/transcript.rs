@@ -1,5 +1,5 @@
-//! `j3.getSubagentTranscript`: a subagent's omp session file, read
-//! incrementally and cut down to [`TranscriptEntry`]s.
+//! `thread.transcript`: a subagent's omp session file, read incrementally
+//! and cut down to [`TranscriptEntry`]s.
 //!
 //! omp writes subagent `<id>` of session `<stem>.jsonl` to
 //! `<stem>/<id>.jsonl`. Reading the file directly works whether or not the
@@ -11,7 +11,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use j3_protocol::j3::{SubagentTranscript, TranscriptEntry};
+use j3_protocol::v2::methods::{TranscriptEntry, TranscriptResult};
 use serde_json::Value;
 
 use crate::omp::omp_rpc::{AgentMessage, AssistantContent, MessageContent, UserContent};
@@ -36,7 +36,7 @@ pub fn subagent_file(session_file: &Path, subagent_id: &str) -> Option<PathBuf> 
 
 /// Whole lines of `path` from `from_byte` (restarting at zero when the file
 /// is shorter), up to [`MAX_READ`] bytes.
-pub fn read(path: &Path, from_byte: u64) -> std::io::Result<SubagentTranscript> {
+pub fn read(path: &Path, from_byte: u64) -> std::io::Result<TranscriptResult> {
     let mut file = File::open(path)?;
     let len = file.metadata()?.len();
     let reset = from_byte > len;
@@ -56,7 +56,7 @@ pub fn read(path: &Path, from_byte: u64) -> std::io::Result<SubagentTranscript> 
         }
     }
     let next_byte = start + whole as u64;
-    Ok(SubagentTranscript {
+    Ok(TranscriptResult {
         next_byte,
         reset,
         more: want < len - start && whole > 0,
@@ -93,13 +93,9 @@ fn push_line(mut line: Value, entries: &mut Vec<TranscriptEntry>) {
                         });
                     }
                     AssistantContent::ToolCall(call) => entries.push(TranscriptEntry::ToolCall {
-                        id: call.id.unwrap_or_default(),
                         name: call.name.unwrap_or_default(),
                         intent: call.intent.filter(|intent| !intent.trim().is_empty()),
-                        arguments: call
-                            .arguments
-                            .map(|arguments| Value::Object(arguments).to_string())
-                            .unwrap_or_default(),
+                        input: call.arguments.map_or(Value::Null, Value::Object),
                     }),
                     _ => {}
                 }
@@ -109,10 +105,9 @@ fn push_line(mut line: Value, entries: &mut Vec<TranscriptEntry>) {
             });
         }
         AgentMessage::ToolResult(result) => entries.push(TranscriptEntry::ToolResult {
-            tool_call_id: result.tool_call_id.unwrap_or_default(),
             name: result.tool_name.unwrap_or_default(),
             text: blocks_text(result.content.unwrap_or_default()),
-            is_error: result.is_error.unwrap_or(false),
+            failed: result.is_error.unwrap_or(false),
         }),
         _ => {}
     }
@@ -190,16 +185,14 @@ mod tests {
                     text: "easy".into()
                 },
                 TranscriptEntry::ToolCall {
-                    id: "c1".into(),
                     name: "bash".into(),
                     intent: Some("Echoing".into()),
-                    arguments: r#"{"command":"echo PONG"}"#.into(),
+                    input: serde_json::json!({"command": "echo PONG"}),
                 },
                 TranscriptEntry::ToolResult {
-                    tool_call_id: "c1".into(),
                     name: "bash".into(),
                     text: "PONG".into(),
-                    is_error: false,
+                    failed: false,
                 },
             ]
         );

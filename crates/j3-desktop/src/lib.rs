@@ -1,5 +1,5 @@
 //! The j3 desktop app on Rune: its own in-process j3 server (the local environment) and
-//! remote j3 servers over the t3 wire protocol, in one window. `main.rs` starts the process;
+//! remote j3 servers over j3's wire protocol (v2), in one window. `main.rs` starts the process;
 //! `app` holds the root state and the window.
 
 // The server-config fixtures in unit tests are large `json!` literals.
@@ -30,7 +30,6 @@ pub mod logos;
 pub mod math;
 pub mod mention;
 pub mod menus;
-pub mod message_text;
 pub mod models;
 pub mod motion;
 pub mod new_thread;

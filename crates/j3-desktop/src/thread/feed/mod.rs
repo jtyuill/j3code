@@ -40,8 +40,9 @@ use std::{
 };
 
 use j3_client::{
-    ThreadState, ThreadSync,
-    t3::orchestration::{TurnItem, TurnItemKind},
+    ThreadSync, ThreadView,
+    entities::{Item, ItemKind, ItemStatus, NoticeLevel},
+    methods::StopSubagentParams,
 };
 use rune::{Color, Cx, El, GrowthSpec, Image, ScrollSpec, Tx, col, el, icon, memo, text};
 use rune_kit::{Kit, Spinner};
@@ -91,7 +92,7 @@ pub struct FeedUi {
 
 #[derive(Default)]
 struct Rows {
-    state: Option<Arc<ThreadState>>,
+    state: Option<Arc<ThreadView>>,
     /// Feed indices of the items shown (`!feed::is_hidden`).
     visible: Rc<[usize]>,
     /// Each shown item's revision: bumped whenever the item differs from the last state's.
@@ -102,7 +103,7 @@ struct Rows {
 impl FeedUi {
     /// The rows of `state`, updating the revisions (and forgetting the expansion of items
     /// that left the feed) when it is a new state.
-    fn sync(&self, state: &Arc<ThreadState>) -> Rc<[usize]> {
+    fn sync(&self, state: &Arc<ThreadView>) -> Rc<[usize]> {
         let mut rows = self.rows.borrow_mut();
         if rows
             .state
@@ -112,18 +113,18 @@ impl FeedUi {
             return rows.visible.clone();
         }
         let last = rows.state.take();
-        let before: HashMap<&str, &TurnItem> = last
+        let before: HashMap<&str, &Item> = last
             .iter()
-            .flat_map(|last| last.feed())
-            .map(|projected| (projected.item.id.as_str(), &projected.item))
+            .flat_map(|last| &last.items)
+            .map(|item| (item.id.as_str(), item))
             .collect();
-        let feed = state.feed();
+        let feed = &state.items;
         let visible: Rc<[usize]> = (0..feed.len())
-            .filter(|&ix| !is_hidden(&feed[ix].item))
+            .filter(|&ix| !is_hidden(&feed[ix]))
             .collect();
         let mut revisions = HashMap::with_capacity(visible.len());
         for &ix in visible.iter() {
-            let item = &feed[ix].item;
+            let item = &feed[ix];
             let kept = before
                 .get(item.id.as_str())
                 .filter(|old| **old == item)
@@ -137,7 +138,7 @@ impl FeedUi {
         rows.revisions = revisions;
         self.expanded
             .borrow_mut()
-            .retain(|id| feed.iter().any(|projected| projected.item.id == *id));
+            .retain(|id| feed.iter().any(|item| item.id == *id));
         rows.visible = visible.clone();
         rows.state = Some(state.clone());
         visible
@@ -165,23 +166,19 @@ impl J3 {
         }
     }
 
-    /// Stops subagent `subagent_id` of run `run_id` in `key`'s thread.
-    pub fn stop_subagent(&mut self, key: &ThreadKey, run_id: &str, subagent_id: &str) {
+    /// Stops subagent `subagent_id` in `key`'s thread.
+    pub fn stop_subagent(&mut self, key: &ThreadKey, subagent_id: &str) {
         let Some(connection) = self.envs.get(&key.env).map(|env| env.connection().clone()) else {
             return;
         };
-        let (thread_id, run_id, subagent_id) = (
-            key.thread_id.clone(),
-            run_id.to_owned(),
-            subagent_id.to_owned(),
-        );
+        let params = StopSubagentParams {
+            thread_id: key.thread_id.clone(),
+            subagent_id: subagent_id.to_owned(),
+            command_id: None,
+        };
         self.run_command(
             "stop the subagent",
-            async move {
-                connection
-                    .stop_subagent(&thread_id, &run_id, &subagent_id)
-                    .await
-            },
+            async move { connection.subagents_stop(params).await },
             |_, _, _| {},
         );
     }
@@ -215,7 +212,7 @@ impl J3 {
 pub struct Ctx<'a> {
     pub k: &'a Kit,
     pub key: &'a ThreadKey,
-    pub state: &'a ThreadState,
+    pub state: &'a ThreadView,
     feed: &'a FeedUi,
     /// The text column's width in points.
     pub width: f32,
@@ -230,6 +227,11 @@ pub struct Ctx<'a> {
 }
 
 impl Ctx<'_> {
+    /// The thread's project, which markdown image paths are relative to.
+    pub fn project_id(&self) -> &str {
+        project_id(self.state)
+    }
+
     pub fn expanded(&self, id: &str) -> bool {
         self.feed.is_expanded(id)
     }
@@ -260,6 +262,14 @@ impl Ctx<'_> {
             reveal: 0.0,
         }
     }
+}
+
+/// The project of `state`'s thread; empty until the thread is known.
+fn project_id(state: &ThreadView) -> &str {
+    state
+        .thread
+        .as_ref()
+        .map_or("", |thread| thread.project_id.as_str())
 }
 
 /// A chevron: down when expanded, right when not.
@@ -297,12 +307,12 @@ pub fn view(s: &J3, cx: &mut Cx<J3>, ui: &mut Ui, key: &ThreadKey) -> El {
     };
     let state = &thread.state;
     match &state.sync {
-        ThreadSync::Deleted => return note("This thread was deleted.".into()),
-        ThreadSync::Failed(e) if state.projection.is_none() => {
-            return note(format!("Couldn’t load the thread: {e}"));
+        ThreadSync::Missing => return note("This thread was deleted.".into()),
+        ThreadSync::Error { message } if state.thread.is_none() => {
+            return note(format!("Couldn’t load the thread: {message}"));
         }
         ThreadSync::Loading => return loading(),
-        _ if state.projection.is_none() => return loading(),
+        _ if state.thread.is_none() => return loading(),
         _ => {}
     }
     let visible = thread.feed.sync(state);
@@ -314,19 +324,14 @@ pub fn view(s: &J3, cx: &mut Cx<J3>, ui: &mut Ui, key: &ThreadKey) -> El {
     let version = Rc::as_ptr(&visible) as *const () as usize;
     // A held message: room below the rows for its reply, and no following the end while it
     // may still grow.
-    let row_key = |ix: usize| {
-        state
-            .feed()
-            .get(ix)
-            .map(|projected| format!("feed-{}", projected.item.id))
-    };
+    let row_key = |ix: usize| state.items.get(ix).map(|item| format!("feed-{}", item.id));
     let last_row = visible.last().and_then(|&ix| row_key(ix));
     let held = thread.feed.anchor().and_then(|anchor| {
         let at = visible.iter().position(|&ix| {
             state
-                .feed()
+                .items
                 .get(ix)
-                .is_some_and(|p| p.item.id == anchor.item())
+                .is_some_and(|item| item.id == anchor.item())
         })?;
         // The row's own space above the message: a new turn's gap, none for the first row.
         Some((
@@ -373,8 +378,8 @@ pub fn view(s: &J3, cx: &mut Cx<J3>, ui: &mut Ui, key: &ThreadKey) -> El {
                         let id = s
                             .threads
                             .get(&key_of)
-                            .and_then(|thread| thread.state.feed().get(*visible_of.get(i)?))
-                            .map_or("", |projected| projected.item.id.as_str());
+                            .and_then(|thread| thread.state.items.get(*visible_of.get(i)?))
+                            .map_or("", |item| item.id.as_str());
                         Cow::Owned(format!("feed-{id}"))
                     },
                     build,
@@ -392,8 +397,8 @@ fn build_row(s: &J3, key: &ThreadKey, visible: &[usize], i: usize, dark: bool, s
     let Some(thread) = s.threads.get(key) else {
         return el();
     };
-    let feed = thread.state.feed();
-    let item_at = |i: usize| Some(&feed.get(*visible.get(i)?)?.item);
+    let feed = &thread.state.items;
+    let item_at = |i: usize| feed.get(*visible.get(i)?);
     let Some(item) = item_at(i) else {
         return el();
     };
@@ -401,7 +406,7 @@ fn build_row(s: &J3, key: &ThreadKey, visible: &[usize], i: usize, dark: bool, s
     let m = Metrics::new(s.prefs.ui());
     let previous = i.checked_sub(1).and_then(item_at);
     let next = item_at(i + 1);
-    let is_prompt = |item: &TurnItem| matches!(item.kind, TurnItemKind::UserMessage(_));
+    let is_prompt = |item: &Item| matches!(item.kind, ItemKind::User(_));
     let top = match previous {
         None => 0.0,
         Some(_) if is_prompt(item) => TURN_GAP,
@@ -415,9 +420,10 @@ fn build_row(s: &J3, key: &ThreadKey, visible: &[usize], i: usize, dark: bool, s
         below: on_rail && next.is_some_and(is_activity),
     };
     // Text that streams in keeps the stack's paced growth; everything else arrives whole.
+    let running = item.status == ItemStatus::Running;
     let streams = match &item.kind {
-        TurnItemKind::AssistantMessage(_) => true,
-        TurnItemKind::Reasoning(reasoning) => reasoning.streaming,
+        ItemKind::Text(_) => true,
+        ItemKind::Thinking(_) => running,
         _ => false,
     };
     let cx = Ctx {
@@ -432,8 +438,8 @@ fn build_row(s: &J3, key: &ThreadKey, visible: &[usize], i: usize, dark: bool, s
         rail,
     };
     let label = match &item.kind {
-        TurnItemKind::UserMessage(message) => Some(message.text.clone()),
-        TurnItemKind::AssistantMessage(message) => Some(message.text.clone()),
+        ItemKind::User(message) => Some(message.text.clone()),
+        ItemKind::Text(message) => Some(message.text.clone()),
         _ => None,
     };
     let frame = move |content: El| {
@@ -462,9 +468,7 @@ fn build_row(s: &J3, key: &ThreadKey, visible: &[usize], i: usize, dark: bool, s
     // A streaming reply shows only its blocks that have ended (`feed::settled_blocks`), so its
     // row changes once a paragraph, not once a token: it is versioned by what it shows.
     let shown = match &item.kind {
-        TurnItemKind::AssistantMessage(message) if message.streaming => {
-            Some(feed::settled_blocks(&message.text))
-        }
+        ItemKind::Text(message) if running => Some(feed::settled_blocks(&message.text)),
         _ => None,
     };
     let version = shown.map_or(thread.feed.revision(&item.id), |shown| {
@@ -488,23 +492,23 @@ fn build_row(s: &J3, key: &ThreadKey, visible: &[usize], i: usize, dark: bool, s
     let id = key.element_id(&format!("feed-row-{}", item.id));
     // Markdown resolves its images first: their states version the row.
     match &item.kind {
-        TurnItemKind::AssistantMessage(message) => {
+        ItemKind::Text(message) => {
             // Each block's words fade in as it first draws, the last one too when the stream
             // ends and it is shown whole.
             let look = Look {
                 reveal: motion::WORD_FADE,
-                ..cx.look(k.c.text_base, message.streaming)
+                ..cx.look(k.c.text_base, running)
             };
             let text = shown.unwrap_or(&message.text);
-            let doc = doc(s, &key.env, &item.thread_id, text, look);
+            let doc = doc(s, &key.env, cx.project_id(), text, look);
             cx.wait_all(&doc.wait);
             return memo(id, (base, doc.images), || {
                 frame(doc.view(s, &format!("md-{}", item.id), look))
             });
         }
-        TurnItemKind::Reasoning(reasoning) if expanded => {
-            let look = cx.look(k.c.text_muted, reasoning.streaming);
-            let images = doc(s, &key.env, &item.thread_id, &reasoning.text, look).images;
+        ItemKind::Thinking(thinking) if expanded => {
+            let look = cx.look(k.c.text_muted, running);
+            let images = doc(s, &key.env, cx.project_id(), &thinking.text, look).images;
             return memo(id, (base, images), || frame(content(s, &cx, item)));
         }
         _ => {}
@@ -513,9 +517,9 @@ fn build_row(s: &J3, key: &ThreadKey, visible: &[usize], i: usize, dark: bool, s
     memo(id, (base, extra), || frame(content(s, &cx, item)))
 }
 
-/// What besides the item a row's look depends on: the images it shows, its subagent's
-/// state, the environment's model names.
-fn extra_version(s: &J3, cx: &Ctx, item: &TurnItem) -> u64 {
+/// What besides the item a row's look depends on: the images it shows, the environment's
+/// model names.
+fn extra_version(s: &J3, cx: &Ctx, item: &Item) -> u64 {
     let mut hasher = DefaultHasher::new();
     let mut image = |image: &ImageRef| match s.image(&cx.key.env, image) {
         ImageLoad::Loading => 0u8.hash(&mut hasher),
@@ -523,7 +527,7 @@ fn extra_version(s: &J3, cx: &Ctx, item: &TurnItem) -> u64 {
         ImageLoad::Loaded(image) => (image.id(), image.is_ready()).hash(&mut hasher),
     };
     match &item.kind {
-        TurnItemKind::UserMessage(message) => {
+        ItemKind::User(message) => {
             for attachment in &message.attachments {
                 if let Some(attachment) = ImageRef::attachment(attachment) {
                     image(&attachment);
@@ -533,31 +537,12 @@ fn extra_version(s: &J3, cx: &Ctx, item: &TurnItem) -> u64 {
                 (Arc::as_ptr(env.models()) as *const () as usize).hash(&mut hasher);
             }
         }
-        TurnItemKind::CommandExecution(_)
-        | TurnItemKind::FileChange(_)
-        | TurnItemKind::FileSearch(_)
-        | TurnItemKind::WebSearch(_)
-        | TurnItemKind::DynamicTool(_) => {
-            let images = feed::tool_view(item).map_or(0, |view| view.images);
-            for index in 0..images as u64 {
-                image(&ImageRef::ToolOutput {
-                    thread_id: item.thread_id.clone(),
-                    item_id: item.id.clone(),
-                    index,
-                });
-            }
-        }
-        TurnItemKind::Subagent(subagent) => {
-            if let Some(entity) = cx.state.subagent(&subagent.subagent_id) {
-                (
-                    entity.status,
-                    &entity.title,
-                    &entity.model,
-                    &entity.progress,
-                    &entity.result,
-                    &entity.run_id,
-                )
-                    .hash(&mut hasher);
+        ItemKind::Tool(_) => {
+            for id in feed::tool_view(item)
+                .map(|view| view.images)
+                .unwrap_or_default()
+            {
+                image(&ImageRef::Attachment { id });
             }
         }
         _ => {}
@@ -566,68 +551,70 @@ fn extra_version(s: &J3, cx: &Ctx, item: &TurnItem) -> u64 {
 }
 
 /// The content of `item`'s row.
-fn content(s: &J3, cx: &Ctx, item: &TurnItem) -> El {
+fn content(s: &J3, cx: &Ctx, item: &Item) -> El {
     let k = cx.k;
     let status = Status::of(k);
+    let running = item.status == ItemStatus::Running;
     match &item.kind {
-        TurnItemKind::UserMessage(message) => rows::user_message(
+        ItemKind::User(message) => rows::user_message(
             s,
             cx,
             &item.id,
             &message.text,
             &message.attachments,
-            message.input_intent,
+            message.delivery,
         ),
-        TurnItemKind::AssistantMessage(message) => {
-            let look = cx.look(k.c.text_base, message.streaming);
-            doc(s, &cx.key.env, &item.thread_id, &message.text, look).view(
+        ItemKind::Text(message) => {
+            let look = cx.look(k.c.text_base, running);
+            doc(s, &cx.key.env, cx.project_id(), &message.text, look).view(
                 s,
                 &format!("md-{}", item.id),
                 look,
             )
         }
-        TurnItemKind::Reasoning(reasoning) => {
-            rows::reasoning(s, cx, item, &reasoning.text, reasoning.streaming)
-        }
-        TurnItemKind::UserInputRequest(request) => rows::question(cx, item.status, request),
-        TurnItemKind::TodoList(todo) => rows::notice(
+        ItemKind::Thinking(thinking) => rows::reasoning(s, cx, item, &thinking.text, running),
+        ItemKind::Todo(todo) => rows::notice(
             cx,
             &icons::CIRCLE_CHECK,
             k.c.text_faint,
             k.c.text_muted,
             feed::todo_notice(todo),
         ),
-        TurnItemKind::Error(error) => rows::notice(
-            cx,
-            &icons::CIRCLE_ALERT,
-            status.danger,
-            k.c.text_base,
-            feed::error_message(error),
-        ),
-        TurnItemKind::SystemNotice(notice) => rows::notice(
-            cx,
-            &icons::INFO,
-            status.info,
-            k.c.text_muted,
-            notice.message.clone(),
-        ),
-        TurnItemKind::RunInterruptResult(result) => rows::notice(
+        ItemKind::Notice(notice) => match notice.level {
+            NoticeLevel::Error => rows::notice(
+                cx,
+                &icons::CIRCLE_ALERT,
+                status.danger,
+                k.c.text_base,
+                notice.text.clone(),
+            ),
+            NoticeLevel::Warning => rows::notice(
+                cx,
+                &icons::CIRCLE_ALERT,
+                status.warning,
+                k.c.text_base,
+                notice.text.clone(),
+            ),
+            NoticeLevel::Info => rows::notice(
+                cx,
+                &icons::INFO,
+                status.info,
+                k.c.text_muted,
+                notice.text.clone(),
+            ),
+        },
+        ItemKind::Stop(stop) => rows::notice(
             cx,
             &icons::SQUARE,
             k.c.text_faint,
             k.c.text_muted,
-            result.message.clone(),
+            feed::stop_label(stop).to_owned(),
         ),
-        TurnItemKind::Compaction(compaction) => {
-            rows::compaction(k, feed::compaction_label(compaction))
-        }
-        TurnItemKind::CommandExecution(_)
-        | TurnItemKind::FileChange(_)
-        | TurnItemKind::FileSearch(_)
-        | TurnItemKind::WebSearch(_)
-        | TurnItemKind::DynamicTool(_) => tool::view(s, cx, item),
-        TurnItemKind::Subagent(subagent) => rows::subagent(cx, item, subagent),
-        // Stop requests and unknown kinds are hidden before rows are built.
-        TurnItemKind::RunInterruptRequest(_) | TurnItemKind::Unknown(_) => el(),
+        ItemKind::Compaction(compaction) => rows::compaction(k, feed::compaction_label(compaction)),
+        ItemKind::Goal(goal) => rows::goal(cx, goal),
+        ItemKind::Tool(_) => tool::view(s, cx, item),
+        ItemKind::Subagent(subagent) => rows::subagent(cx, item, subagent),
+        // Unknown kinds are hidden before rows are built.
+        ItemKind::Unknown => el(),
     }
 }

@@ -1,5 +1,5 @@
 //! `j3`: the j3 desktop app. Talks to its own in-process j3 server (the
-//! local environment) and to remote j3 servers over the t3 wire protocol.
+//! local environment) and to remote j3 servers over j3's wire protocol (v2).
 
 use std::{path::PathBuf, sync::Arc};
 

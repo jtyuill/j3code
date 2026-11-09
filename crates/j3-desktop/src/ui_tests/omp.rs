@@ -1,4 +1,4 @@
-//! The scripted omp behind the test server (as in `crates/j3-client/tests/client.rs`), the
+//! The scripted omp behind the test server (as in `crates/j3-core/tests/v2_app.rs`), the
 //! shell-script utility omp for the model catalog, usage and word prediction, and the fake
 //! microphone and recogniser behind dictation.
 
@@ -27,7 +27,11 @@ use crate::speech::{
     models::{Hardware, SpeechModel},
 };
 
-/// The model the fake omp lists (and the tests launch with).
+/// The provider of the model the fake omp lists (and the tests launch with).
+pub const PROVIDER: &str = "opencode-go";
+/// That model's id within its provider.
+pub const MODEL_ID: &str = "glm-5.3-flash";
+/// That model as the composer names it (`provider/id`).
 pub const MODEL: &str = "opencode-go/glm-5.3-flash";
 
 /// What the fake sessions were asked, and their event channels to answer through.
@@ -296,7 +300,7 @@ impl SessionFactory for FakeFactory {
 
 /// omp's description of [`MODEL`].
 fn model_info() -> Value {
-    json!({"id": "glm-5.3-flash", "name": "GLM 5.3 Flash", "api": "x", "provider": "opencode-go",
+    json!({"id": MODEL_ID, "name": "GLM 5.3 Flash", "api": "x", "provider": PROVIDER,
         "baseUrl": "x", "reasoning": true, "input": ["text"],
         "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
         "contextWindow": null, "maxTokens": null})

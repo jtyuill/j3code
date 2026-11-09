@@ -23,16 +23,16 @@ impl J3 {
     }
 }
 
-/// The thread's title: its projection's, else its sidebar row's, else "Thread".
+/// The thread's title: its live state's, else its sidebar row's, else "Thread".
 pub fn title(s: &J3, key: &ThreadKey) -> String {
     s.threads
         .get(key)
-        .and_then(|thread| thread.state.projection.as_ref())
-        .map(|projection| projection.thread.title.clone())
+        .and_then(|thread| thread.state.thread.as_ref())
+        .map(|thread| thread.title.clone())
         .or_else(|| {
             s.envs
                 .get(&key.env)
-                .and_then(|env| env.state().shell.thread(&key.thread_id))
+                .and_then(|env| env.state().shell.threads.get(&key.thread_id))
                 .map(|thread| thread.title.clone())
         })
         .unwrap_or_else(|| "Thread".to_owned())
@@ -93,7 +93,10 @@ fn actions_menu(s: &J3, ui: &mut Ui, key: &ThreadKey) -> rune::El {
     let k = ui.k;
     let thread = s.threads.get(key);
     let open = thread.is_some_and(|thread| thread.chrome.actions_open);
-    let has_goal = thread.is_some_and(|thread| thread.state.goal().is_some());
+    let has_goal = thread.is_some_and(|thread| {
+        let goal = thread.state.thread.as_ref().and_then(|t| t.goal.as_ref());
+        super::goal::current(goal).is_some()
+    });
     let item = |label: &str, run: MenuRun| {
         let key = key.clone();
         MenuItem::new(label).on_select_tx(move |s: &mut J3, tx: &mut Tx| {

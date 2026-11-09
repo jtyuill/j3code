@@ -1,10 +1,10 @@
 //! The file preview under the tree: a breadcrumb with copy and close, then the file read with
-//! `connection.read_file`, syntax-coloured by its extension with line numbers, or a notice
+//! `projects.readFile`, syntax-coloured by its extension with line numbers, or a notice
 //! (truncated, binary, failed).
 
 use std::{borrow::Cow, ops::Range};
 
-use j3_client::{Error, t3::project::ProjectReadFileResult};
+use j3_client::{Error, envelope::ErrorCode, methods::ReadFileResult};
 use rune::{El, GrowthSpec, ScrollSpec, TextStyle, Tx, col, el, icon, row, text};
 use rune_kit::{
     IconButton, IconButtonVariant, Spinner,
@@ -73,36 +73,38 @@ pub(super) struct Code {
 
 impl Body {
     /// The preview of `path` from its read; highlighting runs here, off the UI thread.
-    pub fn read(path: &str, result: Result<ProjectReadFileResult, Error>) -> Body {
+    pub fn read(path: &str, result: Result<ReadFileResult, Error>) -> Body {
         match result {
             Ok(file) => {
                 let truncated = file.truncated.then(|| {
                     format!(
                         "Showing the first {} of {}.",
-                        format_size(file.contents.len() as u64),
-                        format_size(file.byte_length)
+                        format_size(file.text.len() as u64),
+                        format_size(file.size)
                     )
                 });
                 let language = crate::syntax::language(path);
-                let highlights = rune_kit::syntax::builtin(
-                    (language != "text").then_some(language),
-                    &file.contents,
-                );
-                let (lines, spans) = split_lines(&file.contents, &highlights);
+                let highlights =
+                    rune_kit::syntax::builtin((language != "text").then_some(language), &file.text);
+                let (lines, spans) = split_lines(&file.text, &highlights);
                 let columns = lines
                     .iter()
-                    .map(|line| columns(&file.contents[line.clone()]))
+                    .map(|line| columns(&file.text[line.clone()]))
                     .max()
                     .unwrap_or(0);
                 Body::Text(Code {
-                    text: file.contents,
+                    text: file.text,
                     lines,
                     spans,
                     columns,
                     truncated,
                 })
             }
-            Err(Error::Rejected { error, .. }) if error["failure"] == "binary_file" => Body::Binary,
+            Err(Error::Server(error))
+                if error.code == ErrorCode::Rejected && error.message.contains("binary") =>
+            {
+                Body::Binary
+            }
             Err(error) => Body::Failed(error.to_string()),
         }
     }

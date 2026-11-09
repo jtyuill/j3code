@@ -1,9 +1,9 @@
-//! "Custom snooze" (spec §8.4, t3's custom snooze): a duration from now (amount, default 1,
-//! of minutes, hours or days) or a local date and time (`YYYY-MM-DD`, `HH:MM`, default
-//! 09:00), resolved in the system time zone. A time that has passed or doesn't parse is
-//! refused with a line under the form.
+//! "Custom snooze" (spec §8.4, `docs/triage.md` §7.1 Custom…): a duration from now (amount,
+//! default 1, of minutes, hours or days) or a local date and time (`YYYY-MM-DD`, `HH:MM`,
+//! default 09:00), resolved in the system time zone. A time that has passed or doesn't parse
+//! is refused with a line under the form.
 
-use j3_client::workflow::{CustomSnooze, SnoozeUnit, TimeZone, resolve_custom_snooze};
+use j3_client::inbox::{CustomSnooze, SnoozeUnit, TimeZone, custom_snooze};
 use rune::{El, TextEdit, Tx, col, row, text};
 use rune_kit::{Kit, TextInput};
 use time::OffsetDateTime;
@@ -19,7 +19,7 @@ use crate::{
 /// The refusal under the form.
 pub const INVALID: &str = "That snooze time has passed or isn’t valid. Choose another time.";
 
-/// How a custom snooze is given (t3's "Schedule type").
+/// How a custom snooze is given: a duration or a date and time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Schedule {
     After,
@@ -76,7 +76,7 @@ impl SnoozeForm {
                 unit: self.unit,
             },
         };
-        resolve_custom_snooze(input, now, zone)
+        custom_snooze(input, now, zone)
     }
 
     /// Focuses the first field of the chosen schedule.

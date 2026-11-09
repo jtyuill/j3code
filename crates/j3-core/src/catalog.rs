@@ -1,194 +1,117 @@
-//! The omp provider catalog: the single `ServerProvider` (`instanceId:"omp"`,
-//! `driver:"pi"`) with its models, thinking descriptor, slash commands and
-//! skills (ios-surface M1, M3, §5).
+//! What omp offers (wire.md §5.1.1): models, skills and slash commands.
 //!
 //! Models come from a utility `omp --mode rpc --no-session` process; slash
 //! commands and skills are per cwd, cached, and also fed by thread actors
 //! whenever their omp reports its catalog.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, PoisonError},
+    sync::{Mutex, PoisonError},
     time::Duration,
 };
 
-use j3_protocol::t3::{
-    self,
-    model::{
-        ModelCapabilities, ProviderOptionChoice, ProviderOptionDescriptor,
-        SelectProviderOptionDescriptor,
-    },
-    server::{
-        ServerProvider, ServerProviderModel, ServerProviderSkill, ServerProviderSlashCommand,
-        ServerProviderSlashCommandInput, ServerProviderWorkspaceSnapshot,
-    },
+use j3_protocol::v2::{
+    entities::ThinkingLevel,
+    methods::{Catalog as CatalogData, CatalogCommand, CatalogModel, CatalogSkill, CatalogStatus},
 };
-use serde_json::{Value, json};
+use serde::Deserialize;
 use tokio::sync::broadcast;
 
-use crate::{
-    engine::{
-        model::THINKING_OPTION,
-        projection::{DRIVER, PROVIDER_INSTANCE},
-    },
-    omp::{
-        OmpLauncher,
-        omp_rpc::{
-            AvailableSlashCommand, GetAvailableCommandsCommand, GetAvailableModelsCommand,
-            GetStateCommand, ModelInfo, SlashCommandSource, ThinkingLevel,
-        },
+use crate::omp::{
+    OmpLauncher,
+    omp_rpc::{
+        AvailableSlashCommand, GetAvailableCommandsCommand, GetAvailableModelsCommand,
+        GetStateCommand, ModelInfo, SlashCommandSource,
     },
 };
 
 /// Deadline for one utility omp round trip (spawn + queries).
 const UTILITY_TIMEOUT: Duration = Duration::from_secs(45);
 
-/// Model list state from the last utility run.
-#[derive(Debug, Clone)]
-struct Models {
-    models: Vec<ServerProviderModel>,
-    checked_at: String,
-    error: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct Commands {
-    checked_at: String,
-    commands: Vec<AvailableSlashCommand>,
-}
+/// Model list from the last utility run, or why it failed.
+type Models = Result<Vec<CatalogModel>, String>;
 
 pub struct Catalog {
     launcher: OmpLauncher,
     default_cwd: PathBuf,
     models: Mutex<Option<Models>>,
-    commands: Mutex<HashMap<String, Commands>>,
+    commands: Mutex<HashMap<String, Vec<AvailableSlashCommand>>>,
     /// Serializes model loads (single flight).
     loading: tokio::sync::Mutex<()>,
-    updates: broadcast::Sender<ServerProvider>,
+    updates: broadcast::Sender<CatalogData>,
 }
 
-fn label_of(id: &str) -> String {
-    let mut chars = id.chars();
-    match chars.next() {
-        Some(first) => first.to_uppercase().chain(chars).collect(),
-        None => String::new(),
-    }
+/// The v2 thinking level of an omp level (same lowercase names).
+fn thinking_level(level: impl serde::Serialize) -> Option<ThinkingLevel> {
+    ThinkingLevel::deserialize(serde_json::to_value(level).ok()?).ok()
 }
 
-fn level_name(level: impl serde::Serialize) -> Option<String> {
-    match serde_json::to_value(level).ok()? {
-        Value::String(name) => Some(name),
-        _ => None,
-    }
-}
-
-/// `ServerProviderModel`s from omp's model list (ios-surface §5 "Model list",
-/// "Thinking picker").
-pub fn provider_models(
-    models: &[ModelInfo],
-    default: Option<&str>,
-    thinking: Option<ThinkingLevel>,
-) -> Vec<ServerProviderModel> {
-    let current = thinking.and_then(level_name);
+/// Catalog models from omp's model list: thinking is `off` plus the model's
+/// efforts (`low`/`medium`/`high` when omp lists none), absent without
+/// reasoning; `default` marks omp's current model `provider/id`.
+fn models(models: &[ModelInfo], default: Option<&str>) -> Vec<CatalogModel> {
     models
         .iter()
         .map(|model| {
-            let slug = format!("{}/{}", model.provider, model.id);
-            let descriptors = if model.reasoning {
-                let efforts: Vec<String> = match &model.thinking {
+            let thinking = model.reasoning.then(|| {
+                let efforts: Vec<ThinkingLevel> = match &model.thinking {
                     Some(config) => config
                         .efforts
                         .iter()
-                        .filter_map(|e| level_name(*e))
+                        .filter_map(|e| thinking_level(*e))
                         .collect(),
-                    None => vec!["low".into(), "medium".into(), "high".into()],
+                    None => vec![
+                        ThinkingLevel::Low,
+                        ThinkingLevel::Medium,
+                        ThinkingLevel::High,
+                    ],
                 };
-                let options: Vec<ProviderOptionChoice> = std::iter::once("off".to_owned())
-                    .chain(efforts)
-                    .map(|id| ProviderOptionChoice {
-                        label: label_of(&id),
-                        is_default: (current.as_deref() == Some(id.as_str())).then_some(true),
-                        description: None,
-                        id,
-                    })
-                    .collect();
-                vec![ProviderOptionDescriptor::Select(
-                    SelectProviderOptionDescriptor {
-                        id: THINKING_OPTION.to_owned(),
-                        label: "Thinking".into(),
-                        description: None,
-                        options,
-                        current_value: None,
-                        prompt_injected_values: None,
-                        role: None,
-                    },
-                )]
-            } else {
-                Vec::new()
-            };
-            ServerProviderModel {
-                is_default: (default == Some(slug.as_str())).then_some(true),
-                slug,
+                std::iter::once(ThinkingLevel::Off).chain(efforts).collect()
+            });
+            CatalogModel {
+                default: default == Some(format!("{}/{}", model.provider, model.id).as_str()),
+                provider: model.provider.clone(),
+                id: model.id.clone(),
                 name: if model.name.trim().is_empty() {
                     model.id.clone()
                 } else {
                     model.name.clone()
                 },
-                short_name: None,
-                // Clients show it beside the name; the same model is often
-                // offered by several omp providers.
-                sub_provider: Some(model.provider.clone()),
-                aliases: None,
-                badge: None,
-                is_custom: false,
-                is_legacy: None,
-                capabilities: Some(ModelCapabilities {
-                    option_descriptors: Some(descriptors),
-                }),
+                thinking,
             }
         })
         .collect()
 }
 
-/// Splits omp's slash-command catalog into t3 slash commands and skills.
-pub fn split_commands(
-    commands: &[AvailableSlashCommand],
-) -> (Vec<ServerProviderSlashCommand>, Vec<ServerProviderSkill>) {
+/// Splits omp's slash-command catalog into slash commands and skills
+/// (source `skill`, `skill:` prefix stripped).
+fn split_commands(commands: &[AvailableSlashCommand]) -> (Vec<CatalogCommand>, Vec<CatalogSkill>) {
     let mut slash = Vec::new();
     let mut skills = Vec::new();
     for command in commands {
         if command.name.trim().is_empty() {
             continue;
         }
+        let description = command.description.clone().unwrap_or_default();
         if command.source == SlashCommandSource::Skill {
-            let name = command
-                .name
-                .strip_prefix("skill:")
-                .unwrap_or(&command.name)
-                .to_owned();
-            skills.push(ServerProviderSkill {
-                // omp's catalog carries no file path; its skill URL names it.
-                path: format!("skill://{name}"),
-                name,
-                description: command.description.clone(),
-                scope: None,
-                enabled: true,
-                display_name: None,
-                short_description: None,
-                user_invocation_only: None,
-                user_invocable: Some(true),
+            skills.push(CatalogSkill {
+                name: command
+                    .name
+                    .strip_prefix("skill:")
+                    .unwrap_or(&command.name)
+                    .to_owned(),
+                description,
             });
         } else {
-            slash.push(ServerProviderSlashCommand {
+            slash.push(CatalogCommand {
                 name: command.name.clone(),
-                description: command.description.clone(),
-                input: command
+                description,
+                hint: command
                     .input
                     .as_ref()
                     .and_then(|input| input.hint.clone())
-                    .filter(|hint| !hint.trim().is_empty())
-                    .map(|hint| ServerProviderSlashCommandInput { hint }),
+                    .filter(|hint| !hint.trim().is_empty()),
             });
         }
     }
@@ -207,8 +130,8 @@ impl Catalog {
         }
     }
 
-    /// Provider updates (pushed as `providerStatuses`).
-    pub fn subscribe(&self) -> broadcast::Receiver<ServerProvider> {
+    /// Every change of the catalog (model list loaded or refreshed).
+    pub fn subscribe(&self) -> broadcast::Receiver<CatalogData> {
         self.updates.subscribe()
     }
 
@@ -217,13 +140,7 @@ impl Catalog {
         self.commands
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(
-                cwd.to_owned(),
-                Commands {
-                    checked_at: t3::now_iso(),
-                    commands: commands.to_vec(),
-                },
-            );
+            .insert(cwd.to_owned(), commands.to_vec());
     }
 
     fn cached_models(&self) -> Option<Models> {
@@ -233,7 +150,7 @@ impl Catalog {
             .clone()
     }
 
-    fn cached_commands(&self, cwd: &str) -> Option<Commands> {
+    fn cached_commands(&self, cwd: &str) -> Option<Vec<AvailableSlashCommand>> {
         self.commands
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -241,41 +158,72 @@ impl Catalog {
             .cloned()
     }
 
-    /// The provider; loads the model list on first use.
-    pub async fn provider(&self) -> ServerProvider {
+    /// Loads the model list on first use.
+    pub async fn catalog(&self) -> CatalogData {
         if self.cached_models().is_none() {
             self.load_models(false).await;
         }
-        self.build(None)
+        self.current()
     }
 
-    /// The provider if the model list is already known (no waiting).
-    pub fn provider_now(&self) -> Option<ServerProvider> {
-        self.cached_models().map(|_| self.build(None))
+    /// None until the model list has loaded once.
+    pub fn catalog_now(&self) -> Option<CatalogData> {
+        self.cached_models().map(|_| self.current())
     }
 
-    /// The provider as currently known (`warning` while models load).
-    pub fn current(&self) -> ServerProvider {
-        self.build(None)
+    /// As currently known (`warning` while models load).
+    pub fn current(&self) -> CatalogData {
+        let default_cwd = self.default_cwd.to_string_lossy();
+        let (commands, skills) = self
+            .cached_commands(&default_cwd)
+            .map(|commands| split_commands(&commands))
+            .unwrap_or_default();
+        let (status, message, models) = match self.cached_models() {
+            None => (
+                CatalogStatus::Warning,
+                Some("Loading models…".to_owned()),
+                Vec::new(),
+            ),
+            Some(Err(error)) => (
+                CatalogStatus::Error,
+                Some(format!("omp could not list models: {error}")),
+                Vec::new(),
+            ),
+            Some(Ok(models)) => (CatalogStatus::Ready, None, models),
+        };
+        CatalogData {
+            models,
+            skills,
+            commands,
+            project_commands: BTreeMap::new(),
+            status,
+            message,
+        }
     }
 
-    /// `server.refreshProviders`: optionally reloads models, and includes the
-    /// workspace snapshot for `cwd`.
+    /// `server.refresh`: `fresh` reloads omp's model list and the cwd's
+    /// commands/skills; returns the catalog and `cwd`'s own slash commands
+    /// (empty without a cwd). `project_commands` of the returned catalog is
+    /// empty; the caller files the cwd's commands under the project id.
     pub async fn refresh(
         &self,
         cwd: Option<&str>,
-        refresh_models: bool,
         fresh: bool,
-    ) -> ServerProvider {
-        if refresh_models || self.cached_models().is_none() {
-            self.load_models(refresh_models).await;
+    ) -> (CatalogData, Vec<CatalogCommand>) {
+        if fresh || self.cached_models().is_none() {
+            self.load_models(fresh).await;
         }
-        if let Some(cwd) = cwd
-            && (fresh || self.cached_commands(cwd).is_none())
-        {
+        let Some(cwd) = cwd else {
+            return (self.current(), Vec::new());
+        };
+        if fresh || self.cached_commands(cwd).is_none() {
             self.load_commands(cwd).await;
         }
-        self.build(cwd)
+        let commands = self
+            .cached_commands(cwd)
+            .map(|commands| split_commands(&commands).0)
+            .unwrap_or_default();
+        (self.current(), commands)
     }
 
     async fn load_models(&self, force: bool) {
@@ -283,34 +231,24 @@ impl Catalog {
         if !force && self.cached_models().is_some() {
             return;
         }
-        let checked_at = t3::now_iso();
         let models = match self.query_models().await {
             Ok((models, commands)) => {
                 tracing::info!(models = models.len(), "loaded the omp model catalog");
-                let cwd = self.default_cwd.to_string_lossy().into_owned();
-                self.put_commands(&cwd, &commands);
-                Models {
-                    models,
-                    checked_at,
-                    error: None,
-                }
+                self.put_commands(&self.default_cwd.to_string_lossy(), &commands);
+                Ok(models)
             }
             Err(error) => {
                 tracing::warn!(%error, "loading omp models");
-                Models {
-                    models: Vec::new(),
-                    checked_at,
-                    error: Some(error),
-                }
+                Err(error)
             }
         };
         *self.models.lock().unwrap_or_else(PoisonError::into_inner) = Some(models);
-        let _ = self.updates.send(self.build(None));
+        let _ = self.updates.send(self.current());
     }
 
     async fn query_models(
         &self,
-    ) -> Result<(Vec<ServerProviderModel>, Vec<AvailableSlashCommand>), String> {
+    ) -> Result<(Vec<CatalogModel>, Vec<AvailableSlashCommand>), String> {
         let launcher = self.launcher.clone();
         let cwd = self.default_cwd.clone();
         let work = async move {
@@ -319,7 +257,7 @@ impl Catalog {
                 .await
                 .map_err(|error| error.to_string())?;
             let result = async {
-                let models = session
+                let list = session
                     .call(GetAvailableModelsCommand {})
                     .await
                     .map_err(|error| error.to_string())?;
@@ -335,10 +273,7 @@ impl Catalog {
                     .model
                     .as_ref()
                     .map(|model| format!("{}/{}", model.provider, model.id));
-                Ok((
-                    provider_models(&models, default.as_deref(), state.thinking_level),
-                    commands,
-                ))
+                Ok((models(&list, default.as_deref()), commands))
             }
             .await;
             let _ = session.close().await;
@@ -373,87 +308,23 @@ impl Catalog {
             Err(_) => tracing::warn!(cwd, "loading omp commands timed out"),
         }
     }
-
-    /// The `ServerProvider`, with a workspace snapshot for `cwd` if known.
-    fn build(&self, cwd: Option<&str>) -> ServerProvider {
-        let models = self.cached_models();
-        let default_cwd = self.default_cwd.to_string_lossy().into_owned();
-        let (slash, skills) = self
-            .cached_commands(&default_cwd)
-            .map(|commands| split_commands(&commands.commands))
-            .unwrap_or_default();
-        let workspace = cwd.map(|cwd| {
-            let cached = self.cached_commands(cwd);
-            let (slash, skills) = cached
-                .as_ref()
-                .map(|commands| split_commands(&commands.commands))
-                .unwrap_or_default();
-            ServerProviderWorkspaceSnapshot {
-                cwd: cwd.to_owned(),
-                checked_at: cached.map_or_else(t3::now_iso, |commands| commands.checked_at),
-                slash_commands: slash,
-                slash_commands_pending: None,
-                skills,
-                option_descriptors: None,
-            }
-        });
-        let (status, message, checked_at, models) = match models {
-            None => (
-                "warning",
-                Some("Loading models…".to_owned()),
-                t3::now_iso(),
-                Vec::new(),
-            ),
-            Some(Models {
-                error: Some(error),
-                checked_at,
-                ..
-            }) => (
-                "error",
-                Some(format!("omp could not list models: {error}")),
-                checked_at,
-                Vec::new(),
-            ),
-            Some(Models {
-                models, checked_at, ..
-            }) => ("ready", None, checked_at, models),
-        };
-        let mut provider = json!({
-            "instanceId": PROVIDER_INSTANCE,
-            "driver": DRIVER,
-            "displayName": "omp",
-            "enabled": true,
-            "installed": true,
-            "version": null,
-            "status": status,
-            "auth": {"status": "authenticated"},
-            "checkedAt": checked_at,
-            "models": models,
-            "slashCommands": slash,
-            "skills": skills,
-        });
-        if let Some(message) = message {
-            provider["message"] = Value::String(message);
-        }
-        if let Some(workspace) = workspace {
-            provider["workspaceSnapshots"] = json!([workspace]);
-        }
-        serde_json::from_value(provider).expect("catalog provider matches ServerProvider")
-    }
 }
-
-/// Shared handle used by the app and thread actors.
-pub type SharedCatalog = Arc<Catalog>;
 
 #[cfg(test)]
 mod tests {
+    use serde_json::Value;
+
     use super::*;
     use crate::omp::omp_rpc::RpcNotification;
 
-    fn fixture_commands() -> Vec<AvailableSlashCommand> {
-        let text = include_str!("../tests/fixtures/omp/text.jsonl");
-        text.lines()
+    fn fixture_lines() -> impl Iterator<Item = Value> {
+        include_str!("../tests/fixtures/omp/text.jsonl")
+            .lines()
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+    }
+
+    fn fixture_commands() -> Vec<AvailableSlashCommand> {
+        fixture_lines()
             .find_map(|value| match RpcNotification::from_value(value).ok()? {
                 RpcNotification::AvailableCommandsUpdate(update) => Some(update.commands),
                 _ => None,
@@ -461,48 +332,99 @@ mod tests {
             .expect("fixture has available_commands_update")
     }
 
+    fn model_info(value: Value) -> ModelInfo {
+        serde_json::from_value(value).unwrap()
+    }
+
     #[test]
-    fn engine_catalog_commands_split_into_slash_commands_and_skills() {
+    fn commands_split_into_slash_commands_and_skills() {
         let (slash, skills) = split_commands(&fixture_commands());
         assert!(!slash.is_empty());
         assert!(!skills.is_empty());
         assert!(skills.iter().all(|skill| !skill.name.starts_with("skill:")));
-        assert!(
-            slash
-                .iter()
-                .all(|command| command.input.as_ref().is_none_or(|i| !i.hint.is_empty()))
-        );
+        assert!(slash.iter().all(|command| {
+            command
+                .hint
+                .as_ref()
+                .is_none_or(|hint| !hint.trim().is_empty())
+        }));
     }
 
     #[test]
-    fn engine_catalog_models_get_thinking_descriptor_and_default() {
-        let text = include_str!("../tests/fixtures/omp/text.jsonl");
-        let state: crate::omp::omp_rpc::SessionState = text
-            .lines()
-            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+    fn fixture_model_gets_thinking_and_default() {
+        let state: crate::omp::omp_rpc::SessionState = fixture_lines()
             .find(|value| value["command"] == "get_state")
             .map(|value| serde_json::from_value(value["data"].clone()).unwrap())
             .unwrap();
-        let model = state.model.clone().unwrap();
-        let models = provider_models(
-            &[model],
-            Some("opencode-go/glm-5.3-flash"),
-            state.thinking_level,
+        let model = state.model.unwrap();
+        let list = models(&[model], Some("opencode-go/glm-5.3-flash"));
+        assert_eq!(
+            (list[0].provider.as_str(), list[0].id.as_str()),
+            ("opencode-go", "glm-5.3-flash")
         );
-        assert_eq!(models[0].slug, "opencode-go/glm-5.3-flash");
-        assert_eq!(models[0].is_default, Some(true));
-        let descriptors = models[0]
-            .capabilities
-            .as_ref()
-            .and_then(|c| c.option_descriptors.clone())
-            .unwrap();
-        let ProviderOptionDescriptor::Select(select) = &descriptors[0] else {
-            panic!("thinking descriptor is a select");
-        };
-        assert_eq!(select.id, "thinking");
-        assert_eq!(select.options[0].id, "off");
-        // Encodes and decodes as a ServerProviderModel.
-        let json = serde_json::to_value(&models[0]).unwrap();
-        let _: ServerProviderModel = serde_json::from_value(json).unwrap();
+        assert!(list[0].default);
+        assert_eq!(list[0].thinking.as_ref().unwrap()[0], ThinkingLevel::Off);
+    }
+
+    #[test]
+    fn thinking_lists_efforts_falls_back_and_is_absent_without_reasoning() {
+        let base = serde_json::json!({"provider": "anthropic", "id": "opus", "name": "",
+            "api": "anthropic-messages", "baseUrl": "", "reasoning": true, "input": ["text"],
+            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+            "contextWindow": 1, "maxTokens": 1});
+        let mut efforts = base.clone();
+        efforts["thinking"] = serde_json::json!({"mode": "effort", "minLevel": "low",
+            "maxLevel": "high", "efforts": ["low", "high"]});
+        let mut plain = base.clone();
+        plain["reasoning"] = Value::Bool(false);
+        plain["id"] = "gpt".into();
+        let list = models(
+            &[model_info(efforts), model_info(base), model_info(plain)],
+            Some("openai/gpt"),
+        );
+        assert_eq!(
+            list[0].thinking,
+            Some(vec![
+                ThinkingLevel::Off,
+                ThinkingLevel::Low,
+                ThinkingLevel::High
+            ])
+        );
+        assert_eq!(list[0].name, "opus");
+        assert_eq!(
+            list[1].thinking,
+            Some(vec![
+                ThinkingLevel::Off,
+                ThinkingLevel::Low,
+                ThinkingLevel::Medium,
+                ThinkingLevel::High
+            ])
+        );
+        assert_eq!(list[2].thinking, None);
+        assert!(list.iter().all(|model| !model.default));
+    }
+
+    #[test]
+    fn current_reports_loading_then_ready_or_error_with_default_cwd_commands() {
+        let catalog = Catalog::new(OmpLauncher::new("omp"), PathBuf::from("/w"));
+        let loading = catalog.current();
+        assert_eq!(loading.status, CatalogStatus::Warning);
+        assert!(loading.message.is_some());
+        assert!(catalog.catalog_now().is_none());
+
+        catalog.put_commands("/w", &fixture_commands());
+        *catalog.models.lock().unwrap() = Some(Ok(Vec::new()));
+        let ready = catalog.catalog_now().unwrap();
+        assert_eq!((ready.status, ready.message), (CatalogStatus::Ready, None));
+        assert!(!ready.commands.is_empty() && !ready.skills.is_empty());
+        assert!(ready.project_commands.is_empty());
+
+        *catalog.models.lock().unwrap() = Some(Err("boom".into()));
+        let failed = catalog.current();
+        assert_eq!(failed.status, CatalogStatus::Error);
+        assert_eq!(
+            failed.message.as_deref(),
+            Some("omp could not list models: boom")
+        );
     }
 }

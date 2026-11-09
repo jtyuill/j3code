@@ -1,68 +1,49 @@
-//! omp goal mode and subagents → t3's provider goal and subagent entities
-//! (`docs/protocol/j3-extensions.md`).
+//! omp goal mode and subagents (wire.md §4.4 `goal`, `subagent`).
 //!
 //! - Goal: `get_state.goal`, `goal_updated` and `goal` command results set
-//!   `ProviderThread.goal` (and so `ThreadShell.goal`).
-//! - Subagents: `subagent_lifecycle` / `subagent_progress` frames (subscription
-//!   level `progress`) become one `subagents` entry plus one `subagent` turn
-//!   item each; the result is the final assistant text of the subagent's
-//!   transcript (`get_subagent_messages`), with its last output lines as the
-//!   fallback.
+//!   the thread row's `goal`; a change of objective or state also adds a
+//!   `goal` item to the feed.
+//! - Subagents: `subagent_lifecycle` / `subagent_progress` frames (omp's
+//!   `progress` subscription level) and the `task` tool's result each keep
+//!   one `subagent` item per subagent. Its result is the final assistant
+//!   text of the subagent's transcript (`get_subagent_messages`), with its
+//!   last output lines as the fallback.
 
-use j3_protocol::t3::orchestration::{
-    Actor, NativeRefStrength, ProviderGoal, ProviderGoalStatus, ProviderRef, Subagent,
-    SubagentItem, SubagentOrigin, SubagentStatus, TurnItemKind, TurnItemStatus,
-};
+use j3_protocol::v2::entities::{Goal, GoalState, ItemKind, ItemStatus, SubagentItem};
 use serde_json::{Map, Value};
 
-use super::{Effect, ThreadModel, now, truncate};
+use super::{Effect, ThreadModel, truncate};
 use crate::{
-    engine::projection::{DRIVER, Kind, PROVIDER_INSTANCE},
     omp::omp_rpc::{
-        AgentMessage, AssistantContent, Goal, GoalModeState, GoalStatus, SubagentLifecyclePayload,
+        self, AgentMessage, AssistantContent, GoalModeState, SubagentLifecyclePayload,
         SubagentLifecycleStatus, SubagentMessages, SubagentProgressPayload,
     },
+    v2::tools,
 };
 
 /// Longest activity text in a subagent's progress line.
 const MAX_ACTIVITY: usize = 200;
 
-/// omp goal → t3 provider goal; `None` for a dropped goal (t3 has no
-/// dropped state: the goal is gone).
-fn provider_goal(goal: &Goal) -> Option<ProviderGoal> {
-    let status = match goal.status {
-        GoalStatus::Active => ProviderGoalStatus::Active,
-        GoalStatus::Paused => ProviderGoalStatus::Paused,
-        GoalStatus::BudgetLimited => ProviderGoalStatus::BudgetLimited,
-        GoalStatus::Complete => ProviderGoalStatus::Complete,
-        GoalStatus::Dropped => return None,
-    };
+/// omp's goal.
+fn goal(goal: &omp_rpc::Goal) -> Option<Goal> {
     let objective = goal.objective.trim();
     if objective.is_empty() {
         return None;
     }
-    Some(ProviderGoal {
+    Some(Goal {
         objective: objective.to_owned(),
-        status,
+        state: match goal.status {
+            omp_rpc::GoalStatus::Active => GoalState::Active,
+            omp_rpc::GoalStatus::Paused => GoalState::Paused,
+            omp_rpc::GoalStatus::BudgetLimited => GoalState::BudgetLimited,
+            omp_rpc::GoalStatus::Complete => GoalState::Complete,
+            omp_rpc::GoalStatus::Dropped => GoalState::Dropped,
+        },
         tokens_used: u64::try_from(goal.tokens_used).ok(),
-        token_budget: goal.token_budget.map(|budget| u64::try_from(budget).ok()),
-        time_used_seconds: Some(goal.time_used_seconds.max(0.0).round() as u64),
-        checks: None,
-        last_check: None,
+        budget: goal
+            .token_budget
+            .and_then(|budget| u64::try_from(budget).ok()),
     })
-}
-
-fn item_status(status: SubagentStatus) -> TurnItemStatus {
-    match status {
-        SubagentStatus::Idle => TurnItemStatus::Idle,
-        SubagentStatus::Pending => TurnItemStatus::Pending,
-        SubagentStatus::Running => TurnItemStatus::Running,
-        SubagentStatus::Waiting => TurnItemStatus::Waiting,
-        SubagentStatus::Completed => TurnItemStatus::Completed,
-        SubagentStatus::Failed => TurnItemStatus::Failed,
-        SubagentStatus::Cancelled => TurnItemStatus::Cancelled,
-        SubagentStatus::Interrupted => TurnItemStatus::Interrupted,
-    }
 }
 
 fn text<'a>(progress: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
@@ -73,14 +54,13 @@ fn text<'a>(progress: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
         .filter(|text| !text.is_empty())
 }
 
-/// `AgentProgress.status` → subagent status.
-fn progress_status(progress: &Map<String, Value>) -> Option<SubagentStatus> {
+/// `AgentProgress.status` → item status.
+fn progress_status(progress: &Map<String, Value>) -> Option<ItemStatus> {
     Some(match text(progress, "status")? {
-        "pending" => SubagentStatus::Pending,
-        "running" => SubagentStatus::Running,
-        "completed" => SubagentStatus::Completed,
-        "failed" => SubagentStatus::Failed,
-        "aborted" => SubagentStatus::Cancelled,
+        "pending" | "running" => ItemStatus::Running,
+        "completed" => ItemStatus::Completed,
+        "failed" => ItemStatus::Failed,
+        "aborted" => ItemStatus::Cancelled,
         _ => return None,
     })
 }
@@ -143,115 +123,164 @@ impl ThreadModel {
     // -----------------------------------------------------------------------
 
     /// `goal_updated` and `goal` command results: the goal as omp has it now.
-    pub fn apply_goal(&mut self, goal: Option<&Goal>) {
-        self.set_goal(goal.and_then(provider_goal));
+    pub fn apply_goal(&mut self, update: Option<&omp_rpc::Goal>) {
+        self.set_goal(update.and_then(goal));
     }
 
     /// `get_state.goal`. omp forgets a goal once it is complete, so a
-    /// completed goal stays until another goal replaces it or it is dropped.
+    /// completed goal stays until another replaces it or it is dropped.
     pub fn apply_goal_state(&mut self, state: Option<&GoalModeState>) {
         match state {
             Some(state) => self.apply_goal(Some(&state.goal)),
-            None if self
-                .proj
-                .goal()
-                .is_some_and(|goal| goal.status == ProviderGoalStatus::Complete) => {}
+            None if self.goal_is(GoalState::Complete) => {}
             None => self.set_goal(None),
         }
     }
 
+    fn goal_is(&self, state: GoalState) -> bool {
+        self.thread
+            .goal
+            .as_ref()
+            .is_some_and(|goal| goal.state == state)
+    }
+
     /// The thread pursues an active goal; omp must stay up for it.
     pub fn goal_active(&self) -> bool {
-        self.proj
-            .goal()
-            .is_some_and(|goal| goal.status == ProviderGoalStatus::Active)
+        self.goal_is(GoalState::Active)
     }
 
     /// Drops a completed goal, which only j3 still shows. Returns whether
     /// there was one.
     pub fn clear_completed_goal(&mut self) -> bool {
-        let complete = self
-            .proj
-            .goal()
-            .is_some_and(|goal| goal.status == ProviderGoalStatus::Complete);
+        let complete = self.goal_is(GoalState::Complete);
         if complete {
             self.set_goal(None);
         }
         complete
     }
 
-    fn set_goal(&mut self, goal: Option<ProviderGoal>) {
-        let pth = self.pth();
-        if let Some(thread) = self.proj.provider_threads.iter_mut().find(|t| t.id == pth)
-            && thread.goal != goal
+    /// Sets the row's goal (a dropped goal leaves none) and records a goal
+    /// item when its objective or state changed.
+    fn set_goal(&mut self, goal: Option<Goal>) {
+        let shown = goal.filter(|goal| goal.state != GoalState::Dropped);
+        let item = match (&self.thread.goal, &shown) {
+            (Some(old), Some(new)) if old.objective == new.objective && old.state == new.state => {
+                None
+            }
+            (_, Some(new)) => Some(new.clone()),
+            (Some(old), None) => Some(Goal {
+                state: GoalState::Dropped,
+                ..old.clone()
+            }),
+            (None, None) => None,
+        };
+        if self.thread.goal != shown {
+            self.thread.goal = shown;
+            self.touch_row();
+        }
+        if let Some(item) = item
+            && let Some(turn_id) = self.feed_turn()
         {
-            thread.goal = goal;
-            thread.updated_at = now();
-            self.proj.touch_updated(Kind::ProviderThread, &pth);
+            self.push_item(&turn_id, ItemStatus::Completed, ItemKind::Goal(item));
         }
     }
 
-    /// The omp process is gone: its running subagents ended with it, and omp
-    /// restores an active goal paused when it starts again.
+    /// The turn new agent items belong to: the live one, else the latest.
+    fn feed_turn(&self) -> Option<String> {
+        self.live
+            .as_ref()
+            .map(|live| live.turn_id.clone())
+            .or_else(|| self.turns.last().map(|turn| turn.id.clone()))
+    }
+
+    /// The omp process is gone: its running subagents ended with it, and
+    /// omp restores an active goal paused when it starts again.
     pub fn session_closed(&mut self) {
         let running: Vec<String> = self
-            .proj
-            .subagents
+            .items
             .iter()
-            .filter(|subagent| subagent.status.is_active())
-            .map(|subagent| subagent.id.clone())
+            .filter(|item| {
+                matches!(item.kind, ItemKind::Subagent(_)) && item.status == ItemStatus::Running
+            })
+            .map(|item| item.id.clone())
             .collect();
         for id in running {
-            self.update_subagent(&id, false, |subagent| {
-                subagent.status = SubagentStatus::Interrupted;
-                subagent.completed_at = Some(now());
-            });
+            self.update_item(&id, true, |item| item.status = ItemStatus::Cancelled);
         }
-        if let Some(mut goal) = self.proj.goal().cloned()
-            && goal.status == ProviderGoalStatus::Active
+        if let Some(mut goal) = self.thread.goal.clone()
+            && goal.state == GoalState::Active
         {
-            goal.status = ProviderGoalStatus::Paused;
+            goal.state = GoalState::Paused;
             self.set_goal(Some(goal));
         }
     }
 
-    /// Left over from a previous omp process (see [`Self::session_closed`]).
+    /// Left over from an earlier omp process (see [`Self::session_closed`]).
     pub(super) fn has_live_agent_state(&self) -> bool {
         self.goal_active()
-            || self
-                .proj
-                .subagents
-                .iter()
-                .any(|subagent| subagent.status.is_active())
+            || self.items.iter().any(|item| {
+                matches!(item.kind, ItemKind::Subagent(_)) && item.status == ItemStatus::Running
+            })
     }
 
     // -----------------------------------------------------------------------
     // Subagents
     // -----------------------------------------------------------------------
 
-    /// `subagent_lifecycle`: started (again, when revived), completed, failed
-    /// or aborted.
+    fn subagent_item(&self, subagent_id: &str) -> Option<String> {
+        self.items.iter().rev().find_map(|item| match &item.kind {
+            ItemKind::Subagent(body) if body.subagent_id == subagent_id => Some(item.id.clone()),
+            _ => None,
+        })
+    }
+
+    /// The item of subagent `subagent.subagent_id`, created on first sight
+    /// in the live turn (else the latest). None without a turn.
+    fn ensure_subagent(&mut self, subagent: SubagentItem) -> Option<String> {
+        if let Some(id) = self.subagent_item(&subagent.subagent_id) {
+            return Some(id);
+        }
+        let turn_id = self.feed_turn()?;
+        Some(self.push_item(&turn_id, ItemStatus::Running, ItemKind::Subagent(subagent)))
+    }
+
+    /// The subagents a `task` call spawned (its result's `details.progress`).
+    pub(super) fn spawned_subagents(&mut self, result: &Value) {
+        for subagent in tools::spawned_subagents(result) {
+            self.ensure_subagent(subagent);
+        }
+    }
+
+    /// `subagent_lifecycle`: started (again, when revived), completed,
+    /// failed or aborted.
     pub(super) fn apply_subagent_lifecycle(
         &mut self,
         payload: &SubagentLifecyclePayload,
         effects: &mut Vec<Effect>,
     ) {
         let status = match payload.status {
-            SubagentLifecycleStatus::Started => SubagentStatus::Running,
-            SubagentLifecycleStatus::Completed => SubagentStatus::Completed,
-            SubagentLifecycleStatus::Failed => SubagentStatus::Failed,
-            SubagentLifecycleStatus::Aborted => SubagentStatus::Cancelled,
+            SubagentLifecycleStatus::Started => ItemStatus::Running,
+            SubagentLifecycleStatus::Completed => ItemStatus::Completed,
+            SubagentLifecycleStatus::Failed => ItemStatus::Failed,
+            SubagentLifecycleStatus::Aborted => ItemStatus::Cancelled,
         };
-        if !self.ensure_subagent(
-            &payload.id,
-            &payload.agent,
-            payload.description.as_deref(),
-            None,
-            payload.parent_tool_call_id.as_deref(),
-        ) {
+        let Some(item_id) = self.ensure_subagent(SubagentItem {
+            subagent_id: payload.id.clone(),
+            agent: payload.agent.clone(),
+            description: payload
+                .description
+                .as_deref()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(str::to_owned),
+            prompt: String::new(),
+            model: None,
+            progress: None,
+            result: None,
+        }) else {
             return;
-        }
-        let finished = matches!(status, SubagentStatus::Completed | SubagentStatus::Failed);
+        };
+        let finished = matches!(status, ItemStatus::Completed | ItemStatus::Failed);
         let output = if finished {
             self.subagent_output
                 .get(&payload.id)
@@ -260,27 +289,32 @@ impl ThreadModel {
         } else {
             None
         };
-        if status == SubagentStatus::Running {
+        if status == ItemStatus::Running {
             self.subagent_output.remove(&payload.id);
         }
-        let title = payload
+        let agent = payload.agent.trim().to_owned();
+        let description = payload
             .description
             .as_deref()
             .map(str::trim)
-            .filter(|title| !title.is_empty())
+            .filter(|text| !text.is_empty())
             .map(str::to_owned);
-        self.update_subagent(&payload.id, false, |subagent| {
-            subagent.status = status;
-            if let Some(title) = title {
-                subagent.title = Some(title);
+        self.update_item(&item_id, true, |item| {
+            item.status = status;
+            if status == ItemStatus::Running {
+                item.ended_at = None;
             }
-            if status.is_active() {
-                subagent.result = None;
-                subagent.completed_at = None;
-            } else {
-                subagent.completed_at = Some(now());
-                if let Some(output) = output {
-                    subagent.result = Some(output);
+            if let ItemKind::Subagent(body) = &mut item.kind {
+                if !agent.is_empty() {
+                    body.agent = agent;
+                }
+                if description.is_some() {
+                    body.description = description;
+                }
+                if status == ItemStatus::Running {
+                    body.result = None;
+                } else if output.is_some() {
+                    body.result = output;
                 }
             }
         });
@@ -303,16 +337,17 @@ impl ThreadModel {
             .unwrap_or(&payload.task)
             .trim()
             .to_owned();
-        let description = text(progress, "description");
-        if !self.ensure_subagent(
-            id,
-            &payload.agent,
-            description,
-            Some(&prompt),
-            payload.parent_tool_call_id.as_deref(),
-        ) {
+        let Some(item_id) = self.ensure_subagent(SubagentItem {
+            subagent_id: id.to_owned(),
+            agent: payload.agent.clone(),
+            description: text(progress, "description").map(str::to_owned),
+            prompt: prompt.clone(),
+            model: None,
+            progress: None,
+            result: None,
+        }) else {
             return;
-        }
+        };
         if let Some(output) = progress.get("recentOutput").and_then(Value::as_array) {
             let lines = output
                 .iter()
@@ -325,183 +360,54 @@ impl ThreadModel {
         let model = text(progress, "resolvedModelIdentity")
             .or_else(|| text(progress, "resolvedModel"))
             .map(str::to_owned);
-        let title = description.map(str::to_owned);
+        let description = text(progress, "description").map(str::to_owned);
         let status = progress_status(progress);
-        self.update_subagent(id, true, |subagent| {
-            subagent.prompt = prompt;
-            if title.is_some() {
-                subagent.title = title;
+        let before = self.item(&item_id).map(|item| item.status);
+        // Lifecycle frames own the end states; a stale progress record
+        // never reopens a finished subagent.
+        let status = status.filter(|_| before == Some(ItemStatus::Running));
+        let urgent = status.is_some_and(|status| Some(status) != before);
+        self.update_item(&item_id, urgent, |item| {
+            if let Some(status) = status {
+                item.status = status;
             }
-            if model.is_some() {
-                subagent.model = model;
-            }
-            subagent.progress = summary;
-            // Lifecycle frames own the end states; a stale progress record
-            // never reopens a finished subagent.
-            if let Some(status) = status
-                && subagent.status.is_active()
-            {
-                subagent.status = status;
-                if !status.is_active() {
-                    subagent.completed_at = Some(now());
+            if let ItemKind::Subagent(body) = &mut item.kind {
+                if !prompt.is_empty() {
+                    body.prompt = prompt;
                 }
+                if description.is_some() {
+                    body.description = description;
+                }
+                if model.is_some() {
+                    body.model = model;
+                }
+                body.progress = summary;
             }
         });
     }
 
     /// `get_subagent_messages` of a finished subagent: its final answer.
     pub fn apply_subagent_transcript(&mut self, subagent_id: &str, transcript: &SubagentMessages) {
-        let finished = self.proj.subagent(subagent_id).is_some_and(|subagent| {
-            matches!(
-                subagent.status,
-                SubagentStatus::Completed | SubagentStatus::Failed
-            )
-        });
-        if !finished {
-            return;
-        }
-        if let Some(result) = final_text(&transcript.messages) {
-            self.update_subagent(subagent_id, false, |subagent| {
-                subagent.result = Some(result);
-            });
-        }
-    }
-
-    /// The subagent entity and its turn item, created on first sight in the
-    /// live run (else the latest run). Returns false when there is no run to
-    /// attach it to.
-    fn ensure_subagent(
-        &mut self,
-        id: &str,
-        agent: &str,
-        description: Option<&str>,
-        prompt: Option<&str>,
-        parent_tool_call_id: Option<&str>,
-    ) -> bool {
-        if self.proj.subagent(id).is_some() {
-            return true;
-        }
-        let (run_id, node_id) = match (&self.live, self.proj.latest_run()) {
-            (Some(live), _) => (live.run_id.clone(), live.node_id.clone()),
-            (None, Some(run)) => match &run.root_node_id {
-                Some(node_id) => (run.id.clone(), node_id.clone()),
-                None => return false,
-            },
-            (None, None) => return false,
-        };
-        let title = description
-            .map(str::trim)
-            .filter(|title| !title.is_empty())
-            .unwrap_or(agent)
-            .to_owned();
-        let prompt = prompt.unwrap_or_default().to_owned();
-        let at = now();
-        self.proj.subagents.push(Subagent {
-            id: id.to_owned(),
-            thread_id: self.proj.thread.id.clone(),
-            run_id: Some(run_id.clone()),
-            parent_node_id: node_id.clone(),
-            origin: SubagentOrigin::ProviderNative,
-            created_by: Actor::Agent,
-            driver: DRIVER.to_owned(),
-            provider_instance_id: PROVIDER_INSTANCE.to_owned(),
-            provider_thread_id: None,
-            child_thread_id: None,
-            remote_child: None,
-            native_task_ref: Some(ProviderRef {
-                driver: DRIVER.to_owned(),
-                native_id: Some(id.to_owned()),
-                strength: NativeRefStrength::Strong,
-                fingerprint: None,
-                ordinal: None,
-            }),
-            prompt: prompt.clone(),
-            title: Some(title.clone()),
-            model: None,
-            model_selection: None,
-            completion_wake: None,
-            completion_delivery: None,
-            status: SubagentStatus::Pending,
-            progress: None,
-            workflow: None,
-            result: None,
-            started_at: Some(at.clone()),
-            completed_at: None,
-            updated_at: at,
-            prompt_omitted: None,
-            result_omitted: None,
-        });
-        self.proj.touch_updated(Kind::Subagent, id);
-        let parent_item_id = parent_tool_call_id.and_then(|call_id| {
-            self.live
-                .as_ref()
-                .and_then(|live| live.tools.get(call_id).cloned().flatten())
-        });
-        let item_id = self.push_item(
-            Some(run_id),
-            Some(node_id),
-            TurnItemStatus::Pending,
-            Some(title),
-            TurnItemKind::Subagent(SubagentItem {
-                subagent_id: id.to_owned(),
-                origin: SubagentOrigin::ProviderNative,
-                driver: DRIVER.to_owned(),
-                provider_instance_id: PROVIDER_INSTANCE.to_owned(),
-                child_thread_id: None,
-                remote_child: None,
-                prompt,
-                progress: None,
-                result: None,
-                prompt_omitted: None,
-                result_omitted: None,
-            }),
-        );
-        if let Some(item) = self.proj.item_mut(&item_id) {
-            item.parent_item_id = parent_item_id;
-        }
-        true
-    }
-
-    /// Updates a subagent and mirrors it onto its turn item. Progress-only
-    /// changes (`streaming`, same status) may wait for the coalescing window.
-    fn update_subagent(&mut self, id: &str, streaming: bool, update: impl FnOnce(&mut Subagent)) {
-        let Some(subagent) = self.proj.subagent_mut(id) else {
+        let Some(item_id) = self.subagent_item(subagent_id) else {
             return;
         };
-        let before = subagent.clone();
-        update(subagent);
-        if *subagent == before {
-            return;
-        }
-        subagent.updated_at = now();
-        let streaming = streaming && subagent.status == before.status;
-        let snapshot = subagent.clone();
-        if streaming {
-            self.proj.touch_streaming(Kind::Subagent, id);
-        } else {
-            self.proj.touch_updated(Kind::Subagent, id);
-        }
-        let item_id = self
-            .proj
-            .items
-            .iter()
-            .rev()
-            .find(
-                |item| matches!(&item.kind, TurnItemKind::Subagent(body) if body.subagent_id == id),
-            )
-            .map(|item| item.id.clone());
-        if let Some(item_id) = item_id {
-            self.update_item(&item_id, streaming, |item| {
-                item.status = item_status(snapshot.status);
-                item.title = snapshot.title;
-                item.completed_at = snapshot.completed_at;
-                if let TurnItemKind::Subagent(body) = &mut item.kind {
-                    body.prompt = snapshot.prompt;
-                    body.progress = snapshot.progress;
-                    body.result = snapshot.result;
+        let finished = self
+            .item(&item_id)
+            .is_some_and(|item| matches!(item.status, ItemStatus::Completed | ItemStatus::Failed));
+        if let (true, Some(result)) = (finished, final_text(&transcript.messages)) {
+            self.update_item(&item_id, true, |item| {
+                if let ItemKind::Subagent(body) = &mut item.kind {
+                    body.result = Some(result);
                 }
             });
         }
+    }
+
+    /// Whether subagent `subagent_id` is still running.
+    pub fn subagent_running(&self, subagent_id: &str) -> Option<bool> {
+        let item_id = self.subagent_item(subagent_id)?;
+        self.item(&item_id)
+            .map(|item| item.status == ItemStatus::Running)
     }
 }
 

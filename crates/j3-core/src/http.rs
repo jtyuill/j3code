@@ -1,227 +1,220 @@
-//! HTTP surface t3code clients use (ios-surface §1.3): the environment
-//! descriptor, the RPC WebSocket, the auth-session constant, attachment
-//! upload and asset download, and 501 stubs for the HTTP snapshot endpoints.
+//! The HTTP surface (`docs/protocol/wire.md` §1, §2, §8): discovery, the v2
+//! WebSocket, attachment upload and download, and granted project images.
 
 use std::{io::SeekFrom, sync::Arc};
 
 use axum::{
-    Router,
+    Json, Router,
     body::{Body, Bytes},
-    extract::{Path, RawQuery, State, WebSocketUpgrade, ws::rejection::WebSocketUpgradeRejection},
+    extract::{
+        Path, Query, RawQuery, State, WebSocketUpgrade, ws::rejection::WebSocketUpgradeRejection,
+    },
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use futures_util::stream;
-use serde_json::{Value, json};
+use j3_protocol::v2::{
+    PROTOCOL,
+    entities::Attachment,
+    envelope::{Error, ErrorCode},
+};
+use serde::Deserialize;
+use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use crate::{
-    attachments::{AttachmentKind, AttachmentStore, UploadOutcome},
-    rpc::{self, RpcHandler},
+    app::App,
+    attachments::{
+        AttachmentKind, AttachmentStore, MAX_FILE_BYTES, MAX_IMAGE_BYTES,
+        SUPPORTED_IMAGE_MIME_TYPES,
+    },
+    v2::{driver, router::Router as V2Router},
 };
 
-/// `ORCHESTRATION_PROTOCOL_VERSION` (`environment.ts`).
-const ORCHESTRATION_PROTOCOL_VERSION: u32 = 2;
-/// The same version as the `orchestrationProtocol` query value.
-const ORCHESTRATION_PROTOCOL: &str = "2";
-/// Bytes per body chunk when streaming an asset.
-const ASSET_CHUNK_BYTES: usize = 64 * 1024;
-
-pub struct HttpState {
-    /// ExecutionEnvironmentDescriptor JSON (ios-surface H1); static for the
-    /// process.
-    pub descriptor: Value,
-    pub rpc: Arc<dyn RpcHandler>,
-    pub attachments: Arc<AttachmentStore>,
-}
+/// Bytes per body chunk when streaming an attachment.
+const CHUNK_BYTES: usize = 64 * 1024;
 
 struct Shared {
-    /// The descriptor, encoded once: clients poll it as a liveness check.
-    descriptor: Bytes,
-    auth_session: Bytes,
-    rpc: Arc<dyn RpcHandler>,
+    app: Arc<App>,
+    router: Arc<V2Router>,
     attachments: Arc<AttachmentStore>,
 }
 
-/// `ServerAuthDescriptor` for j3: no auth at all.
-pub fn auth_descriptor() -> Value {
-    json!({
-        "policy": "unsafe-no-auth",
-        "bootstrapMethods": [],
-        "sessionMethods": [],
-        "sessionCookieName": "j3_session",
-    })
-}
-
-/// The constant `AuthSessionState` (ios-surface H3). The permissions are what
-/// the client checks locally before guarded writes, uploads and browsing.
-pub fn auth_session_state() -> Value {
-    json!({
-        "authenticated": true,
-        "auth": auth_descriptor(),
-        "scopes": ["orchestration:read", "orchestration:operate"],
-        "permissions": [
-            "orchestration:read",
-            "orchestration:operate",
-            "filesystem:read",
-            "filesystem:write",
-            "settings:write",
-        ],
-    })
-}
-
-pub fn router(state: HttpState) -> Router {
+/// Every route of a j3 server.
+pub fn router(app: Arc<App>) -> Router {
     let shared = Arc::new(Shared {
-        descriptor: Bytes::from(state.descriptor.to_string()),
-        auth_session: Bytes::from(auth_session_state().to_string()),
-        rpc: state.rpc,
-        attachments: state.attachments,
+        router: Arc::new(V2Router::new(Arc::clone(&app))),
+        attachments: app.attachments(),
+        app,
     });
     Router::new()
-        .route("/.well-known/t3/environment", get(environment))
-        .route("/ws", get(websocket))
-        .route("/api/auth/session", get(auth_session))
-        .route("/api/attachments/upload/{attachment_id}", post(upload))
-        .route("/api/assets/{attachment_id}/{*file_name}", get(asset))
-        .route("/api/orchestration/shell", get(not_implemented))
-        .route(
-            "/api/orchestration/threads/{thread_id}/bounded",
-            get(not_implemented),
-        )
-        .route(
-            "/api/orchestration/threads/{thread_id}/history",
-            get(not_implemented),
-        )
+        .route("/api/v1/info", get(info))
+        .route("/api/v1/ws", get(websocket))
+        .route("/api/v1/attachments", post(upload))
+        .route("/api/v1/attachments/{attachment_id}", get(download))
+        .route("/api/v1/assets/{token}", get(download))
         .with_state(shared)
-}
-
-fn json_bytes(body: Bytes) -> Response {
-    ([(header::CONTENT_TYPE, "application/json")], body).into_response()
 }
 
 fn text(status: StatusCode, body: &'static str) -> Response {
     (status, body).into_response()
 }
 
-async fn environment(State(shared): State<Arc<Shared>>) -> Response {
-    json_bytes(shared.descriptor.clone())
+fn error(status: StatusCode, error: Error) -> Response {
+    (status, Json(error)).into_response()
 }
 
-async fn auth_session(State(shared): State<Arc<Shared>>) -> Response {
-    json_bytes(shared.auth_session.clone())
+async fn info(State(shared): State<Arc<Shared>>) -> Response {
+    Json(shared.app.info()).into_response()
 }
 
-/// H6–H8: the client falls back to the socket on any failure. A plain-text
-/// body keeps the bounded-snapshot client from reading it as "thread missing".
-async fn not_implemented() -> Response {
-    text(StatusCode::NOT_IMPLEMENTED, "Not Implemented")
-}
-
-/// H2. The client must ask for orchestration protocol 2 (first
-/// `orchestrationProtocol` query value, like `URLSearchParams.get`).
+/// The upgrade must ask for this server's protocol (wire.md §1).
 async fn websocket(
     State(shared): State<Arc<Shared>>,
     RawQuery(query): RawQuery,
     upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Response {
+    let protocol = PROTOCOL.to_string();
     let requested = query.as_deref().and_then(|query| {
         query.split('&').find_map(|pair| {
             let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-            (key == "orchestrationProtocol").then_some(value)
+            (key == "protocol").then_some(value)
         })
     });
-    if requested != Some(ORCHESTRATION_PROTOCOL) {
+    if requested != Some(protocol.as_str()) {
         return (
             StatusCode::UPGRADE_REQUIRED,
-            axum::Json(json!({
-                "code": "orchestration_protocol_incompatible",
-                "message": format!(
-                    "Update this client to one that supports orchestration protocol \
-                     {ORCHESTRATION_PROTOCOL_VERSION}."
-                ),
-                "orchestrationProtocolVersion": ORCHESTRATION_PROTOCOL_VERSION,
+            Json(json!({
+                "code": "protocol_mismatch",
+                "message": format!("This server speaks j3 protocol {PROTOCOL}."),
+                "protocol": PROTOCOL,
             })),
         )
             .into_response();
     }
     match upgrade {
         Ok(upgrade) => {
-            let handler = shared.rpc.clone();
-            upgrade.on_upgrade(move |socket| rpc::serve_socket(socket, handler))
+            let handler: Arc<dyn driver::Handler> = shared.router.clone();
+            upgrade.on_upgrade(move |socket| driver::serve_socket(socket, handler))
         }
         Err(rejection) => rejection.into_response(),
     }
 }
 
-/// H4: raw bytes for an id issued by `attachments.createUploadUrl`.
+#[derive(Deserialize)]
+struct UploadQuery {
+    name: Option<String>,
+}
+
+/// `POST /api/v1/attachments?name=…` (wire.md §8).
 async fn upload(
     State(shared): State<Arc<Shared>>,
-    Path(attachment_id): Path<String>,
+    Query(query): Query<UploadQuery>,
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    let size = match shared.attachments.declared_size(&attachment_id).await {
-        Ok(Some(size)) => size,
-        Ok(None) => return text(StatusCode::NOT_FOUND, "Not Found"),
-        Err(error) => {
-            tracing::error!(%error, attachment_id, "reading attachment metadata failed");
-            return text(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to persist upload.",
-            );
-        }
+    let bad = |message: &str| error(StatusCode::BAD_REQUEST, Error::bad_request(message));
+    let Some(name) = query
+        .name
+        .map(|name| name.trim().to_owned())
+        .filter(|name| !name.is_empty())
+    else {
+        return bad("The `name` query parameter is required.");
     };
-    let length_mismatch = headers.get(header::CONTENT_LENGTH).is_some_and(|length| {
-        length
-            .to_str()
-            .ok()
-            .and_then(|length| length.parse::<u64>().ok())
-            != Some(size)
-    });
-    if length_mismatch {
-        return text(
-            StatusCode::BAD_REQUEST,
-            "Content-Length must match the upload size.",
+    let mime_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .split(';')
+                .next()
+                .unwrap_or(value)
+                .trim()
+                .to_ascii_lowercase()
+        })
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "application/octet-stream".to_owned());
+    let Some(size) = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+    else {
+        return bad("Content-Length is required.");
+    };
+    let image = SUPPORTED_IMAGE_MIME_TYPES.contains(&mime_type.as_str());
+    let limit = if image {
+        MAX_IMAGE_BYTES
+    } else {
+        MAX_FILE_BYTES
+    };
+    if size > limit {
+        return error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Error::new(
+                ErrorCode::TooLarge,
+                format!("The file is larger than {} MiB.", limit >> 20),
+            )
+            .with_data(json!({"limit": limit})),
         );
     }
-    // Sizes are capped at 50 MiB by `createUploadUrl`.
-    let Ok(bytes) = axum::body::to_bytes(body, size as usize).await else {
-        return text(
-            StatusCode::BAD_REQUEST,
-            "Body is larger than the upload size.",
-        );
-    };
-    if bytes.len() as u64 != size {
-        return text(StatusCode::BAD_REQUEST, "Body must match the upload size.");
+    if size == 0 {
+        return bad("The file is empty.");
     }
-    match shared
-        .attachments
-        .store_upload(&attachment_id, &bytes)
+    let attachment_id = match shared
+        .app
+        .inner()
+        .create_attachment(image, &name, &mime_type, size)
         .await
     {
-        Ok(UploadOutcome::Stored) => StatusCode::NO_CONTENT.into_response(),
-        Ok(UploadOutcome::Conflict) => text(StatusCode::CONFLICT, "Attachment already uploaded."),
-        Err(error) => {
-            tracing::error!(%error, attachment_id, "persisting attachment upload failed");
-            text(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to persist upload.",
-            )
-        }
+        Ok(id) => id,
+        Err(failure) => return error(StatusCode::INTERNAL_SERVER_ERROR, failure),
+    };
+    let Ok(bytes) = axum::body::to_bytes(body, size as usize).await else {
+        return bad("The body is larger than Content-Length.");
+    };
+    if bytes.len() as u64 != size {
+        return bad("The body must match Content-Length.");
     }
+    if let Err(message) = shared.attachments.store_new(&attachment_id, &bytes).await {
+        tracing::error!(%message, attachment_id, "storing upload failed");
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Error::internal("The upload could not be stored."),
+        );
+    }
+    (
+        StatusCode::CREATED,
+        Json(Attachment {
+            id: attachment_id,
+            name,
+            mime_type,
+            size,
+        }),
+    )
+        .into_response()
 }
 
-/// H5: an uploaded attachment, with single-range `Range`/`If-Range`
-/// support. Images are served inline; other files as downloads named by the
-/// URL's file name segment.
-async fn asset(
+/// `GET /api/v1/attachments/<id>` and `GET /api/v1/assets/<token>`.
+async fn download(
     State(shared): State<Arc<Shared>>,
     method: Method,
-    Path((attachment_id, file_name)): Path<(String, String)>,
+    Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    let stored = match shared.attachments.stored(&attachment_id).await {
+    serve_attachment(&shared.attachments, &method, &id, &headers).await
+}
+
+/// Serves attachment (or granted project image) `attachment_id` with
+/// single-range `Range` support. Images are served inline, other files as
+/// downloads with a sandboxing CSP.
+async fn serve_attachment(
+    attachments: &AttachmentStore,
+    method: &Method,
+    attachment_id: &str,
+    headers: &HeaderMap,
+) -> Response {
+    let stored = match attachments.stored(attachment_id).await {
         Ok(Some(stored)) => stored,
         Ok(None) => return text(StatusCode::NOT_FOUND, "Not Found"),
         Err(error) => {
@@ -229,6 +222,7 @@ async fn asset(
             return text(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
         }
     };
+    let file_name = &stored.name;
     // Bytes behind an id never change, so the id is a strong validator.
     let etag = format!("\"{attachment_id}\"");
     let mut response_headers = HeaderMap::new();
@@ -252,7 +246,7 @@ async fn asset(
             set(header::CONTENT_TYPE, content_type);
             set(
                 header::CONTENT_DISPOSITION,
-                &download_content_disposition(&file_name),
+                &download_content_disposition(file_name),
             );
             set(
                 header::CONTENT_SECURITY_POLICY,
@@ -269,7 +263,7 @@ async fn asset(
     // anything else (dates, weak tags) gets the full body, which is safe.
     let range = headers
         .get(header::RANGE)
-        .filter(|_| method == Method::GET)
+        .filter(|_| *method == Method::GET)
         .and_then(|range| range.to_str().ok())
         .filter(|_| {
             headers
@@ -309,7 +303,7 @@ async fn asset(
         return text(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
     }
     let body = stream::unfold(file.take(length), |mut reader| async move {
-        let mut chunk = Vec::with_capacity(ASSET_CHUNK_BYTES);
+        let mut chunk = Vec::with_capacity(CHUNK_BYTES);
         match reader.read_buf(&mut chunk).await {
             Ok(0) => None,
             Ok(_) => Some((Ok(Bytes::from(chunk)), reader)),
@@ -329,9 +323,9 @@ enum ByteRange {
     Unsatisfiable,
 }
 
-/// One `bytes=first-last` / `bytes=first-` / `bytes=-suffix` range, as the
-/// reference server's `assetByteRange` reads it. None means "ignore the
-/// header" (malformed or multi-range): the full body is sent.
+/// One `bytes=first-last` / `bytes=first-` / `bytes=-suffix` range. None
+/// means "ignore the header" (malformed or multi-range): the full body is
+/// sent.
 fn parse_byte_range(header: &str, size: u64) -> Option<ByteRange> {
     let spec = header.trim();
     let prefix = spec.get(..6)?;
@@ -378,8 +372,7 @@ fn parse_digits(digits: &str) -> Option<Option<u64>> {
     })))
 }
 
-/// `isSafeDownloadMimeType` (reference `http.ts`): a plain `type/subtype`
-/// that is not HTML or XML.
+/// A plain `type/subtype` that is not HTML or XML, safe to serve as is.
 fn is_safe_download_mime_type(mime_type: &str) -> bool {
     let token = |part: &str| {
         !part.is_empty()
@@ -404,7 +397,8 @@ fn is_safe_download_mime_type(mime_type: &str) -> bool {
         || lower.ends_with("+xml"))
 }
 
-/// `downloadContentDisposition` (reference `http.ts`).
+/// `Content-Disposition` of a download named `file_name`, with an RFC 5987
+/// name when it is not plain ASCII.
 fn download_content_disposition(file_name: &str) -> String {
     let sanitized: String = file_name
         .chars()

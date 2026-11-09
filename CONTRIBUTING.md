@@ -15,10 +15,11 @@ git clone git@github.com:jtyuill/j3code.git
 cd j3code
 nix develop        # optional: Rust toolchain, CMake, mold, Linux GUI and audio libraries
                    # (with direnv, `direnv allow` loads it on every `cd` instead)
-pnpm install       # only needed for the TypeScript packages and iOS app
 ```
 
 Without Nix you need Rust 1.88+ and CMake, plus on Linux the libraries installed in [`ci.yml`](.github/workflows/ci.yml). You need `omp` installed to run agents.
+
+The iOS app needs a Mac with Xcode, [XcodeGen](https://github.com/yonaskolb/XcodeGen) and the iOS Rust targets (`rustup target add aarch64-apple-ios aarch64-apple-ios-sim`). `contrib/ios/build-xcframework.sh` builds the Rust side; [`apps/ios/README.md`](apps/ios/README.md) has the rest.
 
 ## Making changes
 
@@ -31,11 +32,11 @@ Without Nix you need Rust 1.88+ and CMake, plus on Linux the libraries installed
    cargo fmt --all
    cargo clippy --workspace --all-targets
    cargo test --workspace --locked
-   pnpm typecheck && pnpm test    # if you touched TypeScript
+   contrib/check-provenance.sh
    ```
 
    Tests that spend tokens or need a live `omp` are `#[ignore]`d. Run them only when you change that code.
-5. If you change the wire protocol, update `docs/protocol` and the TypeScript contracts in the same pull request. The server and iOS app change together.
+5. If you change the wire protocol, update `docs/protocol/wire.md` in the same pull request. The desktop and the iOS app share `j3-client`, so both must still build.
 6. If you change the desktop's UI, look at it headlessly. The binary renders offline fixture scenes (Rune's agent tooling) without a server or a window:
 
    ```sh

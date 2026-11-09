@@ -9,23 +9,21 @@
 
 use std::{
     collections::HashMap,
-    fs, io,
+    fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
 use ignore::WalkBuilder;
-use j3_protocol::t3::project::{
-    ProjectEntriesFailure, ProjectEntry, ProjectEntryKind, ProjectSearchEntriesError,
-    ProjectSearchEntriesInput, ProjectSearchEntriesResult,
-};
+use j3_protocol::v2::envelope::Error;
+use j3_protocol::v2::methods::{EntriesResult, Entry, EntryKind, SearchEntriesParams};
 
 use crate::files::workspace_relative;
 
 /// Most entries one workspace walk keeps.
 pub const MAX_INDEXED: usize = 25_000;
-/// Most entries one search returns (`PROJECT_SEARCH_ENTRIES_MAX_LIMIT`).
+/// Most entries one search returns.
 pub const MAX_LIMIT: usize = 200;
 /// How long a walk answers searches before the workspace is walked again, so
 /// typing a query walks once while files the agent writes show up soon.
@@ -57,53 +55,40 @@ struct Found {
 }
 
 impl EntryIndex {
-    /// The entries `input.query` names under `input.cwd` (`home` expands `~`):
-    /// best matches first, at most `input.limit`.
-    pub fn search(
-        &self,
-        input: &ProjectSearchEntriesInput,
-        home: &str,
-    ) -> Result<ProjectSearchEntriesResult, Box<ProjectSearchEntriesError>> {
-        let fail = |failure, message: String| {
-            let mut error = Box::new(ProjectSearchEntriesError::new(message));
-            error.cwd = Some(input.cwd.clone());
-            error.limit = Some(input.limit);
-            error.failure = Some(failure);
-            error
-        };
-        let root = fs::canonicalize(&input.cwd).map_err(|error| {
-            let failure = if error.kind() == io::ErrorKind::NotFound {
-                ProjectEntriesFailure::WorkspaceRootNotFound
-            } else {
-                ProjectEntriesFailure::WorkspaceRootStatFailed
-            };
-            fail(failure, format!("{}: {error}", input.cwd))
+    /// The entries `params.query` names under the project directory `root`
+    /// (`~` is the server user's home): best matches first, at most
+    /// `params.limit` (default and cap [`MAX_LIMIT`]).
+    pub fn search(&self, root: &str, params: &SearchEntriesParams) -> Result<EntriesResult, Error> {
+        let canonical_root = fs::canonicalize(root).map_err(|error| {
+            Error::rejected(format!("The project folder {root} can't be read: {error}"))
         })?;
-        if !root.is_dir() {
-            return Err(fail(
-                ProjectEntriesFailure::WorkspaceRootNotDirectory,
-                format!("{} is not a directory", input.cwd),
-            ));
+        if !canonical_root.is_dir() {
+            return Err(Error::rejected(format!(
+                "The project folder {root} is not a directory."
+            )));
         }
-        let limit = (input.limit as usize).clamp(1, MAX_LIMIT);
+        let root = canonical_root.as_path();
+        let limit = params
+            .limit
+            .map_or(MAX_LIMIT, |limit| (limit as usize).clamp(1, MAX_LIMIT));
         // `~` and `..` alone name a directory to list, as `~/` and `../` do.
-        let query = match input.query.trim() {
+        let query = match params.query.trim() {
             bare @ ("~" | "..") => format!("{bare}/"),
             query => query.to_owned(),
         };
         let query = query.as_str();
-        let wanted = |found: &Found| match input.kind {
-            Some(ProjectEntryKind::File) if found.directory => false,
-            Some(ProjectEntryKind::Directory) if !found.directory => false,
-            _ => input.image_only != Some(true) || (!found.directory && is_image(&found.path)),
+        let wanted = |found: &Found| match params.kind {
+            Some(EntryKind::File) if found.directory => false,
+            Some(EntryKind::Dir) if !found.directory => false,
+            _ => params.images_only != Some(true) || (!found.directory && is_image(&found.path)),
         };
 
         let (dir_part, rest) = query.rsplit_once('/').unwrap_or(("", query));
         let (found, walk_truncated) = if leaves_workspace(query) {
             let shown = &query[..query.len() - rest.len()];
-            (list_dir(&expand(shown, &root, home), shown, rest), false)
+            (list_dir(&expand(shown, root), shown, rest), false)
         } else if query.is_empty() {
-            (list_dir(&root, "", ""), false)
+            (list_dir(root, "", ""), false)
         } else if let Some(scope) = workspace_relative(dir_part)
             .filter(|scope| !dir_part.is_empty() && !scope.is_empty() && root.join(scope).is_dir())
         {
@@ -113,12 +98,12 @@ impl EntryIndex {
                     false,
                 )
             } else {
-                let walk = self.walk(&root);
+                let walk = self.walk(root);
                 let under = format!("{scope}/");
                 (fuzzy(&walk, &under, &rest.to_lowercase()), walk.truncated)
             }
         } else {
-            let walk = self.walk(&root);
+            let walk = self.walk(root);
             (fuzzy(&walk, "", &query.to_lowercase()), walk.truncated)
         };
 
@@ -127,18 +112,18 @@ impl EntryIndex {
         for found in found.into_iter().filter(wanted) {
             matched += 1;
             if entries.len() < limit {
-                entries.push(ProjectEntry {
+                entries.push(Entry {
                     path: found.path,
                     kind: if found.directory {
-                        ProjectEntryKind::Directory
+                        EntryKind::Dir
                     } else {
-                        ProjectEntryKind::File
+                        EntryKind::File
                     },
                     ignored: None,
                 });
             }
         }
-        Ok(ProjectSearchEntriesResult {
+        Ok(EntriesResult {
             truncated: walk_truncated || matched > limit,
             entries,
         })
@@ -298,10 +283,12 @@ fn leaves_workspace(query: &str) -> bool {
 }
 
 /// The host directory `shown` (a query's directory part: empty, or ending in
-/// `/`) names.
-fn expand(shown: &str, root: &Path, home: &str) -> PathBuf {
+/// `/`) names; `~/` is the server user's home.
+fn expand(shown: &str, root: &Path) -> PathBuf {
     match shown.strip_prefix("~/") {
-        Some(rest) => Path::new(home).join(rest),
+        Some(rest) => {
+            Path::new(&std::env::var("HOME").unwrap_or_else(|_| "/".to_owned())).join(rest)
+        }
         None => root.join(shown),
     }
 }
@@ -317,4 +304,87 @@ fn is_image(path: &str) -> bool {
                 "png" | "jpg" | "jpeg" | "gif" | "webp"
             )
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::files::tests::project;
+
+    fn search(index: &EntryIndex, root: &Path, query: &str) -> Vec<String> {
+        let params = SearchEntriesParams {
+            project_id: "p".into(),
+            query: query.into(),
+            limit: None,
+            kind: None,
+            images_only: None,
+        };
+        let result = index.search(root.to_str().unwrap(), &params).unwrap();
+        result.entries.into_iter().map(|e| e.path).collect()
+    }
+
+    #[test]
+    fn search_ranks_names_over_paths_and_subsequences() {
+        let dir = project();
+        let root = dir.path();
+        for path in [
+            "src/app.rs",
+            "src/apps/main.rs",
+            "docs/mapping.md",
+            "a/p/p.txt",
+            "app.rs",
+        ] {
+            let path = root.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "").unwrap();
+        }
+        fs::write(root.join(".gitignore"), "docs/\n").unwrap();
+        let index = EntryIndex::default();
+        let found = search(&index, root, "app");
+        // Name prefixes (shorter paths first), then paths containing it,
+        // then subsequences.
+        assert_eq!(found[..3], ["app.rs", "src/apps", "src/app.rs"]);
+        assert_eq!(found[3..], ["src/apps/main.rs", "a/p/p.txt"]);
+        assert!(found.iter().all(|path| !path.starts_with("docs")));
+
+        // `dir/rest` narrows to `dir`; `dir/` lists it.
+        assert_eq!(search(&index, root, "src/main"), ["src/apps/main.rs"]);
+        assert_eq!(search(&index, root, "src/"), ["src/apps", "src/app.rs"]);
+        // An empty query lists the root, directories first.
+        assert_eq!(search(&index, root, "")[..2], ["a", "docs"]);
+
+        let params = SearchEntriesParams {
+            project_id: "p".into(),
+            query: "app".into(),
+            limit: Some(1),
+            kind: Some(EntryKind::File),
+            images_only: None,
+        };
+        let limited = index.search(root.to_str().unwrap(), &params).unwrap();
+        assert_eq!(limited.entries.len(), 1);
+        assert_eq!(limited.entries[0].path, "app.rs");
+        assert_eq!(limited.entries[0].kind, EntryKind::File);
+        assert!(limited.truncated);
+    }
+
+    #[test]
+    fn search_lists_directories_outside_the_project_by_prefix() {
+        let dir = project();
+        let root = dir.path().join("proj");
+        fs::create_dir_all(root.join("x")).unwrap();
+        fs::create_dir_all(dir.path().join("sibling")).unwrap();
+        fs::write(dir.path().join("shot.PNG"), "").unwrap();
+        let index = EntryIndex::default();
+        assert_eq!(search(&index, &root, "../si"), ["../sibling"]);
+        let params = SearchEntriesParams {
+            project_id: "p".into(),
+            query: "../".into(),
+            limit: None,
+            kind: None,
+            images_only: Some(true),
+        };
+        let images = index.search(root.to_str().unwrap(), &params).unwrap();
+        let paths: Vec<_> = images.entries.into_iter().map(|e| e.path).collect();
+        assert_eq!(paths, ["../shot.PNG"]);
+    }
 }

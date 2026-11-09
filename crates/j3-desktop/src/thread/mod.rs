@@ -1,4 +1,4 @@
-//! One open thread (spec §5): its live state — a `ThreadHandle` subscription forwarded into
+//! One open thread (spec §5): its live state — a `ThreadWatch` subscription forwarded into
 //! the app by a watch task — and its view: the header (in the shell's toolbar band, see
 //! [`header`]), the feed (§5.1, §6), the cards above the composer (§5.2: [`cards`],
 //! [`question`], [`goal`]) and the layout with the terminal drawer and file pane ([`layout`],
@@ -21,7 +21,10 @@ mod tests;
 
 use std::sync::Arc;
 
-use j3_client::{Connection, ThreadHandle, ThreadState, ThreadSync};
+use j3_client::{
+    Connection, ThreadSync, ThreadView, ThreadWatch,
+    methods::{StopParams, VisitParams},
+};
 use rune::{TextEdit, Tx};
 
 pub use header::toolbar;
@@ -39,7 +42,7 @@ pub const RECENT_THREADS: usize = 8;
 /// A thread's UI state: live while it is open, cached for a while after.
 pub struct ThreadUi {
     /// The latest state: live from the subscription while open, the last one seen after.
-    pub state: Arc<ThreadState>,
+    pub state: Arc<ThreadView>,
     /// The feed's own UI state.
     pub feed: feed::FeedUi,
     /// The header menu and the cards' own state.
@@ -57,10 +60,10 @@ impl ThreadUi {
     }
 }
 
-/// A `ThreadHandle` and the task forwarding its state into the inbox; ends on drop.
+/// A `ThreadWatch` and the task forwarding its state into the inbox; ends on drop.
 struct Subscription {
     /// Keeps the server subscription alive.
-    _handle: ThreadHandle,
+    _watch: ThreadWatch,
     watch: tokio::task::AbortHandle,
 }
 
@@ -83,7 +86,7 @@ pub struct ChromeUi {
     /// The "Set goal" dialog, while open.
     pub goal_dialog: Option<goal::GoalDialog>,
     /// The state the cards were last brought in line with.
-    synced: Option<Arc<ThreadState>>,
+    synced: Option<Arc<ThreadView>>,
 }
 
 impl Default for ChromeUi {
@@ -103,7 +106,7 @@ impl ChromeUi {
     /// Brings the cards in line with `state`: the question card follows the first pending
     /// request (a new one starts a fresh questionnaire), and an edit of a queued message
     /// that left the queue ends. True when anything changed.
-    fn sync(&mut self, state: &Arc<ThreadState>) -> bool {
+    fn sync(&mut self, state: &Arc<ThreadView>) -> bool {
         if self
             .synced
             .as_ref()
@@ -113,19 +116,17 @@ impl ChromeUi {
         }
         self.synced = Some(state.clone());
         let mut changed = false;
-        let pending = state.pending_user_inputs();
-        let first = pending.first();
+        let first = state.open_requests().next();
         let shown = self.question.as_ref().map(|card| card.request_id.as_str());
-        if first.map(|pending| pending.request.id.as_str()) != shown {
+        if first.map(|request| request.id.as_str()) != shown {
             self.question = first.map(question::QuestionCard::new);
             changed = true;
         }
-        if self.queue_edit.as_ref().is_some_and(|edit| {
-            !state
-                .queued_runs()
-                .iter()
-                .any(|queued| queued.run.id == edit.run_id)
-        }) {
+        if self
+            .queue_edit
+            .as_ref()
+            .is_some_and(|edit| !state.queue.iter().any(|entry| entry.id == edit.entry_id))
+        {
             self.queue_edit = None;
             changed = true;
         }
@@ -166,9 +167,15 @@ impl J3 {
         let Some(connection) = self.subscribe_thread(&key) else {
             return;
         };
-        let id = key.thread_id.clone();
+        let params = VisitParams {
+            thread_id: key.thread_id.clone(),
+            visited_at: crate::sidebar::iso(self.clock.now),
+            opened: Some(true),
+            command_id: None,
+        };
         self.services.runtime.spawn(async move {
-            if let Err(e) = connection.visit(&id).await {
+            let id = params.thread_id.clone();
+            if let Err(e) = connection.triage_visit(params).await {
                 tracing::debug!("visit {id}: {e}");
             }
         });
@@ -196,7 +203,7 @@ impl J3 {
             }
         });
         let live = Subscription {
-            _handle: handle,
+            _watch: handle,
             watch: watch.abort_handle(),
         };
         let seen = self.clock.t;
@@ -228,13 +235,13 @@ impl J3 {
     /// first, empty state doesn't replace the cached one. While the open thread loads or
     /// catches up, its feed lands at its end at once instead of growing into place. A message
     /// sent while it is open is held at the top of the feed for its reply (`feed::anchor`).
-    pub fn thread_changed(&mut self, key: &ThreadKey, state: Arc<ThreadState>, tx: &mut Tx) {
+    pub fn thread_changed(&mut self, key: &ThreadKey, state: Arc<ThreadView>, tx: &mut Tx) {
         let open = self.open_thread_key().as_ref() == Some(key);
         let now = self.clock.t;
         if let Some(thread) = self.threads.get_mut(key)
-            && !(is_blank(&state) && thread.state.projection.is_some())
+            && !(is_blank(&state) && thread.state.thread.is_some())
         {
-            if open && (thread.state.projection.is_none() || state.sync != ThreadSync::Live) {
+            if open && (thread.state.thread.is_none() || state.sync != ThreadSync::Synced) {
                 tx.settle();
             }
             thread
@@ -290,21 +297,26 @@ impl J3 {
         self.hubs.retain(|key, _| threads.contains_key(key));
     }
 
-    /// Stops `key`'s active run (⌘.); nothing when no run is active.
+    /// Stops `key`'s active turn (⌘.); nothing when no turn is active.
     pub fn stop_run(&mut self, key: &ThreadKey) {
         let Some(thread) = self.threads.get(key) else {
             return;
         };
-        if thread.state.active_run().is_none() {
+        if thread.state.active_turn().is_none() {
             return;
         }
         let Some(connection) = self.thread_connection(key) else {
             return;
         };
-        let id = key.thread_id.clone();
+        let params = StopParams {
+            thread_id: key.thread_id.clone(),
+            hold_queue: None,
+            force: None,
+            command_id: None,
+        };
         self.run_command(
             "stop the run",
-            async move { connection.stop(&id).await },
+            async move { connection.turns_stop(params).await },
             |_, _, _| {},
         );
     }
@@ -338,6 +350,6 @@ impl J3 {
 }
 
 /// A subscription's first state: nothing received yet.
-fn is_blank(state: &ThreadState) -> bool {
-    state.projection.is_none() && state.sync == ThreadSync::Loading
+fn is_blank(state: &ThreadView) -> bool {
+    state.thread.is_none() && state.sync == ThreadSync::Loading
 }

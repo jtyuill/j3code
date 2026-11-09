@@ -1,11 +1,15 @@
 //! The goal chip above the composer and the "Set goal" dialog (spec §5.2, item 4).
 //!
-//! The chip shows omp's goal for the thread: its objective, status and usage, with Pause
-//! (while active), Resume (paused or out of budget) and Drop (Clear once complete). A goal is
+//! The chip shows omp's goal for the thread (none once dropped): its objective, status and
+//! token usage, with Pause (while active), Resume (paused or out of budget) and Drop (Clear
+//! once complete). A goal is
 //! created from the header's actions menu, "Set goal…", which opens a dialog drawn here into
 //! the overlay layer: an objective and an optional token budget.
 
-use j3_client::t3::orchestration::{ProviderGoal, ProviderGoalStatus};
+use j3_client::{
+    entities::{Goal, GoalState},
+    methods::{CreateGoalParams, ThreadParams},
+};
 use rune::{El, TextEdit, Tx, col, icon, row, spacer, text};
 use rune_kit::{Button, ButtonVariant, ControlSize, Dialog, Kit, TextInput};
 
@@ -48,7 +52,10 @@ impl J3 {
         let Some(connection) = self.thread_connection(key) else {
             return;
         };
-        let thread_id = key.thread_id.clone();
+        let params = ThreadParams {
+            thread_id: key.thread_id.clone(),
+            command_id: None,
+        };
         let what = match command {
             GoalCommand::Pause => "pause the goal",
             GoalCommand::Resume => "resume the goal",
@@ -58,9 +65,9 @@ impl J3 {
             what,
             async move {
                 match command {
-                    GoalCommand::Pause => connection.pause_goal(&thread_id).await,
-                    GoalCommand::Resume => connection.resume_goal(&thread_id).await,
-                    GoalCommand::Drop => connection.drop_goal(&thread_id).await,
+                    GoalCommand::Pause => connection.goals_pause(params).await,
+                    GoalCommand::Resume => connection.goals_resume(params).await,
+                    GoalCommand::Drop => connection.goals_drop(params).await,
                 }
             },
             |_, _, _| {},
@@ -89,7 +96,7 @@ impl J3 {
         }
     }
 
-    /// "Set Goal": creates the goal (`connection.create_goal`) and closes the dialog, or
+    /// "Set Goal": creates the goal (`goals.create`) and closes the dialog, or
     /// marks what's missing: an objective, or a budget that is a whole number.
     pub fn confirm_goal_dialog(&mut self, key: &ThreadKey) {
         let Some(dialog) = self
@@ -110,10 +117,15 @@ impl J3 {
         let Some(connection) = self.thread_connection(key) else {
             return;
         };
-        let thread_id = key.thread_id.clone();
+        let params = CreateGoalParams {
+            thread_id: key.thread_id.clone(),
+            objective,
+            budget,
+            command_id: None,
+        };
         self.run_command(
             "set the goal",
-            async move { connection.create_goal(&thread_id, &objective, budget).await },
+            async move { connection.goals_create(params).await },
             |_, _, _| {},
         );
     }
@@ -142,52 +154,43 @@ pub fn format_tokens(tokens: u64) -> String {
     }
 }
 
-/// What the goal chip says about usage: tokens of budget and time.
-pub fn goal_usage(goal: &ProviderGoal) -> String {
-    let mut parts = Vec::new();
-    match (goal.tokens_used, goal.token_budget.flatten()) {
-        (Some(used), Some(budget)) => parts.push(format!(
-            "{} / {} tokens",
-            format_tokens(used),
-            format_tokens(budget)
-        )),
-        (Some(used), None) => parts.push(format!("{} tokens", format_tokens(used))),
-        (None, Some(budget)) => parts.push(format!("budget {} tokens", format_tokens(budget))),
-        (None, None) => {}
+/// What the goal chip says about usage: tokens of budget.
+pub fn goal_usage(goal: &Goal) -> String {
+    match (goal.tokens_used, goal.budget) {
+        (Some(used), Some(budget)) => {
+            format!("{} / {} tokens", format_tokens(used), format_tokens(budget))
+        }
+        (Some(used), None) => format!("{} tokens", format_tokens(used)),
+        (None, Some(budget)) => format!("budget {} tokens", format_tokens(budget)),
+        (None, None) => String::new(),
     }
-    if let Some(seconds) = goal.time_used_seconds.filter(|s| *s > 0) {
-        parts.push(if seconds < 60 {
-            format!("{seconds}s")
-        } else {
-            format!("{}m", seconds / 60)
-        });
-    }
-    parts.join(" · ")
 }
 
-pub fn status_label(status: ProviderGoalStatus) -> &'static str {
-    match status {
-        ProviderGoalStatus::Active => "Active",
-        ProviderGoalStatus::Paused => "Paused",
-        ProviderGoalStatus::Blocked => "Blocked",
-        ProviderGoalStatus::UsageLimited => "Usage limited",
-        ProviderGoalStatus::BudgetLimited => "Budget reached",
-        ProviderGoalStatus::Complete => "Complete",
+pub fn status_label(state: GoalState) -> &'static str {
+    match state {
+        GoalState::Active => "Active",
+        GoalState::Paused => "Paused",
+        GoalState::BudgetLimited => "Budget reached",
+        GoalState::Complete => "Complete",
+        GoalState::Dropped => "Dropped",
     }
+}
+
+/// The thread's goal while it has one: none once dropped.
+pub fn current(goal: Option<&Goal>) -> Option<&Goal> {
+    goal.filter(|goal| goal.state != GoalState::Dropped)
 }
 
 /// The goal chip: star, objective, status, usage and the commands the status allows.
-pub fn chip(ui: &Ui, key: &ThreadKey, goal: &ProviderGoal) -> El {
+pub fn chip(ui: &Ui, key: &ThreadKey, goal: &Goal) -> El {
     let k = ui.k;
-    let status = goal.status;
+    let status = goal.state;
     let palette = Status::of(k);
     let color = match status {
-        ProviderGoalStatus::Active => k.c.icon_accent,
-        ProviderGoalStatus::Complete => palette.success,
-        ProviderGoalStatus::Blocked
-        | ProviderGoalStatus::UsageLimited
-        | ProviderGoalStatus::BudgetLimited => palette.warning,
-        ProviderGoalStatus::Paused => palette.muted,
+        GoalState::Active => k.c.icon_accent,
+        GoalState::Complete => palette.success,
+        GoalState::BudgetLimited => palette.warning,
+        GoalState::Paused | GoalState::Dropped => palette.muted,
     };
     let command = |id: &str, label: &str, command: GoalCommand| {
         let key = key.clone();
@@ -226,16 +229,13 @@ pub fn chip(ui: &Ui, key: &ThreadKey, goal: &ProviderGoal) -> El {
     if !usage.is_empty() {
         chip = chip.child(text(usage).font(k.ty.text_xsmall).color(k.c.text_muted));
     }
-    if status == ProviderGoalStatus::Active {
+    if status == GoalState::Active {
         chip = chip.child(command("goal-pause", "Pause", GoalCommand::Pause));
     }
-    if matches!(
-        status,
-        ProviderGoalStatus::Paused | ProviderGoalStatus::BudgetLimited
-    ) {
+    if matches!(status, GoalState::Paused | GoalState::BudgetLimited) {
         chip = chip.child(command("goal-resume", "Resume", GoalCommand::Resume));
     }
-    let drop = if status == ProviderGoalStatus::Complete {
+    let drop = if status == GoalState::Complete {
         "Clear"
     } else {
         "Drop"
@@ -356,26 +356,35 @@ mod tests {
     }
 
     #[test]
-    fn usage_reads_tokens_budget_and_time() {
-        let goal = |used, budget, seconds| ProviderGoal {
+    fn usage_reads_tokens_and_budget() {
+        let goal = |used, budget| Goal {
+            objective: "o".into(),
+            state: GoalState::Active,
             tokens_used: used,
-            token_budget: Some(budget),
-            time_used_seconds: seconds,
-            ..serde_json::from_value(serde_json::json!({"objective": "o", "status": "active"}))
-                .unwrap()
+            budget,
         };
         assert_eq!(
-            goal_usage(&goal(Some(48_210), Some(200_000), Some(1_260))),
-            "48.2k / 200.0k tokens · 21m"
+            goal_usage(&goal(Some(48_210), Some(200_000))),
+            "48.2k / 200.0k tokens"
         );
+        assert_eq!(goal_usage(&goal(Some(950), None)), "950 tokens");
         assert_eq!(
-            goal_usage(&goal(Some(950), None, Some(42))),
-            "950 tokens · 42s"
-        );
-        assert_eq!(
-            goal_usage(&goal(None, Some(1_500_000), None)),
+            goal_usage(&goal(None, Some(1_500_000))),
             "budget 1.5M tokens"
         );
-        assert_eq!(goal_usage(&goal(None, None, Some(0))), "");
+        assert_eq!(goal_usage(&goal(None, None)), "");
+    }
+
+    #[test]
+    fn a_dropped_goal_is_no_goal() {
+        let goal = |state| Goal {
+            objective: "o".into(),
+            state,
+            tokens_used: None,
+            budget: None,
+        };
+        assert!(current(Some(&goal(GoalState::Paused))).is_some());
+        assert!(current(Some(&goal(GoalState::Dropped))).is_none());
+        assert!(current(None).is_none());
     }
 }

@@ -171,7 +171,13 @@ pub(super) fn projects(s: &J3, ui: &Ui) -> El {
         let env_key = env.key().to_owned();
         let shell = &env.state().shell;
         let mut group = Group::new(format!("projects-{env_key}")).title(env.label());
-        for project in &shell.projects {
+        let mut projects: Vec<_> = shell.projects.values().collect();
+        projects.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        for project in projects {
             let (remove_env, remove_id) = (env_key.clone(), project.id.clone());
             group = group.row(
                 row()
@@ -181,7 +187,7 @@ pub(super) fn projects(s: &J3, ui: &Ui) -> El {
                     .px(16.0)
                     .py(10.0)
                     .center_y()
-                    .child(title_detail(k, &project.title, &project.workspace_root))
+                    .child(title_detail(k, &project.title, &project.path))
                     .child(remove_button(
                         k,
                         format!("remove-project-{env_key}-{}", project.id),
@@ -190,7 +196,7 @@ pub(super) fn projects(s: &J3, ui: &Ui) -> El {
             );
         }
         if shell.projects.is_empty() {
-            let line = if shell.loaded {
+            let line = if shell.synced {
                 "No projects"
             } else {
                 "Connecting…"

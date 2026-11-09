@@ -3,8 +3,8 @@
 //! and View PR or Create PR.
 
 use j3_client::{
-    t3::git::GitStackedAction,
-    workflow::git::{self, QuickActionKind},
+    git::{self, QuickActionKind},
+    methods::GitAction,
 };
 use rune::{Cx, El, Tx, row, text};
 use rune_kit::{
@@ -97,7 +97,7 @@ pub fn view(s: &J3, _cx: &mut Cx<J3>, ui: &mut Ui, key: &ThreadKey) -> El {
             s.open_commit_dialog(key)
         }))
         .item(item("Push", menu.push, |s, key, _| {
-            s.run_git_action(key, GitStackedAction::Push, None)
+            s.run_git_action(key, GitAction::Push, None)
         }))
         .item(item("Pull", menu.pull, |s, key, _| s.git_pull(key)));
     if menu.view_pr {
@@ -108,7 +108,7 @@ pub fn view(s: &J3, _cx: &mut Cx<J3>, ui: &mut Ui, key: &ThreadKey) -> El {
         dropdown = dropdown
             .separator()
             .item(item("Create PR", true, |s, key, _| {
-                s.run_git_action(key, GitStackedAction::CreatePr, None)
+                s.run_git_action(key, GitAction::Pr, None)
             }));
     }
     let dropdown = dropdown.build(k, ui.layer);

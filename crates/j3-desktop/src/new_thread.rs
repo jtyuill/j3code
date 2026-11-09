@@ -6,6 +6,7 @@
 //! searchable and disabled while the environment has none, when the composer's place says
 //! how to add one. A composer (and its draft) belongs to one environment and project.
 
+use j3_client::methods::CreateThreadParams;
 use rune::{Cx, El, Tx, col, row, text};
 use rune_kit::{
     Combobox, ComboboxOption, ComboboxState, Placement, Popover, Select, SelectAppearance,
@@ -129,9 +130,10 @@ impl J3 {
         let Some(env) = self.envs.get(&target.env) else {
             return false;
         };
-        let projects = &env.state().shell.projects;
+        let shell = &env.state().shell;
+        let projects = &shell.projects;
         if let Some(id) = &target.project {
-            if projects.iter().any(|p| &p.id == id) {
+            if projects.contains_key(id) {
                 target.project_seen = true;
                 return false;
             }
@@ -139,7 +141,10 @@ impl J3 {
                 return false;
             }
         }
-        let first = projects.first().map(|p| p.id.clone());
+        let first = shell
+            .projects_in_order()
+            .first()
+            .map(|project| project.id.clone());
         target.project_seen = first.is_some();
         if first == target.project {
             return false;
@@ -183,19 +188,24 @@ impl J3 {
             return;
         };
         let connection = environment.connection().clone();
+        let params = CreateThreadParams {
+            project_id: project,
+            model: submission.model,
+            mode: None,
+            title: Some(j3_client::prompt_title(
+                &submission.text,
+                submission.attachments.len(),
+            )),
+            text: submission.text,
+            attachments: submission.attachments,
+            command_id: None,
+        };
         self.spawn(async move {
-            let result = connection
-                .launch(
-                    &project,
-                    &submission.text,
-                    submission.attachments,
-                    submission.model,
-                )
-                .await;
+            let result = connection.threads_create(params).await;
             move |s: &mut J3, tx: &mut Tx| match result {
-                Ok(thread_id) => {
+                Ok(created) => {
                     s.finish_composer(&key, Ok(()));
-                    s.open_thread(ThreadKey::new(env, thread_id), tx);
+                    s.open_thread(ThreadKey::new(env, created.thread.id), tx);
                     s.focus_composer(tx);
                 }
                 Err(e) => s.finish_composer(&key, Err(e.to_string())),
@@ -305,10 +315,10 @@ fn pickers(s: &J3, ui: &Ui, layer: &mut Vec<El>) -> El {
             env.state()
                 .shell
                 .projects
-                .iter()
+                .values()
                 .map(|project| {
                     let mut option = ComboboxOption::new(&project.id, &project.title);
-                    option.detail = project.workspace_root.clone();
+                    option.detail = project.path.clone();
                     option
                 })
                 .collect()

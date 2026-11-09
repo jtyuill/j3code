@@ -1,8 +1,9 @@
-//! `projects.listEntries` and `projects.readFile`: one directory level of a
-//! project and the text of one file, read on the server host. The desktop's
-//! file pane browses with them; the iOS app reads an optional `t3.json`.
+//! `projects.listEntries`, `projects.readFile` and `projects.browse`
+//! (wire.md §5.3): one directory level of a project, the text of one file,
+//! and the directories under the user's home matching a typed path, read on
+//! the server host.
 //!
-//! Both are blocking filesystem work; callers run them on `spawn_blocking`.
+//! All are blocking filesystem work; callers run them on `spawn_blocking`.
 
 use std::{
     collections::HashSet,
@@ -12,10 +13,9 @@ use std::{
     process::{Command, Stdio},
 };
 
-use j3_protocol::t3::project::{
-    ProjectEntriesFailure, ProjectEntry, ProjectEntryKind, ProjectFileFailure,
-    ProjectFileOperation, ProjectListEntriesError, ProjectListEntriesInput,
-    ProjectListEntriesResult, ProjectReadFileError, ProjectReadFileInput, ProjectReadFileResult,
+use j3_protocol::v2::envelope::Error;
+use j3_protocol::v2::methods::{
+    BrowseEntry, BrowseResult, EntriesResult, Entry, EntryKind, ReadFileResult,
 };
 
 /// Most entries one listing returns.
@@ -25,49 +25,36 @@ pub const MAX_READ_BYTES: u64 = 1 << 20;
 /// A NUL byte this early marks a file as binary.
 const BINARY_SNIFF_BYTES: usize = 8 << 10;
 
-/// The entries of `directoryPath` (relative to `cwd`): directories first,
-/// then by case-insensitive name, without `.git`, at most [`MAX_ENTRIES`].
-/// Entries git ignores are flagged when `cwd` is in a git work tree.
-pub fn list_entries(
-    input: &ProjectListEntriesInput,
-) -> Result<ProjectListEntriesResult, Box<ProjectListEntriesError>> {
-    let fail = |failure, message: String| {
-        let mut error = Box::new(ProjectListEntriesError::new(message));
-        error.cwd = Some(input.cwd.clone());
-        error.failure = Some(failure);
-        error
-    };
-    let root = fs::canonicalize(&input.cwd).map_err(|error| {
-        let failure = if error.kind() == io::ErrorKind::NotFound {
-            ProjectEntriesFailure::WorkspaceRootNotFound
-        } else {
-            ProjectEntriesFailure::WorkspaceRootStatFailed
-        };
-        fail(failure, format!("{}: {error}", input.cwd))
+/// The entries of `dir` (relative to the project directory `root`):
+/// directories first, then by case-insensitive name, without `.git`, at most
+/// [`MAX_ENTRIES`]. Entries git ignores are flagged when `root` is in a git
+/// work tree.
+pub fn list_entries(root: &str, dir: Option<&str>) -> Result<EntriesResult, Error> {
+    let canonical_root = fs::canonicalize(root).map_err(|error| {
+        Error::rejected(format!("The project folder {root} can't be read: {error}"))
     })?;
-    if !root.is_dir() {
-        return Err(fail(
-            ProjectEntriesFailure::WorkspaceRootNotDirectory,
-            format!("{} is not a directory", input.cwd),
-        ));
-    }
-    let requested = input.directory_path.as_deref().unwrap_or_default().trim();
-    let list_failed = |message: String| fail(ProjectEntriesFailure::DirectoryListFailed, message);
-    let prefix = workspace_relative(requested)
-        .ok_or_else(|| list_failed(format!("{requested} is outside the workspace")))?;
-    let dir = if prefix.is_empty() {
-        root.clone()
-    } else {
-        fs::canonicalize(root.join(&prefix))
-            .map_err(|error| list_failed(format!("{prefix}: {error}")))?
-    };
-    if !dir.starts_with(&root) {
-        return Err(list_failed(format!(
-            "{prefix} resolves outside the workspace: {}",
-            dir.display()
+    if !canonical_root.is_dir() {
+        return Err(Error::rejected(format!(
+            "The project folder {root} is not a directory."
         )));
     }
-    let read = fs::read_dir(&dir).map_err(|error| list_failed(format!("{prefix}: {error}")))?;
+    let requested = dir.unwrap_or_default().trim();
+    let prefix = workspace_relative(requested)
+        .ok_or_else(|| Error::rejected(format!("{requested} is outside the project folder.")))?;
+    let listed_dir = if prefix.is_empty() {
+        canonical_root.clone()
+    } else {
+        fs::canonicalize(canonical_root.join(&prefix))
+            .map_err(|error| Error::rejected(format!("{prefix} can't be listed: {error}")))?
+    };
+    if !listed_dir.starts_with(&canonical_root) {
+        return Err(Error::rejected(format!(
+            "{prefix} resolves outside the project folder: {}",
+            listed_dir.display()
+        )));
+    }
+    let read = fs::read_dir(&listed_dir)
+        .map_err(|error| Error::rejected(format!("{prefix} can't be listed: {error}")))?;
 
     let mut listed: Vec<(String, bool)> = read
         .filter_map(Result::ok)
@@ -77,23 +64,17 @@ pub fn list_entries(
             if name == ".git" {
                 return None;
             }
-            let directory = match entry.file_type() {
-                // A symlink lists as what it points at (a file when broken).
-                Ok(kind) if kind.is_symlink() => entry.path().is_dir(),
-                Ok(kind) => kind.is_dir(),
-                Err(_) => false,
-            };
-            Some((name, directory))
+            Some((name, is_dir(&entry)))
         })
         .collect();
     listed.sort_by_cached_key(|(name, directory)| (!directory, name.to_lowercase(), name.clone()));
     let truncated = listed.len() > MAX_ENTRIES;
     listed.truncate(MAX_ENTRIES);
 
-    let ignored = git_ignored(&dir, listed.iter().map(|(name, _)| name.as_str()));
+    let ignored = git_ignored(&listed_dir, listed.iter().map(|(name, _)| name.as_str()));
     let entries = listed
         .into_iter()
-        .map(|(name, directory)| ProjectEntry {
+        .map(|(name, directory)| Entry {
             ignored: ignored.contains(&name).then_some(true),
             path: if prefix.is_empty() {
                 name
@@ -101,141 +82,156 @@ pub fn list_entries(
                 format!("{prefix}/{name}")
             },
             kind: if directory {
-                ProjectEntryKind::Directory
+                EntryKind::Dir
             } else {
-                ProjectEntryKind::File
+                EntryKind::File
             },
         })
         .collect();
-    Ok(ProjectListEntriesResult { entries, truncated })
+    Ok(EntriesResult { entries, truncated })
 }
 
-/// The text of `relativePath`: relative to `cwd` (and resolving inside it),
-/// or an absolute host path. At most [`MAX_READ_BYTES`]; `byteLength` is the
-/// whole file's size. A missing file with `allowMissing` is
-/// `exists: false`.
-pub fn read_file(
-    input: &ProjectReadFileInput,
-) -> Result<ProjectReadFileResult, Box<ProjectReadFileError>> {
-    let requested = input.relative_path.trim();
-    let cwd = &input.cwd;
-    let allow_missing = input.allow_missing == Some(true);
-    let error = |failure, message: String| {
-        let mut error = Box::new(ProjectReadFileError::new(message));
-        error.cwd = Some(cwd.clone());
-        error.relative_path = Some(requested.to_owned());
-        error.failure = Some(failure);
-        error
+/// Whether a directory entry is a directory; a symlink counts as what it
+/// points at (a file when broken).
+fn is_dir(entry: &fs::DirEntry) -> bool {
+    match entry.file_type() {
+        Ok(kind) if kind.is_symlink() => entry.path().is_dir(),
+        Ok(kind) => kind.is_dir(),
+        Err(_) => false,
+    }
+}
+
+/// The text of `path`: relative to the project directory `root` (and
+/// resolving inside it), or an absolute host path. At most
+/// [`MAX_READ_BYTES`]; `size` is the whole file's. A missing file is
+/// `exists: false` with `allow_missing`, else `not_found`.
+pub fn read_file(root: &str, path: &str, allow_missing: bool) -> Result<ReadFileResult, Error> {
+    let requested = path.trim();
+    let missing = |path: String| {
+        if allow_missing {
+            Ok(ReadFileResult {
+                path,
+                text: String::new(),
+                size: 0,
+                truncated: false,
+                exists: false,
+            })
+        } else {
+            Err(Error::not_found("file", &path))
+        }
     };
-    let operation_failed = |operation, path: &Path, cause: io::Error| {
-        let mut error = error(
-            ProjectFileFailure::OperationFailed,
-            format!("Failed to read workspace file '{requested}' in '{cwd}': {cause}"),
-        );
-        error.operation = Some(operation);
-        error.operation_path = Some(path.to_string_lossy().into_owned());
-        error
-    };
-    let missing = |relative_path: String| ProjectReadFileResult {
-        relative_path,
-        contents: String::new(),
-        byte_length: 0,
-        truncated: false,
-        exists: Some(false),
-    };
+    let unreadable =
+        |cause: io::Error| Error::rejected(format!("{requested} can't be read: {cause}"));
 
     // The lexical target, the path answered with, and the root it must stay in.
-    let (target, relative_path, root) = if Path::new(requested).is_absolute() {
+    let (target, relative_path, canonical_root) = if Path::new(requested).is_absolute() {
         (PathBuf::from(requested), requested.to_owned(), None)
     } else {
-        let root = match fs::canonicalize(cwd) {
-            Ok(root) => root,
-            Err(cause) if allow_missing && cause.kind() == io::ErrorKind::NotFound => {
-                return Ok(missing(requested.to_owned()));
+        let canonical_root = match fs::canonicalize(root) {
+            Ok(canonical_root) => canonical_root,
+            Err(cause) if cause.kind() == io::ErrorKind::NotFound => {
+                return missing(requested.to_owned());
             }
             Err(cause) => {
-                return Err(operation_failed(
-                    ProjectFileOperation::RealpathWorkspaceRoot,
-                    Path::new(cwd),
-                    cause,
-                ));
+                return Err(Error::rejected(format!(
+                    "The project folder {root} can't be read: {cause}"
+                )));
             }
         };
         let relative = workspace_relative(requested)
             .filter(|relative| !relative.is_empty())
             .ok_or_else(|| {
-                error(
-                    ProjectFileFailure::WorkspacePathOutsideRoot,
-                    format!("Workspace file '{requested}' is outside workspace root '{cwd}'."),
-                )
+                Error::rejected(format!("{requested} is outside the project folder."))
             })?;
-        (root.join(&relative), relative, Some(root))
+        (
+            canonical_root.join(&relative),
+            relative,
+            Some(canonical_root),
+        )
     };
     let resolved = match fs::canonicalize(&target) {
         Ok(resolved) => resolved,
-        Err(cause) if allow_missing && cause.kind() == io::ErrorKind::NotFound => {
-            return Ok(missing(relative_path));
-        }
-        Err(cause) => {
-            return Err(operation_failed(
-                ProjectFileOperation::RealpathTarget,
-                &target,
-                cause,
-            ));
-        }
+        Err(cause) if cause.kind() == io::ErrorKind::NotFound => return missing(relative_path),
+        Err(cause) => return Err(unreadable(cause)),
     };
-    if let Some(root) = &root
-        && !resolved.starts_with(root)
+    if let Some(canonical_root) = &canonical_root
+        && !resolved.starts_with(canonical_root)
     {
-        let mut error = error(
-            ProjectFileFailure::ResolvedPathOutsideRoot,
-            format!(
-                "Workspace file '{requested}' resolves outside workspace root '{cwd}': {}",
-                resolved.display()
-            ),
-        );
-        error.resolved_path = Some(resolved.to_string_lossy().into_owned());
-        error.resolved_workspace_root = Some(root.to_string_lossy().into_owned());
-        return Err(error);
-    }
-    let with_resolved = |mut error: Box<ProjectReadFileError>| {
-        error.resolved_path = Some(resolved.to_string_lossy().into_owned());
-        error
-    };
-
-    let file = File::open(&resolved)
-        .map_err(|cause| operation_failed(ProjectFileOperation::Open, &resolved, cause))?;
-    let metadata = file
-        .metadata()
-        .map_err(|cause| operation_failed(ProjectFileOperation::Stat, &resolved, cause))?;
-    if !metadata.is_file() {
-        return Err(with_resolved(error(
-            ProjectFileFailure::PathNotFile,
-            format!("Workspace path '{requested}' in '{cwd}' is not a file."),
+        return Err(Error::rejected(format!(
+            "{requested} resolves outside the project folder: {}",
+            resolved.display()
         )));
     }
-    let byte_length = metadata.len();
-    let mut bytes = Vec::with_capacity(byte_length.min(MAX_READ_BYTES) as usize);
+
+    let file = File::open(&resolved).map_err(unreadable)?;
+    let metadata = file.metadata().map_err(unreadable)?;
+    if !metadata.is_file() {
+        return Err(Error::rejected(format!("{requested} is not a file.")));
+    }
+    let size = metadata.len();
+    let mut bytes = Vec::with_capacity(size.min(MAX_READ_BYTES) as usize);
     file.take(MAX_READ_BYTES)
         .read_to_end(&mut bytes)
-        .map_err(|cause| operation_failed(ProjectFileOperation::Read, &resolved, cause))?;
+        .map_err(unreadable)?;
     if bytes[..bytes.len().min(BINARY_SNIFF_BYTES)].contains(&0) {
-        return Err(with_resolved(error(
-            ProjectFileFailure::BinaryFile,
-            format!(
-                "Workspace file '{requested}' in '{cwd}' is binary and cannot be previewed as text."
-            ),
+        return Err(Error::rejected(format!(
+            "{requested} is binary and can't be shown as text."
         )));
     }
-    let contents = String::from_utf8(bytes)
+    let text = String::from_utf8(bytes)
         .unwrap_or_else(|invalid| String::from_utf8_lossy(invalid.as_bytes()).into_owned());
-    Ok(ProjectReadFileResult {
-        relative_path,
-        contents,
-        byte_length,
-        truncated: byte_length > MAX_READ_BYTES,
-        exists: Some(true),
+    Ok(ReadFileResult {
+        path: relative_path,
+        text,
+        size,
+        truncated: size > MAX_READ_BYTES,
+        exists: true,
     })
+}
+
+/// `projects.browse`: the directories in the folder `partial_path` names
+/// (`~` is `home`, relative paths are under `home`), sorted by
+/// case-insensitive name. A path not ending in `/` that is not a directory
+/// lists its parent, so the client filters by the typed name.
+pub fn browse(home: &str, partial_path: &str) -> Result<BrowseResult, Error> {
+    let partial = partial_path.trim();
+    let mut dir = if partial.is_empty() {
+        PathBuf::from(home)
+    } else {
+        Path::new(home).join(expand_home(partial, home))
+    };
+    if !partial.ends_with('/')
+        && !dir.is_dir()
+        && let Some(parent) = dir.parent()
+    {
+        dir = parent.to_owned();
+    }
+    let read = fs::read_dir(&dir)
+        .map_err(|error| Error::rejected(format!("{} can't be listed: {error}", dir.display())))?;
+    let mut entries: Vec<BrowseEntry> = read
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().is_dir())
+        .map(|entry| BrowseEntry {
+            name: entry.file_name().to_string_lossy().into_owned(),
+            path: entry.path().to_string_lossy().into_owned(),
+        })
+        .collect();
+    entries.sort_by_cached_key(|entry| entry.name.to_lowercase());
+    Ok(BrowseResult {
+        parent_path: dir.to_string_lossy().into_owned(),
+        entries,
+    })
+}
+
+/// `path` with a leading `~` replaced by `home`.
+fn expand_home(path: &str, home: &str) -> PathBuf {
+    if path == "~" {
+        PathBuf::from(home)
+    } else if let Some(rest) = path.strip_prefix("~/") {
+        Path::new(home).join(rest)
+    } else {
+        PathBuf::from(path)
+    }
 }
 
 /// Why [`image_file`] refused a path.
@@ -354,8 +350,9 @@ fn git_ignored<'a>(dir: &Path, names: impl Iterator<Item = &'a str>) -> HashSet<
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use j3_protocol::v2::envelope::ErrorCode;
 
     #[test]
     fn workspace_relative_normalizes_and_refuses_escapes() {
@@ -368,5 +365,178 @@ mod tests {
         assert_eq!(workspace_relative(".."), None);
         assert_eq!(workspace_relative("a/../../b"), None);
         assert_eq!(workspace_relative("/etc"), None);
+    }
+
+    /// A fresh directory, removed on drop.
+    pub(crate) struct TempDir(PathBuf);
+
+    impl TempDir {
+        pub(crate) fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    pub(crate) fn project() -> TempDir {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("j3-files-{}-{n}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        TempDir(fs::canonicalize(dir).unwrap())
+    }
+
+    fn write(root: &Path, path: &str, contents: &[u8]) {
+        let path = root.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+    }
+
+    fn code(error: &Error) -> ErrorCode {
+        error.code
+    }
+
+    #[test]
+    fn list_entries_sorts_dirs_first_and_flags_ignored() {
+        let dir = project();
+        let root = dir.path();
+        let git = Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .current_dir(root)
+            .status();
+        assert!(git.unwrap().success());
+        write(root, ".gitignore", b"build/\n*.log\n");
+        write(root, "b.txt", b"b");
+        write(root, "A.txt", b"a");
+        write(root, "debug.log", b"");
+        write(root, "build/out", b"");
+        write(root, "src/main.rs", b"");
+        let listed = list_entries(root.to_str().unwrap(), None).unwrap();
+        let paths: Vec<_> = listed.entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            ["build", "src", ".gitignore", "A.txt", "b.txt", "debug.log"]
+        );
+        assert!(!listed.truncated);
+        let ignored: Vec<_> = listed
+            .entries
+            .iter()
+            .filter(|e| e.ignored == Some(true))
+            .map(|e| e.path.as_str())
+            .collect();
+        assert_eq!(ignored, ["build", "debug.log"]);
+        assert_eq!(listed.entries[0].kind, EntryKind::Dir);
+        assert_eq!(listed.entries[2].kind, EntryKind::File);
+
+        let nested = list_entries(root.to_str().unwrap(), Some("src")).unwrap();
+        assert_eq!(nested.entries[0].path, "src/main.rs");
+        let escape = list_entries(root.to_str().unwrap(), Some("../")).unwrap_err();
+        assert_eq!(code(&escape), ErrorCode::Rejected);
+        let missing = list_entries(root.to_str().unwrap(), Some("nope")).unwrap_err();
+        assert_eq!(code(&missing), ErrorCode::Rejected);
+    }
+
+    #[test]
+    fn list_entries_truncates() {
+        let dir = project();
+        for n in 0..=MAX_ENTRIES {
+            write(dir.path(), &format!("f{n:05}"), b"");
+        }
+        let listed = list_entries(dir.path().to_str().unwrap(), None).unwrap();
+        assert!(listed.truncated);
+        assert_eq!(listed.entries.len(), MAX_ENTRIES);
+    }
+
+    #[test]
+    fn read_file_reads_truncates_and_refuses() {
+        let dir = project();
+        let root = dir.path();
+        let root_str = root.to_str().unwrap();
+        write(root, "src/a.txt", b"hello");
+        let read = read_file(root_str, "./src/a.txt", false).unwrap();
+        assert_eq!(
+            read,
+            ReadFileResult {
+                path: "src/a.txt".into(),
+                text: "hello".into(),
+                size: 5,
+                truncated: false,
+                exists: true,
+            }
+        );
+        // An absolute host path is read as is.
+        let absolute = root.join("src/a.txt");
+        let read = read_file(root_str, absolute.to_str().unwrap(), false).unwrap();
+        assert_eq!(
+            (read.path.as_str(), read.text.as_str()),
+            (absolute.to_str().unwrap(), "hello")
+        );
+
+        write(root, "big.txt", &vec![b'x'; MAX_READ_BYTES as usize + 10]);
+        let big = read_file(root_str, "big.txt", false).unwrap();
+        assert!(big.truncated);
+        assert_eq!(big.size, MAX_READ_BYTES + 10);
+        assert_eq!(big.text.len(), MAX_READ_BYTES as usize);
+
+        write(root, "bin", b"ab\0cd");
+        assert_eq!(
+            code(&read_file(root_str, "bin", false).unwrap_err()),
+            ErrorCode::Rejected
+        );
+
+        let missing = read_file(root_str, "gone.json", false).unwrap_err();
+        assert_eq!(code(&missing), ErrorCode::NotFound);
+        let allowed = read_file(root_str, "gone.json", true).unwrap();
+        assert!(!allowed.exists);
+        assert_eq!(allowed.path, "gone.json");
+
+        let escape = read_file(root_str, "../etc/passwd", false).unwrap_err();
+        assert_eq!(code(&escape), ErrorCode::Rejected);
+        let outside = project();
+        write(outside.path(), "secret", b"s");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(outside.path().join("secret"), root.join("link")).unwrap();
+            let escape = read_file(root_str, "link", false).unwrap_err();
+            assert_eq!(code(&escape), ErrorCode::Rejected);
+        }
+        assert_eq!(
+            code(&read_file(root_str, "src", false).unwrap_err()),
+            ErrorCode::Rejected
+        );
+    }
+
+    #[test]
+    fn browse_lists_directories_of_the_typed_path() {
+        let dir = project();
+        let home = dir.path().to_str().unwrap();
+        for path in ["Code/b", "Code/a", "code2", "Docs"] {
+            fs::create_dir_all(dir.path().join(path)).unwrap();
+        }
+        write(dir.path(), "Code/file", b"");
+        let names = |result: BrowseResult| -> Vec<String> {
+            result.entries.into_iter().map(|e| e.name).collect()
+        };
+        // A partial name lists its parent; the client filters by prefix.
+        let partial = browse(home, "~/Cod").unwrap();
+        assert_eq!(partial.parent_path, home);
+        assert_eq!(names(partial), ["Code", "code2", "Docs"]);
+        let inside = browse(home, "Code/").unwrap();
+        assert_eq!(inside.parent_path, format!("{home}/Code/"));
+        assert_eq!(
+            inside.entries[0].path,
+            dir.path().join("Code/a").to_str().unwrap()
+        );
+        assert_eq!(names(inside), ["a", "b"]);
+        assert_eq!(names(browse(home, "").unwrap()), ["Code", "code2", "Docs"]);
+        let gone = browse(home, "~/missing/deeper/").unwrap_err();
+        assert_eq!(code(&gone), ErrorCode::Rejected);
     }
 }

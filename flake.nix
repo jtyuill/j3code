@@ -159,7 +159,7 @@
                 for size in 128 256 512; do
                   dir=$out/share/icons/hicolor/''${size}x''${size}/apps
                   mkdir -p $dir
-                  magick ${./apps/mobile/assets/brand/ios-icon-1024.png} -resize ''${size}x''${size} \
+                  magick ${./assets/icon-1024.png} -resize ''${size}x''${size} \
                     $dir/dev.jacobyuill.j3code.png
                 done
               '';

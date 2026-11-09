@@ -1,17 +1,16 @@
 //! Environments (spec §2.4): one j3 server each, its connection, the latest connection
-//! state forwarded from its `watch` channel, its model catalog, and the chat images fetched
-//! through it. [`Environments`] keeps them in order, the local environment first, and
-//! [`Environments::distinct`] hides servers reached twice.
+//! state forwarded from its `watch` channel, its model catalog, the project slash commands
+//! fetched through it and the chat images fetched through it. [`Environments`] keeps them in
+//! order, the local environment first, and [`Environments::distinct`] hides servers reached
+//! twice.
 
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use base64::Engine as _;
 use j3_client::{
-    Connection, ConnectionState, ConnectionStatus,
-    t3::{
-        assets::{AssetDisposition, AssetResource},
-        chat_attachment::ChatAttachment,
-    },
+    Connection, ConnectionState, Status,
+    entities::Attachment,
+    methods::{CatalogCommand, ImageUrlParams},
 };
 use rune::Tx;
 
@@ -37,42 +36,29 @@ pub enum EnvironmentKind {
 /// An image the chat shows, by where its bytes come from.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ImageRef {
-    /// An uploaded image attachment.
-    Attachment {
-        id: String,
-        name: String,
-        mime_type: String,
-    },
-    /// Image `index` of a tool call's output.
-    ToolOutput {
-        thread_id: String,
-        item_id: String,
-        index: u64,
-    },
-    /// An image file on the thread's host: relative to its project, or
-    /// absolute.
-    HostFile { thread_id: String, path: String },
+    /// An attachment on the server: an uploaded image or a tool's output image.
+    Attachment { id: String },
+    /// An image file in a project on the thread's host, relative to the project.
+    HostFile { project_id: String, path: String },
     /// An `http(s):` or `data:` URL, read by this app itself.
     Url(String),
 }
 
 impl ImageRef {
     /// The image of an attachment; None for other files.
-    pub fn attachment(attachment: &ChatAttachment) -> Option<Self> {
-        match attachment {
-            ChatAttachment::Image(image) => Some(Self::Attachment {
-                id: image.id.clone(),
-                name: image.name.clone(),
-                mime_type: image.mime_type.clone(),
-            }),
-            _ => None,
-        }
+    pub fn attachment(attachment: &Attachment) -> Option<Self> {
+        attachment
+            .mime_type
+            .starts_with("image/")
+            .then(|| Self::Attachment {
+                id: attachment.id.clone(),
+            })
     }
 
-    /// The image a markdown `![](url)` in thread `thread_id` names: web and
-    /// `data:` URLs as they are, anything else a (percent-encoded) path on
-    /// the thread's host, with or without `file://`.
-    pub fn markdown(url: &str, thread_id: &str) -> Self {
+    /// The image a markdown `![](url)` in a thread of project `project_id` names: web and
+    /// `data:` URLs as they are, anything else a (percent-encoded) path in the project, with
+    /// or without `file://`.
+    pub fn markdown(url: &str, project_id: &str) -> Self {
         let url = url.trim();
         let scheme = url
             .split_once(':')
@@ -83,42 +69,11 @@ impl ImageRef {
                 let path = url.strip_prefix("file://").unwrap_or(url);
                 let path = path.split(['?', '#']).next().unwrap_or_default();
                 Self::HostFile {
-                    thread_id: thread_id.to_owned(),
+                    project_id: project_id.to_owned(),
                     path: String::from_utf8_lossy(&percent_decode(path)).into_owned(),
                 }
             }
         }
-    }
-
-    /// The server resource holding the image; None for URLs.
-    fn resource(&self) -> Option<AssetResource> {
-        Some(match self {
-            Self::Attachment {
-                id,
-                name,
-                mime_type,
-            } => AssetResource::Attachment {
-                attachment_id: id.clone(),
-                file_name: Some(name.clone()),
-                mime_type: Some(mime_type.clone()),
-                disposition: Some(AssetDisposition::Inline),
-                render_intent: None,
-            },
-            Self::ToolOutput {
-                thread_id,
-                item_id,
-                index,
-            } => AssetResource::ToolOutputImage {
-                thread_id: thread_id.clone(),
-                item_id: item_id.clone(),
-                index: *index,
-            },
-            Self::HostFile { thread_id, path } => AssetResource::WorkspaceFile {
-                thread_id: thread_id.clone(),
-                path: path.clone(),
-            },
-            Self::Url(_) => return None,
-        })
     }
 }
 
@@ -129,9 +84,11 @@ pub struct Environment {
     kind: EnvironmentKind,
     connection: Connection,
     state: Arc<ConnectionState>,
-    /// The labelled models `state`'s config offers, rebuilt when its
-    /// providers change.
+    /// The labelled models `state`'s catalog offers, rebuilt when they change.
     models: Arc<[ModelChoice]>,
+    /// Each project's own slash commands, by project id, as `server.refresh` last returned
+    /// them (the catalog the server streams has none).
+    project_commands: BTreeMap<String, Vec<CatalogCommand>>,
     /// The task forwarding `connection.state()` into the inbox; stopped on drop.
     watch: Option<tokio::task::AbortHandle>,
 }
@@ -187,6 +144,7 @@ impl Environment {
             connection,
             models: model_catalog(&state),
             state,
+            project_commands: BTreeMap::new(),
             watch,
         }
     }
@@ -224,25 +182,33 @@ impl Environment {
         &self.models
     }
 
-    /// The server's stable `environmentId`, once its descriptor is known.
-    pub fn environment_id(&self) -> Option<&str> {
-        self.state
-            .descriptor
-            .as_ref()
-            .map(|descriptor| descriptor.environment_id.as_str())
+    /// The server's stable id, once its info is known.
+    pub fn server_id(&self) -> Option<&str> {
+        self.state.info.as_ref().map(|info| info.server_id.as_str())
     }
 
+    /// Connected and caught up with the server's shell.
     pub fn is_live(&self) -> bool {
-        matches!(self.state.status, ConnectionStatus::Live)
+        matches!(self.state.status, Status::Connected) && self.state.shell.synced
+    }
+
+    /// Whether the server offers capability `name` (`git`, `terminal`, …); true until its
+    /// info is known.
+    pub fn has_capability(&self, name: &str) -> bool {
+        self.state
+            .info
+            .as_ref()
+            .is_none_or(|info| info.capabilities.iter().any(|c| c == name))
     }
 
     /// A short status for the sidebar when not live (`None` when live).
     pub fn status_label(&self) -> Option<&'static str> {
         match &self.state.status {
-            ConnectionStatus::Live => None,
-            ConnectionStatus::Connecting | ConnectionStatus::Synchronizing => Some("Connecting…"),
-            ConnectionStatus::Reconnecting { .. } => Some("Offline"),
-            ConnectionStatus::Closed => Some("Closed"),
+            Status::Connected if self.state.shell.synced => None,
+            Status::Connecting | Status::Connected => Some("Connecting…"),
+            Status::Reconnecting { .. } => Some("Offline"),
+            Status::Incompatible { .. } => Some("Incompatible"),
+            Status::Closed => Some("Closed"),
         }
     }
 
@@ -253,30 +219,38 @@ impl Environment {
             lines.push(status.summary());
         }
         lines.push(match &self.state.status {
-            ConnectionStatus::Connecting => "Connecting".to_owned(),
-            ConnectionStatus::Synchronizing => "Synchronizing".to_owned(),
-            ConnectionStatus::Live => "Connected".to_owned(),
-            ConnectionStatus::Reconnecting { attempt, error } => {
+            Status::Connecting => "Connecting".to_owned(),
+            Status::Connected if !self.state.shell.synced => "Synchronizing".to_owned(),
+            Status::Connected => "Connected".to_owned(),
+            Status::Reconnecting { attempt, error } => {
                 format!("Reconnecting (attempt {attempt}): {error}")
             }
-            ConnectionStatus::Closed => "Closed".to_owned(),
+            Status::Incompatible { message } => format!("Incompatible: {message}"),
+            Status::Closed => "Closed".to_owned(),
         });
-        if let Some(descriptor) = &self.state.descriptor {
-            lines.push(format!(
-                "{} · j3 {}",
-                descriptor.label, descriptor.server_version
-            ));
+        if let Some(info) = &self.state.info {
+            lines.push(format!("{} · j3 {}", info.name, info.version));
         }
         lines.join("\n")
     }
 
-    /// Stores a newer state, rebuilding the model catalog when the providers changed.
+    /// Stores a newer state, rebuilding the model catalog when the models changed.
     pub fn set_state(&mut self, state: Arc<ConnectionState>) {
-        let old = self.state.config.as_ref().map(|config| &config.providers);
-        if old != state.config.as_ref().map(|config| &config.providers) {
+        let old = self.state.catalog.as_ref().map(|catalog| &catalog.models);
+        if old != state.catalog.as_ref().map(|catalog| &catalog.models) {
             self.models = model_catalog(&state);
         }
         self.state = state;
+    }
+
+    /// Project `project_id`'s own slash commands, once fetched (`server.refresh`).
+    pub fn project_commands(&self, project_id: &str) -> Option<&[CatalogCommand]> {
+        self.project_commands.get(project_id).map(Vec::as_slice)
+    }
+
+    /// Stores project slash commands `server.refresh` returned.
+    pub fn set_project_commands(&mut self, commands: BTreeMap<String, Vec<CatalogCommand>>) {
+        self.project_commands.extend(commands);
     }
 }
 
@@ -288,10 +262,10 @@ impl Drop for Environment {
     }
 }
 
-/// The labelled model catalog of `state`'s config; empty without one.
+/// The labelled model catalog of `state`'s catalog; empty without one.
 fn model_catalog(state: &ConnectionState) -> Arc<[ModelChoice]> {
     state
-        .config
+        .catalog
         .as_ref()
         .map(models::model_choices)
         .unwrap_or_default()
@@ -339,7 +313,7 @@ impl Environments {
     /// (e.g. the default `shieldy` remote on shieldy itself). Their config
     /// entries stay; they reappear if the ids ever differ.
     pub fn distinct(&self) -> Vec<&Environment> {
-        let ids: Vec<Option<&str>> = self.list.iter().map(Environment::environment_id).collect();
+        let ids: Vec<Option<&str>> = self.list.iter().map(Environment::server_id).collect();
         distinct(&ids)
             .into_iter()
             .map(|ix| &self.list[ix])
@@ -352,10 +326,9 @@ impl Environments {
     }
 }
 
-/// Indices of the entries to show, given each one's server environment id
-/// (`None` until its descriptor arrives): an entry whose id an earlier entry
-/// already has is the same server reached twice and is left out. The local
-/// environment is listed first, so it wins.
+/// Indices of the entries to show, given each one's server id (`None` until its info
+/// arrives): an entry whose id an earlier entry already has is the same server reached twice
+/// and is left out. The local environment is listed first, so it wins.
 pub fn distinct(ids: &[Option<&str>]) -> Vec<usize> {
     let mut seen = std::collections::HashSet::new();
     ids.iter()
@@ -475,17 +448,23 @@ impl J3 {
             };
             self.images.set(key.clone(), ImageLoad::Loading);
             self.spawn(async move {
-                let bytes = match (&image, image.resource()) {
-                    (ImageRef::Url(url), _) if url.starts_with("data:") => data_url(url),
-                    (ImageRef::Url(url), _) => fetch(url).await,
-                    (_, Some(resource)) => match connection.resource_url(resource).await {
-                        Ok(url) => fetch(&url).await,
-                        Err(e) => {
-                            tracing::debug!("asset url for {image:?}: {e}");
-                            None
+                let bytes = match &image {
+                    ImageRef::Url(url) if url.starts_with("data:") => data_url(url),
+                    ImageRef::Url(url) => fetch(url).await,
+                    ImageRef::Attachment { id } => fetch(&connection.attachment_url(id)).await,
+                    ImageRef::HostFile { project_id, path } => {
+                        let params = ImageUrlParams {
+                            project_id: project_id.clone(),
+                            path: path.clone(),
+                        };
+                        match connection.projects_image_url(params).await {
+                            Ok(granted) => fetch(&connection.url(&granted.url)).await,
+                            Err(e) => {
+                                tracing::debug!("image url for {image:?}: {e}");
+                                None
+                            }
                         }
-                    },
-                    (_, None) => None,
+                    }
                 };
                 // An image arriving is not text arriving: rows take its size at once rather
                 // than gliding the feed to its end.
@@ -567,7 +546,7 @@ mod tests {
     #[test]
     fn markdown_images_resolve_to_urls_or_host_files() {
         let host = |path: &str| ImageRef::HostFile {
-            thread_id: "T".into(),
+            project_id: "T".into(),
             path: path.into(),
         };
         assert_eq!(

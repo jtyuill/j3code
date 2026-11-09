@@ -62,7 +62,7 @@ pub enum Action {
     ResetZoom,
     /// Open (or hide) the open thread's terminal drawer.
     ToggleTerminal,
-    /// Open the sidebar's Nth thread (1-based), as t3's `thread.jump.N`.
+    /// Open the sidebar's Nth thread (1-based).
     JumpToThread(u8),
 }
 

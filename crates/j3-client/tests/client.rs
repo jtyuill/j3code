@@ -1,11 +1,9 @@
-//! `j3-client` against a real in-process `j3_core` server on an ephemeral port
-//! with a scripted omp session: handshake, projects, launch + streaming,
-//! questions, queue/steer/interrupt, reconnect after a dropped socket, image
-//! upload, workspace commands, the settle workflow calls, git status and
-//! streamed git actions.
+//! The v2 client (`j3_client::v2`) against a real in-process `j3_core`
+//! server on an ephemeral port with a scripted omp session: connect and
+//! shell, a streamed turn, the queue, requests, reconnect after a dropped
+//! socket, attachments, and a terminal stream.
 
 use std::{
-    collections::BTreeMap,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -15,18 +13,17 @@ use std::{
 
 use futures_util::future::BoxFuture;
 use j3_client::{
-    Answer, Connection, ConnectionState, ConnectionStatus, Error, GitActionUpdate, SendMode,
-    ThreadState, ThreadSync,
-    t3::{
-        git::{GitActionProgress, GitActionProgressPhase, GitCommitStepStatus, GitStackedAction},
-        model::ModelSelection,
-        orchestration::{
-            ProviderGoalStatus, RunStatus, SettledOverride, SubagentStatus, ThreadShell,
-            TurnItemKind, TurnItemStatus, UserMessageInputIntent,
-        },
-        terminal::{TerminalAttachStreamEvent, TerminalSessionStatus},
+    Connection, ConnectionState, Error, PROTOCOL, Status, ThreadSync, ThreadView, ThreadWatch,
+    entities::{
+        Answer, ItemKind, ItemStatus, ModelRef, RequestStatus, ThinkingLevel, ThreadStatus,
+        TurnStatus,
     },
-    workflow::{self, AgentStatus, T3Section, ThreadStatus},
+    envelope::ErrorCode,
+    methods::{
+        AnswerParams, AttachParams, CreateProjectParams, CreateThreadParams, Delivery,
+        ListEntriesParams, QueueEntryParams, RenameThreadParams, SendParams, TerminalCloseParams,
+        TerminalItem, TerminalState, TerminalWriteParams,
+    },
 };
 use j3_core::{
     app::{App, AppConfig},
@@ -36,7 +33,7 @@ use j3_core::{
         omp_rpc::{
             self, AvailableSlashCommand, Event, ExtensionUiResponse, GoalOp, GoalResult,
             ImageContent, PromptAck, RpcNotification, SessionState, SubagentMessages,
-            ThinkingLevel,
+            ThinkingLevel as OmpThinkingLevel,
         },
     },
     serve::Server,
@@ -49,11 +46,10 @@ use tokio::{
     task::JoinHandle,
 };
 
-const MODEL: &str = "opencode-go/glm-5.3-flash";
 const WAIT: Duration = Duration::from_secs(15);
 
 // ---------------------------------------------------------------------------
-// Scripted omp (from crates/j3-core/tests/engine_app.rs)
+// Scripted omp (from tests/client.rs)
 // ---------------------------------------------------------------------------
 
 #[derive(Default)]
@@ -61,10 +57,6 @@ struct Script {
     calls: Mutex<Vec<String>>,
     events: Mutex<Option<mpsc::UnboundedSender<Event>>>,
     ui_responses: Mutex<Vec<ExtensionUiResponse>>,
-    /// omp's current goal (`Goal` JSON), driven by `goal` like omp does.
-    goal: Mutex<Option<Value>>,
-    /// Ids of running subagents (`cancel_subagent` stops them).
-    subagents: Mutex<Vec<String>>,
 }
 
 impl Script {
@@ -96,45 +88,33 @@ impl Script {
             "message": {"role": "assistant"}, "assistantMessageEvent": event}));
     }
 
-    /// omp's lifecycle frame for subagent `id`, started by tool call `call_task`.
-    fn subagent_lifecycle(&self, id: &str, status: &str) {
-        let mut running = self.subagents.lock().unwrap();
-        running.retain(|running| running != id);
-        if status == "started" {
-            running.push(id.to_owned());
-        }
-        drop(running);
-        self.emit(
-            json!({"type": "subagent_lifecycle", "payload": {"id": id, "agent": "task",
-            "agentSource": "bundled", "status": status, "index": 0, "parentToolCallId": "call_task",
-            "description": "Answer PONG", "detached": true}}),
+    /// omp starts an assistant text block.
+    fn text_start(&self, message_id: &str) {
+        self.text(message_id, json!({"type": "text_start", "contentIndex": 0}));
+    }
+
+    /// omp streams `delta` into the text block.
+    fn say(&self, message_id: &str, delta: &str) {
+        self.text(
+            message_id,
+            json!({"type": "text_delta", "contentIndex": 0, "delta": delta}),
         );
     }
 
-    fn subagent_progress(&self, id: &str, status: &str, output: &[&str], tokens: u64) {
-        self.emit(json!({"type": "subagent_progress", "payload": {"index": 0, "agent": "task",
-            "agentSource": "bundled", "task": "Complete assignment thoroughly:\n\nReply PONG.",
-            "assignment": "Reply PONG.", "parentToolCallId": "call_task", "detached": true,
-            "progress": {"index": 0, "id": id, "agent": "task", "agentSource": "bundled", "status": status,
-                "task": "Reply PONG.", "lastIntent": "Thinking about PONG", "recentTools": [],
-                "recentOutput": output, "toolCount": 0, "requests": 1, "tokens": tokens, "cost": 0,
-                "durationMs": 10, "resolvedModelIdentity": MODEL}}}));
+    /// omp ends the text block with its whole `content`.
+    fn text_end(&self, message_id: &str, content: &str) {
+        self.text(
+            message_id,
+            json!({"type": "text_end", "contentIndex": 0, "content": content}),
+        );
     }
-}
-
-fn goal_refused(error: &str) -> omp::Error {
-    omp::Error::Rpc(omp_rpc::Error::Command {
-        command: "goal".into(),
-        error: error.into(),
-        code: None,
-    })
 }
 
 struct FakeSession(Arc<Script>);
 
 impl AgentSession for FakeSession {
     fn session_file(&self) -> &Path {
-        Path::new("/tmp/j3-client-fake-session.jsonl")
+        Path::new("/tmp/j3-client-v2-fake-session.jsonl")
     }
 
     fn prompt(
@@ -176,7 +156,7 @@ impl AgentSession for FakeSession {
 
     fn set_thinking_level(
         &self,
-        level: ThinkingLevel,
+        level: OmpThinkingLevel,
     ) -> BoxFuture<'_, j3_core::engine::session::Result<()>> {
         self.0
             .record(format!("thinking:{}", serde_json::to_value(level).unwrap()));
@@ -200,62 +180,23 @@ impl AgentSession for FakeSession {
     fn available_commands(
         &self,
     ) -> BoxFuture<'_, j3_core::engine::session::Result<Vec<AvailableSlashCommand>>> {
-        Box::pin(async {
-            Ok(serde_json::from_value(json!([
-                {"name": "skill:jev", "source": "skill", "description": "Calibrated judgments"},
-                {"name": "compact", "source": "builtin"}
-            ]))
-            .unwrap())
-        })
+        Box::pin(async { Ok(Vec::new()) })
     }
 
     fn goal(
         &self,
         op: GoalOp,
-        objective: Option<String>,
-        token_budget: Option<i64>,
+        _objective: Option<String>,
+        _token_budget: Option<i64>,
     ) -> BoxFuture<'_, j3_core::engine::session::Result<GoalResult>> {
         self.0.record(format!("goal:{}", op.as_str()));
-        let mut goal = self.0.goal.lock().unwrap();
-        let status = |goal: &Option<Value>| goal.as_ref().map(|goal| goal["status"].clone());
-        let outcome = match op {
-            GoalOp::Create if goal.is_some() => Err(goal_refused("A goal is already active.")),
-            GoalOp::Create => {
-                *goal = Some(
-                    json!({"id": "g1", "objective": objective.unwrap_or_default(),
-                    "status": "active", "tokensUsed": 0, "timeUsedSeconds": 0, "createdAt": 1,
-                    "updatedAt": 1, "tokenBudget": token_budget}),
-                );
-                Ok(())
-            }
-            GoalOp::Pause if status(&goal) == Some(json!("active")) => {
-                goal.as_mut().unwrap()["status"] = json!("paused");
-                Ok(())
-            }
-            GoalOp::Resume if status(&goal) == Some(json!("paused")) => {
-                let goal = goal.as_mut().unwrap();
-                goal["status"] = json!("active");
-                goal["tokensUsed"] = json!(1200);
-                goal["timeUsedSeconds"] = json!(61.6);
-                Ok(())
-            }
-            GoalOp::Drop if goal.is_some() => {
-                goal.as_mut().unwrap()["status"] = json!("dropped");
-                Ok(())
-            }
-            _ => Err(goal_refused("No goal to change.")),
-        };
-        if outcome.is_ok() {
-            // Like omp: `goal_updated` first, then the response.
-            self.0
-                .emit(json!({"type": "goal_updated", "goal": goal.clone()}));
-            if status(&goal) == Some(json!("dropped")) {
-                *goal = None;
-            }
-        }
-        let result = json!({"goal": goal.clone(), "state": null});
-        drop(goal);
-        Box::pin(async move { outcome.map(|()| serde_json::from_value(result).unwrap()) })
+        Box::pin(async {
+            Err(omp::Error::Rpc(omp_rpc::Error::Command {
+                command: "goal".into(),
+                error: "Goals are not scripted.".into(),
+                code: None,
+            }))
+        })
     }
 
     fn cancel_subagent(
@@ -263,11 +204,7 @@ impl AgentSession for FakeSession {
         subagent_id: String,
     ) -> BoxFuture<'_, j3_core::engine::session::Result<bool>> {
         self.0.record(format!("cancel_subagent:{subagent_id}"));
-        let running = self.0.subagents.lock().unwrap().contains(&subagent_id);
-        if running {
-            self.0.subagent_lifecycle(&subagent_id, "aborted");
-        }
-        Box::pin(async move { Ok(running) })
+        Box::pin(async { Ok(false) })
     }
 
     fn subagent_messages(
@@ -276,12 +213,11 @@ impl AgentSession for FakeSession {
     ) -> BoxFuture<'_, j3_core::engine::session::Result<SubagentMessages>> {
         self.0.record(format!("subagent_messages:{subagent_id}"));
         Box::pin(async {
-            Ok(serde_json::from_value(json!({"sessionFile": "/tmp/sub.jsonl", "fromByte": 0,
-                "nextByte": 10, "reset": false, "entries": [], "messages": [
-                    {"role": "user", "content": [{"type": "text", "text": "Reply PONG."}], "timestamp": 1},
-                    {"role": "assistant", "content": [{"type": "thinking", "thinking": "easy"},
-                        {"type": "text", "text": "PONG, from the transcript"}], "timestamp": 2}]}))
-            .unwrap())
+            Ok(
+                serde_json::from_value(json!({"sessionFile": "/tmp/sub.jsonl", "fromByte": 0,
+                "nextByte": 0, "reset": false, "entries": [], "messages": []}))
+                .unwrap(),
+            )
         })
     }
 
@@ -326,7 +262,7 @@ struct TestServer {
 }
 
 fn temp_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("j3-client-{name}-{}", random_hex(10)));
+    let dir = std::env::temp_dir().join(format!("j3-client-v2-{name}-{}", random_hex(10)));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
@@ -432,25 +368,26 @@ impl Drop for Proxy {
 async fn wait_state<T>(
     rx: &mut watch::Receiver<Arc<T>>,
     what: &str,
-    check: impl FnMut(&Arc<T>) -> bool,
+    mut check: impl FnMut(&T) -> bool,
 ) -> Arc<T> {
-    match tokio::time::timeout(WAIT, rx.wait_for(check)).await {
+    match tokio::time::timeout(WAIT, rx.wait_for(|state| check(state))).await {
         Ok(Ok(state)) => Arc::clone(&state),
         Ok(Err(_)) => panic!("{what}: state channel closed"),
         Err(_) => panic!("timed out waiting for {what}"),
     }
 }
 
-async fn live(connection: &Connection) -> Arc<ConnectionState> {
+/// Connected with the shell caught up.
+async fn synced(connection: &Connection) -> Arc<ConnectionState> {
     let mut state = connection.state();
-    wait_state(&mut state, "a live connection", |s| {
-        s.status == ConnectionStatus::Live
+    wait_state(&mut state, "a synced connection", |s| {
+        s.status == Status::Connected && s.shell.synced
     })
     .await
 }
 
 async fn wait_calls(script: &Script, what: &str, check: impl Fn(&[String]) -> bool) {
-    for _ in 0..500 {
+    for _ in 0..1500 {
         if check(&script.calls()) {
             return;
         }
@@ -459,64 +396,75 @@ async fn wait_calls(script: &Script, what: &str, check: impl Fn(&[String]) -> bo
     panic!("timed out waiting for {what}: {:?}", script.calls());
 }
 
-fn model() -> ModelSelection {
-    serde_json::from_value(
-        json!({"instanceId": "omp", "model": MODEL, "options": [{"id": "thinking", "value": "high"}]}),
-    )
-    .unwrap()
-}
-
-fn assistant_text(state: &ThreadState) -> Vec<(String, bool)> {
-    state
-        .feed()
-        .iter()
-        .filter_map(|row| match &row.item.kind {
-            TurnItemKind::AssistantMessage(message) => {
-                Some((message.text.clone(), message.streaming))
-            }
-            _ => None,
-        })
-        .collect()
+fn model() -> ModelRef {
+    ModelRef {
+        provider: "opencode-go".into(),
+        id: "glm-5.3-flash".into(),
+        thinking: Some(ThinkingLevel::High),
+    }
 }
 
 /// Creates the server's project and returns its id.
 async fn project(connection: &Connection, server: &TestServer) -> String {
-    let project = connection
-        .create_project("Demo", &server.project_dir())
+    let created = connection
+        .projects_create(CreateProjectParams {
+            title: "Demo".into(),
+            path: server.project_dir(),
+            default_model: None,
+            command_id: None,
+        })
         .await
         .unwrap();
-    assert_eq!(project.title, "Demo");
-    project.id
+    assert_eq!(created.project.title, "Demo");
+    created.project.id
 }
 
-/// Launches a thread and waits for omp's prompt and the run to be running.
-async fn launch_running(
+/// Creates a thread, waits for omp's prompt and starts the agent; returns
+/// the watch once its turn is running.
+async fn create_running(
     connection: &Connection,
     server: &TestServer,
     project_id: &str,
     text: &str,
-) -> (
-    String,
-    watch::Receiver<Arc<ThreadState>>,
-    j3_client::ThreadHandle,
-) {
-    let thread_id = connection
-        .launch(project_id, text, Vec::new(), model())
+) -> (String, watch::Receiver<Arc<ThreadView>>, ThreadWatch) {
+    let created = connection
+        .threads_create(CreateThreadParams {
+            project_id: project_id.to_owned(),
+            model: model(),
+            mode: None,
+            title: Some(text.to_owned()),
+            text: text.to_owned(),
+            attachments: Vec::new(),
+            command_id: None,
+        })
         .await
         .unwrap();
-    let handle = connection.thread(&thread_id);
-    let mut state = handle.state();
+    let thread_id = created.thread.id.clone();
+    let watch = connection.thread(&thread_id);
+    let mut state = watch.state();
     wait_calls(&server.script, "prompt", |calls| {
         calls.iter().any(|c| c == &format!("prompt:{text}:0"))
     })
     .await;
     server.script.emit(json!({"type": "agent_start"}));
-    wait_state(&mut state, "a running run", |s| {
-        s.active_run()
-            .is_some_and(|run| run.status == RunStatus::Running)
+    wait_state(&mut state, "a running turn", |s| {
+        s.sync == ThreadSync::Synced
+            && s.turns
+                .last()
+                .is_some_and(|turn| turn.status == TurnStatus::Running)
     })
     .await;
-    (thread_id, state, handle)
+    (thread_id, state, watch)
+}
+
+fn assistant_text(view: &ThreadView) -> Vec<String> {
+    view.items
+        .iter()
+        .filter_map(|item| match &item.kind {
+            ItemKind::Text(body) => Some(body.text.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// A minimal executor with no tokio context, to show calls are
@@ -544,580 +492,272 @@ fn block_on<F: Future>(future: F) -> F::Output {
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
-async fn handshake_projects_and_browse() {
-    let server = TestServer::start("handshake").await;
+async fn connects_and_tracks_projects() {
+    let server = TestServer::start("connect").await;
     let connection = Connection::open(server.url(), tokio::runtime::Handle::current());
-    assert_eq!(connection.http_base(), server.url());
-
-    let state = live(&connection).await;
-    let descriptor = state.descriptor.as_ref().unwrap();
-    assert_eq!(descriptor.label, "test-host");
-    let config = state.config.as_ref().unwrap();
-    assert_eq!(config.environment.environment_id, descriptor.environment_id);
-    assert_eq!(config.providers[0].instance_id, "omp");
-    assert!(state.shell.loaded && state.shell.synchronized);
-    assert!(state.shell.projects.is_empty());
-
-    // Creating a project reaches the shell through `project.updated`.
-    let project_id = project(&connection, &server).await;
-    let mut watch = connection.state();
-    let state = wait_state(&mut watch, "the project in the shell", |s| {
-        s.shell.project(&project_id).is_some()
-    })
-    .await;
-    assert_eq!(
-        state.shell.project(&project_id).unwrap().workspace_root,
-        server.project_dir()
-    );
-
-    // Browse the project's parent from a thread with no tokio runtime.
-    let parent = server
-        .project_dir
-        .parent()
-        .unwrap()
-        .to_string_lossy()
-        .into_owned();
-    let remote = connection.clone();
-    let browse = std::thread::spawn(move || block_on(remote.browse(&format!("{parent}/"))))
-        .join()
-        .unwrap()
-        .unwrap();
+    let state = synced(&connection).await;
+    let info = state.info.as_ref().expect("info");
+    assert_eq!(info.protocol, PROTOCOL);
+    assert!(!info.server_id.is_empty());
     assert!(
-        browse
-            .entries
-            .iter()
-            .any(|entry| entry.full_path == server.project_dir()),
-        "{browse:?}"
+        info.capabilities.iter().any(|c| c == "terminal"),
+        "{info:?}"
+    );
+    assert!(
+        state.catalog.is_some(),
+        "the catalog arrives with the handshake"
     );
 
-    // The project's files, one level at a time.
-    let cwd = server.project_dir();
-    std::fs::create_dir_all(server.project_dir.join("src")).unwrap();
-    std::fs::write(server.project_dir.join("src/main.rs"), "fn main() {}\n").unwrap();
-    std::fs::write(server.project_dir.join("logo.png"), b"\x89PNG\0").unwrap();
-    let root = connection.list_entries(&cwd, "").await.unwrap();
-    let paths: Vec<_> = root.entries.iter().map(|e| e.path.as_str()).collect();
-    assert_eq!(paths, ["src", "logo.png"]);
-    let src = connection.list_entries(&cwd, "src").await.unwrap();
-    assert_eq!(src.entries[0].path, "src/main.rs");
-    let file = connection.read_file(&cwd, "src/main.rs").await.unwrap();
-    assert_eq!(file.contents, "fn main() {}\n");
-    let binary = connection.read_file(&cwd, "logo.png").await.unwrap_err();
-    let j3_client::Error::Rejected { error, .. } = &binary else {
-        panic!("expected a typed failure, got {binary:?}")
-    };
-    assert_eq!(error["failure"], "binary_file");
-
-    // Typed failures carry the server's message.
-    let error = connection
-        .archive("missing-thread")
+    let created = connection
+        .projects_create(CreateProjectParams {
+            title: "Demo".into(),
+            path: server.project_dir(),
+            default_model: None,
+            command_id: None,
+        })
         .await
-        .expect_err("archiving a missing thread fails");
-    let j3_client::Error::Rejected { tag, message, .. } = &error else {
-        panic!("expected a typed failure, got {error:?}")
-    };
-    assert_eq!(tag.as_deref(), Some("OrchestrationV2DispatchCommandError"));
-    assert_eq!(&error.to_string(), message);
-
-    connection.delete_project(&project_id).await.unwrap();
-    wait_state(&mut watch, "the project removed", |s| {
-        s.shell.project(&project_id).is_none()
+        .unwrap();
+    let mut rx = connection.state();
+    let shell = wait_state(&mut rx, "the project in the shell", |s| {
+        s.shell.projects.contains_key(&created.project.id)
     })
     .await;
+    assert_eq!(shell.shell.projects[&created.project.id].title, "Demo");
+    assert!(shell.shell.sequence >= created.sequence);
+
+    // Server errors keep their code and sentence.
+    let error = connection
+        .projects_create(CreateProjectParams {
+            title: "Nowhere".into(),
+            path: "/definitely/not/a/dir".into(),
+            default_model: None,
+            command_id: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Server(_)), "{error:?}");
+
+    // Calls work from an executor without a tokio context.
+    let listing = std::thread::spawn({
+        let connection = connection.clone();
+        let project_id = created.project.id.clone();
+        move || {
+            block_on(connection.projects_list_entries(ListEntriesParams {
+                project_id,
+                dir: None,
+            }))
+        }
+    })
+    .join()
+    .unwrap()
+    .unwrap();
+    assert!(!listing.truncated);
 
     connection.close().await;
-    assert_eq!(connection.state().borrow().status, ConnectionStatus::Closed);
-    assert!(matches!(
-        connection.browse("/").await,
-        Err(j3_client::Error::Closed)
-    ));
+    assert_eq!(connection.state().borrow().status, Status::Closed);
+    let closed = connection
+        .projects_list_entries(ListEntriesParams {
+            project_id: created.project.id,
+            dir: None,
+        })
+        .await;
+    assert_eq!(closed.unwrap_err(), Error::Disconnected);
     server.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn launch_streams_text_and_answers_questions() {
-    let server = TestServer::start("launch").await;
+async fn streams_a_turn_to_completion() {
+    let server = TestServer::start("turn").await;
     let connection = Connection::open(server.url(), tokio::runtime::Handle::current());
-    live(&connection).await;
+    synced(&connection).await;
     let project_id = project(&connection, &server).await;
+    let (thread_id, mut state, _watch) =
+        create_running(&connection, &server, &project_id, "Say hi").await;
 
-    let (thread_id, mut state, _handle) =
-        launch_running(&connection, &server, &project_id, "Say hi").await;
-    let calls = server.script.calls();
-    assert!(calls.contains(&"thinking:\"high\"".to_owned()), "{calls:?}");
+    let started = state.borrow().clone();
+    assert!(matches!(&started.items[0].kind,
+        ItemKind::User(user) if user.text == "Say hi"));
+    assert_eq!(started.thread.as_ref().unwrap().id, thread_id);
 
-    // The thread shows up in the shell as running.
-    let mut shell = connection.state();
-    let shell_state = wait_state(&mut shell, "the thread in the shell", |s| {
-        s.shell
-            .thread(&thread_id)
-            .is_some_and(|thread| workflow::thread_status(thread) == ThreadStatus::Working)
+    // Streamed text grows the item piece by piece.
+    server.script.text_start("m1");
+    server.script.say("m1", "Hel");
+    wait_state(&mut state, "the first piece", |s| {
+        assistant_text(s) == ["Hel"]
     })
     .await;
-    assert_eq!(shell_state.shell.threads_of(&project_id).len(), 1);
-    assert_eq!(
-        shell_state.shell.thread(&thread_id).unwrap().title,
-        "Say hi"
-    );
+    server.script.say("m1", "lo");
+    server.script.say("m1", "!");
+    wait_state(&mut state, "the streamed text", |s| {
+        assistant_text(s) == ["Hello!"]
+    })
+    .await;
+    server.script.text_end("m1", "Hello!");
 
-    // Streaming text reaches the feed piece by piece.
-    server
-        .script
-        .text("m1", json!({"type": "text_start", "contentIndex": 0}));
-    server.script.text(
-        "m1",
-        json!({"type": "text_delta", "contentIndex": 0, "delta": "Hel"}),
-    );
-    let partial = wait_state(&mut state, "streaming text", |s| {
-        assistant_text(s) == vec![("Hel".to_owned(), true)]
+    server.script.settle("completed");
+    let done = wait_state(&mut state, "the turn completed", |s| {
+        s.turns
+            .last()
+            .is_some_and(|turn| turn.status == TurnStatus::Completed)
+            && s.thread
+                .as_ref()
+                .is_some_and(|thread| thread.status == ThreadStatus::Idle)
     })
     .await;
-    assert_eq!(partial.sync, ThreadSync::Live);
-    server.script.text(
-        "m1",
-        json!({"type": "text_delta", "contentIndex": 0, "delta": "lo!"}),
-    );
-    server.script.text(
-        "m1",
-        json!({"type": "text_end", "contentIndex": 0, "content": "Hello!"}),
-    );
-    wait_state(&mut state, "final text", |s| {
-        assistant_text(s) == vec![("Hello!".to_owned(), false)]
-    })
-    .await;
-    let feed = state.borrow().feed().to_vec();
-    assert!(matches!(&feed[0].item.kind,
-        TurnItemKind::UserMessage(m) if m.text == "Say hi" && m.input_intent == UserMessageInputIntent::TurnStart));
     assert!(
-        feed.iter()
-            .enumerate()
-            .all(|(index, row)| row.position == index as u64)
+        done.items
+            .iter()
+            .any(|item| matches!(&item.kind, ItemKind::Text(_))
+                && item.status == ItemStatus::Completed),
+        "{:?}",
+        done.items
+    );
+    assert!(
+        done.items
+            .windows(2)
+            .all(|pair| pair[0].ordinal < pair[1].ordinal),
+        "items by ordinal"
+    );
+    assert_eq!(assistant_text(&done), ["Hello!"]);
+    let mut shell = connection.state();
+    wait_state(&mut shell, "the idle row in the shell", |s| {
+        s.shell
+            .threads
+            .get(&thread_id)
+            .is_some_and(|thread| thread.status == ThreadStatus::Idle)
+    })
+    .await;
+
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn queues_and_cancels_a_prompt() {
+    let server = TestServer::start("queue").await;
+    let connection = Connection::open(server.url(), tokio::runtime::Handle::current());
+    synced(&connection).await;
+    let project_id = project(&connection, &server).await;
+    let (thread_id, mut state, _watch) =
+        create_running(&connection, &server, &project_id, "first").await;
+
+    let sent = connection
+        .turns_send(SendParams {
+            thread_id: thread_id.clone(),
+            text: "later".into(),
+            attachments: Vec::new(),
+            model: None,
+            delivery: Delivery::Queue,
+            command_id: None,
+        })
+        .await
+        .unwrap();
+    let entry_id = sent.queue_entry_id.expect("queued");
+    let queued = wait_state(&mut state, "the queue entry", |s| s.queue.len() == 1).await;
+    assert_eq!(queued.queue[0].id, entry_id);
+    assert_eq!(queued.queue[0].text, "later");
+
+    connection
+        .queue_cancel(QueueEntryParams {
+            thread_id: thread_id.clone(),
+            entry_id,
+            command_id: None,
+        })
+        .await
+        .unwrap();
+    wait_state(&mut state, "the queue empty", |s| s.queue.is_empty()).await;
+    server.script.settle("completed");
+    wait_state(&mut state, "the turn completed", |s| {
+        s.turns
+            .last()
+            .is_some_and(|turn| turn.status == TurnStatus::Completed)
+    })
+    .await;
+    assert!(
+        !server
+            .script
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("prompt:later")),
+        "a cancelled entry never reaches omp"
     );
 
-    // omp asks; the question is pending with its item; the answer reaches omp.
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn answers_a_request() {
+    let server = TestServer::start("request").await;
+    let connection = Connection::open(server.url(), tokio::runtime::Handle::current());
+    synced(&connection).await;
+    let project_id = project(&connection, &server).await;
+    let (thread_id, mut state, _watch) =
+        create_running(&connection, &server, &project_id, "Ask me").await;
+
     server.script.emit(
         json!({"type": "extension_ui_request", "id": "ui-1", "method": "select",
         "title": "Pick one", "options": ["alpha", "beta"]}),
     );
-    let asked = wait_state(&mut state, "a pending question", |s| {
-        !s.pending_user_inputs().is_empty()
+    let asked = wait_state(&mut state, "an open request", |s| {
+        s.requests.iter().any(|r| r.status == RequestStatus::Open)
     })
     .await;
-    let (request_id, question_id) = {
-        let pending = asked.pending_user_inputs();
-        assert_eq!(pending.len(), 1);
-        let question = &pending[0].questions[0];
-        assert_eq!(question.question, "Pick one");
-        (pending[0].request.id.clone(), question.id.clone())
-    };
-    assert_eq!(asked.active_run().unwrap().status, RunStatus::Waiting);
-    let mut shell_rx = connection.state();
-    wait_state(&mut shell_rx, "waiting for input in the shell", |s| {
-        s.shell
-            .thread(&thread_id)
-            .is_some_and(|thread| workflow::thread_status(thread) == ThreadStatus::Input)
+    let request = asked
+        .requests
+        .iter()
+        .find(|r| r.status == RequestStatus::Open)
+        .unwrap()
+        .clone();
+    assert_eq!(request.questions.len(), 1);
+    wait_state(&mut state, "the turn waiting", |s| {
+        s.turns
+            .last()
+            .is_some_and(|turn| turn.status == TurnStatus::Waiting)
     })
     .await;
 
     connection
-        .answer(
-            &thread_id,
-            &request_id,
-            BTreeMap::from([(question_id, Answer::One("beta".into()))]),
-        )
+        .requests_answer(AnswerParams {
+            thread_id: thread_id.clone(),
+            request_id: request.id.clone(),
+            answers: vec![Answer {
+                question_id: request.questions[0].id.clone(),
+                values: vec!["beta".into()],
+                other: None,
+            }],
+            command_id: None,
+        })
         .await
         .unwrap();
-    wait_state(&mut state, "the question resolved", |s| {
-        s.pending_user_inputs().is_empty()
-            && s.active_run()
-                .is_some_and(|run| run.status == RunStatus::Running)
+    let answered = wait_state(&mut state, "the request answered", |s| {
+        s.requests
+            .iter()
+            .any(|r| r.id == request.id && r.status == RequestStatus::Answered)
     })
     .await;
+    assert!(
+        answered
+            .requests
+            .iter()
+            .all(|r| r.status != RequestStatus::Open)
+    );
     let responses = server.script.ui_responses.lock().unwrap().clone();
     assert_eq!(
         serde_json::to_value(&responses[0]).unwrap(),
         json!({"type": "extension_ui_response", "id": "ui-1", "value": "beta"})
     );
 
-    server.script.settle("completed");
-    let done = wait_state(&mut state, "the run completed", |s| {
-        s.active_run().is_none()
-    })
-    .await;
-    assert!(done.can_send_now());
-    assert_eq!(
-        done.projection.as_ref().unwrap().runs[0].status,
-        RunStatus::Completed
-    );
-
-    // Workspace commands for the project's directory come from omp.
-    let commands = connection
-        .refresh_workspace(&server.project_dir())
-        .await
-        .unwrap();
-    assert!(
-        commands.skills.iter().any(|skill| skill.name == "jev"),
-        "{commands:?}"
-    );
-    assert!(
-        connection
-            .state()
-            .borrow()
-            .workspaces
-            .contains_key(&server.project_dir())
-    );
-
-    // Rename, visit, archive, unarchive, delete.
-    connection.visit(&thread_id).await.unwrap();
-    connection.rename(&thread_id, "Greeting").await.unwrap();
-    wait_state(&mut shell, "the rename", |s| {
-        s.shell
-            .thread(&thread_id)
-            .is_some_and(|thread| thread.title == "Greeting")
-    })
-    .await;
-    connection.archive(&thread_id).await.unwrap();
-    wait_state(&mut shell, "the thread archived", |s| {
-        s.shell.thread(&thread_id).is_none()
-    })
-    .await;
-    let archived = connection.archived().await.unwrap();
-    assert!(archived.threads.iter().any(|thread| thread.id == thread_id));
-    connection.unarchive(&thread_id).await.unwrap();
-    wait_state(&mut shell, "the thread unarchived", |s| {
-        s.shell.thread(&thread_id).is_some()
-    })
-    .await;
-    connection.delete_thread(&thread_id).await.unwrap();
-    wait_state(&mut state, "the thread deleted", |s| {
-        s.sync == ThreadSync::Deleted
-    })
-    .await;
-    wait_state(&mut shell, "the thread gone", |s| {
-        s.shell.thread(&thread_id).is_none()
-    })
-    .await;
-
     server.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn queue_steer_and_interrupt() {
-    let server = TestServer::start("queue").await;
-    let connection = Connection::open(server.url(), tokio::runtime::Handle::current());
-    live(&connection).await;
-    let project_id = project(&connection, &server).await;
-    let (thread_id, mut state, _handle) =
-        launch_running(&connection, &server, &project_id, "first").await;
-    let active = state.borrow().active_run().unwrap().id.clone();
-    wait_state(&mut state, "steerable", |s| s.can_steer()).await;
-
-    // Queue two; edit one, cancel the other.
-    connection
-        .send(
-            &thread_id,
-            "queued one",
-            Vec::new(),
-            Some(model()),
-            SendMode::Queue,
-        )
-        .await
-        .unwrap();
-    connection
-        .send(&thread_id, "queued two", Vec::new(), None, SendMode::Queue)
-        .await
-        .unwrap();
-    let queued = wait_state(&mut state, "two queued runs", |s| {
-        s.queued_runs().len() == 2
-    })
-    .await;
-    let (q1, q2) = {
-        let runs = queued.queued_runs();
-        assert_eq!(runs[0].text, "queued one");
-        assert_eq!(runs[1].text, "queued two");
-        (runs[0].run.id.clone(), runs[1].run.id.clone())
-    };
-    connection
-        .edit_queued(&thread_id, &q1, "queued one (edited)")
-        .await
-        .unwrap();
-    connection.cancel_queued(&thread_id, &q2).await.unwrap();
-    let edited = wait_state(&mut state, "edit + cancel", |s| {
-        let runs = s.queued_runs();
-        runs.len() == 1 && runs[0].text == "queued one (edited)"
-    })
-    .await;
-    assert!(
-        edited
-            .feed()
-            .iter()
-            .all(|row| row.item.run_id.as_deref() != Some(q2.as_str())),
-        "a cancelled queued message leaves the feed"
-    );
-
-    // Steer the running turn.
-    connection
-        .send(&thread_id, "steer this", Vec::new(), None, SendMode::Auto)
-        .await
-        .unwrap();
-    wait_calls(&server.script, "steer", |calls| {
-        calls.iter().any(|c| c == "steer:steer this")
-    })
-    .await;
-    wait_state(&mut state, "the steer in the feed", |s| {
-        s.feed().iter().any(|row| matches!(&row.item.kind,
-            TurnItemKind::UserMessage(m) if m.input_intent == UserMessageInputIntent::Steer && m.text == "steer this"))
-    })
-    .await;
-
-    // Interrupt with a held queue.
-    connection
-        .interrupt(&thread_id, &active, true)
-        .await
-        .unwrap();
-    let stopped = wait_state(&mut state, "interrupted and held", |s| {
-        s.active_run().is_none() && s.queue_held()
-    })
-    .await;
-    let projection = stopped.projection.as_ref().unwrap();
-    assert_eq!(
-        projection
-            .runs
-            .iter()
-            .find(|run| run.id == active)
-            .unwrap()
-            .status,
-        RunStatus::Interrupted
-    );
-    assert!(
-        stopped
-            .feed()
-            .iter()
-            .any(|row| matches!(row.item.kind, TurnItemKind::RunInterruptResult(_)))
-    );
-    assert!(!stopped.can_steer());
-
-    // Resume: the edited message starts.
-    connection.resume_queue(&thread_id).await.unwrap();
-    wait_calls(&server.script, "queued prompt", |calls| {
-        calls.iter().any(|c| c == "prompt:queued one (edited):0")
-    })
-    .await;
-    server.script.emit(json!({"type": "agent_start"}));
-    wait_state(&mut state, "the queued run running", |s| {
-        s.active_run()
-            .is_some_and(|run| run.id == q1 && run.status == RunStatus::Running)
-    })
-    .await;
-
-    // Promote a new queued message into the running turn.
-    connection
-        .send(&thread_id, "promote me", Vec::new(), None, SendMode::Queue)
-        .await
-        .unwrap();
-    let queued = wait_state(&mut state, "a queued run", |s| s.queued_runs().len() == 1).await;
-    let q3 = queued.queued_runs()[0].run.id.clone();
-    connection
-        .promote_to_steer(&thread_id, &q3, &q1)
-        .await
-        .unwrap();
-    wait_state(&mut state, "the promoted steer", |s| {
-        s.queued_runs().is_empty()
-            && s.feed().iter().any(|row| matches!(&row.item.kind,
-                TurnItemKind::UserMessage(m) if m.input_intent == UserMessageInputIntent::PromotedQueuedToSteer))
-    })
-    .await;
-    assert!(
-        server
-            .script
-            .calls()
-            .contains(&"steer:promote me".to_owned())
-    );
-
-    // Stop without a run id.
-    connection.stop(&thread_id).await.unwrap();
-    wait_state(&mut state, "stopped", |s| s.active_run().is_none()).await;
-
-    server.stop().await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn subagents_and_goals() {
-    let server = TestServer::start("extras").await;
-    let connection = Connection::open(server.url(), tokio::runtime::Handle::current());
-    live(&connection).await;
-    let project_id = project(&connection, &server).await;
-    let (thread_id, mut state, _handle) =
-        launch_running(&connection, &server, &project_id, "delegate").await;
-    let run_id = state.borrow().active_run().unwrap().id.clone();
-    let script = &server.script;
-
-    // The agent starts a subagent through the `task` tool.
-    script.emit(
-        json!({"type": "tool_execution_start", "toolCallId": "call_task", "toolName": "task",
-        "args": {"tasks": [{"agent": "task", "task": "Reply PONG."}]}}),
-    );
-    script.emit(json!({"type": "tool_execution_end", "toolCallId": "call_task", "toolName": "task",
-        "result": {"content": [{"type": "text", "text": "Spawned agent `Pinger`."}]}, "isError": false}));
-    script.subagent_lifecycle("Pinger", "started");
-    script.subagent_progress("Pinger", "running", &[], 1200);
-    let running = wait_state(&mut state, "a running subagent", |s| {
-        s.subagent("Pinger").is_some_and(|subagent| {
-            subagent.status == SubagentStatus::Running && subagent.progress.is_some()
-        })
-    })
-    .await;
-    let subagent = running.subagent("Pinger").unwrap();
-    assert_eq!(subagent.title.as_deref(), Some("Answer PONG"));
-    assert_eq!(subagent.prompt, "Reply PONG.");
-    assert_eq!(subagent.model.as_deref(), Some(MODEL));
-    assert_eq!(
-        subagent.progress.as_deref(),
-        Some("Thinking about PONG · 1.2k tokens")
-    );
-    assert_eq!(subagent.run_id.as_deref(), Some(run_id.as_str()));
-    assert_eq!(running.subagents().len(), 1);
-    // Its feed row sits under the `task` tool row.
-    let row = running
-        .feed()
-        .iter()
-        .find(|row| matches!(&row.item.kind, TurnItemKind::Subagent(body) if body.subagent_id == "Pinger"))
-        .expect("a subagent row");
-    assert_eq!(row.item.status, TurnItemStatus::Running);
-    let parent = running
-        .feed()
-        .iter()
-        .find(|candidate| Some(&candidate.item.id) == row.item.parent_item_id.as_ref())
-        .expect("the task tool row");
-    assert!(
-        matches!(&parent.item.kind, TurnItemKind::DynamicTool(tool) if tool.tool_name.as_deref() == Some("task"))
-    );
-
-    // Stop it without stopping the run.
-    connection
-        .stop_subagent(&thread_id, &run_id, "Pinger")
-        .await
-        .unwrap();
-    let stopped = wait_state(&mut state, "a cancelled subagent", |s| {
-        s.subagent("Pinger")
-            .is_some_and(|subagent| subagent.status == SubagentStatus::Cancelled)
-    })
-    .await;
-    assert!(
-        stopped
-            .active_run()
-            .is_some_and(|run| run.status == RunStatus::Running)
-    );
-    assert!(
-        script
-            .calls()
-            .contains(&"cancel_subagent:Pinger".to_owned())
-    );
-    let error = connection
-        .stop_subagent(&thread_id, &run_id, "Pinger")
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(&error, Error::Rejected { message, .. } if message == "That subagent is no longer running."),
-        "{error:?}"
-    );
-
-    // The agent revives it; it finishes and its transcript holds the answer.
-    script.subagent_lifecycle("Pinger", "started");
-    wait_state(&mut state, "the revived subagent", |s| {
-        s.subagent("Pinger")
-            .is_some_and(|subagent| subagent.status == SubagentStatus::Running)
-    })
-    .await;
-    script.subagent_progress("Pinger", "completed", &["PONG"], 2400);
-    script.subagent_lifecycle("Pinger", "completed");
-    let done = wait_state(&mut state, "the subagent result", |s| {
-        s.subagent("Pinger")
-            .is_some_and(|subagent| subagent.result.as_deref() == Some("PONG, from the transcript"))
-    })
-    .await;
-    let subagent = done.subagent("Pinger").unwrap();
-    assert_eq!(subagent.status, SubagentStatus::Completed);
-    assert!(subagent.completed_at.is_some());
-    assert_eq!(done.subagents().len(), 1);
-
-    // Goals: create, pause, resume (with usage), a refused second create, drop.
-    connection
-        .create_goal(&thread_id, "Ship the release", Some(50_000))
-        .await
-        .unwrap();
-    let created = wait_state(&mut state, "an active goal", |s| {
-        s.goal()
-            .is_some_and(|goal| goal.status == ProviderGoalStatus::Active)
-    })
-    .await;
-    let goal = created.goal().unwrap();
-    assert_eq!(goal.objective, "Ship the release");
-    assert_eq!(goal.token_budget, Some(Some(50_000)));
-    let mut shell = connection.state();
-    wait_state(&mut shell, "the goal on the shell row", |s| {
-        s.shell.thread(&thread_id).is_some_and(|thread| {
-            thread
-                .goal
-                .as_ref()
-                .and_then(Option::as_ref)
-                .is_some_and(|goal| goal.objective == "Ship the release")
-        })
-    })
-    .await;
-    connection.pause_goal(&thread_id).await.unwrap();
-    wait_state(&mut state, "a paused goal", |s| {
-        s.goal()
-            .is_some_and(|goal| goal.status == ProviderGoalStatus::Paused)
-    })
-    .await;
-    connection.resume_goal(&thread_id).await.unwrap();
-    let resumed = wait_state(&mut state, "a resumed goal", |s| {
-        s.goal()
-            .is_some_and(|goal| goal.status == ProviderGoalStatus::Active)
-    })
-    .await;
-    assert_eq!(resumed.goal().unwrap().tokens_used, Some(1200));
-    assert_eq!(resumed.goal().unwrap().time_used_seconds, Some(62));
-    let error = connection
-        .create_goal(&thread_id, "Another", None)
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(&error, Error::Rejected { message, .. } if message == "A goal is already active."),
-        "{error:?}"
-    );
-    connection.drop_goal(&thread_id).await.unwrap();
-    wait_state(&mut state, "no goal", |s| s.goal().is_none()).await;
-    assert_eq!(
-        script
-            .calls()
-            .iter()
-            .filter(|call| call.starts_with("goal:"))
-            .collect::<Vec<_>>(),
-        [
-            "goal:create",
-            "goal:pause",
-            "goal:resume",
-            "goal:create",
-            "goal:drop"
-        ]
-    );
-
-    script.settle("completed");
-    wait_state(&mut state, "the run done", |s| s.active_run().is_none()).await;
-    server.stop().await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn reconnects_after_the_socket_drops() {
+async fn reconnects_and_catches_up() {
     let server = TestServer::start("reconnect").await;
     let proxy = Proxy::start(server.addr).await;
     let connection = Connection::open(proxy.url(), tokio::runtime::Handle::current());
-    live(&connection).await;
+    synced(&connection).await;
     let project_id = project(&connection, &server).await;
-    let (thread_id, mut state, _handle) =
-        launch_running(&connection, &server, &project_id, "keep going").await;
+    let (thread_id, mut state, watch) =
+        create_running(&connection, &server, &project_id, "keep going").await;
 
     // Record every published sequence to check none goes backwards.
     let mut seen_thread = state.clone();
@@ -1130,74 +770,69 @@ async fn reconnects_after_the_socket_drops() {
     });
     let mut seen_shell = connection.state();
     let shell_sequences = tokio::spawn(async move {
-        let mut seen = vec![seen_shell.borrow_and_update().shell.snapshot_sequence];
+        let mut seen = vec![seen_shell.borrow_and_update().shell.sequence];
         while seen_shell.changed().await.is_ok() {
-            seen.push(seen_shell.borrow_and_update().shell.snapshot_sequence);
+            seen.push(seen_shell.borrow_and_update().shell.sequence);
         }
         seen
     });
 
-    server
-        .script
-        .text("m1", json!({"type": "text_start", "contentIndex": 0}));
-    server.script.text(
-        "m1",
-        json!({"type": "text_delta", "contentIndex": 0, "delta": "before"}),
-    );
+    server.script.text_start("m1");
+    server.script.say("m1", "before");
     wait_state(&mut state, "text before the drop", |s| {
-        assistant_text(s) == vec![("before".to_owned(), true)]
+        assistant_text(s) == ["before"]
     })
     .await;
     let before = state.borrow().sequence;
 
-    // Drop the socket; the server keeps going without the client.
+    // Drop the socket; the server goes on without the client, and another
+    // client renames the thread meanwhile.
     proxy.sever();
     let mut status = connection.state();
     wait_state(&mut status, "reconnecting", |s| {
-        matches!(s.status, ConnectionStatus::Reconnecting { .. })
+        matches!(s.status, Status::Reconnecting { .. })
     })
     .await;
-    server.script.text(
-        "m1",
-        json!({"type": "text_delta", "contentIndex": 0, "delta": " and after"}),
-    );
-    server.script.text(
-        "m1",
-        json!({"type": "text_end", "contentIndex": 0, "content": "before and after"}),
-    );
+    let other = Connection::open(server.url(), tokio::runtime::Handle::current());
+    other
+        .threads_rename(RenameThreadParams {
+            thread_id: thread_id.clone(),
+            title: "Survived".into(),
+            command_id: None,
+        })
+        .await
+        .unwrap();
+    server.script.say("m1", " and after");
+    server.script.text_end("m1", "before and after");
     server.script.settle("completed");
 
-    // The client reconnects and catches up.
-    live(&connection).await;
-    let caught_up = wait_state(&mut state, "caught up after reconnect", |s| {
-        s.sync == ThreadSync::Live
-            && s.active_run().is_none()
-            && assistant_text(s) == vec![("before and after".to_owned(), false)]
+    // The client reconnects and catches up on both streams.
+    let shell = wait_state(&mut status, "the rename in the shell", |s| {
+        s.status == Status::Connected
+            && s.shell.synced
+            && s.shell
+                .threads
+                .get(&thread_id)
+                .is_some_and(|thread| thread.title == "Survived")
+    })
+    .await;
+    assert!(shell.shell.projects.contains_key(&project_id));
+    let caught_up = wait_state(&mut state, "the thread caught up", |s| {
+        s.sync == ThreadSync::Synced
+            && s.thread
+                .as_ref()
+                .is_some_and(|thread| thread.title == "Survived")
+            && s.turns
+                .last()
+                .is_some_and(|turn| turn.status == TurnStatus::Completed)
+            && assistant_text(s) == ["before and after"]
     })
     .await;
     assert!(caught_up.sequence > before);
-    let shell = connection.state().borrow().clone();
-    assert!(
-        shell
-            .shell
-            .thread(&thread_id)
-            .is_some_and(|thread| workflow::thread_status(thread) == ThreadStatus::Ready)
-    );
 
-    // Calls work on the new socket.
-    connection.rename(&thread_id, "Survived").await.unwrap();
-    let mut shell_rx = connection.state();
-    wait_state(&mut shell_rx, "rename after reconnect", |s| {
-        s.shell
-            .thread(&thread_id)
-            .is_some_and(|thread| thread.title == "Survived")
-    })
-    .await;
-
+    other.close().await;
     connection.close().await;
-    drop(state);
-    drop(_handle);
-    drop(connection);
+    drop((state, watch, connection));
     let thread_sequences = thread_sequences.await.unwrap();
     let shell_sequences = shell_sequences.await.unwrap();
     assert!(
@@ -1212,464 +847,153 @@ async fn reconnects_after_the_socket_drops() {
     server.stop().await;
 }
 
+/// A 1x1 PNG.
+const PNG: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+    0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x00, 0x01, 0x00, 0x00,
+    0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae,
+    0x42, 0x60, 0x82,
+];
+
 #[tokio::test(flavor = "multi_thread")]
-async fn uploads_an_image_and_serves_it() {
+async fn uploads_and_sends_an_image() {
     let server = TestServer::start("upload").await;
     let connection = Connection::open(server.url(), tokio::runtime::Handle::current());
-    live(&connection).await;
+    synced(&connection).await;
     let project_id = project(&connection, &server).await;
 
-    // A 1x1 PNG.
-    let png: Vec<u8> = vec![
-        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
-        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f,
-        0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x00,
-        0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49,
-        0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
-    ];
     let attachment = connection
-        .upload_image("dot.png", "image/png", png.clone())
+        .upload("dot.png", "image/png", PNG.to_vec())
         .await
         .unwrap();
-    let url = connection.asset_url(&attachment).await.unwrap();
-    assert!(url.starts_with(&server.url()), "{url}");
+    assert_eq!(attachment.name, "dot.png");
+    assert_eq!(attachment.mime_type, "image/png");
+    assert_eq!(attachment.size, PNG.len() as u64);
+    let url = connection.attachment_url(&attachment.id);
+    assert_eq!(
+        url,
+        format!("{}/api/v1/attachments/{}", server.url(), attachment.id)
+    );
     let response = reqwest::get(&url).await.unwrap();
     assert!(response.status().is_success());
     assert_eq!(
         response.headers()["content-type"].to_str().unwrap(),
         "image/png"
     );
-    assert_eq!(response.bytes().await.unwrap().as_ref(), png.as_slice());
+    assert_eq!(response.bytes().await.unwrap().as_ref(), PNG);
+    assert_eq!(
+        connection.url("/api/v1/assets/abc"),
+        format!("{}/api/v1/assets/abc", server.url())
+    );
 
-    // The attachment travels with a message to omp.
-    let thread_id = connection
-        .launch(&project_id, "look", vec![attachment.clone()], model())
+    let (thread_id, mut state, _watch) =
+        create_running(&connection, &server, &project_id, "first").await;
+    server.script.settle("completed");
+    wait_state(&mut state, "the first turn completed", |s| {
+        s.turns
+            .last()
+            .is_some_and(|turn| turn.status == TurnStatus::Completed)
+    })
+    .await;
+
+    let sent = connection
+        .turns_send(SendParams {
+            thread_id,
+            text: "look".into(),
+            attachments: vec![attachment.id.clone()],
+            model: None,
+            delivery: Delivery::Auto,
+            command_id: None,
+        })
         .await
         .unwrap();
-    wait_calls(&server.script, "prompt with image", |calls| {
+    assert!(sent.turn_id.is_some(), "{sent:?}");
+    wait_calls(&server.script, "the prompt with its image", |calls| {
         calls.iter().any(|c| c == "prompt:look:1")
     })
     .await;
-    let handle = connection.thread(&thread_id);
-    let mut state = handle.state();
-    let loaded = wait_state(&mut state, "the thread", |s| !s.feed().is_empty()).await;
-    assert!(matches!(&loaded.feed()[0].item.kind,
-        TurnItemKind::UserMessage(m) if m.attachments == vec![attachment.clone()]));
-
-    server.stop().await;
-}
-
-/// Runs `git` in `dir`, which must succeed.
-fn git(dir: &str, args: &[&str]) {
-    let status = std::process::Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .status()
-        .expect("run git");
-    assert!(status.success(), "git {args:?}");
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn git_status_and_streamed_actions() {
-    let server = TestServer::start("git").await;
-    let connection = Connection::open(server.url(), tokio::runtime::Handle::current());
-    live(&connection).await;
-    let dir = server.project_dir();
-    git(&dir, &["init", "-q"]);
-    git(&dir, &["config", "user.name", "j3 test"]);
-    git(&dir, &["config", "user.email", "test@j3.invalid"]);
-    std::fs::write(Path::new(&dir).join("notes.txt"), "one\ntwo\n").unwrap();
-
-    let status = connection.git_status(&dir).await.unwrap();
-    assert!(status.is_repo && status.has_working_tree_changes);
-    assert!(!status.has_primary_remote && !status.has_upstream);
-    let files: Vec<_> = status
-        .working_tree
-        .files
-        .iter()
-        .map(|file| (file.path.as_str(), file.insertions, file.deletions))
-        .collect();
-    assert_eq!(files, [("notes.txt", 2, 0)]);
-    assert_eq!(
-        workflow::git::quick_action(Some(&status), false).kind,
-        workflow::git::QuickActionKind::Run(GitStackedAction::Commit)
-    );
-
-    // A commit with a message: its phases stream, then the result.
-    let mut run =
-        connection.run_git_action(&dir, GitStackedAction::Commit, Some("Add notes".into()));
-    let mut progress = Vec::new();
-    let result = loop {
-        match run.next().await.expect("an outcome") {
-            GitActionUpdate::Progress(event) => progress.push(event.progress),
-            GitActionUpdate::Finished(outcome) => break outcome.unwrap(),
-        }
-    };
-    assert!(run.next().await.is_none());
-    assert_eq!(
-        progress,
-        [
-            GitActionProgress::ActionStarted {
-                phases: vec![GitActionProgressPhase::Commit],
-            },
-            GitActionProgress::PhaseStarted {
-                phase: GitActionProgressPhase::Commit,
-                label: "Committing...".into(),
-            },
-        ]
-    );
-    assert_eq!(result.commit.status, GitCommitStepStatus::Created);
-    assert_eq!(result.commit.subject.as_deref(), Some("Add notes"));
-    let status = connection.git_status(&dir).await.unwrap();
-    assert!(!status.has_working_tree_changes && status.working_tree.files.is_empty());
-
-    // Pull requests are cut: the action fails with the server's sentence.
-    let mut run = connection.run_git_action(&dir, GitStackedAction::CreatePr, None);
-    let outcome = loop {
-        if let GitActionUpdate::Finished(outcome) = run.next().await.expect("an outcome") {
-            break outcome;
-        }
-    };
-    match outcome {
-        Err(Error::Rejected { tag, message, .. }) => {
-            assert_eq!(tag.as_deref(), Some("GitManagerError"));
-            assert!(message.starts_with("Git manager failed in "), "{message}");
-        }
-        other => panic!("expected a rejection, got {other:?}"),
-    }
+    wait_state(&mut state, "the user item with the image", |s| {
+        s.items.iter().any(|item| {
+            matches!(&item.kind,
+            ItemKind::User(user) if user.text == "look" && user.attachments == [attachment.clone()])
+        })
+    })
+    .await;
 
     server.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn terminal_attach_write_resize_and_close() {
+async fn streams_a_terminal() {
     let server = TestServer::start("terminal").await;
     let connection = Connection::open(server.url(), tokio::runtime::Handle::current());
-    live(&connection).await;
+    synced(&connection).await;
     let project_id = project(&connection, &server).await;
-    let (thread_id, _state, _handle) =
-        launch_running(&connection, &server, &project_id, "shell").await;
+    let (thread_id, _state, _watch) =
+        create_running(&connection, &server, &project_id, "shell").await;
 
-    let mut terminal = connection.attach_terminal(&thread_id, "term-1", Some((90, 20)), false);
-    let snapshot = match terminal.next().await.expect("a snapshot").unwrap() {
-        TerminalAttachStreamEvent::Snapshot(snapshot) => snapshot.snapshot,
+    let mut terminal = connection.attach_terminal(AttachParams {
+        thread_id: thread_id.clone(),
+        terminal_id: "term-1".into(),
+        cols: Some(90),
+        rows: Some(20),
+        env: Default::default(),
+        restart: None,
+    });
+    match terminal.next().await.expect("a snapshot").unwrap() {
+        TerminalItem::Snapshot(snapshot) => assert_eq!(snapshot.state, TerminalState::Running),
         other => panic!("expected a snapshot, got {other:?}"),
-    };
-    assert_eq!(snapshot.status, TerminalSessionStatus::Running);
-    assert_eq!(snapshot.cwd, server.project_dir());
+    }
     connection
-        .write_terminal(&thread_id, "term-1", "echo hi-$((40+2))\n".into())
-        .await
-        .unwrap();
-    connection
-        .resize_terminal(&thread_id, "term-1", 100, 30)
+        .terminal_write(TerminalWriteParams {
+            thread_id: thread_id.clone(),
+            terminal_id: "term-1".into(),
+            // Enough output for more than one window of frames.
+            data: "for i in $(seq 1 40); do echo line-$i; done; echo hi-$((40+2))\n".into(),
+        })
         .await
         .unwrap();
     let mut output = String::new();
     tokio::time::timeout(WAIT, async {
         while !output.contains("hi-42") {
-            if let TerminalAttachStreamEvent::Output(chunk) =
-                terminal.next().await.expect("output").unwrap()
-            {
-                output.push_str(&chunk.data);
+            if let TerminalItem::Output { data } = terminal.next().await.expect("output").unwrap() {
+                output.push_str(&data);
             }
         }
     })
     .await
     .unwrap_or_else(|_| panic!("no output; got {output:?}"));
 
-    // Errors carry the server's sentence.
-    match connection
-        .resize_terminal(&thread_id, "term-9", 80, 24)
-        .await
-    {
-        Err(Error::Rejected { tag, message, .. }) => {
-            assert_eq!(tag.as_deref(), Some("TerminalSessionLookupError"));
-            assert!(
-                message.starts_with("Unknown terminal thread: "),
-                "{message}"
-            );
-        }
-        other => panic!("expected a rejection, got {other:?}"),
-    }
-
     connection
-        .close_terminal(&thread_id, "term-1")
+        .terminal_close(TerminalCloseParams {
+            thread_id,
+            terminal_id: Some("term-1".into()),
+            delete_history: None,
+        })
         .await
         .unwrap();
-    let ended = tokio::time::timeout(WAIT, async {
+    let closed = tokio::time::timeout(WAIT, async {
         let mut closed = false;
-        while let Some(event) = terminal.next().await {
-            closed |= matches!(event.unwrap(), TerminalAttachStreamEvent::Closed(_));
+        while let Some(item) = terminal.next().await {
+            closed |= matches!(item.unwrap(), TerminalItem::Closed);
         }
         closed
     })
     .await
     .unwrap();
-    assert!(ended, "the stream ends with closed");
+    assert!(closed, "the stream ends with closed");
 
-    server.stop().await;
-}
-
-/// The shell row of `thread_id` once `check` holds.
-async fn wait_row(
-    connection: &Connection,
-    thread_id: &str,
-    what: &str,
-    check: impl Fn(&ThreadShell) -> bool,
-) -> ThreadShell {
-    let mut shell = connection.state();
-    let state = wait_state(&mut shell, what, |s| {
-        s.shell.thread(thread_id).is_some_and(&check)
-    })
-    .await;
-    state.shell.thread(thread_id).unwrap().clone()
-}
-
-fn rejected(error: &Error) -> bool {
-    matches!(error, Error::Rejected { tag, .. } if tag.as_deref() == Some("OrchestrationV2DispatchCommandError"))
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn settle_workflow_calls() {
-    let server = TestServer::start("settle").await;
-    let connection = Connection::open(server.url(), tokio::runtime::Handle::current());
-    live(&connection).await;
-    let project_id = project(&connection, &server).await;
-    let (thread_id, mut state, _handle) =
-        launch_running(&connection, &server, &project_id, "Settle me").await;
-    let now = time::OffsetDateTime::now_utc;
-
-    // Working, then Done: the first message stamped a visit before the run
-    // completed, so the completion is unread.
-    let row = wait_row(&connection, &thread_id, "the running row", |row| {
-        workflow::agent_status(row) == AgentStatus::Working
-    })
-    .await;
-    assert_eq!(workflow::thread_status(&row), ThreadStatus::Working);
-    assert!(workflow::working_started_at(&row).is_some());
-    server.script.settle("completed");
-    wait_state(&mut state, "the run completed", |s| {
-        s.active_run().is_none()
-    })
-    .await;
-    let row = wait_row(&connection, &thread_id, "an unread completion", |row| {
-        workflow::agent_status(row) == AgentStatus::Done
-    })
-    .await;
-    assert!(workflow::has_unseen_completion(&row));
-    assert_eq!(workflow::thread_status(&row).label(true), Some("Done"));
-    assert_eq!(
-        workflow::t3_section(&row, now(), true),
-        Some(T3Section::Active)
-    );
-
-    // Visiting reads it; mark-unread brings it back.
-    connection.visit(&thread_id).await.unwrap();
-    wait_row(&connection, &thread_id, "the completion seen", |row| {
-        workflow::agent_status(row) == AgentStatus::Idle
-    })
-    .await;
-    connection.mark_unread(&thread_id).await.unwrap();
-    wait_row(&connection, &thread_id, "unread again", |row| {
-        workflow::has_unseen_completion(row)
-    })
-    .await;
-
-    // Pin at a key, reorder it; Active reorders are refused while pinned.
-    connection.pin(&thread_id, Some("m")).await.unwrap();
-    let row = wait_row(&connection, &thread_id, "the pin", |row| {
-        row.pin_order_key == Some(Some("m".into()))
-    })
-    .await;
-    assert_eq!(
-        workflow::t3_section(&row, now(), true),
-        Some(T3Section::Pinned)
-    );
-    connection.reorder_pinned(&thread_id, "g").await.unwrap();
-    wait_row(&connection, &thread_id, "the pin reorder", |row| {
-        row.pin_order_key == Some(Some("g".into()))
-    })
-    .await;
+    // An unknown thread's terminal is not found.
     let error = connection
-        .reorder_active(&thread_id, "t")
+        .terminal_write(TerminalWriteParams {
+            thread_id: "nope".into(),
+            terminal_id: "term-9".into(),
+            data: "x".into(),
+        })
         .await
         .unwrap_err();
-    assert!(rejected(&error), "{error:?}");
-    connection.unpin(&thread_id).await.unwrap();
-    let row = wait_row(&connection, &thread_id, "the unpin", |row| {
-        row.pinned_at.clone().flatten().is_none()
-    })
-    .await;
-    assert_eq!(row.pin_order_key.clone().flatten(), None);
-    connection.reorder_active(&thread_id, "t").await.unwrap();
-    wait_row(&connection, &thread_id, "the active reorder", |row| {
-        row.active_order_key == Some(Some("t".into()))
-    })
-    .await;
-
-    // Settle drops the order key; unsettle reopens it.
-    connection.settle(&thread_id).await.unwrap();
-    let row = wait_row(&connection, &thread_id, "settled", |row| {
-        workflow::t3_section(row, now(), true) == Some(T3Section::Settled)
-    })
-    .await;
-    assert!(row.settled_at.is_some());
-    assert_eq!(row.active_order_key.clone().flatten(), None);
-    assert_eq!(
-        workflow::settled_timestamp(&row),
-        row.settled_at.as_deref().map(|at| {
-            time::OffsetDateTime::parse(at, &time::format_description::well_known::Rfc3339).unwrap()
-        })
-    );
-    connection.unsettle(&thread_id).await.unwrap();
-    let row = wait_row(&connection, &thread_id, "unsettled", |row| {
-        row.settled_override == Some(SettledOverride::Active)
-    })
-    .await;
-    assert!(row.unsettled_at.clone().flatten().is_some());
-    assert_eq!(
-        workflow::t3_section(&row, now(), true),
-        Some(T3Section::Active)
-    );
-
-    // Snooze: the past is refused; a future wake hides it; unsnooze wakes it.
-    assert!(workflow::can_snooze(&row, now()));
-    let error = connection
-        .snooze(&thread_id, now() - time::Duration::minutes(1))
-        .await
-        .unwrap_err();
-    assert!(rejected(&error), "{error:?}");
-    let presets = workflow::resolve_snooze_presets(now(), &workflow::TimeZone::UTC);
-    let wake = presets[0].snoozed_until;
-    connection.snooze(&thread_id, wake).await.unwrap();
-    let row = wait_row(&connection, &thread_id, "snoozed", |row| {
-        workflow::effective_snoozed(row, now())
-    })
-    .await;
-    assert_eq!(
-        workflow::t3_section(&row, now(), true),
-        Some(T3Section::Snoozed)
-    );
-    assert_eq!(
-        workflow::next_snooze_wake_after([&row], now()),
-        Some(
-            wake.replace_nanosecond(wake.millisecond() as u32 * 1_000_000)
-                .unwrap()
-        )
-    );
-    connection.unsnooze(&thread_id).await.unwrap();
-    wait_row(&connection, &thread_id, "awake", |row| {
-        row.snoozed_until.clone().flatten().is_none()
-    })
-    .await;
-
-    // The per-thread auto-settle opt-out.
-    connection.set_auto_settle(&thread_id, false).await.unwrap();
-    wait_row(&connection, &thread_id, "auto-settle off", |row| {
-        row.auto_settle_disabled_at.clone().flatten().is_some()
-    })
-    .await;
-    connection.set_auto_settle(&thread_id, true).await.unwrap();
-    wait_row(&connection, &thread_id, "auto-settle on", |row| {
-        row.auto_settle_disabled_at.clone().flatten().is_none()
-    })
-    .await;
-
-    // A real message reopens a settled thread.
-    connection.settle(&thread_id).await.unwrap();
-    wait_row(&connection, &thread_id, "settled again", |row| {
-        row.settled_override == Some(SettledOverride::Settled)
-    })
-    .await;
-    connection
-        .send(
-            &thread_id,
-            "Back to work",
-            Vec::new(),
-            None,
-            SendMode::Start,
-        )
-        .await
-        .unwrap();
-    let row = wait_row(&connection, &thread_id, "auto-unsettled", |row| {
-        row.settled_override.is_none()
-    })
-    .await;
-    assert_ne!(
-        workflow::t3_section(&row, now(), false),
-        Some(T3Section::Settled)
-    );
+    assert_eq!(error.code(), Some(ErrorCode::NotFound), "{error:?}");
 
     server.stop().await;
-}
-
-/// Read-only smoke test against a live server (default shieldy):
-/// `cargo test -p j3-client --test client -- --ignored live_server_smoke`.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs a live j3 server (J3_SMOKE_URL, default http://shieldy:3780)"]
-async fn live_server_smoke() {
-    let url = std::env::var("J3_SMOKE_URL").unwrap_or_else(|_| "http://shieldy:3780".into());
-    let connection = Connection::open(url.clone(), tokio::runtime::Handle::current());
-    let mut watch = connection.state();
-    let state = wait_state(&mut watch, "a live connection", |s| {
-        s.status == ConnectionStatus::Live
-    })
-    .await;
-    let descriptor = state.descriptor.as_ref().unwrap();
-    let config = state.config.as_ref().unwrap();
-    println!(
-        "{url}: environment {} ({}), server {}, protocol {:?}",
-        descriptor.label,
-        descriptor.environment_id,
-        descriptor.server_version,
-        descriptor.orchestration_protocol_version
-    );
-    for provider in &config.providers {
-        println!(
-            "provider {} ({}): {:?}, {} models, {} slash commands, {} skills",
-            provider.instance_id,
-            provider.driver,
-            provider.status,
-            provider.models.len(),
-            provider.slash_commands.len(),
-            provider.skills.len()
-        );
-    }
-    println!(
-        "shell: sequence {}, {} projects, {} threads",
-        state.shell.snapshot_sequence,
-        state.shell.projects.len(),
-        state.shell.threads.len()
-    );
-    for project in &state.shell.projects {
-        println!(
-            "  {} {} — {} threads",
-            project.title,
-            project.workspace_root,
-            state.shell.threads_of(&project.id).len()
-        );
-    }
-    let home = connection.browse("~/").await.unwrap();
-    println!(
-        "browse ~/: {} ({} entries)",
-        home.parent_path,
-        home.entries.len()
-    );
-    assert!(!home.parent_path.is_empty());
-    if let Some(thread) = state.shell.threads.first() {
-        let handle = connection.thread(&thread.id);
-        let mut thread_state = handle.state();
-        let loaded = wait_state(&mut thread_state, "a thread snapshot", |s| {
-            s.sync == ThreadSync::Live
-        })
-        .await;
-        println!(
-            "thread {:?}: {} feed items, active run: {}",
-            thread.title,
-            loaded.feed().len(),
-            loaded.active_run().is_some()
-        );
-    }
-    connection.close().await;
 }

@@ -4,6 +4,7 @@
 
 use std::time::Duration;
 
+use j3_text::keywords;
 use rune::{
     Cx, El, PillStyle, TextEdit, TextStyle, Tx, col, el, icon, row, spacer, text, text_input,
 };
@@ -13,7 +14,7 @@ use super::{ComposerKey, draft, images, menu, mic, picker, usage};
 use crate::{
     actions::{Action, shortcut_label},
     app::{J3, Ui},
-    icons, keywords,
+    icons,
     theme::Status,
 };
 
@@ -47,15 +48,13 @@ pub fn view(s: &J3, cx: &mut Cx<J3>, ui: &mut Ui, key: &ComposerKey) -> El {
     let has_models = target.env.is_some_and(|env| !env.models().is_empty());
     // An empty catalog is nearly always a server problem (omp not found, say): say what the
     // server reported.
-    let catalog_note = (!has_models)
-        .then(|| target.env?.state().config.as_ref()?.providers.first())
-        .flatten()
-        .map(|provider| {
-            provider
-                .message
-                .clone()
-                .unwrap_or_else(|| "Loading models…".to_owned())
-        });
+    let catalog_note = (!has_models).then_some(target.env).flatten().map(|env| {
+        env.state()
+            .catalog
+            .as_ref()
+            .and_then(|catalog| catalog.message.clone())
+            .unwrap_or_else(|| "Loading models…".to_owned())
+    });
     // The poll notices focus changes (prediction warm-up, shimmer); ask for one.
     if composer.is_some_and(|c| c.focused != c.edit.focused) {
         s.inbox.wake();

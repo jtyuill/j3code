@@ -1,8 +1,8 @@
-//! The commit dialog (t3's, minus the per-file checkboxes), drawn by the control into the
-//! overlay layer: the branch, the changed files with their line counts and totals, an
-//! optional message, and Commit, Commit & push, or Commit, push & PR.
+//! The commit dialog, drawn by the control into the overlay layer: the branch, the changed
+//! files with their line counts and totals, an optional message, and Commit, Commit & push,
+//! or Commit, push & PR.
 
-use j3_protocol::t3::git::{GitStackedAction, VcsChangeRequestState, VcsStatusResult};
+use j3_client::methods::{GitAction, GitStatus, PullRequestState};
 use rune::{El, TextEdit, TextStyle, col, row, spacer, text};
 use rune_kit::{Button, ButtonVariant, Kit, TextArea};
 
@@ -15,25 +15,25 @@ use crate::{
 
 /// The open dialog: the status it was opened over.
 pub(super) struct CommitForm {
-    status: VcsStatusResult,
+    status: GitStatus,
 }
 
 impl CommitForm {
     /// A GitHub feature branch without an open pull request can open one.
     fn offers_pr(&self) -> bool {
         let status = &self.status;
-        status.source_control_provider.is_some()
-            && !status.is_default_ref
-            && status.has_primary_remote
+        status.github
+            && !status.on_default_branch
+            && status.has_remote
             && status
-                .pr
+                .pull_request
                 .as_ref()
-                .is_none_or(|pr| pr.state != VcsChangeRequestState::Open)
+                .is_none_or(|pr| pr.state != PullRequestState::Open)
     }
 
     /// Commit & push needs somewhere to push to.
     fn can_push(&self) -> bool {
-        self.status.has_upstream || self.status.has_primary_remote
+        self.status.has_upstream || self.status.has_remote
     }
 }
 
@@ -67,7 +67,7 @@ impl J3 {
     }
 
     /// Runs `action` from the dialog with its message (empty: generated) and closes it.
-    fn commit_from_dialog(&mut self, key: &ThreadKey, action: GitStackedAction) {
+    fn commit_from_dialog(&mut self, key: &ThreadKey, action: GitAction) {
         let Some(git) = self.git.get_mut(key) else {
             return;
         };
@@ -98,7 +98,7 @@ pub(super) fn view(git: &GitControl, ui: &mut Ui, key: &ThreadKey) {
                 .child(
                     text(
                         form.status
-                            .ref_name
+                            .branch
                             .clone()
                             .unwrap_or_else(|| "(detached HEAD)".to_owned()),
                     )
@@ -165,8 +165,8 @@ fn counts(insertions: u64, deletions: u64, font: TextStyle, k: &Kit) -> El {
 
 /// The changed files with their counts (`git-commit-files`), then the totals; "none" when
 /// the tree is clean.
-fn files(status: &VcsStatusResult, max_h: f32, k: &Kit) -> El {
-    let files = &status.working_tree.files;
+fn files(status: &GitStatus, max_h: f32, k: &Kit) -> El {
+    let files = &status.files;
     if files.is_empty() {
         return text("none")
             .font(k.ty.text_small_medium)
@@ -203,7 +203,7 @@ fn files(status: &VcsStatusResult, max_h: f32, k: &Kit) -> El {
                         .min_w(0.0)
                         .truncate(),
                 )
-                .child(counts(file.insertions, file.deletions, mono, k))
+                .child(counts(file.additions, file.deletions, mono, k))
         }));
     let noun = if files.len() == 1 { "file" } else { "files" };
     col().w_full().gap(4.0).child(list).child(
@@ -217,18 +217,13 @@ fn files(status: &VcsStatusResult, max_h: f32, k: &Kit) -> El {
                     .color(k.c.text_muted),
             )
             .child(spacer())
-            .child(counts(
-                status.working_tree.insertions,
-                status.working_tree.deletions,
-                mono,
-                k,
-            )),
+            .child(counts(status.additions, status.deletions, mono, k)),
     )
 }
 
 /// Cancel, then Commit, push & PR (when it applies), Commit & push and Commit.
 fn footer(form: &CommitForm, k: &Kit, key: &ThreadKey) -> El {
-    let action = |label: &str, variant, run: GitStackedAction| {
+    let action = |label: &str, variant, run: GitAction| {
         let key = key.clone();
         Button::new(label)
             .variant(variant)
@@ -253,7 +248,7 @@ fn footer(form: &CommitForm, k: &Kit, key: &ThreadKey) -> El {
             action(
                 "Commit, push & PR",
                 ButtonVariant::Outline,
-                GitStackedAction::CommitPushPr,
+                GitAction::CommitPushPr,
             )
             .build(k)
             .key("git-commit-push-pr"),
@@ -264,14 +259,14 @@ fn footer(form: &CommitForm, k: &Kit, key: &ThreadKey) -> El {
             action(
                 "Commit & push",
                 ButtonVariant::Outline,
-                GitStackedAction::CommitPush,
+                GitAction::CommitPush,
             )
             .disabled(!form.can_push())
             .build(k)
             .key("git-commit-push"),
         )
         .child(
-            action("Commit", ButtonVariant::Contrast, GitStackedAction::Commit)
+            action("Commit", ButtonVariant::Contrast, GitAction::Commit)
                 .build(k)
                 .key("git-commit"),
         )
@@ -279,7 +274,7 @@ fn footer(form: &CommitForm, k: &Kit, key: &ThreadKey) -> El {
 
 /// Whether the dialog over `status` offers Commit, push & PR / Commit & push, for tests.
 #[cfg(test)]
-pub(super) fn offers(status: VcsStatusResult) -> (bool, bool) {
+pub(super) fn offers(status: GitStatus) -> (bool, bool) {
     let form = CommitForm { status };
     (form.offers_pr(), form.can_push())
 }

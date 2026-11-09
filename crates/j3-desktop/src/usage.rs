@@ -1,5 +1,5 @@
 //! Provider usage limits (`omp usage --json` on an environment's host,
-//! through `j3.getUsage`), shown from the composer's usage button for the
+//! through `server.usage`), shown from the composer's usage button for the
 //! composer's environment and the chosen model's provider.
 //!
 //! [`UsageStore`] is app-wide (`J3::usage`): the last snapshot of each
@@ -27,10 +27,10 @@ use std::{
     time::Duration,
 };
 
-use j3_protocol::j3::{UsageLimit, UsageSnapshot};
+use j3_client::methods::{Usage, UsageLimit};
 use time::OffsetDateTime;
 
-use crate::app::J3;
+use crate::{app::J3, sidebar::parse_time};
 
 const CACHE_FILE: &str = "usage.json";
 /// How often the shown environments' usage is asked for again.
@@ -40,7 +40,7 @@ const POLL_INTERVAL: Duration = Duration::from_secs(60);
 #[derive(Default)]
 pub struct UsageStore {
     /// Latest snapshot per environment key.
-    cache: BTreeMap<String, UsageSnapshot>,
+    cache: BTreeMap<String, Usage>,
     /// Environments with a request in flight.
     pending: HashSet<String>,
     /// The last request's failure, per environment.
@@ -69,7 +69,7 @@ impl UsageStore {
     }
 
     /// `env`'s cached snapshot.
-    pub fn snapshot(&self, env: &str) -> Option<&UsageSnapshot> {
+    pub fn snapshot(&self, env: &str) -> Option<&Usage> {
         self.cache.get(env)
     }
 
@@ -87,7 +87,7 @@ impl UsageStore {
     pub fn updated_at(&self, env: &str) -> Option<OffsetDateTime> {
         self.cache
             .get(env)
-            .and_then(|snapshot| unix_ms(snapshot.generated_at))
+            .and_then(|snapshot| parse_time(&snapshot.generated_at))
     }
 
     /// Whether `env`'s snapshot is missing or due for a poll. A little
@@ -95,13 +95,13 @@ impl UsageStore {
     fn is_stale(&self, env: &str, now: OffsetDateTime) -> bool {
         self.cache
             .get(env)
-            .and_then(|snapshot| unix_ms(snapshot.generated_at))
+            .and_then(|snapshot| parse_time(&snapshot.generated_at))
             .is_none_or(|at| now - at >= POLL_INTERVAL - Duration::from_secs(5))
     }
 
     /// Lands the answer to `env`'s request: a snapshot replaces the cached
     /// one (and is saved), an error keeps it.
-    fn answered(&mut self, env: String, result: Result<UsageSnapshot, String>) {
+    fn answered(&mut self, env: String, result: Result<Usage, String>) {
         self.pending.remove(&env);
         match result {
             Ok(snapshot) => {
@@ -140,7 +140,10 @@ impl J3 {
         let key = env.to_owned();
         self.usage.pending.insert(key.clone());
         self.spawn(async move {
-            let result = connection.usage().await.map_err(|error| error.to_string());
+            let result = connection
+                .server_usage()
+                .await
+                .map_err(|error| error.to_string());
             move |s: &mut J3, _: &mut rune::Tx| s.usage.answered(key, result)
         });
     }
@@ -200,12 +203,12 @@ impl J3 {
 }
 
 /// The highest used fraction among `provider`'s limits in `snapshot`.
-pub fn peak(snapshot: &UsageSnapshot, provider: &str) -> Option<f64> {
+pub fn peak(snapshot: &Usage, provider: &str) -> Option<f64> {
     snapshot
-        .reports
+        .accounts
         .iter()
-        .filter(|report| report.provider == provider)
-        .flat_map(|report| &report.limits)
+        .filter(|account| account.provider == provider)
+        .flat_map(|account| &account.limits)
         .filter_map(used_fraction)
         .max_by(f64::total_cmp)
 }
@@ -234,8 +237,7 @@ impl Span {
         let label = limit
             .window
             .as_ref()
-            .and_then(|window| window.label.as_deref())
-            .unwrap_or(&limit.label)
+            .map_or(&limit.label, |window| &window.label)
             .to_lowercase();
         if label.contains("5 hour") || label.contains("5h") || label.contains("session") {
             Some(Self::Session)
@@ -252,15 +254,15 @@ impl Span {
 /// `provider`'s used fraction per window, shortest first. Each account
 /// counts its first limit of a window (the provider's overall one, before
 /// per-model limits); of several accounts the highest wins.
-pub fn windows(snapshot: &UsageSnapshot, provider: &str) -> Vec<(Span, f64)> {
+pub fn windows(snapshot: &Usage, provider: &str) -> Vec<(Span, f64)> {
     let mut found: BTreeMap<Span, f64> = BTreeMap::new();
-    for report in snapshot
-        .reports
+    for account in snapshot
+        .accounts
         .iter()
-        .filter(|report| report.provider == provider)
+        .filter(|account| account.provider == provider)
     {
         let mut seen = Vec::new();
-        for limit in &report.limits {
+        for limit in &account.limits {
             let Some(window) = Span::of(limit) else {
                 continue;
             };
@@ -279,7 +281,7 @@ pub fn windows(snapshot: &UsageSnapshot, provider: &str) -> Vec<(Span, f64)> {
 
 /// [`windows`] as `Session 12% · Weekly 20%`; `None` when `provider`
 /// reports none.
-pub fn breakdown(snapshot: &UsageSnapshot, provider: &str) -> Option<String> {
+pub fn breakdown(snapshot: &Usage, provider: &str) -> Option<String> {
     let windows = windows(snapshot, provider);
     (!windows.is_empty()).then(|| {
         windows
@@ -293,7 +295,7 @@ pub fn breakdown(snapshot: &UsageSnapshot, provider: &str) -> Option<String> {
 /// The limit's label, with its window when the label doesn't name it
 /// ("Gemini · Weekly", but just "Claude 5 Hour").
 pub fn limit_title(limit: &UsageLimit) -> String {
-    match limit.window.as_ref().and_then(|w| w.label.as_deref()) {
+    match limit.window.as_ref().map(|w| w.label.as_str()) {
         Some(window) if !limit.label.contains(window) => format!("{} · {window}", limit.label),
         _ => limit.label.clone(),
     }
@@ -301,18 +303,7 @@ pub fn limit_title(limit: &UsageLimit) -> String {
 
 /// How much of `limit` is used, 0 to 1, when it says.
 pub fn used_fraction(limit: &UsageLimit) -> Option<f64> {
-    let amount = &limit.amount;
-    amount
-        .used_fraction
-        .or_else(|| match (amount.used, amount.limit) {
-            (Some(used), Some(max)) if max > 0. => Some(used / max),
-            _ => None,
-        })
-}
-
-/// A protocol timestamp (Unix milliseconds) as a time.
-pub fn unix_ms(ms: i64) -> Option<OffsetDateTime> {
-    OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000).ok()
+    (limit.limit > 0.).then(|| limit.used / limit.limit)
 }
 
 /// A countdown such as `45m`, `3h 12m` or `2d 4h`.
@@ -326,7 +317,7 @@ pub fn remaining(duration: time::Duration) -> String {
 }
 
 /// The cache at `path`; empty when missing or unreadable.
-fn load(path: &Path) -> BTreeMap<String, UsageSnapshot> {
+fn load(path: &Path) -> BTreeMap<String, Usage> {
     let Ok(bytes) = std::fs::read(path) else {
         return BTreeMap::new();
     };
@@ -355,24 +346,24 @@ mod tests {
     fn windows_are_the_providers_overall_limits_by_length() {
         let limit = |label: &str, window: &str, used: f64| {
             serde_json::json!({
-                "id": label, "label": label, "window": {"label": window},
-                "amount": {"usedFraction": used},
+                "label": label, "window": {"label": window},
+                "used": used, "limit": 100., "unit": "percent",
             })
         };
-        let snapshot: UsageSnapshot = serde_json::from_value(serde_json::json!({
-            "generatedAt": 0,
-            "reports": [
+        let snapshot: Usage = serde_json::from_value(serde_json::json!({
+            "generatedAt": "2026-11-09T11:18:00.000Z",
+            "accounts": [
                 {"provider": "anthropic", "limits": [
-                    limit("Claude 5 Hour", "5 Hour", 0.12),
-                    limit("Claude 7 Day", "7 Day", 0.2),
-                    limit("Claude 7 Day (Fable)", "7 Day", 0.9),
+                    limit("Claude 5 Hour", "5 Hour", 12.),
+                    limit("Claude 7 Day", "7 Day", 20.),
+                    limit("Claude 7 Day (Fable)", "7 Day", 90.),
                 ]},
                 {"provider": "opencode-go", "limits": [
                     limit("5 Hour limit", "5 Hour", 0.),
-                    limit("Weekly limit", "Weekly", 0.04),
-                    limit("Monthly limit", "Monthly", 0.5),
+                    limit("Weekly limit", "Weekly", 4.),
+                    limit("Monthly limit", "Monthly", 50.),
                 ]},
-                {"provider": "openai-codex", "limits": [limit("30 days", "30 days", 0.01)]},
+                {"provider": "openai-codex", "limits": [limit("30 days", "30 days", 1.)]},
             ],
         }))
         .unwrap();

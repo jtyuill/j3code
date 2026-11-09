@@ -1,11 +1,15 @@
-//! Archived threads (spec §8.3): each environment's archive, loaded with
-//! `connection.archived()` when Settings opens, newest first, with Unarchive (which opens the
-//! restored thread) and Delete… (behind an alert). Shown on Settings' "Archived threads"
-//! page, one group per environment.
+//! Archived threads (spec §8.3): each environment's archived threads, straight from its
+//! shell (`thread.archived_at` set), newest first, with Unarchive (which opens the restored
+//! thread) and Delete… (behind an alert). Shown on Settings' "Archived threads" page, one
+//! group per environment.
 
 use std::collections::HashMap;
 
-use j3_client::t3::methods::ArchivedShellSnapshot;
+use j3_client::{
+    Shell,
+    entities::Thread,
+    methods::{DeleteThreadParams, ThreadParams},
+};
 use rune::{El, Tx, col, row, text};
 use rune_kit::{Button, ButtonVariant, ControlSize, Kit, Spinner};
 
@@ -14,113 +18,73 @@ use crate::{
     dialogs::Dialog,
     feed::relative_age,
     icons,
-    sidebar::ThreadKey,
+    sidebar::{ThreadKey, parse_time},
     theme::Status,
 };
 
-/// One environment's archive.
-pub enum Listing {
-    Loading,
-    Loaded(ArchivedShellSnapshot),
-    Failed(String),
-}
-
-/// One environment's archive and the last unarchive/delete failure.
-pub struct Archive {
-    pub listing: Listing,
-    pub error: Option<String>,
-}
-
-/// Every environment's archive, by environment key.
+/// The last unarchive/delete failure of each environment, by environment key.
 #[derive(Default)]
 pub struct Archives {
-    by_env: HashMap<String, Archive>,
+    errors: HashMap<String, String>,
 }
 
 impl Archives {
-    pub fn get(&self, env: &str) -> Option<&Archive> {
-        self.by_env.get(env)
-    }
-
-    /// Shows `env`'s archive as `listing` (fixtures; [`J3::load_archived`] otherwise).
-    pub fn set(&mut self, env: &str, listing: Listing) {
-        self.by_env.insert(
-            env.to_owned(),
-            Archive {
-                listing,
-                error: None,
-            },
-        );
+    pub fn error(&self, env: &str) -> Option<&str> {
+        self.errors.get(env).map(String::as_str)
     }
 
     pub fn clear(&mut self) {
-        self.by_env.clear();
+        self.errors.clear();
     }
 }
 
 impl J3 {
-    /// (Re)loads environment `env`'s archived threads.
-    pub fn load_archived(&mut self, env: &str) {
-        let Some(connection) = self.envs.get(env).map(|e| e.connection().clone()) else {
-            return;
-        };
-        let archives = &mut self.settings.archived.by_env;
-        match archives.get_mut(env) {
-            // A reload keeps showing the list it has until the new one arrives.
-            Some(archive) => archive.error = None,
-            None => self.settings.archived.set(env, Listing::Loading),
-        }
-        let key = env.to_owned();
-        self.spawn(async move {
-            let result = connection.archived().await;
-            move |s: &mut J3, _: &mut Tx| {
-                if let Some(archive) = s.settings.archived.by_env.get_mut(&key) {
-                    archive.listing = match result {
-                        Ok(snapshot) => Listing::Loaded(snapshot),
-                        Err(e) => Listing::Failed(e.to_string()),
-                    };
-                }
-            }
-        });
-    }
-
     /// Restores `key`'s thread, then opens it.
     pub fn unarchive_thread(&mut self, key: ThreadKey) {
         let Some(connection) = self.envs.get(&key.env).map(|e| e.connection().clone()) else {
             return;
         };
-        let id = key.thread_id.clone();
+        self.settings.archived.errors.remove(&key.env);
+        let thread_id = key.thread_id.clone();
         self.spawn(async move {
-            let result = connection.unarchive(&id).await;
+            let result = connection
+                .threads_unarchive(ThreadParams {
+                    thread_id,
+                    command_id: None,
+                })
+                .await;
             move |s: &mut J3, tx: &mut Tx| match result {
-                Ok(_) => {
-                    s.load_archived(&key.env);
-                    s.open_thread(key, tx);
-                }
+                Ok(_) => s.open_thread(key, tx),
                 Err(e) => s.archive_failed(&key.env, e.to_string()),
             }
         });
     }
 
-    /// Deletes archived thread `key` (after the alert confirmed) and reloads the archive.
+    /// Deletes archived thread `key` (after the alert confirmed); the shell drops its row.
     pub fn delete_archived(&mut self, key: ThreadKey) {
         let Some(connection) = self.envs.get(&key.env).map(|e| e.connection().clone()) else {
             return;
         };
-        let id = key.thread_id.clone();
+        self.settings.archived.errors.remove(&key.env);
+        let thread_id = key.thread_id.clone();
         self.spawn(async move {
-            let result = connection.delete_thread(&id).await;
-            move |s: &mut J3, _: &mut Tx| match result {
-                Ok(_) => s.load_archived(&key.env),
-                Err(e) => s.archive_failed(&key.env, e.to_string()),
+            let result = connection
+                .threads_delete(DeleteThreadParams {
+                    thread_id,
+                    only_if_unused: None,
+                    command_id: None,
+                })
+                .await;
+            move |s: &mut J3, _: &mut Tx| {
+                if let Err(e) = result {
+                    s.archive_failed(&key.env, e.to_string());
+                }
             }
         });
     }
 
     fn archive_failed(&mut self, env: &str, error: String) {
-        if let Some(archive) = self.settings.archived.by_env.get_mut(env) {
-            archive.error = Some(error);
-        }
+        self.settings.archived.errors.insert(env.to_owned(), error);
     }
 }
 
@@ -133,57 +97,58 @@ pub fn view(s: &J3, ui: &Ui, env: &str) -> El {
         .gap(4.0)
         .px(16.0)
         .py(12.0);
-    let Some(archive) = s.settings.archived.get(env) else {
-        return column.child(Spinner::new().size(16.0).build(k));
-    };
-    if let Some(error) = &archive.error {
+    if let Some(error) = s.settings.archived.error(env) {
         column = column.child(
-            text(error.clone())
+            text(error.to_owned())
                 .font(k.ty.text_xsmall)
                 .color(Status::of(k).danger)
                 .wrap(),
         );
     }
-    match &archive.listing {
-        Listing::Loading => column.child(Spinner::new().size(16.0).build(k)),
-        Listing::Failed(error) => column.child(
-            text(format!("Couldn’t load archived threads: {error}"))
-                .font(k.ty.text_small)
-                .color(Status::of(k).danger)
-                .wrap(),
-        ),
-        Listing::Loaded(snapshot) if snapshot.threads.is_empty() => column.child(
+    let Some(state) = s.envs.get(env).map(|e| e.state().clone()) else {
+        return column;
+    };
+    let shell = &state.shell;
+    // Until the shell first syncs, its absence of archived rows means nothing yet.
+    if !shell.synced {
+        return column.child(Spinner::new().size(16.0).build(k));
+    }
+    let threads = newest_first(shell);
+    if threads.is_empty() {
+        return column.child(
             text("No archived threads")
                 .font(k.ty.text_small)
                 .color(k.c.text_muted),
-        ),
-        Listing::Loaded(snapshot) => {
-            for thread in newest_first(snapshot) {
-                let project = snapshot
-                    .projects
-                    .iter()
-                    .find(|p| p.id == thread.project_id)
-                    .map(|p| p.title.as_str())
-                    .unwrap_or_default();
-                let age = thread
-                    .archived_at
-                    .as_deref()
-                    .and_then(|at| relative_age(at, s.clock.now))
-                    .unwrap_or_default();
-                let key = ThreadKey::new(env, thread.id.clone());
-                column = column.child(archived_row(k, &key, &thread.title, project, &age));
-            }
-            column
-        }
+        );
     }
+    for thread in threads {
+        let project = shell
+            .projects
+            .get(&thread.project_id)
+            .map(|p| p.title.as_str())
+            .unwrap_or_default();
+        let age = thread
+            .archived_at
+            .as_deref()
+            .and_then(|at| relative_age(at, s.clock.now))
+            .unwrap_or_default();
+        let key = ThreadKey::new(env, thread.id.clone());
+        column = column.child(archived_row(k, &key, &thread.title, project, &age));
+    }
+    column
 }
 
-/// The snapshot's threads, most recently archived first.
-fn newest_first(
-    snapshot: &ArchivedShellSnapshot,
-) -> Vec<&j3_client::t3::orchestration::ThreadShell> {
-    let mut threads: Vec<_> = snapshot.threads.iter().collect();
-    threads.sort_by(|a, b| b.archived_at.cmp(&a.archived_at));
+/// The shell's archived threads, most recently archived first (ties by id).
+fn newest_first(shell: &Shell) -> Vec<&Thread> {
+    let mut threads: Vec<_> = shell
+        .threads
+        .values()
+        .filter(|thread| thread.archived_at.is_some())
+        .collect();
+    threads.sort_by(|a, b| {
+        let at = |t: &Thread| t.archived_at.as_deref().and_then(parse_time);
+        at(b).cmp(&at(a)).then_with(|| a.id.cmp(&b.id))
+    });
     threads
 }
 
@@ -246,8 +211,8 @@ mod tests {
 
     #[test]
     fn archived_threads_list_newest_first() {
-        let snapshot = crate::app::fixtures::archived_snapshot();
-        let ids: Vec<&str> = newest_first(&snapshot)
+        let state = crate::app::fixtures::local_state();
+        let ids: Vec<&str> = newest_first(&state.shell)
             .iter()
             .map(|t| t.id.as_str())
             .collect();

@@ -123,7 +123,7 @@ fn fixture_scenes_render_offline() {
             }
             Scene::Thread | Scene::Herdr | Scene::Files | Scene::GitCommit | Scene::Terminal => {
                 assert_eq!(s.route.main, Main::Thread(open.clone()));
-                assert!(s.threads[&open].state.projection.is_some());
+                assert!(s.threads[&open].state.thread.is_some());
                 assert!(app.rt.find("feed").is_some());
                 assert_eq!(
                     s.prefs.ui().workflow == Workflow::Herdr,

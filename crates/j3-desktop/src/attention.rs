@@ -10,8 +10,9 @@ use std::{
 };
 
 use j3_client::{
-    ShellState,
-    workflow::{AgentNotification, AgentStatus, agent_notification, agent_status, is_listed},
+    Shell,
+    herdr::{AgentNotification, AgentStatus, agent_notification, agent_status},
+    inbox::is_listed,
 };
 use tokio::runtime::Handle;
 
@@ -50,16 +51,15 @@ impl Alert {
 #[derive(Default)]
 pub struct AttentionMonitor {
     /// Thread statuses by environment, then thread id. An environment is
-    /// present once its shell has been seen loaded: its first statuses are a
+    /// present once its shell has been seen synced: its first statuses are a
     /// baseline, not changes.
     statuses: HashMap<String, HashMap<String, AgentStatus>>,
 }
 
 impl AttentionMonitor {
     /// Records `env`'s statuses and returns the alerts their changes raise.
-    /// `open` is the open thread of this environment, if any.
-    pub fn observe(&mut self, env: &str, shell: &ShellState, open: Option<&str>) -> Vec<Alert> {
-        if !shell.loaded {
+    pub fn observe(&mut self, env: &str, shell: &Shell, open: Option<&str>) -> Vec<Alert> {
+        if !shell.synced {
             return Vec::new();
         }
         let baseline = !self.statuses.contains_key(env);
@@ -71,7 +71,7 @@ impl AttentionMonitor {
         };
         let mut alerts = Vec::new();
         let mut seen = HashSet::new();
-        for thread in shell.threads.iter().filter(|thread| is_listed(thread)) {
+        for thread in shell.threads.values().filter(|thread| is_listed(thread)) {
             let next = agent_status(thread);
             seen.insert(thread.id.as_str());
             let previous = statuses.insert(thread.id.clone(), next);
@@ -91,6 +91,8 @@ impl AttentionMonitor {
             }
         }
         statuses.retain(|id, _| seen.contains(id.as_str()));
+        // Threads that need the user first; each group in thread id order.
+        alerts.sort_by_key(|alert| alert.kind == AgentNotification::Finished);
         alerts
     }
 
@@ -199,26 +201,32 @@ mod tests {
         ui_settings::UiSettings,
     };
 
-    /// `state` with thread `id`'s fields patched.
+    /// `state` with thread `id`'s fields patched (objects merge recursively).
     fn patched(mut state: ConnectionState, id: &str, patch: Value) -> ConnectionState {
-        let thread = state
-            .shell
-            .threads
-            .iter_mut()
-            .find(|thread| thread.id == id)
-            .expect("a fixture thread");
+        let thread = state.shell.threads.get_mut(id).expect("a fixture thread");
         let mut value = serde_json::to_value(&*thread).expect("a thread serializes");
-        if let (Some(value), Value::Object(patch)) = (value.as_object_mut(), patch) {
-            value.extend(patch);
-        }
+        merge(&mut value, patch);
         *thread = serde_json::from_value(value).expect("the patched thread decodes");
         state
     }
 
+    fn merge(target: &mut Value, patch: Value) {
+        match (target, patch) {
+            (Value::Object(target), Value::Object(patch)) => {
+                for (key, value) in patch {
+                    merge(target.entry(key).or_insert(Value::Null), value);
+                }
+            }
+            (target, patch) => *target = patch,
+        }
+    }
+
+    /// The latest turn completed just now, after the last visit.
     fn finished() -> Value {
-        json!({"status": "completed", "activeRunId": null, "activityRunStatus": null,
-               "activityRunStartedAt": null, "pendingRuntimeRequest": null,
-               "latestRunCompletedAt": ago(0), "lastVisitedAt": ago(30)})
+        json!({"status": "idle", "activeTurnId": null, "pendingRequest": null,
+               "latestTurn": {"id": "turn-finished", "status": "completed",
+                              "requestedAt": ago(5), "startedAt": ago(5), "endedAt": ago(0)},
+               "triage": {"visitedAt": ago(30)}})
     }
 
     fn app() -> TestApp {
@@ -260,8 +268,9 @@ mod tests {
             local_state(),
             "thr-sidebar-dnd",
             json!({
-                "status": "failed", "activeRunId": null, "activityRunStatus": null,
-                "latestRunCompletedAt": ago(0), "lastError": "boom"
+                "status": "failed", "activeTurnId": null, "pendingRequest": null,
+                "latestTurn": {"id": "turn-failed", "status": "failed", "requestedAt": ago(5),
+                               "endedAt": ago(0), "errorKind": "provider"}
             }),
         );
         let state = patched(blocked, "thr-scroll", finished());
@@ -323,7 +332,11 @@ mod tests {
         );
         assert!(toasts(&app).is_empty());
         // A question on it still raises one.
-        let asking = patched(local_state(), &open.thread_id, json!({"status": "waiting"}));
+        let asking = patched(
+            local_state(),
+            &open.thread_id,
+            json!({"pendingRequest": {"id": "req-ask", "kind": "ask", "openedAt": ago(0)}}),
+        );
         observe(&mut app, asking);
         assert_eq!(
             toasts(&app),

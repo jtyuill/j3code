@@ -2,7 +2,7 @@
 //! `desktop.json`. Every field has a serde default, so files written before a
 //! field existed keep loading.
 
-use j3_client::workflow::{AgentOrder, StatusIndicators};
+use j3_client::herdr::{AgentOrder, StatusIndicators};
 use serde::{Deserialize, Serialize};
 
 use crate::speech::models::SpeechModel;
@@ -11,16 +11,18 @@ use crate::speech::models::SpeechModel;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Workflow {
-    /// t3code's settle workflow: Pinned, Active, then the Working, Snoozed
-    /// and Settled shelves.
+    /// j3's triage workflow (`docs/triage.md`): Pinned, Active, then the
+    /// Working, Snoozed and Settled shelves.
     #[default]
-    T3,
+    // Files written before the rename stored the old name: read as Inbox, saved as "inbox".
+    #[serde(alias = "t3")] // deny-list: allow
+    Inbox,
     /// herdr's agent workflow: Spaces with rolled-up attention, then every
     /// agent with its state glyph.
     Herdr,
 }
 
-/// A bottom-anchored shelf of the T3 sidebar.
+/// A bottom-anchored shelf of the Inbox sidebar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Shelf {
@@ -57,8 +59,8 @@ pub const ZOOM_LEVELS: [f32; 9] = [0.75, 0.8, 0.9, 1., 1.1, 1.25, 1.5, 1.75, 2.]
 #[serde(rename_all = "camelCase", default)]
 pub struct UiSettings {
     pub workflow: Workflow,
-    /// t3's `sidebarWorkingShelfEnabled`: running threads leave Active for
-    /// the Working shelf. Off, Active keeps its own (rearrangeable) order.
+    /// Running threads leave Active for the Working shelf. Off, Active keeps
+    /// its own (rearrangeable) order.
     pub working_shelf: bool,
     /// herdr's `ui.status_indicators`.
     pub status_indicators: StatusIndicators,
@@ -70,8 +72,7 @@ pub struct UiSettings {
     pub sounds: bool,
     /// Typeset TeX math (`$…$`, `$$…$$`, `\(…\)`, `\[…\]`) in messages.
     pub math_rendering: bool,
-    /// T3 shelves the user expanded; like t3 web, every shelf starts
-    /// collapsed.
+    /// Inbox shelves the user expanded; every shelf starts collapsed.
     pub expanded_shelves: Vec<Shelf>,
     /// Widest the conversation text and composer get, in rem. Narrower
     /// columns are easier to read.
@@ -260,7 +261,7 @@ mod tests {
     fn missing_fields_take_their_defaults() {
         let ui: UiSettings = serde_json::from_value(json!({})).unwrap();
         assert_eq!(ui, UiSettings::default());
-        assert_eq!(ui.workflow, Workflow::T3);
+        assert_eq!(ui.workflow, Workflow::Inbox);
         assert_eq!(ui.status_indicators, StatusIndicators::Dots);
         assert_eq!(ui.agent_order, AgentOrder::Spaces);
         assert!(ui.toasts && ui.sounds && ui.working_shelf && ui.math_rendering);

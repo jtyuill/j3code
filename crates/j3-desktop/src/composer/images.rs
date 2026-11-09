@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use j3_client::t3::chat_attachment::ChatAttachment;
+use j3_client::entities::Attachment;
 use rune::{ClipboardContent, El, SurfaceFit, Tx, col, el, icon, row, text};
 use rune_kit::Spinner;
 
@@ -23,7 +23,7 @@ const TOO_BIG: &str = "Images must be 10 MB or smaller.";
 
 pub enum Upload {
     Uploading,
-    Done(ChatAttachment),
+    Done(Attachment),
     Failed(String),
 }
 
@@ -35,12 +35,12 @@ pub struct PendingImage {
     pub upload: Upload,
 }
 
-/// The attachments to send, or why the draft can't be sent yet.
-pub(super) fn attachments(images: &[PendingImage]) -> Result<Vec<ChatAttachment>, &'static str> {
+/// The ids of the attachments to send, or why the draft can't be sent yet.
+pub(super) fn attachments(images: &[PendingImage]) -> Result<Vec<String>, &'static str> {
     images
         .iter()
         .map(|image| match &image.upload {
-            Upload::Done(attachment) => Ok(attachment.clone()),
+            Upload::Done(attachment) => Ok(attachment.id.clone()),
             Upload::Uploading => Err("Wait for images to finish uploading."),
             Upload::Failed(_) => Err("Remove the images that failed to upload."),
         })
@@ -100,7 +100,7 @@ impl J3 {
         let key = key.clone();
         self.spawn(async move {
             let result = connection
-                .upload_image(&name, mime, bytes)
+                .upload(&name, mime, bytes)
                 .await
                 .map_err(|e| e.to_string());
             move |s: &mut J3, tx: &mut Tx| {
@@ -110,12 +110,7 @@ impl J3 {
         });
     }
 
-    fn image_uploaded(
-        &mut self,
-        key: &ComposerKey,
-        id: u64,
-        result: Result<ChatAttachment, String>,
-    ) {
+    fn image_uploaded(&mut self, key: &ComposerKey, id: u64, result: Result<Attachment, String>) {
         let Some(composer) = self.composers.get_mut(key) else {
             return;
         };

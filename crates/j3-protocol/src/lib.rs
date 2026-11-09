@@ -1,9 +1,7 @@
-//! Wire protocol between j3 clients (desktop, iOS) and j3 servers.
-//!
-//! Frames follow Effect RPC's JSON serialization so the forked iOS client
-//! (`@t3tools/client-runtime`) can talk to the Rust server unchanged.
+//! j3's wire protocol between j3 clients (desktop, iOS) and j3 servers
+//! (`docs/protocol/wire.md`). Its types live in [`v2`] and are re-exported
+//! here.
 
-pub mod effect_rpc;
+pub mod v2;
 
-pub mod j3;
-pub mod t3;
+pub use v2::*;

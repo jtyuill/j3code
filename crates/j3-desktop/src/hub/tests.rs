@@ -3,7 +3,11 @@
 
 use std::{sync::Arc, time::Duration};
 
-use j3_client::ThreadState;
+use j3_client::{
+    ThreadView,
+    entities::ItemKind,
+    methods::{TranscriptEntry, TranscriptResult},
+};
 use rune::{Key, KeyEvent, Mods};
 
 use crate::{
@@ -66,9 +70,13 @@ fn the_hub_replaces_the_chat_and_lists_running_subagents_first() {
     );
     assert!(app.rt.find("feed").is_none(), "and the feed");
     assert!(app.rt.find("thread-title").is_some(), "the header stays");
+    let title = {
+        let state = &app.rt.state.threads[&open_thread_key()].state;
+        super::view::subagent_title(state.subagent("sa-bench").expect("the fixture has it").1)
+    };
     assert_eq!(
-        label_of(&app, "hub-agent-sa-bench").as_deref(),
-        Some("sa-bench, BenchFeed, Running")
+        label_of(&app, "hub-agent-sa-bench"),
+        Some(format!("sa-bench, {title}, Running"))
     );
     assert_eq!(selected(&app).as_deref(), Some("sa-bench"));
     let y = |app: &TestApp, key: &str| app.rt.find(key).unwrap().1;
@@ -86,10 +94,13 @@ fn the_hub_replaces_the_chat_and_lists_running_subagents_first() {
     assert_eq!(selected(&app).as_deref(), Some("sa-bench"));
     app.key(typed("j"));
     assert_eq!(selected(&app).as_deref(), Some("sa-audit"));
+    // The failed `sa-profile` ended before `sa-audit`, so it closes the roster.
+    app.key(press(Key::Down));
+    assert_eq!(selected(&app).as_deref(), Some("sa-profile"));
     app.key(press(Key::Down));
     assert_eq!(
         selected(&app).as_deref(),
-        Some("sa-audit"),
+        Some("sa-profile"),
         "the roster's end holds"
     );
 }
@@ -168,8 +179,10 @@ fn the_hub_opens_only_with_subagents() {
     app.settle(30);
     let key = open_thread_key();
     let thread = app.rt.state.threads.get_mut(&key).unwrap();
-    let mut state = ThreadState::clone(&thread.state);
-    state.projection.as_mut().unwrap().subagents.clear();
+    let mut state = ThreadView::clone(&thread.state);
+    state
+        .items
+        .retain(|item| !matches!(item.kind, ItemKind::Subagent(_)));
     thread.state = Arc::new(state);
     let open = key.clone();
     app.rt.update(move |s: &mut J3, tx| s.open_hub(open, tx));
@@ -193,8 +206,6 @@ fn a_held_left_key_does_not_close_the_hub() {
 
 #[test]
 fn a_reset_transcript_shows_its_new_text() {
-    use j3_protocol::j3::{SubagentTranscript, TranscriptEntry};
-
     let mut app = hub_app();
     let key = open_thread_key();
     let read = |from: u64, next: u64, reset: bool, text: &str| {
@@ -203,7 +214,7 @@ fn a_reset_transcript_shows_its_new_text() {
             text: text.to_owned(),
         }];
         move |s: &mut J3, tx: &mut rune::Tx| {
-            let transcript = SubagentTranscript {
+            let transcript = TranscriptResult {
                 next_byte: next,
                 reset,
                 more: false,

@@ -20,8 +20,10 @@ mod view;
 #[cfg(test)]
 mod tests;
 
-use j3_client::SendMode;
-use j3_client::t3::{chat_attachment::ChatAttachment, model::ModelSelection};
+use j3_client::{
+    entities::{ModelRef, ThinkingLevel},
+    methods::{Delivery, RefreshParams, SendParams},
+};
 use rune::{TextEdit, Tx};
 
 #[cfg(test)]
@@ -77,12 +79,12 @@ impl ComposerKey {
 }
 
 /// What a submit hands its destination: the trimmed text (mentions as typed `^slug`), the
-/// uploaded images and the chosen model with its thinking level.
+/// uploaded images' attachment ids and the chosen model with its thinking level.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Submission {
     pub text: String,
-    pub attachments: Vec<ChatAttachment>,
-    pub model: ModelSelection,
+    pub attachments: Vec<String>,
+    pub model: ModelRef,
 }
 
 /// One composer's state.
@@ -95,10 +97,11 @@ pub struct ComposerState {
     pub busy: bool,
     pub images: Vec<PendingImage>,
     next_image: u64,
-    /// The model the user picked; `None` follows the thread's or project's preference.
-    model: Option<(String, String)>,
+    /// The model the user picked, by slug; `None` follows the thread's or project's
+    /// preference.
+    model: Option<String>,
     /// The thinking level the user picked.
-    level: Option<String>,
+    level: Option<ThinkingLevel>,
     picker: PickerState,
     /// The usage popover is open.
     usage_open: bool,
@@ -125,29 +128,27 @@ pub struct ComposerState {
     focused: bool,
     /// When (`Clock::t`) the keyword shimmer repaints next, while it runs.
     shimmer_at: Option<f64>,
-    /// The workspace's commands were asked for.
-    workspace_requested: bool,
+    /// The project's own slash commands were asked for.
+    commands_requested: bool,
 }
 
 /// What a composer works against, resolved from its key.
 pub(crate) struct Target<'a> {
     pub env: Option<&'a Environment>,
-    /// The project's workspace root (commands and skills are per workspace).
-    pub cwd: String,
+    /// The project (slash commands and `@` paths are per project), once listed.
+    pub project_id: Option<String>,
     /// The thread's model, or the project's default for a new thread.
-    pub preferred: Option<ModelSelection>,
-    /// The thread has an active run (Send becomes Queue or Stop).
+    pub preferred: Option<ModelRef>,
+    /// The thread has an active turn (Send becomes Queue or Stop).
     pub running: bool,
 }
 
 /// A model's thinking levels.
 pub(crate) struct Levels {
-    /// The option descriptor's id (`thinking`).
-    pub descriptor: String,
-    /// `(id, label)` per level.
-    pub options: Vec<(String, String)>,
-    /// The level the next submission carries.
-    pub chosen: Option<String>,
+    /// The levels the model offers.
+    pub options: Vec<ThinkingLevel>,
+    /// The level the next submission carries; `None` leaves it to omp.
+    pub chosen: Option<ThinkingLevel>,
 }
 
 impl J3 {
@@ -175,36 +176,30 @@ impl J3 {
         }
     }
 
-    /// The environment, workspace, preferred model and run state of `key`'s composer.
+    /// The environment, project, preferred model and run state of `key`'s composer.
     pub(crate) fn composer_target(&self, key: &ComposerKey) -> Target<'_> {
         let env = self.envs.get(key.env());
         let shell = env.map(|env| &env.state().shell);
         match key {
             ComposerKey::Thread(thread) => {
-                let listed = shell.and_then(|shell| shell.thread(&thread.thread_id));
-                let cwd = listed
-                    .and_then(|t| shell?.project(&t.project_id))
-                    .map(|p| p.workspace_root.clone())
-                    .unwrap_or_default();
+                let listed = shell.and_then(|shell| shell.threads.get(&thread.thread_id));
                 let running = self
                     .threads
                     .get(thread)
-                    .is_some_and(|t| t.state.active_run().is_some());
+                    .is_some_and(|t| t.state.active_turn().is_some());
                 Target {
                     env,
-                    cwd,
-                    preferred: listed.map(|t| t.model_selection.clone()),
+                    project_id: listed.map(|t| t.project_id.clone()),
+                    preferred: listed.map(|t| t.model.clone()),
                     running,
                 }
             }
             ComposerKey::NewThread { project, .. } => {
-                let project = project.as_deref().and_then(|id| shell?.project(id));
+                let project = project.as_deref().and_then(|id| shell?.projects.get(id));
                 Target {
                     env,
-                    cwd: project
-                        .map(|p| p.workspace_root.clone())
-                        .unwrap_or_default(),
-                    preferred: project.and_then(|p| p.default_model_selection.clone()),
+                    project_id: project.map(|p| p.id.clone()),
+                    preferred: project.and_then(|p| p.default_model.clone()),
                     running: false,
                 }
             }
@@ -220,68 +215,66 @@ impl J3 {
             .composers
             .get(key)
             .and_then(|c| c.model.as_ref())
-            .and_then(|picked| choices.iter().find(|c| &c.key == picked));
+            .and_then(|picked| choices.iter().find(|c| c.slug() == picked));
         match picked {
             Some(choice) => Some(choice),
             None => choices.get(models::initial_choice(choices, target.preferred.as_ref())?),
         }
     }
 
-    /// The chosen model's thinking levels and the chosen level.
+    /// The chosen model's thinking levels and the chosen level: the one picked, else the
+    /// preferred model's, when the chosen model offers it. None without levels.
     pub(crate) fn composer_levels(&self, key: &ComposerKey) -> Option<Levels> {
         let choice = self.composer_choice(key)?;
-        let target = self.composer_target(key);
-        let config = target.env?.state().config.as_ref()?;
-        let descriptor = models::thinking_descriptor(config, choice)?;
-        let picked = self.composers.get(key).and_then(|c| c.level.clone());
-        let preferred = picked.or_else(|| {
-            let preferred = target.preferred.as_ref()?;
-            models::selection_level(preferred, &descriptor.id).map(str::to_owned)
-        });
+        if choice.thinking.is_empty() {
+            return None;
+        }
+        let picked = self.composers.get(key).and_then(|c| c.level);
+        let preferred = self
+            .composer_target(key)
+            .preferred
+            .and_then(|model| model.thinking);
         Some(Levels {
-            descriptor: descriptor.id.clone(),
-            options: descriptor
-                .options
-                .iter()
-                .map(|option| (option.id.clone(), option.label.clone()))
-                .collect(),
-            chosen: models::initial_level(descriptor, preferred.as_deref()),
+            options: choice.thinking.clone(),
+            chosen: models::initial_level(choice, picked)
+                .or_else(|| models::initial_level(choice, preferred)),
         })
     }
 
-    /// The model selection a submit carries, with the chosen thinking level.
-    pub fn composer_selection(&self, key: &ComposerKey) -> Option<ModelSelection> {
+    /// The model a submit carries, with the chosen thinking level.
+    pub fn composer_selection(&self, key: &ComposerKey) -> Option<ModelRef> {
         let choice = self.composer_choice(key)?;
-        let levels = self.composer_levels(key);
-        let level = levels
-            .as_ref()
-            .and_then(|l| Some((l.descriptor.as_str(), l.chosen.as_deref()?)));
-        Some(models::model_selection(choice, level))
+        let level = self.composer_levels(key).and_then(|levels| levels.chosen);
+        Some(models::model_ref(choice, level))
     }
 
-    /// `key`'s commands and skills: the provider-wide ones merged with its workspace's.
+    /// `key`'s commands and skills: its project's own commands, then the server's.
     pub(crate) fn composer_catalog(&self, key: &ComposerKey) -> Catalog {
         let target = self.composer_target(key);
-        let Some(state) = target.env.map(|env| env.state()) else {
+        let Some(env) = target.env else {
             return Catalog::default();
         };
-        let Some(config) = state.config.as_ref() else {
+        let Some(catalog) = env.state().catalog.as_ref() else {
             return Catalog::default();
         };
-        let mut catalog = Catalog::for_workspace(config, &target.cwd);
-        if let Some(fetched) = state.workspaces.get(&target.cwd) {
-            catalog.merge(&fetched.slash_commands, &fetched.skills);
-        }
-        catalog
+        let project = target
+            .project_id
+            .as_deref()
+            .and_then(|id| {
+                env.project_commands(id)
+                    .or_else(|| catalog.project_commands.get(id).map(Vec::as_slice))
+            })
+            .unwrap_or_default();
+        Catalog::new(catalog, project)
     }
 
-    /// Asks the server for the workspace's commands once, when it has none yet: as soon as
-    /// the environment is live (polled while the composer is the main one).
-    fn request_workspace(&mut self, key: &ComposerKey) {
+    /// Asks the server for the project's own slash commands once, when they aren't known
+    /// yet: as soon as the environment is live (polled while the composer is the main one).
+    fn request_project_commands(&mut self, key: &ComposerKey) {
         if self
             .composers
             .get(key)
-            .is_some_and(|c| c.workspace_requested)
+            .is_some_and(|c| c.commands_requested)
             || !self.envs.get(key.env()).is_some_and(|env| env.is_live())
         {
             return;
@@ -290,22 +283,34 @@ impl J3 {
         let Some(env) = target.env else {
             return;
         };
-        let state = env.state();
-        let Some(config) = state.config.as_ref() else {
+        let project_id = target.project_id;
+        let known = project_id.as_deref().is_none_or(|id| {
+            env.project_commands(id).is_some()
+                || env
+                    .state()
+                    .catalog
+                    .as_ref()
+                    .is_some_and(|catalog| catalog.project_commands.contains_key(id))
+        });
+        let connection = env.connection().clone();
+        self.composer(key).commands_requested = true;
+        let (false, Some(project_id)) = (known, project_id) else {
             return;
         };
-        let cwd = target.cwd;
-        let known = cwd.is_empty()
-            || state.workspaces.contains_key(&cwd)
-            || Catalog::for_workspace(config, &cwd).has_workspace;
-        let connection = env.connection().clone();
-        self.composer(key).workspace_requested = true;
-        if known {
-            return;
-        }
-        self.services.runtime.spawn(async move {
-            if let Err(e) = connection.refresh_workspace(&cwd).await {
-                tracing::warn!("loading commands for {cwd}: {e}");
+        let env = key.env().to_owned();
+        let params = RefreshParams {
+            project_id: Some(project_id.clone()),
+            fresh: None,
+        };
+        self.spawn(async move {
+            let result = connection.server_refresh(params).await;
+            move |s: &mut J3, _: &mut Tx| match result {
+                Ok(catalog) => {
+                    if let Some(env) = s.envs.get_mut(&env) {
+                        env.set_project_commands(catalog.project_commands);
+                    }
+                }
+                Err(e) => tracing::warn!("loading the commands of project {project_id}: {e}"),
             }
         });
     }
@@ -318,7 +323,7 @@ impl J3 {
     }
 
     /// Sends `key`'s draft (Enter, the Send/Queue button): to its thread, queued behind an
-    /// active run, or as the first message of a new thread. Refused while sending or
+    /// active turn, or as the first message of a new thread. Refused while sending or
     /// dictating, with nothing to send, while an image uploads or after one failed, and
     /// without a model.
     pub fn submit_composer(&mut self, key: &ComposerKey, tx: &mut Tx) {
@@ -360,31 +365,24 @@ impl J3 {
         }
     }
 
-    /// Sends a submission to `thread`: started, or queued behind its active run.
+    /// Sends a submission to `thread`: started, or queued behind its active turn.
     fn send_to_thread(&mut self, thread: ThreadKey, submission: Submission) {
         let key = ComposerKey::Thread(thread.clone());
         let Some(connection) = self.envs.get(&thread.env).map(|e| e.connection().clone()) else {
             self.finish_composer(&key, Err("The environment is gone.".to_owned()));
             return;
         };
-        let running = self
-            .threads
-            .get(&thread)
-            .is_some_and(|t| t.state.active_run().is_some());
-        let mode = if running {
-            SendMode::Queue
-        } else {
-            SendMode::Start
+        let params = SendParams {
+            thread_id: thread.thread_id.clone(),
+            text: submission.text,
+            attachments: submission.attachments,
+            model: Some(submission.model),
+            delivery: Delivery::Auto,
+            command_id: None,
         };
         self.spawn(async move {
             let result = connection
-                .send(
-                    &thread.thread_id,
-                    &submission.text,
-                    submission.attachments,
-                    Some(submission.model),
-                    mode,
-                )
+                .turns_send(params)
                 .await
                 .map(drop)
                 .map_err(|e| e.to_string());
@@ -449,10 +447,10 @@ impl J3 {
         }
         let shell = &env.state().shell;
         match key {
-            ComposerKey::Thread(thread) => shell.thread(&thread.thread_id).is_none(),
+            ComposerKey::Thread(thread) => !shell.threads.contains_key(&thread.thread_id),
             ComposerKey::NewThread { project, .. } => project
                 .as_deref()
-                .is_none_or(|project| shell.project(project).is_none()),
+                .is_none_or(|project| !shell.projects.contains_key(project)),
         }
     }
 
@@ -501,7 +499,7 @@ impl J3 {
                 self.warm_assist();
             }
         }
-        self.request_workspace(&key);
+        self.request_project_commands(&key);
         let composer = self.composer(&key);
         if focused && draft::shows_keyword(&composer.edit) {
             if composer.shimmer_at.is_none_or(|at| now >= at) {

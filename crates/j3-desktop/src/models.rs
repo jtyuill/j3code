@@ -1,49 +1,54 @@
-//! Model and thinking-level choices derived from a server's config, the way
-//! t3's `buildModelOptions` does (ios-surface §2.2 M1, "Model picker").
+//! Model and thinking-level choices derived from a server's catalog (ios-surface §2.2 M1,
+//! "Model picker"). A model is named by its selector `provider/id`, which is also what a
+//! `^model` mention types.
 
 use std::{collections::HashMap, hash::Hash};
 
-use j3_protocol::t3::{
-    model::{
-        ModelSelection, ProviderOptionDescriptor, ProviderOptionSelection,
-        ProviderOptionSelectionValue, SelectProviderOptionDescriptor,
-    },
-    server::{ServerConfig, ServerProvider, ServerProviderAuthStatus, ServerProviderModel},
+use j3_client::{
+    entities::{ModelRef, ThinkingLevel},
+    methods::Catalog,
 };
 
 use crate::{logos, mention};
 
-/// The option id omp's thinking level travels under.
-const THINKING: &str = "thinking";
-
 /// One pickable model.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelChoice {
-    /// `(provider instance id, model slug)`: the model's identity.
-    pub key: (String, String),
-    pub name: String,
-    /// The upstream provider serving it (omp's `anthropic`, `openai-codex`,
-    /// …): the model's `subProvider`, else the slug's `<provider>/` prefix.
+    /// The provider serving it (omp's `anthropic`, `openai-codex`, …).
     pub provider: String,
+    id: String,
+    /// `provider/id`: the model's identity.
+    slug: String,
+    pub name: String,
+    /// The thinking levels it offers; empty without reasoning.
+    pub thinking: Vec<ThinkingLevel>,
     pub is_default: bool,
     /// How the UI names it; [`model_choices`] sets it for the whole catalog.
     pub label: ModelLabel,
 }
 
 impl ModelChoice {
-    pub fn instance_id(&self) -> &str {
-        &self.key.0
+    /// Model `id` of `provider`, unlabelled, without thinking levels.
+    pub fn new(provider: &str, id: &str, name: &str) -> Self {
+        Self {
+            provider: provider.to_owned(),
+            id: id.to_owned(),
+            slug: format!("{provider}/{id}"),
+            name: name.to_owned(),
+            thinking: Vec::new(),
+            is_default: false,
+            label: ModelLabel::default(),
+        }
     }
 
+    /// `provider/id`.
     pub fn slug(&self) -> &str {
-        &self.key.1
+        &self.slug
     }
 
-    /// The slug after its first `/` (the provider's own model id), or the
-    /// whole slug.
+    /// The provider's own model id.
     pub fn id(&self) -> &str {
-        let slug = self.slug();
-        slug.split_once('/').map_or(slug, |(_, id)| id)
+        &self.id
     }
 }
 
@@ -193,30 +198,16 @@ fn qualifier(provider: Option<&str>, detail: Option<&str>) -> Option<String> {
     }
 }
 
-fn usable(provider: &ServerProvider) -> bool {
-    provider.enabled
-        && provider.installed
-        && provider.auth.status != ServerProviderAuthStatus::Unauthenticated
-}
-
-/// Models of every usable provider, in config order, labelled.
-pub fn model_choices(config: &ServerConfig) -> Vec<ModelChoice> {
-    let mut choices: Vec<ModelChoice> = config
-        .providers
+/// Models of the catalog, in catalog order, labelled.
+pub fn model_choices(catalog: &Catalog) -> Vec<ModelChoice> {
+    let mut choices: Vec<ModelChoice> = catalog
+        .models
         .iter()
-        .filter(|provider| usable(provider))
-        .flat_map(|provider| {
-            provider.models.iter().map(|model| ModelChoice {
-                key: (provider.instance_id.clone(), model.slug.clone()),
-                name: model.name.clone(),
-                provider: model
-                    .sub_provider
-                    .clone()
-                    .or_else(|| Some(model.slug.split_once('/')?.0.to_owned()))
-                    .unwrap_or_else(|| provider.instance_id.clone()),
-                is_default: model.is_default == Some(true),
-                label: ModelLabel::default(),
-            })
+        .map(|model| {
+            let mut choice = ModelChoice::new(&model.provider, &model.id, &model.name);
+            choice.thinking = model.thinking.clone().unwrap_or_default();
+            choice.is_default = model.default;
+            choice
         })
         .collect();
     let labels = model_labels(&choices);
@@ -241,96 +232,56 @@ pub fn by_provider(choices: &[ModelChoice]) -> Vec<(&str, Vec<usize>)> {
 
 /// The choice to preselect: `preferred` if the server still offers it,
 /// else the server's default model, else the first one.
-pub fn initial_choice(
-    choices: &[ModelChoice],
-    preferred: Option<&ModelSelection>,
-) -> Option<usize> {
+pub fn initial_choice(choices: &[ModelChoice], preferred: Option<&ModelRef>) -> Option<usize> {
     preferred
-        .and_then(|selection| {
-            choices.iter().position(|choice| {
-                choice.instance_id() == selection.instance_id && choice.slug() == selection.model
-            })
+        .and_then(|model| {
+            choices
+                .iter()
+                .position(|choice| choice.provider == model.provider && choice.id == model.id)
         })
         .or_else(|| choices.iter().position(|choice| choice.is_default))
         .or(if choices.is_empty() { None } else { Some(0) })
 }
 
-fn find_model<'a>(
-    config: &'a ServerConfig,
-    choice: &ModelChoice,
-) -> Option<&'a ServerProviderModel> {
-    config
-        .providers
-        .iter()
-        .find(|provider| provider.instance_id == choice.instance_id())?
-        .models
-        .iter()
-        .find(|model| model.slug == choice.slug())
-}
-
-/// The model's thinking-level select descriptor: the one with id `thinking`,
-/// else the first `select` with the `reasoning` role.
-pub fn thinking_descriptor<'a>(
-    config: &'a ServerConfig,
-    choice: &ModelChoice,
-) -> Option<&'a SelectProviderOptionDescriptor> {
-    let descriptors = find_model(config, choice)?
-        .capabilities
-        .as_ref()?
-        .option_descriptors
-        .as_deref()?;
-    let selects = descriptors
-        .iter()
-        .filter_map(|descriptor| match descriptor {
-            ProviderOptionDescriptor::Select(select) => Some(select),
-            ProviderOptionDescriptor::Boolean(_) => None,
-        });
-    selects
-        .clone()
-        .find(|select| select.id == THINKING)
-        .or_else(|| selects.clone().find(|select| select.role.is_some()))
-}
-
-/// The level to preselect: `preferred` if offered, else the descriptor's
-/// current value, else its default option, else the first option.
+/// The level to preselect: `preferred` if the model offers it; otherwise none, which
+/// leaves the level to omp.
 pub fn initial_level(
-    descriptor: &SelectProviderOptionDescriptor,
-    preferred: Option<&str>,
-) -> Option<String> {
-    let offered = |id: &str| descriptor.options.iter().any(|option| option.id == id);
-    preferred
-        .filter(|id| offered(id))
-        .or(descriptor.current_value.as_deref().filter(|id| offered(id)))
-        .or_else(|| {
-            descriptor
-                .options
-                .iter()
-                .find(|option| option.is_default == Some(true))
-                .map(|option| option.id.as_str())
-        })
-        .or_else(|| descriptor.options.first().map(|option| option.id.as_str()))
-        .map(str::to_owned)
+    choice: &ModelChoice,
+    preferred: Option<ThinkingLevel>,
+) -> Option<ThinkingLevel> {
+    preferred.filter(|level| choice.thinking.contains(level))
 }
 
-/// The thinking level carried by a selection, if any.
-pub fn selection_level<'a>(selection: &'a ModelSelection, descriptor_id: &str) -> Option<&'a str> {
-    match selection.option(descriptor_id)? {
-        ProviderOptionSelectionValue::String(value) => Some(value),
-        ProviderOptionSelectionValue::Bool(_) => None,
+/// A thinking level's wire name (`off` … `xhigh`), also its element id.
+pub fn level_id(level: ThinkingLevel) -> &'static str {
+    match level {
+        ThinkingLevel::Off => "off",
+        ThinkingLevel::Minimal => "minimal",
+        ThinkingLevel::Low => "low",
+        ThinkingLevel::Medium => "medium",
+        ThinkingLevel::High => "high",
+        ThinkingLevel::Xhigh => "xhigh",
     }
 }
 
-/// The wire selection for `choice` at thinking `level` (under `descriptor_id`).
-pub fn model_selection(choice: &ModelChoice, level: Option<(&str, &str)>) -> ModelSelection {
-    ModelSelection {
-        instance_id: choice.instance_id().to_owned(),
-        model: choice.slug().to_owned(),
-        options: level.map(|(id, value)| {
-            vec![ProviderOptionSelection {
-                id: id.to_owned(),
-                value: ProviderOptionSelectionValue::String(value.to_owned()),
-            }]
-        }),
+/// How a thinking level is shown.
+pub fn level_label(level: ThinkingLevel) -> &'static str {
+    match level {
+        ThinkingLevel::Off => "Off",
+        ThinkingLevel::Minimal => "Minimal",
+        ThinkingLevel::Low => "Low",
+        ThinkingLevel::Medium => "Medium",
+        ThinkingLevel::High => "High",
+        ThinkingLevel::Xhigh => "Extra high",
+    }
+}
+
+/// The wire model for `choice` at thinking `level`.
+pub fn model_ref(choice: &ModelChoice, level: Option<ThinkingLevel>) -> ModelRef {
+    ModelRef {
+        provider: choice.provider.clone(),
+        id: choice.id.clone(),
+        thinking: level,
     }
 }
 
@@ -338,93 +289,80 @@ pub fn model_selection(choice: &ModelChoice, level: Option<(&str, &str)>) -> Mod
 mod tests {
     use super::*;
 
-    fn config() -> ServerConfig {
+    fn catalog() -> Catalog {
         serde_json::from_value(serde_json::json!({
-            "environment": {"environmentId":"env","label":"mac","platform":{"os":"darwin","arch":"arm64"},
-                "serverVersion":"0.1.0","orchestrationProtocolVersion":2,"capabilities":{}},
-            "auth": {"policy":"unsafe-no-auth","bootstrapMethods":[],"sessionMethods":[],"sessionCookieName":"j3"},
-            "cwd":"/", "keybindingsConfigPath":"/k.json", "keybindings":[], "issues":[], "availableEditors":[],
-            "observability":{"logsDirectoryPath":"/l","localTracingEnabled":false,"otlpTracesEnabled":false,"otlpMetricsEnabled":false},
-            "settings":{},
-            "providers":[
-                {"instanceId":"off","driver":"pi","enabled":false,"installed":true,"version":null,"status":"ready",
-                 "auth":{"status":"authenticated"},"checkedAt":"t","models":[
-                    {"slug":"x/hidden","name":"Hidden","isCustom":false,"capabilities":null}]},
-                {"instanceId":"omp","driver":"pi","enabled":true,"installed":true,"version":"1","status":"ready",
-                 "auth":{"status":"authenticated"},"checkedAt":"t","models":[
-                    {"slug":"a/one","name":"One","isCustom":false,"capabilities":null},
-                    {"slug":"b/two","name":"Two","subProvider":"bee","isCustom":false,"isDefault":true,"capabilities":{"optionDescriptors":[
-                        {"type":"boolean","id":"fast","label":"Fast"},
-                        {"type":"select","id":"thinking","label":"Thinking","options":[
-                            {"id":"off","label":"Off"},{"id":"medium","label":"Medium","isDefault":true},{"id":"high","label":"High"}]}]}},
-                    {"slug":"a/three","name":"Three","isCustom":false,"capabilities":null}]}
-            ]
+            "models": [
+                {"provider": "a", "id": "one", "name": "One"},
+                {"provider": "bee", "id": "two", "name": "Two", "default": true,
+                 "thinking": ["off", "medium", "high"]},
+                {"provider": "a", "id": "three", "name": "Three"}
+            ],
+            "skills": [], "commands": [], "status": "ready"
         }))
         .unwrap()
     }
 
+    fn model(provider: &str, id: &str, thinking: Option<ThinkingLevel>) -> ModelRef {
+        ModelRef {
+            provider: provider.into(),
+            id: id.into(),
+            thinking,
+        }
+    }
+
     #[test]
-    fn lists_models_of_usable_providers_and_picks_defaults() {
-        let config = config();
-        let choices = model_choices(&config);
+    fn lists_the_catalog_and_picks_defaults() {
+        let choices = model_choices(&catalog());
         let slugs: Vec<&str> = choices.iter().map(|c| c.slug()).collect();
-        assert_eq!(slugs, ["a/one", "b/two", "a/three"]);
-        // The subProvider wins over the slug prefix; groups keep first-seen order.
+        assert_eq!(slugs, ["a/one", "bee/two", "a/three"]);
+        // Groups keep first-seen order.
         let groups: Vec<(&str, Vec<usize>)> = by_provider(&choices);
         assert_eq!(groups, [("a", vec![0, 2]), ("bee", vec![1])]);
         assert_eq!(initial_choice(&choices, None), Some(1));
-        let preferred = ModelSelection {
-            instance_id: "omp".into(),
-            model: "a/one".into(),
-            options: None,
-        };
-        assert_eq!(initial_choice(&choices, Some(&preferred)), Some(0));
-        let gone = ModelSelection {
-            instance_id: "omp".into(),
-            model: "z/gone".into(),
-            options: None,
-        };
-        assert_eq!(initial_choice(&choices, Some(&gone)), Some(1));
+        assert_eq!(
+            initial_choice(&choices, Some(&model("a", "one", None))),
+            Some(0)
+        );
+        assert_eq!(
+            initial_choice(&choices, Some(&model("z", "gone", None))),
+            Some(1)
+        );
         assert_eq!(initial_choice(&[], None), None);
     }
 
     #[test]
-    fn thinking_levels_come_from_the_model_descriptor() {
-        let config = config();
-        let choices = model_choices(&config);
-        assert!(thinking_descriptor(&config, &choices[0]).is_none());
-        let descriptor = thinking_descriptor(&config, &choices[1]).unwrap();
-        assert_eq!(descriptor.id, "thinking");
-        assert_eq!(initial_level(descriptor, None).as_deref(), Some("medium"));
+    fn thinking_levels_come_from_the_catalog() {
+        let choices = model_choices(&catalog());
+        assert!(choices[0].thinking.is_empty());
         assert_eq!(
-            initial_level(descriptor, Some("high")).as_deref(),
-            Some("high")
+            choices[1].thinking,
+            [
+                ThinkingLevel::Off,
+                ThinkingLevel::Medium,
+                ThinkingLevel::High
+            ]
         );
         assert_eq!(
-            initial_level(descriptor, Some("bogus")).as_deref(),
-            Some("medium")
+            initial_level(&choices[1], Some(ThinkingLevel::High)),
+            Some(ThinkingLevel::High)
         );
+        assert_eq!(initial_level(&choices[1], Some(ThinkingLevel::Low)), None);
+        assert_eq!(initial_level(&choices[0], Some(ThinkingLevel::High)), None);
 
-        let selection = model_selection(&choices[1], Some(("thinking", "high")));
         assert_eq!(
-            serde_json::to_value(&selection).unwrap(),
-            serde_json::json!({"instanceId":"omp","model":"b/two","options":[{"id":"thinking","value":"high"}]})
+            serde_json::to_value(model_ref(&choices[1], Some(ThinkingLevel::High))).unwrap(),
+            serde_json::json!({"provider": "bee", "id": "two", "thinking": "high"})
         );
-        assert_eq!(selection_level(&selection, "thinking"), Some("high"));
         assert_eq!(
-            serde_json::to_value(model_selection(&choices[0], None)).unwrap(),
-            serde_json::json!({"instanceId":"omp","model":"a/one"})
+            serde_json::to_value(model_ref(&choices[0], None)).unwrap(),
+            serde_json::json!({"provider": "a", "id": "one"})
         );
+        assert_eq!(level_id(ThinkingLevel::Xhigh), "xhigh");
     }
 
     fn named(provider: &str, slug: &str, name: &str) -> ModelChoice {
-        ModelChoice {
-            key: ("omp".into(), slug.into()),
-            name: name.into(),
-            provider: provider.into(),
-            is_default: false,
-            label: ModelLabel::default(),
-        }
+        let id = slug.strip_prefix(&format!("{provider}/")).unwrap_or(slug);
+        ModelChoice::new(provider, id, name)
     }
 
     fn texts(choices: &[ModelChoice]) -> Vec<String> {

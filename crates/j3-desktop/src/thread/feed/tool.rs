@@ -3,7 +3,7 @@
 //! then its body (a running command's output, a diff) in a tinted block that expands in
 //! place, and the images the tool returned.
 
-use j3_client::t3::orchestration::TurnItem;
+use j3_client::entities::Item;
 use rune::{El, Icon, TextStyle, col, el, row, text};
 use rune_kit::{Kit, Spinner};
 
@@ -66,7 +66,7 @@ pub fn more_label(expanded: bool, hidden: usize) -> String {
 }
 
 /// The row of tool item `item`.
-pub fn view(s: &J3, cx: &Ctx, item: &TurnItem) -> El {
+pub fn view(s: &J3, cx: &Ctx, item: &Item) -> El {
     let Some(view) = tool_view(item) else {
         return el();
     };
@@ -162,10 +162,10 @@ pub fn view(s: &J3, cx: &Ctx, item: &TurnItem) -> El {
         );
         has_body = true;
     }
-    if view.images > 0 {
+    if !view.images.is_empty() {
         let mut images = row().w_full().pt(4.0).pb(4.0).gap(8.0).flex_wrap();
-        for index in 0..view.images as u64 {
-            images = images.child(output_image(s, cx, item, index));
+        for (index, attachment) in view.images.iter().enumerate() {
+            images = images.child(output_image(s, cx, &item.id, index, attachment));
         }
         column = column.child(images);
         has_body = true;
@@ -180,18 +180,16 @@ pub fn view(s: &J3, cx: &Ctx, item: &TurnItem) -> El {
     )
 }
 
-/// Image `index` of a tool's output, as large as it is up to the feed's width and
+/// Image `index` of a tool's output (attachment `attachment`), as large as it is up to the feed's width and
 /// [`MAX_OUTPUT_IMAGE_HEIGHT`].
-fn output_image(s: &J3, cx: &Ctx, item: &TurnItem, index: u64) -> El {
+fn output_image(s: &J3, cx: &Ctx, item_id: &str, index: usize, attachment: &str) -> El {
     let k = cx.k;
-    let image = ImageRef::ToolOutput {
-        thread_id: item.thread_id.clone(),
-        item_id: item.id.clone(),
-        index,
+    let image = ImageRef::Attachment {
+        id: attachment.to_owned(),
     };
     let decorate = |frame: El| {
         frame
-            .key(format!("tool-image-{}-{index}", item.id))
+            .key(format!("tool-image-{item_id}-{index}"))
             .role("image")
             .radius(k.radius.md)
             .clip_rounded(k.radius.md)

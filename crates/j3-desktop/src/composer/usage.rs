@@ -2,7 +2,7 @@
 //! composer's environment, and a popover listing its limits, refreshed when opened. The data
 //! is the app's `UsageStore`; watches follow the shown composer (`J3::poll_composer`).
 
-use j3_protocol::j3::{UsageLimit, UsageReport};
+use j3_client::methods::{UsageAccount, UsageLimit};
 use rune::{El, ScrollSpec, col, el, icon, row, text};
 use rune_kit::{Placement, Popover, Spinner};
 
@@ -11,8 +11,9 @@ use crate::{
     app::{J3, Ui},
     feed::age_since,
     icons, logos,
+    sidebar::parse_time,
     theme::Status,
-    usage::{self as store, limit_title, remaining, unix_ms, used_fraction},
+    usage::{self as store, limit_title, remaining, used_fraction},
 };
 
 impl J3 {
@@ -146,13 +147,13 @@ fn panel(s: &J3, ui: &Ui, key: &ComposerKey, provider: &str) -> El {
                 .wrap(),
         );
     }
-    // Report indices stay those of the whole snapshot, so keys are stable.
-    let reports: Vec<(usize, &UsageReport)> = snapshot
+    // Account indices stay those of the whole snapshot, so keys are stable.
+    let accounts: Vec<(usize, &UsageAccount)> = snapshot
         .iter()
-        .flat_map(|snapshot| snapshot.reports.iter().enumerate())
-        .filter(|(_, report)| report.provider == provider)
+        .flat_map(|snapshot| snapshot.accounts.iter().enumerate())
+        .filter(|(_, account)| account.provider == provider)
         .collect();
-    if reports.is_empty() {
+    if accounts.is_empty() {
         if snapshot.is_some() {
             body = body.child(
                 text(format!("No usage limits reported for {provider_name}"))
@@ -162,31 +163,29 @@ fn panel(s: &J3, ui: &Ui, key: &ComposerKey, provider: &str) -> El {
         }
         return body;
     }
-    for (ix, report) in &reports {
-        body = body.child(report_view(ui, env_key, *ix, report, reports.len(), now));
+    for (ix, account) in &accounts {
+        body = body.child(account_view(ui, env_key, *ix, account, accounts.len(), now));
     }
     body
 }
 
-/// One account's limits; several accounts are told apart by email or org and plan.
-fn report_view(
+/// One account's limits; several accounts are told apart by email and plan.
+fn account_view(
     ui: &Ui,
     env: &str,
     ix: usize,
-    report: &UsageReport,
+    account: &UsageAccount,
     accounts: usize,
     now: time::OffsetDateTime,
 ) -> El {
     let k = ui.k;
-    let account = &report.metadata;
-    let who = [
-        account.email.as_deref().or(account.org_name.as_deref()),
-        account.plan_type.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>()
-    .join(" · ");
+    let who = account
+        .account
+        .iter()
+        .flat_map(|info| [info.email.as_deref(), info.plan.as_deref()])
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" · ");
     let mut column = col().gap(4.0);
     if accounts > 1 && !who.is_empty() {
         column = column.child(
@@ -196,7 +195,7 @@ fn report_view(
                 .truncate(),
         );
     }
-    for (lix, limit) in report.limits.iter().enumerate() {
+    for (lix, limit) in account.limits.iter().enumerate() {
         column = column.child(limit_view(
             ui,
             format!("usage-{env}-{ix}-{lix}"),
@@ -221,8 +220,8 @@ fn limit_view(ui: &Ui, key: String, limit: &UsageLimit, now: time::OffsetDateTim
     let resets = limit
         .window
         .as_ref()
-        .and_then(|window| window.resets_at)
-        .and_then(unix_ms)
+        .and_then(|window| window.resets_at.as_deref())
+        .and_then(parse_time)
         .map(|at| format!("resets in {}", remaining(at - now)));
     let title = limit_title(limit);
     let bar = row()

@@ -2,9 +2,9 @@
 //! commands, navigation order, the clock, the sidebar pane's state — and its view, in the
 //! workflow the preferences choose:
 //!
-//! - **T3** ([`t3`], [`t3_view`]): t3code's settle workflow. One list across environments:
-//!   Pinned and Active at the top; the Working, Snoozed and Settled shelves anchored at the
-//!   bottom.
+//! - **Inbox** ([`inbox`], [`inbox_view`]): j3's triage workflow (`docs/triage.md`). One
+//!   list across environments: Pinned and Active at the top; the Working, Snoozed and Settled
+//!   shelves anchored at the bottom.
 //! - **herdr** ([`herdr`]): herdr's agent workflow. Spaces (projects) with their rolled-up
 //!   attention, then every agent (thread) with its state.
 //!
@@ -13,9 +13,9 @@
 
 mod dnd;
 mod herdr;
+mod inbox;
+mod inbox_view;
 mod menu;
-mod t3;
-mod t3_view;
 #[cfg(test)]
 mod tests;
 
@@ -28,16 +28,20 @@ use std::{
     time::Duration,
 };
 
-use j3_client::{ConnectionState, workflow::AgentOrder};
+use j3_client::{
+    ConnectionState,
+    herdr::AgentOrder,
+    methods::{AutoSettleParams, OrderParams, PinParams, SettleParams, SnoozeParams, ThreadParams},
+};
 use rune::{Cx, El, Tx};
 use rune_kit::PaneState;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 pub use dnd::DragState;
 pub use herdr::{AgentRow, HerdrRows, SpaceRow, display_title, glyph, status_color};
+pub use inbox::{InboxRow, InboxRows, SETTLED_INITIAL_COUNT, SETTLED_PAGE_COUNT};
+pub use inbox_view::status_look;
 pub use menu::{RowMenu, Submenu};
-pub use t3::{SETTLED_INITIAL_COUNT, SETTLED_PAGE_COUNT, T3Row, T3Rows};
-pub use t3_view::status_look;
 
 use crate::{
     actions::{Action, KeyContext},
@@ -74,7 +78,7 @@ pub struct ProjectKey {
     pub project_id: String,
 }
 
-/// One thread mutation (t3's sidebar commands).
+/// One triage command (`docs/triage.md` §6, §7).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ThreadCommand {
     Settle,
@@ -100,9 +104,9 @@ pub struct EnvSnapshot<'a> {
 pub struct SidebarState {
     /// The sidebar pane's width and open state (17 rem, 12.5–30 rem).
     pub pane: PaneState,
-    /// T3's project filter (`None`: all projects).
+    /// The Inbox's project filter (`None`: all projects).
     pub project_filter: Option<ProjectKey>,
-    /// Settled rows shown (t3's paged tail).
+    /// Settled rows shown (the paged tail).
     pub settled_shown: usize,
     /// When time-dependent rows next change (`clock.t` seconds); `None` while nothing on
     /// screen depends on the time.
@@ -163,7 +167,7 @@ impl SidebarState {
 #[derive(Default)]
 struct RowsCache {
     key: u64,
-    t3: Option<Rc<T3Rows>>,
+    inbox: Option<Rc<InboxRows>>,
     herdr: Option<Rc<HerdrRows>>,
     goto: Option<Rc<HerdrRows>>,
 }
@@ -189,6 +193,21 @@ pub fn adjacent<'k>(
 /// Parses an ISO-8601 timestamp from the wire.
 pub fn parse_time(iso: &str) -> Option<OffsetDateTime> {
     OffsetDateTime::parse(iso, &Rfc3339).ok()
+}
+
+/// `at` as a wire timestamp: RFC 3339 UTC with millisecond precision.
+pub fn iso(at: OffsetDateTime) -> String {
+    let at = at.to_offset(time::UtcOffset::UTC);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        at.year(),
+        u8::from(at.month()),
+        at.day(),
+        at.hour(),
+        at.minute(),
+        at.second(),
+        at.millisecond()
+    )
 }
 
 /// How long until the next whole minute of `now`, so relative times like `5m` stay current.
@@ -224,13 +243,13 @@ impl J3 {
         cache
     }
 
-    /// T3 mode's rows now (built once per change of inputs or clock tick).
-    pub fn t3_rows(&self) -> Rc<T3Rows> {
+    /// The Inbox's rows now (built once per change of inputs or clock tick).
+    pub fn inbox_rows(&self) -> Rc<InboxRows> {
         let mut cache = self.rows_cache();
         cache
-            .t3
+            .inbox
             .get_or_insert_with(|| {
-                Rc::new(T3Rows::build(
+                Rc::new(InboxRows::build(
                     &self.env_snapshots(),
                     self.prefs.ui(),
                     self.sidebar.project_filter.as_ref(),
@@ -276,7 +295,7 @@ impl J3 {
     /// The visible threads in display order, for keyboard navigation.
     pub fn thread_order(&self) -> Vec<ThreadKey> {
         match self.prefs.ui().workflow {
-            Workflow::T3 => self.t3_rows().order(),
+            Workflow::Inbox => self.inbox_rows().order(),
             Workflow::Herdr => self.herdr_rows().order(),
         }
     }
@@ -285,7 +304,7 @@ impl J3 {
     pub fn nth_thread(&self, n: usize) -> Option<ThreadKey> {
         let ix = n.checked_sub(1)?;
         match self.prefs.ui().workflow {
-            Workflow::T3 => self.t3_rows().rows().nth(ix).map(|row| row.key.clone()),
+            Workflow::Inbox => self.inbox_rows().rows().nth(ix).map(|row| row.key.clone()),
             Workflow::Herdr => self
                 .herdr_rows()
                 .agents
@@ -310,17 +329,17 @@ impl J3 {
         }
     }
 
-    /// Whether element `key` is one of the sidebar's rows (a T3 thread, a herdr space or
+    /// Whether element `key` is one of the sidebar's rows (an Inbox thread, a herdr space or
     /// agent). Other elements share their prefixes (the header's `thread-actions`).
     fn is_sidebar_row(&self, key: &str) -> bool {
         if self.route.settings {
             return false;
         }
         match self.prefs.ui().workflow {
-            Workflow::T3 => {
+            Workflow::Inbox => {
                 key.starts_with("thread-")
                     && self
-                        .t3_rows()
+                        .inbox_rows()
                         .rows()
                         .any(|row| row.key.element_id("thread") == key)
             }
@@ -382,22 +401,57 @@ impl J3 {
             async move {
                 for (connection, id, command) in commands {
                     let id = id.as_str();
+                    let thread = || ThreadParams {
+                        thread_id: id.to_owned(),
+                        command_id: None,
+                    };
+                    let order = |order: String| OrderParams {
+                        thread_id: id.to_owned(),
+                        order,
+                        command_id: None,
+                    };
                     match command {
-                        ThreadCommand::Settle => connection.settle(id).await,
-                        ThreadCommand::Unsettle => connection.unsettle(id).await,
-                        ThreadCommand::Snooze(until) => connection.snooze(id, until).await,
-                        ThreadCommand::Wake => connection.unsnooze(id).await,
-                        ThreadCommand::Pin(key) => connection.pin(id, key.as_deref()).await,
-                        ThreadCommand::Unpin => connection.unpin(id).await,
+                        ThreadCommand::Settle => {
+                            let params = SettleParams {
+                                thread_id: id.to_owned(),
+                                settled_at: None,
+                                command_id: None,
+                            };
+                            connection.triage_settle(params).await
+                        }
+                        ThreadCommand::Unsettle => connection.triage_unsettle(thread()).await,
+                        ThreadCommand::Snooze(until) => {
+                            let params = SnoozeParams {
+                                thread_id: id.to_owned(),
+                                until: iso(until),
+                                command_id: None,
+                            };
+                            connection.triage_snooze(params).await
+                        }
+                        ThreadCommand::Wake => connection.triage_wake(thread()).await,
+                        ThreadCommand::Pin(order) => {
+                            let params = PinParams {
+                                thread_id: id.to_owned(),
+                                order,
+                                command_id: None,
+                            };
+                            connection.triage_pin(params).await
+                        }
+                        ThreadCommand::Unpin => connection.triage_unpin(thread()).await,
                         ThreadCommand::ReorderPinned(key) => {
-                            connection.reorder_pinned(id, &key).await
+                            connection.triage_order_pinned(order(key)).await
                         }
                         ThreadCommand::ReorderActive(key) => {
-                            connection.reorder_active(id, &key).await
+                            connection.triage_order_active(order(key)).await
                         }
-                        ThreadCommand::MarkUnread => connection.mark_unread(id).await,
+                        ThreadCommand::MarkUnread => connection.triage_mark_unread(thread()).await,
                         ThreadCommand::AutoSettle(enabled) => {
-                            connection.set_auto_settle(id, enabled).await
+                            let params = AutoSettleParams {
+                                thread_id: id.to_owned(),
+                                enabled,
+                                command_id: None,
+                            };
+                            connection.triage_set_auto_settle(params).await
                         }
                     }?;
                 }
@@ -416,7 +470,7 @@ impl J3 {
             (Arc::as_ptr(env.state()) as usize).hash(&mut h);
         }
         let ui = self.prefs.ui();
-        (ui.workflow == Workflow::T3, ui.working_shelf).hash(&mut h);
+        (ui.workflow == Workflow::Inbox, ui.working_shelf).hash(&mut h);
         (ui.status_indicators, ui.agent_order).hash(&mut h);
         ui.expanded_shelves.hash(&mut h);
         self.sidebar.project_filter.hash(&mut h);
@@ -433,11 +487,11 @@ impl J3 {
         h.finish()
     }
 
-    /// Whether T3's list is on screen (its menus, drag and drop targets live only then).
-    fn t3_shown(&self) -> bool {
+    /// Whether the Inbox list is on screen (its menus, drag and drop targets live only then).
+    fn inbox_shown(&self) -> bool {
         !self.route.settings
             && self.sidebar.pane.is_open()
-            && self.prefs.ui().workflow == Workflow::T3
+            && self.prefs.ui().workflow == Workflow::Inbox
     }
 
     /// The sidebar's clock: time-dependent rows (working timers every second, ages on the
@@ -450,7 +504,7 @@ impl J3 {
             self.sidebar.keyboard = false;
         }
         let mut changed = false;
-        if !self.t3_shown() {
+        if !self.inbox_shown() {
             let open = self.sidebar.row_menu.is_some()
                 || self.sidebar.filter_menu
                 || self.sidebar.drag.is_some();
@@ -475,16 +529,16 @@ impl J3 {
         if let Some(filter) = &self.sidebar.project_filter {
             let gone = !self.env_snapshots().iter().any(|env| {
                 env.key == filter.env
-                    && (!env.state.shell.loaded
-                        || env.state.shell.project(&filter.project_id).is_some())
+                    && (!env.state.shell.synced
+                        || env.state.shell.projects.contains_key(&filter.project_id))
             });
             if gone {
                 self.sidebar.project_filter = None;
             }
         }
         let wait = match self.prefs.ui().workflow {
-            Workflow::T3 => {
-                let rows = self.t3_rows();
+            Workflow::Inbox => {
+                let rows = self.inbox_rows();
                 // Rows that left the list report where they are again when they return.
                 self.sidebar
                     .drop_rects
@@ -505,7 +559,7 @@ impl J3 {
 /// previous / next thread, wrapping, as everywhere the sidebar has the keyboard.
 pub fn view(s: &J3, cx: &mut Cx<J3>, ui: &mut Ui) -> El {
     let body = match s.prefs.ui().workflow {
-        Workflow::T3 => t3_view::view(s, cx, ui),
+        Workflow::Inbox => inbox_view::view(s, cx, ui),
         Workflow::Herdr => herdr::view(s, ui),
     };
     body.on_key(|s: &mut J3, ev, tx: &mut Tx| {

@@ -11,13 +11,9 @@ use std::{
 use tokio::{net::TcpListener, process::Command, sync::watch, task::JoinSet};
 use tracing::{info, warn};
 
-use crate::{
-    app::App,
-    http::{HttpState, router},
-    rpc::RpcHandler,
-};
+use crate::{app::App, http::router};
 
-/// Default port for j3 servers (t3code keeps 3773).
+/// Default port for j3 servers.
 pub const DEFAULT_PORT: u16 = 3780;
 /// How long in-flight HTTP requests get after shutdown starts.
 const SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
@@ -42,12 +38,7 @@ impl Server {
     /// Binds every address (duplicates ignored) and starts serving `app`. Port 0 picks a
     /// free port; [`Server::addrs`] reports the one bound.
     pub async fn bind(app: Arc<App>, addrs: &[SocketAddr]) -> Result<Self, BindError> {
-        let rpc: Arc<dyn RpcHandler> = app.clone();
-        let routes = router(HttpState {
-            descriptor: app.descriptor(),
-            rpc,
-            attachments: app.attachments(),
-        });
+        let routes = router(Arc::clone(&app));
         let (stop, stop_rx) = watch::channel(false);
         let mut tasks = JoinSet::new();
         let mut requested = Vec::new();

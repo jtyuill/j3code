@@ -3,9 +3,13 @@
 
 use std::collections::HashMap;
 
-use j3_client::workflow::{
-    AgentOrder, AgentStatus, EnvThread, StatusIndicators, agent_status, is_listed, rollup,
-    sort_agents_by_attention, sort_agents_by_space,
+use j3_client::{
+    EnvThread,
+    herdr::{
+        AgentOrder, AgentStatus, StatusIndicators, agent_status, rollup, sort_agents_by_attention,
+        sort_agents_by_space,
+    },
+    inbox::is_listed,
 };
 use rune::{Color, El, Tx, col, el, row, spacer, text};
 use rune_kit::{
@@ -70,7 +74,7 @@ impl HerdrRows {
         let mut threads: Vec<EnvThread> = Vec::new();
         for env in snapshots {
             let shell = &env.state.shell;
-            for project in &shell.projects {
+            for project in shell.projects_in_order() {
                 rank.insert((env.key, project.id.as_str()), spaces.len());
                 spaces.push(SpaceRow {
                     project: ProjectKey {
@@ -86,7 +90,7 @@ impl HerdrRows {
             threads.extend(
                 shell
                     .threads
-                    .iter()
+                    .values()
                     .filter(|thread| is_listed(thread))
                     .map(|thread| EnvThread {
                         environment: env.key,
@@ -142,7 +146,7 @@ impl HerdrRows {
             agents,
             indicators,
             agent_order: order,
-            note: (!snapshots.iter().any(|env| env.state.shell.loaded)).then_some("Connecting…"),
+            note: (!snapshots.iter().any(|env| env.state.shell.synced)).then_some("Connecting…"),
         }
     }
 
