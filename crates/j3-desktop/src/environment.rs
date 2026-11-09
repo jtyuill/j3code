@@ -199,6 +199,10 @@ impl Environment {
         &self.label
     }
 
+    pub fn set_label(&mut self, label: String) {
+        self.label = label;
+    }
+
     pub fn kind(&self) -> &EnvironmentKind {
         &self.kind
     }
@@ -364,14 +368,14 @@ pub fn distinct(ids: &[Option<&str>]) -> Vec<usize> {
 impl J3 {
     /// Opens the local environment and every remote of `desktop.json`.
     pub fn open_environments(&mut self) {
-        let hostname = gethostname::gethostname().to_string_lossy().into_owned();
+        let name = crate::device::name(self.prefs.ui().device_name.as_deref());
         let status = match &self.services.local {
             Some(local) => local.status().clone(),
             None => LocalServerStatus::External("headless run; no server started".into()),
         };
         let local = Environment::open(
             LOCAL_KEY,
-            hostname,
+            name,
             self.services.local_url(),
             EnvironmentKind::Local(status),
             &self.services,
@@ -388,6 +392,19 @@ impl J3 {
                 &self.inbox,
             );
             self.envs.push(env);
+        }
+    }
+
+    /// Names this computer `name` (blank: inferred from the machine again), saves it, and
+    /// relabels the local environment. The local server reports it to other devices from
+    /// its next start.
+    pub fn set_device_name(&mut self, name: &str, tx: &mut Tx) {
+        let name = name.trim();
+        let name = (!name.is_empty()).then(|| name.to_owned());
+        self.update_ui(|ui| ui.device_name = name, tx);
+        let label = crate::device::name(self.prefs.ui().device_name.as_deref());
+        if let Some(local) = self.envs.get_mut(LOCAL_KEY) {
+            local.set_label(label);
         }
     }
 

@@ -12,6 +12,7 @@ pub mod assist;
 pub mod attention;
 pub mod completion;
 pub mod composer;
+pub mod device;
 pub mod dialogs;
 pub mod environment;
 pub mod environments;

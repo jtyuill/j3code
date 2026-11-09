@@ -68,6 +68,16 @@ fn remove_button(k: &Kit, key: String, press: impl Fn(&mut J3, &mut Tx) + 'stati
         .key(key)
 }
 
+/// A small "Rename…" button.
+fn rename_button(k: &Kit, key: String, press: impl Fn(&mut J3, &mut Tx) + 'static) -> El {
+    Button::new("Rename…")
+        .variant(ButtonVariant::Ghost)
+        .control_size(ControlSize::Small)
+        .on_press_tx(press)
+        .build(k)
+        .key(key)
+}
+
 /// A small outlined "Add …" button.
 fn add_button(k: &Kit, label: &str, key: String, press: impl Fn(&mut J3, &mut Tx) + 'static) -> El {
     Button::new(label)
@@ -112,9 +122,18 @@ pub(super) fn environments(s: &J3, ui: &Ui) -> El {
             .color(k.c.text_muted)
             .help(env.status_detail());
         let end = if env.is_local() {
-            text("This computer")
-                .font(k.ty.text_xsmall)
-                .color(k.c.text_muted)
+            row()
+                .gap(8.0)
+                .center_y()
+                .child(
+                    text("This computer")
+                        .font(k.ty.text_xsmall)
+                        .color(k.c.text_muted),
+                )
+                .child(rename_button(k, "rename-device".into(), |s, tx| {
+                    let dialog = Dialog::rename_device(s);
+                    s.open_dialog(dialog, tx);
+                }))
         } else {
             let remove = key.clone();
             remove_button(k, format!("remove-environment-{key}"), move |s, tx| {

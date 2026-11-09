@@ -103,6 +103,9 @@ pub struct UiSettings {
     /// is the one recommended for this machine.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dictation_model: Option<String>,
+    /// What this computer is called in j3; `None` is inferred from the machine (`device`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_name: Option<String>,
 }
 
 impl Default for UiSettings {
@@ -125,6 +128,7 @@ impl Default for UiSettings {
             favorite_models: Vec::new(),
             usage_inline: Vec::new(),
             dictation_model: None,
+            device_name: None,
             zoom: 1.,
         }
     }
@@ -346,6 +350,7 @@ mod tests {
             favorite_models: Vec::new(),
             usage_inline: Vec::new(),
             dictation_model: Some("small.en".into()),
+            device_name: Some("revolver".into()),
             zoom: 1.25,
         };
         ui.set_expanded(Shelf::Settled, true);
@@ -365,7 +370,7 @@ mod tests {
                 "expandedShelves": ["settled"], "textMeasure": 42.0, "uiFont": "Inter",
                 "interfaceFontSize": 15.0, "codeFontSize": 13.0, "terminalFontSize": 12.0,
                 "favoriteModels": ["a/one"], "usageInline": ["anthropic"],
-                "dictationModel": "small.en", "zoom": 1.25})
+                "dictationModel": "small.en", "deviceName": "revolver", "zoom": 1.25})
         );
         assert_eq!(serde_json::from_value::<UiSettings>(value).unwrap(), ui);
         assert!(ui.is_expanded(Shelf::Settled));

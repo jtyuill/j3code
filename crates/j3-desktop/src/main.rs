@@ -5,8 +5,9 @@ use std::{path::PathBuf, sync::Arc};
 
 use j3_desktop::{
     assist::{self, AssistOmp},
-    environments,
+    device, environments,
     local_server::LocalServer,
+    preferences::Preferences,
     services::Services,
     speech::SpeechEngine,
 };
@@ -30,12 +31,21 @@ fn main() {
     // (`app::fixtures`) and needs no server either.
     let headless = rune::is_headless();
     let scene = std::env::args().any(|arg| arg == "--scene");
-    // Starting is fast (SQLite open, bind); doing it before the window means the local
-    // connection's first attempt already finds the server.
-    let local = (!headless && !scene).then(|| Arc::new(runtime.block_on(LocalServer::start())));
     let config_path = environments::config_path()
         .inspect_err(|e| tracing::warn!("{e}"))
         .ok();
+    // The server reports this computer's name, so the setting is read before it starts.
+    let hostname = gethostname::gethostname().to_string_lossy().into_owned();
+    let label = device::name(
+        Preferences::load(config_path.clone(), &hostname)
+            .ui()
+            .device_name
+            .as_deref(),
+    );
+    // Starting is fast (SQLite open, bind); doing it before the window means the local
+    // connection's first attempt already finds the server.
+    let local =
+        (!headless && !scene).then(|| Arc::new(runtime.block_on(LocalServer::start(label))));
     let data_dir = dirs::data_dir().map(|dir| dir.join("j3"));
     let assist = AssistOmp::new(
         assist::launcher(data_dir.as_deref()),

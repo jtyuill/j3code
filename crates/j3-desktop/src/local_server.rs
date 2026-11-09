@@ -56,10 +56,10 @@ pub struct LocalServer {
 
 impl LocalServer {
     /// Opens the app in `dirs::data_dir()/j3` and binds `127.0.0.1:3780`
-    /// plus the Tailscale IPv4 if there is one. Never fails: problems are
-    /// reported through [`LocalServer::status`].
-    pub async fn start() -> Self {
-        let (status, server) = match Self::try_start().await {
+    /// plus the Tailscale IPv4 if there is one; other devices see the server as `label`.
+    /// Never fails: problems are reported through [`LocalServer::status`].
+    pub async fn start(label: String) -> Self {
+        let (status, server) = match Self::try_start(label).await {
             Ok(server) => (
                 LocalServerStatus::Serving(server.addrs().to_vec()),
                 Some(server),
@@ -93,14 +93,13 @@ impl LocalServer {
         &self.url
     }
 
-    async fn try_start() -> Result<Server, LocalServerStatus> {
+    async fn try_start(label: String) -> Result<Server, LocalServerStatus> {
         let data_dir = dirs::data_dir()
             .map(|dir| dir.join("j3"))
             .ok_or_else(|| LocalServerStatus::Failed("no data directory".to_owned()))?;
         let logs = data_dir.join("logs");
         std::fs::create_dir_all(&logs)
             .map_err(|e| LocalServerStatus::Failed(format!("creating {}: {e}", logs.display())))?;
-        let label = gethostname::gethostname().to_string_lossy().into_owned();
         let app = App::open(AppConfig {
             data_dir: data_dir.clone(),
             label,

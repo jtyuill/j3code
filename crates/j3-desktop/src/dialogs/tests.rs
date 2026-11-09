@@ -3,9 +3,12 @@
 use rune::{Key, KeyEvent, Mods};
 
 use super::{Dialog, Field, snooze::INVALID};
-use crate::app::{
-    fixtures::{LOCAL_LABEL, Scene, open_thread_key},
-    testing::TestApp,
+use crate::{
+    app::{
+        fixtures::{LOCAL_LABEL, Scene, open_thread_key},
+        testing::TestApp,
+    },
+    environment::LOCAL_KEY,
 };
 
 fn tap(app: &mut TestApp, key: &str) {
@@ -61,6 +64,47 @@ fn add_environment_explains_what_is_missing_then_adds_it() {
     );
     assert!(app.rt.state.envs.get("http://revived:3780").is_some());
     assert_eq!(app.rt.state.prefs.remotes().len(), 1);
+}
+
+#[test]
+fn a_device_name_relabels_this_computer_and_blank_goes_back_to_inferred() {
+    let mut app = TestApp::with_scene(Scene::Thread);
+    let label = |app: &TestApp| {
+        let env = app.rt.state.envs.get(LOCAL_KEY).expect("local environment");
+        env.label().to_owned()
+    };
+    app.rt.update(|s, tx| {
+        let dialog = Dialog::rename_device(s);
+        s.open_dialog(dialog, tx);
+    });
+    app.frame();
+    app.rt.update(|s, _| {
+        s.dialogs
+            .field(Field::DeviceName)
+            .replace_text("  revolver ")
+    });
+    tap(&mut app, "dialog-confirm");
+    assert!(app.rt.state.dialogs.open.is_none());
+    assert_eq!(label(&app), "revolver");
+    assert_eq!(
+        app.rt.state.prefs.ui().device_name.as_deref(),
+        Some("revolver")
+    );
+
+    app.rt.update(|s, tx| {
+        let dialog = Dialog::rename_device(s);
+        s.open_dialog(dialog, tx);
+    });
+    assert_eq!(
+        app.rt.state.dialogs.field(Field::DeviceName).text,
+        "revolver"
+    );
+    app.rt
+        .update(|s, _| s.dialogs.field(Field::DeviceName).replace_text(""));
+    app.frame();
+    tap(&mut app, "dialog-confirm");
+    assert_eq!(label(&app), crate::device::inferred());
+    assert_eq!(app.rt.state.prefs.ui().device_name, None);
 }
 
 #[test]

@@ -35,6 +35,8 @@ pub enum Dialog {
         url: TextEdit,
         error: Option<String>,
     },
+    /// Name this computer; empty goes back to the name inferred from the machine.
+    RenameDevice { name: TextEdit },
     /// Rename a thread; empty titles are refused.
     RenameThread { key: ThreadKey, title: TextEdit },
     /// Confirm deleting a thread (`archived`: from Settings' archive, which reloads after).
@@ -70,6 +72,14 @@ impl Dialog {
             url: TextEdit::new(""),
             error: None,
         }
+    }
+
+    pub fn rename_device(s: &J3) -> Self {
+        let mut name = TextEdit::new(s.prefs.ui().device_name.clone().unwrap_or_default());
+        name.focused = true;
+        let end = name.text.len();
+        name.set_selection(0, end);
+        Self::RenameDevice { name }
     }
 
     pub fn rename_thread(s: &J3, key: ThreadKey) -> Self {
@@ -119,6 +129,7 @@ impl Dialog {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Field {
     Label,
+    DeviceName,
     Url,
     Title,
     Path,
@@ -153,6 +164,7 @@ impl DialogState {
     pub fn field(&mut self, field: Field) -> &mut TextEdit {
         match (&mut self.open, field) {
             (Some(Dialog::AddEnvironment { label, .. }), Field::Label) => label,
+            (Some(Dialog::RenameDevice { name }), Field::DeviceName) => name,
             (Some(Dialog::AddEnvironment { url, .. }), Field::Url) => url,
             (Some(Dialog::RenameThread { title, .. }), Field::Title) => title,
             (Some(Dialog::AddProject(picker)), Field::Path) => &mut picker.path,
@@ -211,6 +223,7 @@ impl J3 {
                     });
                 }
             }
+            Dialog::RenameDevice { name } => self.set_device_name(&name.text, tx),
             Dialog::RemoveEnvironment { key, .. } => {
                 if let Err(error) = self.remove_environment(&key, tx) {
                     self.toasts.error(error);
@@ -384,6 +397,26 @@ pub fn view(s: &J3, cx: &mut Cx<J3>, ui: &mut Ui) {
                 format!("Remove “{title}”?"),
                 Some("Files on disk aren’t deleted.".into()),
                 footer(k, "Remove", true, false),
+                400.0,
+            ),
+            Dialog::RenameDevice { name } => (
+                "rename-device",
+                "Rename this computer".into(),
+                Some(format!(
+                    "Leave empty to use “{}”, the name j3 infers from this machine. Other devices see the new name the next time j3 starts.",
+                    crate::device::inferred()
+                )),
+                form(
+                    TextInput::new(name)
+                        .width(None)
+                        .placeholder(crate::device::inferred())
+                        .label("Name")
+                        .on_edit(|s: &mut J3| s.dialogs.field(Field::DeviceName))
+                        .on_submit(|s: &mut J3, tx: &mut Tx| s.confirm_dialog(tx))
+                        .build(k)
+                        .key("device-name"),
+                    footer(k, "Save", false, false),
+                ),
                 400.0,
             ),
             Dialog::AddEnvironment { label, url, error } => {
