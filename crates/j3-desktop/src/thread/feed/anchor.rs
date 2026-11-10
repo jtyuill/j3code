@@ -25,8 +25,8 @@ pub const PROMPT_TOP: f32 = 24.0;
 /// so the shrink never pulls the end up under the reader.
 pub const REST_DELAY: f64 = 1.0;
 /// Most seconds the glide to a newly held message is renewed. Rows above it may still be
-/// climbing into their height (a previous reply's paced growth), and the feed's end reaches
-/// the message's place only once they land; until then the glide rides that end.
+/// gliding into their height, and the feed's end reaches the message's place only once they
+/// land; until then the glide rides that end.
 const AIM_FOR: f64 = 3.0;
 /// The feed's scroll viewport: `rune_kit::scroll_bar` keys it `feed` inside `feed-area`.
 const VIEWPORT: &str = "feed-area/feed";

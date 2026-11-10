@@ -58,8 +58,9 @@ impl NewThreadState {
 
 impl J3 {
     /// Shows the new-thread surface for `env` and `project` (the environment's first project
-    /// when `None`) with its composer focused.
+    /// when `None`) with its composer focused. It lands at once, as opening a thread does.
     pub fn new_thread(&mut self, env: String, project: Option<String>, tx: &mut Tx) {
+        tx.instant();
         self.close_settings(tx);
         self.new_thread.env = env;
         self.new_thread.project = project;

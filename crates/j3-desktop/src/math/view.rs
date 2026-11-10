@@ -50,9 +50,6 @@ pub struct Look<'a> {
     pub streaming: bool,
     /// Typeset math (the `math_rendering` preference); off, the markdown draws as written.
     pub math: bool,
-    /// Seconds each word takes to fade in when it first draws after the message mounted
-    /// (`El::reveal`, staggered down the page); 0 draws words at once.
-    pub reveal: f32,
 }
 
 /// One message's markdown, cut into parts and with its images resolved.
@@ -170,7 +167,6 @@ impl Doc {
             let version = (
                 source,
                 look.streaming,
-                look.reveal.to_bits(),
                 k.dark,
                 ink,
                 sizes,
@@ -300,16 +296,10 @@ fn markdown(source: &str, images: Rc<HashMap<String, (Image, f32)>>, look: Look)
     }
     let width = look.width;
     let densities = images.clone();
-    let markdown = Markdown::new(source)
+    Markdown::new(source)
         .style(style)
         .streaming(look.streaming)
-        .selectable(true);
-    let markdown = if look.reveal > 0.0 {
-        markdown.reveal(look.reveal)
-    } else {
-        markdown
-    };
-    markdown
+        .selectable(true)
         .images(move |src| images.get(src).map(|(image, _)| image.clone()))
         .image_frame(move |picture, frame| {
             let density = densities.get(frame.src).map_or(1.0, |(_, d)| *d);

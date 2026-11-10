@@ -18,8 +18,9 @@
 //!
 //! Motion follows `crate::motion`: tool calls arrive constantly in a live turn, so a row
 //! that arrives complete fades in quickly while its height glides open on a short spring of
-//! its own — no clipped unroll, no speed-capped climb in stages as its output lands. Only
-//! streaming text keeps the stack's paced growth.
+//! its own — no clipped unroll, no speed-capped climb in stages as its output lands.
+//! Streaming text doesn't move at all: each block lands, at its full height, in the frame it
+//! arrives.
 
 mod anchor;
 mod body;
@@ -259,7 +260,6 @@ impl Ctx<'_> {
             width: self.width,
             streaming,
             math: self.math,
-            reveal: 0.0,
         }
     }
 }
@@ -419,7 +419,7 @@ fn build_row(s: &J3, key: &ThreadKey, visible: &[usize], i: usize, dark: bool, s
         above: on_rail && previous.is_some_and(is_activity),
         below: on_rail && next.is_some_and(is_activity),
     };
-    // Text that streams in keeps the stack's paced growth; everything else arrives whole.
+    // Text that streams in lands at once; everything else arrives whole on a short glide.
     let running = item.status == ItemStatus::Running;
     let streams = match &item.kind {
         ItemKind::Text(_) => true,
@@ -455,7 +455,7 @@ fn build_row(s: &J3, key: &ThreadKey, visible: &[usize], i: usize, dark: bool, s
             .pt(if on_rail { 0.0 } else { top })
             .child(inner);
         let row = if streams {
-            row
+            row.instant_changes()
         } else {
             row.fold_glide(motion::QUICK).transition(motion::arrive())
         };
@@ -493,12 +493,7 @@ fn build_row(s: &J3, key: &ThreadKey, visible: &[usize], i: usize, dark: bool, s
     // Markdown resolves its images first: their states version the row.
     match &item.kind {
         ItemKind::Text(message) => {
-            // Each block's words fade in as it first draws, the last one too when the stream
-            // ends and it is shown whole.
-            let look = Look {
-                reveal: motion::WORD_FADE,
-                ..cx.look(k.c.text_base, running)
-            };
+            let look = cx.look(k.c.text_base, running);
             let text = shown.unwrap_or(&message.text);
             let doc = doc(s, &key.env, cx.project_id(), text, look);
             cx.wait_all(&doc.wait);

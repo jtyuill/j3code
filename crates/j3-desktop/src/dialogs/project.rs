@@ -159,6 +159,7 @@ impl J3 {
         picker.env = env;
         picker.error = None;
         picker.siblings = None;
+        picker.listing = Listing::Loading;
         picker.path.replace_text("~/".to_owned());
         picker.path.set_caret(picker.path.text.len());
         picker.path.focused = true;
@@ -210,7 +211,9 @@ impl J3 {
     }
 
     /// Lists the folders matching the path on the chosen device, and the folders beside the
-    /// segment being typed when that is a directory not listed yet.
+    /// segment being typed when that is a directory not listed yet. Folders already listed
+    /// stay until the reply replaces them, and replies land at once: the list refilters with
+    /// every key typed, so it never blinks through a spinner or fades.
     fn browse_folders(&mut self) {
         let Some(env) = self.picker().map(|picker| picker.env.clone()) else {
             return;
@@ -225,7 +228,9 @@ impl J3 {
             picker.listing = Listing::Failed("That device isn’t configured any more.".into());
             return;
         };
-        picker.listing = Listing::Loading;
+        if !matches!(picker.listing, Listing::Loaded { .. }) {
+            picker.listing = Listing::Loading;
+        }
         let partial = picker.path.text.clone();
         let id = picker.id;
         let dir = dir_part(&partial).to_owned();
@@ -244,7 +249,8 @@ impl J3 {
                             partial_path: dir.clone(),
                         })
                         .await;
-                    move |s: &mut J3, _: &mut Tx| {
+                    move |s: &mut J3, tx: &mut Tx| {
+                        tx.instant();
                         if let Ok(result) = result {
                             s.set_siblings(id, &dir, result.entries);
                         }
@@ -258,7 +264,8 @@ impl J3 {
                     partial_path: partial.clone(),
                 })
                 .await;
-            move |s: &mut J3, _: &mut Tx| {
+            move |s: &mut J3, tx: &mut Tx| {
+                tx.instant();
                 if let Ok(result) = &result
                     && partial.ends_with('/')
                 {
