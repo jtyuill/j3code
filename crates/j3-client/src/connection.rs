@@ -328,7 +328,8 @@ impl Connection {
     // -----------------------------------------------------------------------
 
     /// Uploads a file (`POST /api/v1/attachments`) for `turns.send`,
-    /// `threads.create` and `queue.edit`.
+    /// `threads.create` and `queue.edit`. A closed or [offline](Self::offline)
+    /// connection fails at once, as its calls do, without reaching the server.
     pub async fn upload(
         &self,
         name: &str,
@@ -337,6 +338,9 @@ impl Connection {
     ) -> Result<Attachment, Error> {
         let shared = Arc::clone(&self.inner.shared);
         let (name, mime_type) = (name.to_owned(), mime_type.to_owned());
+        if matches!(*shared.session.borrow(), supervisor::SessionSlot::Closed) {
+            return Err(Error::Disconnected);
+        }
         self.spawn(async move {
             let mut url = shared.url("/api/v1/attachments")?;
             url.query_pairs_mut().append_pair("name", &name);
