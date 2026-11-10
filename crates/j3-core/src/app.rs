@@ -5,7 +5,10 @@
 use std::{
     collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, PoisonError},
+    sync::{
+        Arc, Mutex, PoisonError,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -18,14 +21,15 @@ use j3_protocol::v2::{
     entities::{Attachment, ModelRef, Project},
     envelope::{Error, ErrorCode},
     methods::{
-        BrowseResult, Catalog, CreateProjectParams, CreateThreadParams, DeleteProjectParams,
-        EntriesResult, GitAction, GitRunItem, GitStatus, ImageUrlResult, PullResult,
-        ReadFileResult, SearchEntriesParams, TranscriptResult, UpdateProjectParams, Usage,
+        BrowseResult, BtwAskParams, Catalog, CreateProjectParams, CreateThreadParams,
+        DeleteProjectParams, EntriesResult, GitAction, GitRunItem, GitStatus, ImageUrlResult,
+        PullResult, ReadFileResult, SearchEntriesParams, TranscriptResult, UpdateProjectParams,
+        Usage,
     },
     streams::ThreadSnapshot,
 };
 use serde_json::{Value, json};
-use tokio::sync::{broadcast::error::RecvError, oneshot};
+use tokio::sync::{broadcast::error::RecvError, mpsc, oneshot};
 
 use crate::{
     attachments::{self, AttachmentKind, AttachmentStore},
@@ -92,6 +96,8 @@ pub(crate) struct Inner {
     omp: OmpLauncher,
     actor_config: ActorConfig,
     actors: Mutex<HashMap<String, ThreadHandle>>,
+    /// Numbers `btw.ask` calls.
+    next_btw: AtomicU64,
     info: Value,
     home: String,
     /// Every thread's terminals.
@@ -165,7 +171,7 @@ fn info(server_id: &str, label: &str, home: &str) -> Value {
         "name": name,
         "protocol": PROTOCOL,
         "version": env!("CARGO_PKG_VERSION"),
-        "capabilities": ["terminal", "git", "files", "usage", "goals"],
+        "capabilities": ["terminal", "git", "files", "usage", "goals", "btw"],
         "platform": std::env::consts::OS,
         "home": home,
     })
@@ -238,6 +244,7 @@ impl App {
             omp: config.omp,
             actor_config,
             actors: Mutex::new(HashMap::new()),
+            next_btw: AtomicU64::new(0),
             info,
             home,
             terminals: Terminals::new(),
@@ -734,6 +741,55 @@ impl Inner {
             })
         })
         .await
+    }
+
+    /// `btw.ask`: the topic as it starts, the answer's text as it grows,
+    /// then the finished topic. Dropping the stream cancels the question.
+    pub(crate) fn btw_ask(
+        &self,
+        params: BtwAskParams,
+    ) -> Result<BoxStream<'static, StreamEvent>, Error> {
+        /// Cancels the ask when its stream goes.
+        struct Cancel {
+            actor: ThreadHandle,
+            ask_id: u64,
+        }
+        impl Drop for Cancel {
+            fn drop(&mut self) {
+                let _ = self.actor.send(Request::BtwCancel {
+                    ask_id: self.ask_id,
+                });
+            }
+        }
+        let ask_id = self.next_btw.fetch_add(1, Ordering::Relaxed);
+        for _ in 0..2 {
+            let actor = self
+                .actor(&params.thread_id)
+                .map_err(|error| error.into_error(&params.thread_id))?;
+            let (items, answers) = mpsc::unbounded_channel();
+            let request = Request::Btw {
+                ask_id,
+                question: params.question.clone(),
+                record_id: params.record_id.clone(),
+                items,
+            };
+            if actor.send(request).is_err() {
+                self.forget(&params.thread_id);
+                continue;
+            }
+            let cancel = Cancel { actor, ask_id };
+            return Ok(
+                stream::unfold((answers, cancel), |(mut answers, cancel)| async move {
+                    let event = match answers.recv().await? {
+                        Ok(item) => StreamEvent::Item(encode(&item)),
+                        Err(error) => StreamEvent::Fail(error),
+                    };
+                    Some((event, (answers, cancel)))
+                })
+                .boxed(),
+            );
+        }
+        Err(Error::not_found("thread", &params.thread_id))
     }
 
     // -----------------------------------------------------------------------

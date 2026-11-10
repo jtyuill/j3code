@@ -9,7 +9,7 @@
 
 use rune::{Cursor, Cx, Drag, El, Phase, ScrollSpec, Tx, col, el, row};
 
-use super::{cards, goal, question};
+use super::{btw, cards, goal, question};
 use crate::{
     app::{J3, Ui},
     composer::ComposerKey,
@@ -98,6 +98,7 @@ fn chat(s: &J3, cx: &mut Cx<J3>, ui: &mut Ui, key: &ThreadKey) -> El {
                 .map(|card| question::card(ui, key, card)),
             goal::current(state.thread.as_ref().and_then(|t| t.goal.as_ref()))
                 .map(|goal| goal::chip(ui, key, goal)),
+            chrome.btw.as_ref().map(|card| btw::view(s, ui, key, card)),
         ]
         .into_iter()
         .flatten()

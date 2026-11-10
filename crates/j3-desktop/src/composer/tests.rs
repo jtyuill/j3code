@@ -253,15 +253,15 @@ fn pasted_images_upload_at_once_and_block_sending_until_removed() {
         .paste_content(ClipboardContent::new("").with_image(image));
     app.frame();
     assert_eq!(
-        label(&app, "composer-image-0").as_deref(),
+        label(&app, "composer-attachment-0").as_deref(),
         Some("pasted-1.png")
     );
     // Offline, the upload fails; the draft can't go until the image is removed.
     for _ in 0..500 {
         app.frame();
         if !matches!(
-            app.rt.state.composers[&key].images[0].upload,
-            super::images::Upload::Uploading
+            app.rt.state.composers[&key].attachments[0].upload,
+            super::attachments::Upload::Uploading
         ) {
             break;
         }
@@ -271,13 +271,13 @@ fn pasted_images_upload_at_once_and_block_sending_until_removed() {
     press(&mut app, Key::Enter, Mods::default());
     assert_eq!(
         app.rt.state.composers[&key].error.as_deref(),
-        Some("Remove the images that failed to upload.")
+        Some("Remove the attachments that failed to upload.")
     );
-    let (x, y) = app.rt.find("remove-image-0").expect("a remove button");
+    let (x, y) = app.rt.find("remove-attachment-0").expect("a remove button");
     app.rt.pointer_down(x, y);
     app.rt.pointer_up(x, y);
     app.frame();
-    assert!(app.rt.state.composers[&key].images.is_empty());
+    assert!(app.rt.state.composers[&key].attachments.is_empty());
 
     let key2 = key.clone();
     app.rt
@@ -287,7 +287,7 @@ fn pasted_images_upload_at_once_and_block_sending_until_removed() {
         Some("Paste a PNG, JPEG, WebP or GIF image.")
     );
     let mut big = PNG.to_vec();
-    big.resize(super::images::MAX_IMAGE_BYTES + 1, 0);
+    big.resize(super::attachments::MAX_IMAGE_BYTES + 1, 0);
     let key2 = key.clone();
     app.rt
         .update(move |s, _| s.add_composer_image(&key2, big, None));
@@ -295,6 +295,31 @@ fn pasted_images_upload_at_once_and_block_sending_until_removed() {
         app.rt.state.composers[&key].error.as_deref(),
         Some("Images must be 10 MB or smaller.")
     );
+}
+
+#[test]
+fn any_file_is_an_attachment_up_to_the_servers_limit() {
+    let (mut app, key) = focused(Scene::NewThread);
+    let key2 = key.clone();
+    app.rt.update(move |s, _| {
+        s.add_composer_file(&key2, b"%PDF-1.7".to_vec(), "paper.pdf".to_owned())
+    });
+    app.frame();
+    assert_eq!(
+        label(&app, "composer-attachment-0").as_deref(),
+        Some("paper.pdf")
+    );
+    assert!(app.rt.state.composers[&key].error.is_none());
+
+    let big = vec![0; super::attachments::MAX_FILE_BYTES as usize + 1];
+    let key2 = key.clone();
+    app.rt
+        .update(move |s, _| s.add_composer_file(&key2, big, "big.bin".to_owned()));
+    assert_eq!(
+        app.rt.state.composers[&key].error.as_deref(),
+        Some("Files must be 50 MB or smaller.")
+    );
+    assert_eq!(app.rt.state.composers[&key].attachments.len(), 1);
 }
 
 #[test]

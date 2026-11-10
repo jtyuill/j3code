@@ -22,8 +22,8 @@ pub use j3_client::{
     },
     envelope::ErrorCode,
     methods::{
-        BrowseEntry, BrowseResult, CatalogCommand, CatalogModel, CatalogSkill, CatalogStatus,
-        EntriesResult, Entry, EntryKind,
+        BrowseEntry, BrowseResult, BtwRecord, BtwStatus, BtwTurn, CatalogCommand, CatalogModel,
+        CatalogSkill, CatalogStatus, EntriesResult, Entry, EntryKind,
     },
 };
 
@@ -447,6 +447,31 @@ pub struct Entry {
 pub enum EntryKind {
     File,
     Dir,
+}
+
+/// A side-question topic (`/btw`): the question and its follow-ups, oldest
+/// first.
+#[uniffi::remote(Record)]
+pub struct BtwRecord {
+    pub id: String,
+    pub turns: Vec<BtwTurn>,
+}
+
+#[uniffi::remote(Record)]
+pub struct BtwTurn {
+    pub question: String,
+    /// Markdown; grows while `status` is `Running`.
+    pub answer: String,
+    pub status: BtwStatus,
+    pub error: Option<String>,
+}
+
+#[uniffi::remote(Enum)]
+pub enum BtwStatus {
+    Running,
+    Complete,
+    Cancelled,
+    Error,
 }
 
 // ---------------------------------------------------------------------------

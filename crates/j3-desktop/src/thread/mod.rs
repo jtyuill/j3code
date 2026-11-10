@@ -1,7 +1,7 @@
 //! One open thread (spec §5): its live state — a `ThreadWatch` subscription forwarded into
 //! the app by a watch task — and its view: the header (in the shell's toolbar band, see
 //! [`header`]), the feed (§5.1, §6), the cards above the composer (§5.2: [`cards`],
-//! [`question`], [`goal`]) and the layout with the terminal drawer and file pane ([`layout`],
+//! [`question`], [`goal`], [`btw`]) and the layout with the terminal drawer and file pane ([`layout`],
 //! §5.4). The agents hub (§5.3) is `crate::hub`.
 //!
 //! `J3::open_thread` subscribes, routes the main pane to the thread and marks it visited.
@@ -10,6 +10,7 @@
 //! [`RECENT_THREADS`] most recently open threads, so reopening one draws at once while the
 //! new subscription catches up. An archived or deleted thread is forgotten.
 
+pub mod btw;
 pub mod cards;
 pub mod feed;
 pub mod goal;
@@ -85,6 +86,8 @@ pub struct ChromeUi {
     pub question: Option<question::QuestionCard>,
     /// The "Set goal" dialog, while open.
     pub goal_dialog: Option<goal::GoalDialog>,
+    /// The side question (`/btw`) and its answer.
+    pub btw: Option<btw::BtwCard>,
     /// The state the cards were last brought in line with.
     synced: Option<Arc<ThreadView>>,
 }
@@ -97,6 +100,7 @@ impl Default for ChromeUi {
             queue_edit: None,
             question: None,
             goal_dialog: None,
+            btw: None,
             synced: None,
         }
     }

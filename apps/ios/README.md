@@ -67,7 +67,8 @@ cargo test -p j3-mobile
 
 # Smoke test: builds everything, starts j3-test-server (a j3 server whose omp
 # is a script), boots a simulator and runs the UI test that connects through
-# the deep link, opens the thread, sends a prompt and answers omp's question.
+# the deep link, opens the thread, sends a prompt, answers omp's question and
+# asks a side question.
 contrib/ios/smoke.sh                  # J3_SIM=<simulator name>, J3_PORT=<port>
 ```
 
@@ -79,7 +80,8 @@ xcrun simctl openurl booted 'j3code://connections/new?host=127.0.0.1:3799&autoCo
 ```
 
 Its omp answers `Echo: <prompt>`; a prompt containing "ask" first opens a
-`select` request ("Pick a color").
+`select` request ("Pick a color"), and a `/btw` side question is answered
+`Aside: <question>`.
 
 A read-only tour of a real server, writing screenshots on the Mac:
 

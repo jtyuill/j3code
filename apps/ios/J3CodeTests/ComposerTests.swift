@@ -234,6 +234,52 @@ final class ComposerTests: XCTestCase {
         XCTAssertEqual(message?.attachments.count, 1)
     }
 
+    func testPickedFileUploadsUnderItsName() async throws {
+        let context = FakeContext()
+        let model = ComposerModel(context: context, model: nil)
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("notes \(UUID().uuidString).md")
+        try Data("remember the milk".utf8).write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        model.addFile(url)
+        XCTAssertEqual(model.uploads.map(\.name), [url.lastPathComponent])
+        XCTAssertNil(model.uploads[0].thumbnail)
+        try await waitUntil { !model.isUploading }
+
+        // A file alone is a message; omp reads it as an `@` mention.
+        let attachment = try XCTUnwrap(model.take()?.attachments.first)
+        XCTAssertEqual(attachment.name, url.lastPathComponent)
+        XCTAssertEqual(attachment.size, 17)
+        XCTAssertFalse(attachment.mimeType.hasPrefix("image/"))
+    }
+
+    func testMissingFileFailsItsUpload() async throws {
+        let model = ComposerModel(context: FakeContext(), model: nil)
+        model.addFile(FileManager.default.temporaryDirectory.appendingPathComponent("gone-\(UUID().uuidString).txt"))
+        try await waitUntil { !model.isUploading }
+        guard case .failed = model.uploads[0].state else { return XCTFail("the upload should fail") }
+        XCTAssertFalse(model.canSend)
+    }
+
+    // MARK: Side questions
+
+    func testOnlyABtwDraftIsASideQuestion() {
+        XCTAssertEqual(SideQuestion.question(in: "/btw why is it slow?"), "why is it slow?")
+        XCTAssertEqual(SideQuestion.question(in: "/btw\n two\nlines "), "two\nlines")
+        XCTAssertEqual(SideQuestion.question(in: "/btw"), "")
+        XCTAssertNil(SideQuestion.question(in: "/btwx why"))
+        XCTAssertNil(SideQuestion.question(in: "so /btw why"))
+        XCTAssertNil(SideQuestion.question(in: "/compact"))
+
+        // The command's chip counts as its token.
+        let model = ComposerModel(context: FakeContext(), model: nil)
+        model.parts = [.chip(Chip(kind: .command, token: "/btw", label: "btw")), .text(" why?")]
+        XCTAssertEqual(model.sideQuestion, "why?")
+        model.clear()
+        XCTAssertNil(model.sideQuestion)
+        XCTAssertTrue(model.parts.isEmpty)
+    }
+
     // MARK: Helpers
 
     private func waitUntil(timeout: TimeInterval = 5, _ condition: () -> Bool) async throws {

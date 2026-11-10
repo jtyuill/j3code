@@ -221,6 +221,29 @@ impl AgentSession for FakeSession {
         })
     }
 
+    fn btw(
+        &self,
+        question: String,
+        _: Option<String>,
+    ) -> BoxFuture<'_, j3_core::engine::session::Result<omp_rpc::BtwHistoryRecord>> {
+        self.0.record(format!("btw:{question}"));
+        Box::pin(async move {
+            Ok(serde_json::from_value(
+                json!({"id": "btw-1", "leafId": null, "question": question, "answer": "",
+                    "status": "running", "createdAt": 1, "updatedAt": 1}),
+            )
+            .unwrap())
+        })
+    }
+
+    fn btw_cancel(
+        &self,
+        record_id: String,
+    ) -> BoxFuture<'_, j3_core::engine::session::Result<bool>> {
+        self.0.record(format!("btw_cancel:{record_id}"));
+        Box::pin(async { Ok(true) })
+    }
+
     fn respond_ui(&self, response: ExtensionUiResponse) -> j3_core::engine::session::Result<()> {
         self.0.ui_responses.lock().unwrap().push(response);
         Ok(())

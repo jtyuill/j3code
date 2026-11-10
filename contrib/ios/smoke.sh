@@ -3,7 +3,8 @@
 # starts a j3 server with a scripted omp (crates/j3-mobile, bin
 # j3-test-server), boots a simulator, and runs the UI test that installs and
 # launches the app, connects through the j3code:// deep link, opens the
-# server's thread, sends a prompt and answers omp's question.
+# server's thread, sends a prompt, answers omp's question and asks a side
+# question.
 #
 #   contrib/ios/smoke.sh
 #

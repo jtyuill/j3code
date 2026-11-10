@@ -1,4 +1,4 @@
-//! The composer's layout (spec §7): the completion menu above, the image strip, the field
+//! The composer's layout (spec §7): the completion menu above, the attachment strip, the field
 //! with its ghost text, the error and catalog notes, then the model picker, the usage gauge,
 //! the microphone and the send button.
 
@@ -10,7 +10,7 @@ use rune::{
 };
 use rune_kit::{Kit, Spinner};
 
-use super::{ComposerKey, draft, images, menu, mic, picker, usage};
+use super::{ComposerKey, attachments, draft, menu, mic, picker, usage};
 use crate::{
     actions::{Action, shortcut_label},
     app::{J3, Ui},
@@ -66,7 +66,7 @@ pub fn view(s: &J3, cx: &mut Cx<J3>, ui: &mut Ui, key: &ComposerKey) -> El {
         .fill(k.c.bg_base)
         .border(1.0, k.c.border_base)
         .radius(k.radius.lg);
-    if let Some(strip) = images::view(s, ui, key) {
+    if let Some(strip) = attachments::view(s, ui, key) {
         root = root.child(strip);
     }
     root = root.child(field(s, cx, ui, key, edit));

@@ -84,6 +84,16 @@ fn models(models: &[ModelInfo], default: Option<&str>) -> Vec<CatalogModel> {
         .collect()
 }
 
+/// `/btw`: omp offers it in its own interface only, and j3 clients answer it
+/// through `btw.ask` (wire.md §5.13).
+fn btw_command() -> CatalogCommand {
+    CatalogCommand {
+        name: "btw".to_owned(),
+        description: "Ask a side question without interrupting the thread".to_owned(),
+        hint: Some("<question>".to_owned()),
+    }
+}
+
 /// Splits omp's slash-command catalog into slash commands and skills
 /// (source `skill`, `skill:` prefix stripped).
 fn split_commands(commands: &[AvailableSlashCommand]) -> (Vec<CatalogCommand>, Vec<CatalogSkill>) {
@@ -174,10 +184,13 @@ impl Catalog {
     /// As currently known (`warning` while models load).
     pub fn current(&self) -> CatalogData {
         let default_cwd = self.default_cwd.to_string_lossy();
-        let (commands, skills) = self
+        let (mut commands, skills) = self
             .cached_commands(&default_cwd)
             .map(|commands| split_commands(&commands))
             .unwrap_or_default();
+        if !commands.iter().any(|command| command.name == "btw") {
+            commands.push(btw_command());
+        }
         let (status, message, models) = match self.cached_models() {
             None => (
                 CatalogStatus::Warning,

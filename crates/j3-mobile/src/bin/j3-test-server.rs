@@ -5,7 +5,8 @@
 //! few files (for `@path` completion) and one thread, `Hello`. The scripted
 //! omp answers every prompt with `Echo: <prompt>`; a prompt containing
 //! "ask" first opens a `select` request ("Pick a color") and answers with
-//! the choice once it is made.
+//! the choice once it is made. A side question (`/btw`) is answered with
+//! `Aside: <question>`.
 //!
 //! ```sh
 //! cargo run -p j3-mobile --features test-server --bin j3-test-server -- --port 3799
@@ -87,6 +88,16 @@ impl Script {
         ));
     }
 
+    /// Answers side question `question` (topic `btw-1`), word by word.
+    async fn answer_aside(self: Arc<Self>, question: String) {
+        let answer = format!("Aside: {question}");
+        for word in answer.split_inclusive(' ') {
+            tokio::time::sleep(STEP / 4).await;
+            self.emit(json!({"type": "btw_delta", "recordId": "btw-1", "delta": word}));
+        }
+        self.emit(json!({"type": "btw_record", "record": aside(&question, &answer, "complete")}));
+    }
+
     async fn run(self: Arc<Self>, prompt: String) {
         tokio::time::sleep(STEP).await;
         self.emit(json!({"type": "agent_start"}));
@@ -114,6 +125,12 @@ impl Script {
         tokio::time::sleep(STEP).await;
         self.settle("completed");
     }
+}
+
+/// omp's record of the side question `question` (topic `btw-1`).
+fn aside(question: &str, answer: &str, status: &str) -> Value {
+    json!({"id": "btw-1", "leafId": null, "question": question, "answer": answer,
+        "status": status, "createdAt": 1, "updatedAt": 1})
 }
 
 struct ScriptedSession {
@@ -198,6 +215,20 @@ impl AgentSession for ScriptedSession {
                 .expect("empty subagent messages"),
             )
         })
+    }
+
+    fn btw(
+        &self,
+        question: String,
+        _: Option<String>,
+    ) -> BoxFuture<'_, Result<omp_rpc::BtwHistoryRecord>> {
+        let record = aside(&question, "", "running");
+        tokio::spawn(Arc::clone(&self.script).answer_aside(question));
+        Box::pin(async move { Ok(serde_json::from_value(record).expect("a btw record")) })
+    }
+
+    fn btw_cancel(&self, _: String) -> BoxFuture<'_, Result<bool>> {
+        Box::pin(async { Ok(false) })
     }
 
     fn respond_ui(&self, response: ExtensionUiResponse) -> Result<()> {

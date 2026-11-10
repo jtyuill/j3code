@@ -1,12 +1,16 @@
 //! The composer against the real server: launching a new thread, `^model` chips, `@path`
-//! completion, magic keywords, omp's word prediction and dictation.
+//! completion, file attachments, `/btw` side questions, magic keywords, omp's word prediction
+//! and dictation.
 
 use std::time::Duration;
 
-use rune::Key;
+use rune::{ClipboardContent, Key};
 use serde_json::json;
 
-use super::{harness::Harness, omp::MODEL};
+use super::{
+    harness::Harness,
+    omp::{MODEL, btw_record},
+};
 use crate::composer::keyword_tokens;
 
 impl Harness {
@@ -274,4 +278,95 @@ fn a_bang_draft_shows_no_model_menu_and_no_model_chip() {
     assert_eq!(app.draft(), text);
     assert!(!app.exists(&format!("completion-option-{MODEL}")));
     assert!(app.chips().is_empty());
+}
+
+#[test]
+fn a_pasted_file_is_uploaded_and_reaches_omp_as_a_mention() {
+    let mut app = Harness::start("file-attachment");
+    app.focused_new_thread_composer();
+    let file = app.data_dir.join("notes.txt");
+    std::fs::write(&file, "remember the milk").unwrap();
+
+    // Copied in the file manager, pasted into the field.
+    app.rt_mut()
+        .paste_content(ClipboardContent::new("").with_files([file]));
+    app.until("the file is a chip", |h| {
+        h.label_of("composer-attachment-0").as_deref() == Some("notes.txt")
+    });
+    app.typed("Read this");
+    let key = app.composer_key();
+    app.until("the upload is done", |h| {
+        matches!(
+            h.state().composers[&key].attachments[0].upload,
+            crate::composer::Upload::Done(_)
+        )
+    });
+    app.press(Key::Enter);
+
+    // omp gets no image: the server names the uploaded file after the text, and omp reads it.
+    app.until("omp is prompted", |h| h.script.count("prompt:") == 1);
+    let calls = app.script.calls();
+    let prompt = calls.iter().find(|c| c.starts_with("prompt:")).unwrap();
+    let path = prompt
+        .strip_prefix("prompt:Read this\n\n@\"")
+        .and_then(|rest| rest.strip_suffix("/notes.txt\":0"))
+        .unwrap_or_else(|| panic!("no mention in {prompt:?}"));
+    assert_eq!(
+        std::fs::read_to_string(format!("{path}/notes.txt")).unwrap(),
+        "remember the milk"
+    );
+    // The message in the feed is the text as typed.
+    app.until("the thread opens", |h| h.feed_row("Read this").is_some());
+}
+
+#[test]
+fn a_btw_draft_asks_a_side_question_beside_the_run() {
+    let mut app = Harness::start("btw");
+    let project_id = app.project();
+    app.until_models();
+    app.open_running_thread(&project_id, "Work");
+    app.click_composer();
+
+    // The server lists `/btw` among omp's commands.
+    app.typed("/bt");
+    app.until("the menu offers /btw", |h| {
+        h.exists("completion-option-/btw")
+    });
+    app.press(Key::Enter);
+    assert_eq!(app.draft(), "/btw ");
+    // Without a question nothing is asked.
+    app.press(Key::Enter);
+    assert_eq!(app.draft(), "/btw ");
+    app.typed("why?");
+    app.press(Key::Enter);
+    app.until_called("btw:why?:");
+    assert_eq!(app.draft(), "");
+    app.until("the card shows the question", |h| {
+        h.label_of("btw-question-0").as_deref() == Some("why?") && h.exists("btw-running")
+    });
+
+    // The answer streams into the card.
+    app.script
+        .emit(json!({"type": "btw_delta", "recordId": "btw-1", "delta": "Because."}));
+    app.until("the answer shows", |h| {
+        h.label_of("btw-answer-0").as_deref() == Some("Because.")
+    });
+    app.script
+        .emit(json!({"type": "btw_record", "record": btw_record("why?", "Because.", "complete")}));
+    app.until("the answer is complete", |h| !h.exists("btw-running"));
+
+    // Another `/btw` follows up in the topic; Escape closes the card and cancels it.
+    app.typed("/btw and then?");
+    app.press(Key::Enter);
+    app.until_called("btw:and then?:btw-1");
+    app.until("the follow-up shows", |h| {
+        h.has_label("and then?") && h.exists("btw-running")
+    });
+    app.press(Key::Escape);
+    app.until_called("btw_cancel:btw-1");
+    assert!(!app.exists("btw-header"));
+
+    // The thread never heard of it: the run goes on and nothing was queued.
+    assert_eq!(app.script.count("prompt:"), 1);
+    assert!(app.stoppable());
 }

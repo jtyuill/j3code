@@ -17,7 +17,7 @@ mod rpc;
 mod state;
 mod supervisor;
 
-pub use connection::{Connection, GitRun, TerminalSession, ThreadWatch};
+pub use connection::{BtwRun, Connection, GitRun, TerminalSession, ThreadWatch, apply_btw};
 pub use error::Error;
 /// The wire types (`j3_protocol::v2`).
 pub use j3_protocol::v2::{PROTOCOL, entities, envelope, methods, streams};

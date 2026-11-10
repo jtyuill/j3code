@@ -35,7 +35,7 @@ There is no authentication. Servers listen on loopback and the host's Tailscale 
   "name": "shieldy",
   "protocol": 2,
   "version": "0.1.0",
-  "capabilities": ["terminal", "git", "files", "usage", "goals"],
+  "capabilities": ["terminal", "git", "files", "usage", "goals", "btw"],
   "platform": "linux",
   "home": "/home/jacob"
 }
@@ -208,7 +208,7 @@ One row of the conversation feed.
 
 | `kind` | Fields |
 |---|---|
-| `user` | `text`, `attachments: Attachment[]`, `delivery: "prompt" \| "steer"` |
+| `user` | `text` (as the user wrote it; §8 says how attachments reach omp), `attachments: Attachment[]`, `delivery: "prompt" \| "steer"` |
 | `text` | `text` (assistant answer, Markdown) |
 | `thinking` | `text` |
 | `tool` | `callId`, `name`, `intent?` (omp's one-line `i`), `input` (object), `output?: ToolOutput`, `detail?: ToolDetail` |
@@ -299,6 +299,8 @@ Every method lists its params, its result (unary) or items (stream), and the err
   "message": null
 }
 ```
+
+`commands` always has `btw` (§5.13) on a server with the `btw` capability: omp lists it in its own interface only, and a client answers a `/btw` draft through `btw.ask` instead of sending it.
 
 `thinking` is absent for models without reasoning. `status` is `ready`, `warning` (omp answered with problems, `message` says which) or `error` (omp could not be queried).
 
@@ -472,6 +474,23 @@ Terminal streams use a window of 64 frames instead of 8 (§3.2), so output keeps
 
 Uploads are plain HTTP (§8).
 
+### 5.13 btw
+
+Capability `btw`. A side question (omp's `/btw`): omp answers it from the thread's conversation, beside whatever the thread is doing, with no tools. The question and its answer are not turns or items and no client streams them but the caller. omp keeps them in the session's side-question history.
+
+| Method | Params | Items | Errors |
+|---|---|---|---|
+| `btw.ask` | `threadId`, `question`, `recordId?` (follow up in that topic) | stream of items tagged by `type` (below); it ends after the `record` whose last turn is no longer `running` | `not_found`, `rejected` (blank question, or omp refused: unknown topic, no model), `unavailable` (omp could not start, or stopped before it answered), `conflict` (another `btw.ask` on the thread replaced this one) |
+
+| `type` | Fields | Notes |
+|---|---|---|
+| `record` | `record: BtwRecord` | The whole topic: first, and on every status change. |
+| `delta` | `recordId`, `append` | Text appended to the answer of the topic's last turn. |
+
+`BtwRecord`: `{id, turns: BtwTurn[]}`, the question and its follow-ups, oldest first. `BtwTurn`: `{question, answer, status: "running" \| "complete" \| "cancelled" \| "error", error?}`; `answer` is Markdown.
+
+omp answers one side question per thread at a time: a second `btw.ask` cancels the first, whose stream ends with `conflict`. Cancelling the call (`cancel`, or closing the socket) cancels the question. `btw.ask` starts the thread's omp if it is not running.
+
 ## 6. Streams and sequence
 
 ### 6.1 Sequence
@@ -527,6 +546,7 @@ How the server derives the entities from omp's RPC events and session file. The 
 | omp | v2 |
 |---|---|
 | `prompt` accepted (user message) | `Turn` `running` + `user` item; a steer is a `user` item with `delivery: "steer"` in the active turn |
+| `btw_record`, `btw_delta` | `btw.ask` items (§5.13); never thread state |
 | `agent_start` … `session_settled` | the turn's lifetime; `session_settled` ends it, not `agent_end` (background jobs can wake the agent after it yields) |
 | assistant `thinking` / `text` blocks | `thinking` / `text` items, streamed with `item.delta` |
 | tool call (except `ask`, `todo`) | `tool` item; `detail` per §4.4 |
@@ -546,6 +566,8 @@ How the server derives the entities from omp's RPC events and session file. The 
 **Upload.** `POST /api/v1/attachments` with the file bytes as the body, `Content-Type` set to its MIME type and `Content-Length` set, and query `name=<file name>`. Images (`image/gif`, `image/jpeg`, `image/png`, `image/webp`) may be up to 10 MiB, other files up to 50 MiB. The answer is `201` with the `Attachment`; `413` with an error object for too much data, `400` for a missing name or length.
 
 **Download.** `GET /api/v1/attachments/<id>` serves the bytes with the stored MIME type, `ETag: "<id>"`, `Cache-Control: private, max-age=3600`, and single-range `Range` support. Images are served inline, other files as downloads with a sandboxing CSP.
+
+**How omp gets them.** An image of one of the four types above goes to omp inline with the message. Any other file goes as an omp file mention: the server appends one `@"<path>"` per file to the text it gives omp, on their own lines after the user's text, where `<path>` is a path on the server host that ends in the file's upload name. omp reads a mentioned file into the prompt itself (text as text, PDFs and office documents converted, images and videos as pictures; files it cannot read are named to the model, which can still open them with its tools), exactly as for an `@path` the user typed. The `user` item keeps the text as written. A steer names the files the same way, but omp reads mentions only on a prompt.
 
 Attachment ids are 128-bit random and act as the only capability needed to read the bytes; with no authentication on the tailnet, that is the boundary (PLAN.md "Auth").
 

@@ -1,8 +1,27 @@
 import Foundation
 import Observation
 
+/// A side question (`/btw`) and its answer: omp answers beside whatever the
+/// thread is doing, and the conversation keeps no trace of it.
+struct SideAnswer {
+    /// The question on its way, until the topic carries it.
+    var asked: String?
+    /// The question and its follow-ups with their answers.
+    var topic: BtwRecord?
+    /// Why the question could not be answered.
+    var error: String?
+    var isRunning = true
+
+    /// The topic a new question follows up on: the one shown, once its last
+    /// answer is complete.
+    var followUp: BtwRecord? {
+        guard error == nil, topic?.turns.last?.status == .complete else { return nil }
+        return topic
+    }
+}
+
 /// An open thread: its live snapshot, its composer, and the commands of the
-/// thread screen (send, stop, requests, queue).
+/// thread screen (send, stop, requests, queue, side questions).
 @MainActor @Observable
 final class ThreadModel {
     let connection: HostConnection
@@ -12,6 +31,11 @@ final class ThreadModel {
     var editingEntry: QueueEntry?
     /// A command is in flight (sending a prompt, answering a request).
     private(set) var isBusy = false
+    /// The side question's sheet, while it shows.
+    private(set) var sideAnswer: SideAnswer?
+    @ObservationIgnored private var sideSubscription: Subscription?
+    /// Counts asks, so a late update of an earlier one is dropped.
+    @ObservationIgnored private var sideGeneration = 0
     @ObservationIgnored private weak var app: AppModel?
     @ObservationIgnored private var subscription: Subscription?
     @ObservationIgnored private var watchedHost: Host?
@@ -88,10 +112,22 @@ final class ThreadModel {
     }
 
     /// Sends the composer's message: starts a turn when idle; while a turn
-    /// runs, `delivery` decides (queue by default, or steer).
+    /// runs, `delivery` decides (queue by default, or steer). A `/btw` draft
+    /// is asked as a side question instead.
     func send(_ delivery: SendDelivery = .auto) {
         if let entry = editingEntry {
             saveEdit(of: entry)
+            return
+        }
+        if connection.answersSideQuestions, let question = composer.sideQuestion {
+            if question.isEmpty {
+                app?.alert = "Type a question after /btw."
+            } else if !composer.uploads.isEmpty {
+                app?.alert = "A side question takes no attachments."
+            } else {
+                composer.clear()
+                askSideQuestion(question)
+            }
             return
         }
         guard let message = composer.take() else { return }
@@ -123,6 +159,42 @@ final class ThreadModel {
         perform { [host, threadId] in
             _ = try await host.dismissRequest(threadId: threadId, requestId: request.id)
         }
+    }
+
+    // MARK: Side questions
+
+    /// Asks omp `question` beside the thread, following up on the topic the
+    /// sheet shows.
+    func askSideQuestion(_ question: String) {
+        sideSubscription?.cancel()
+        sideGeneration += 1
+        let topic = sideAnswer?.followUp
+        sideAnswer = SideAnswer(asked: question, topic: topic)
+        sideSubscription = host.askBtw(
+            threadId: threadId, question: question, recordId: topic?.id,
+            listener: SideAnswerForwarder(owner: self, generation: sideGeneration)
+        )
+    }
+
+    /// Closes the sheet, cancelling a question still being answered.
+    func closeSideAnswer() {
+        sideSubscription?.cancel()
+        sideSubscription = nil
+        sideGeneration += 1
+        sideAnswer = nil
+    }
+
+    fileprivate func sideAnswerChanged(_ topic: BtwRecord, generation: Int) {
+        guard generation == sideGeneration, sideAnswer != nil else { return }
+        sideAnswer?.topic = topic
+        sideAnswer?.asked = nil
+    }
+
+    fileprivate func sideAnswerEnded(_ error: String?, generation: Int) {
+        guard generation == sideGeneration, sideAnswer != nil else { return }
+        sideAnswer?.error = error
+        sideAnswer?.isRunning = false
+        sideSubscription = nil
     }
 
     // MARK: Queue
@@ -214,5 +286,31 @@ extension ThreadModel: ComposerContext {
 
     func upload(name: String, mimeType: String, data: Data) async throws -> Attachment {
         try await host.uploadAttachment(name: name, mimeType: mimeType, bytes: data)
+    }
+}
+
+/// Hands a side question's updates to its thread on the main actor, in
+/// order. Listener calls arrive on a library runtime thread; this returns at
+/// once.
+private final class SideAnswerForwarder: BtwListener, @unchecked Sendable {
+    private weak var owner: ThreadModel?
+    private let generation: Int
+
+    @MainActor
+    init(owner: ThreadModel, generation: Int) {
+        self.owner = owner
+        self.generation = generation
+    }
+
+    func btwChanged(topic: BtwRecord) {
+        DispatchQueue.main.async { [self] in
+            MainActor.assumeIsolated { owner?.sideAnswerChanged(topic, generation: generation) }
+        }
+    }
+
+    func btwEnded(error: String?) {
+        DispatchQueue.main.async { [self] in
+            MainActor.assumeIsolated { owner?.sideAnswerEnded(error, generation: generation) }
+        }
     }
 }

@@ -11,7 +11,7 @@ use base64::Engine as _;
 use j3_protocol::v2::{
     entities::{Answer, Attachment, ThreadMode, TurnErrorKind},
     envelope::{Error, ErrorCode},
-    methods::Delivery,
+    methods::{BtwItem, BtwRecord, BtwStatus, BtwTurn, Delivery},
 };
 use serde_json::{Value, json};
 use tokio::{
@@ -30,8 +30,8 @@ use crate::{
     omp::{
         self,
         omp_rpc::{
-            self, AvailableSlashCommand, Event, GoalOp, ImageContent, LitImage, RpcNotification,
-            SlashCommandSource,
+            self, AvailableSlashCommand, BtwHistoryRecord, Event, GoalOp, ImageContent, LitImage,
+            RpcNotification, SlashCommandSource,
         },
     },
 };
@@ -111,6 +111,9 @@ pub enum Command {
 
 pub type CommandReply = oneshot::Sender<Result<Value, Error>>;
 
+/// Where a `btw.ask` stream's items go; closing it ends the stream.
+pub type BtwSink = mpsc::UnboundedSender<Result<BtwItem, Error>>;
+
 /// Messages to a thread actor.
 pub enum Request {
     /// Runs a command; the reply is its result (wire.md §5: `{sequence}`,
@@ -132,6 +135,17 @@ pub enum Request {
     /// omp named the thread. Applied only while the thread still has the
     /// title `from` it was launched with, so a rename in between wins.
     Retitle { from: String, title: String },
+    /// `btw.ask` (wire.md §5.13): asks omp a side question and sends the
+    /// answer to `items`. It replaces a side question still being answered.
+    Btw {
+        /// Names this ask in [`Request::BtwCancel`].
+        ask_id: u64,
+        question: String,
+        record_id: Option<String>,
+        items: BtwSink,
+    },
+    /// The stream of ask `ask_id` is gone: cancel it if it still runs.
+    BtwCancel { ask_id: u64 },
     /// Commits everything pending now.
     Flush { reply: oneshot::Sender<()> },
     /// The auto-settle sweep: settle when still due on live state
@@ -187,6 +201,7 @@ pub fn spawn(
         current_model: None,
         current_thinking: None,
         skills: Vec::new(),
+        btw: None,
         flush_at: None,
         idle_since: Instant::now(),
         expiries: HashMap::new(),
@@ -211,10 +226,63 @@ struct Actor {
     current_thinking: Option<omp_rpc::ThinkingLevel>,
     /// Skill names known to this thread's omp, for `$skill` rewriting.
     skills: Vec<String>,
+    /// The side question omp is answering.
+    btw: Option<BtwRun>,
     flush_at: Option<Instant>,
     idle_since: Instant,
     expiries: HashMap<String, Instant>,
     deleted: bool,
+}
+
+/// A side question being answered.
+struct BtwRun {
+    ask_id: u64,
+    record_id: String,
+    items: BtwSink,
+}
+
+/// omp's side-question topic as the wire's: its first turn, then the
+/// follow-ups.
+fn btw_record(record: &BtwHistoryRecord) -> BtwRecord {
+    fn turn(
+        question: &str,
+        answer: &str,
+        status: omp_rpc::BtwStatus,
+        error: Option<&String>,
+    ) -> BtwTurn {
+        BtwTurn {
+            question: question.to_owned(),
+            answer: answer.to_owned(),
+            status: match status {
+                omp_rpc::BtwStatus::Running => BtwStatus::Running,
+                omp_rpc::BtwStatus::Complete => BtwStatus::Complete,
+                // A turn whose omp died mid-answer.
+                omp_rpc::BtwStatus::Cancelled | omp_rpc::BtwStatus::Interrupted => {
+                    BtwStatus::Cancelled
+                }
+                omp_rpc::BtwStatus::Error => BtwStatus::Error,
+            },
+            error: error.cloned(),
+        }
+    }
+    let first = turn(
+        &record.question,
+        &record.answer,
+        record.status,
+        record.error.as_ref(),
+    );
+    let follow_ups = record.follow_ups.iter().flatten().map(|follow_up| {
+        turn(
+            &follow_up.question,
+            &follow_up.answer,
+            follow_up.status,
+            follow_up.error.as_ref(),
+        )
+    });
+    BtwRecord {
+        id: record.id.clone(),
+        turns: std::iter::once(first).chain(follow_ups).collect(),
+    }
 }
 
 async fn next_event(events: &mut Option<Events>) -> Option<Event> {
@@ -338,6 +406,7 @@ impl Actor {
             || self.model.next_startable().is_some()
             || !self.expiries.is_empty()
             || self.flush_at.is_some()
+            || self.btw.is_some()
             || (self.session.is_some() && self.model.goal_active());
         (!busy).then(|| self.idle_since + self.config.idle_timeout)
     }
@@ -444,6 +513,7 @@ impl Actor {
     }
 
     async fn close_session(&mut self) {
+        self.fail_btw();
         self.events = None;
         if let Some(session) = self.session.take() {
             session.close().await;
@@ -462,6 +532,7 @@ impl Actor {
     }
 
     fn on_process_exit(&mut self) {
+        self.fail_btw();
         self.events = None;
         if self.session.take().is_some() {
             tracing::warn!(thread = %self.model.thread_id(), "omp exited");
@@ -474,9 +545,25 @@ impl Actor {
     }
 
     async fn on_event(&mut self, event: Event) {
-        if let Event::Notification(RpcNotification::AvailableCommandsUpdate(update)) = &event {
-            let commands = update.commands.clone();
-            self.set_commands(&commands);
+        match &event {
+            Event::Notification(RpcNotification::AvailableCommandsUpdate(update)) => {
+                let commands = update.commands.clone();
+                self.set_commands(&commands);
+            }
+            Event::Notification(RpcNotification::BtwDelta(delta)) => {
+                if let Some(run) = self.btw.as_ref().filter(|r| r.record_id == delta.record_id) {
+                    let _ = run.items.send(Ok(BtwItem::Delta {
+                        record_id: delta.record_id.clone(),
+                        append: delta.delta.clone(),
+                    }));
+                }
+                return;
+            }
+            Event::Notification(RpcNotification::BtwRecord(update)) => {
+                self.on_btw_record(&update.record);
+                return;
+            }
+            _ => {}
         }
         let effects = self.model.apply(&event);
         self.run_effects(effects).await;
@@ -557,6 +644,95 @@ impl Actor {
         }
         self.expiries
             .retain(|request_id, _| self.model.is_open_request(request_id));
+    }
+
+    // -----------------------------------------------------------------------
+    // Side questions
+    // -----------------------------------------------------------------------
+
+    /// `btw.ask`: omp answers on its own, beside whatever the thread runs.
+    async fn ask_btw(
+        &mut self,
+        ask_id: u64,
+        question: &str,
+        record_id: Option<String>,
+        items: BtwSink,
+    ) {
+        let question = question.trim();
+        if question.is_empty() {
+            let _ = items.send(Err(Error::rejected("Type a question after /btw.")));
+            return;
+        }
+        if let Err(message) = self.ensure_session().await {
+            let _ = items.send(Err(Error::new(ErrorCode::Unavailable, message)));
+            return;
+        }
+        // omp answers one side question at a time: the new one wins.
+        if let Some(previous) = self.btw.take() {
+            self.cancel_btw(&previous.record_id).await;
+            let _ = previous.items.send(Err(Error::new(
+                ErrorCode::Conflict,
+                "Another side question replaced this one.",
+            )));
+        }
+        let Some(session) = &self.session else {
+            return;
+        };
+        match session.btw(question.to_owned(), record_id).await {
+            Ok(record) => {
+                let _ = items.send(Ok(BtwItem::Record {
+                    record: btw_record(&record),
+                }));
+                self.btw = Some(BtwRun {
+                    ask_id,
+                    record_id: record.id,
+                    items,
+                });
+            }
+            Err(error) => {
+                tracing::warn!(%error, "omp btw");
+                let _ = items.send(Err(omp_refusal(
+                    &error,
+                    "The side question could not be asked.",
+                )));
+            }
+        }
+    }
+
+    async fn cancel_btw(&self, record_id: &str) {
+        if let Some(session) = &self.session
+            && let Err(error) = session.btw_cancel(record_id.to_owned()).await
+        {
+            tracing::debug!(%error, "omp btw_cancel");
+        }
+    }
+
+    /// omp's `btw_record`: the topic on a status change. One that is no
+    /// longer running ends the stream.
+    fn on_btw_record(&mut self, record: &BtwHistoryRecord) {
+        let Some(run) = self.btw.as_ref().filter(|run| run.record_id == record.id) else {
+            return;
+        };
+        let record = btw_record(record);
+        let running = record
+            .turns
+            .last()
+            .is_some_and(|turn| turn.status == BtwStatus::Running);
+        let _ = run.items.send(Ok(BtwItem::Record { record }));
+        if !running {
+            self.btw = None;
+            self.idle_since = Instant::now();
+        }
+    }
+
+    /// omp is gone: the side question it was answering fails.
+    fn fail_btw(&mut self) {
+        if let Some(run) = self.btw.take() {
+            let _ = run.items.send(Err(Error::new(
+                ErrorCode::Unavailable,
+                "The agent stopped before it answered.",
+            )));
+        }
     }
 
     async fn start_next(&mut self) {
@@ -645,6 +821,33 @@ impl Actor {
         images
     }
 
+    /// What omp gets as `input`'s text: `$skill` rewritten, then one
+    /// `@"path"` mention per uploaded file that is not an image omp takes
+    /// inline. omp reads a mentioned file into the prompt itself, as for an
+    /// `@path` the user typed.
+    async fn prompt_text(&self, input: &UserInput) -> String {
+        let mut text = rewrite_skill(&input.text, &self.skills);
+        let mut mentions = Vec::new();
+        for attachment in &input.attachments {
+            if crate::attachments::SUPPORTED_IMAGE_MIME_TYPES
+                .contains(&attachment.mime_type.as_str())
+            {
+                continue;
+            }
+            match self.config.attachments.named_path(&attachment.id).await {
+                Ok(path) => mentions.push(format!("@\"{}\"", path.display())),
+                Err(error) => tracing::warn!(%error, id = %attachment.id, "reading attachment"),
+            }
+        }
+        if !mentions.is_empty() {
+            if !text.is_empty() {
+                text.push_str("\n\n");
+            }
+            text.push_str(&mentions.join("\n"));
+        }
+        text
+    }
+
     /// Prompts omp for the live turn (already committed). Returns true when
     /// the turn already ended and the queue may advance.
     async fn prompt_once(&mut self, input: UserInput) -> bool {
@@ -659,7 +862,7 @@ impl Actor {
             return true;
         }
         let images = self.images(&input.attachments).await;
-        let text = rewrite_skill(&input.text, &self.skills);
+        let text = self.prompt_text(&input).await;
         let Some(session) = &self.session else {
             return false;
         };
@@ -720,7 +923,7 @@ impl Actor {
         };
         let images = self.images(&input.attachments).await;
         session
-            .steer(rewrite_skill(&input.text, &self.skills), images)
+            .steer(self.prompt_text(input).await, images)
             .await
             .map_err(|error| {
                 tracing::warn!(%error, "omp steer");
@@ -831,6 +1034,18 @@ impl Actor {
                 }
             }
             Request::Retitle { from, title } => self.retitle(&from, &title).await,
+            Request::Btw {
+                ask_id,
+                question,
+                record_id,
+                items,
+            } => self.ask_btw(ask_id, &question, record_id, items).await,
+            Request::BtwCancel { ask_id } => {
+                if let Some(run) = self.btw.take_if(|run| run.ask_id == ask_id) {
+                    self.cancel_btw(&run.record_id).await;
+                    self.idle_since = Instant::now();
+                }
+            }
             Request::Flush { reply } => {
                 self.flush();
                 let _ = reply.send(());

@@ -12,7 +12,7 @@ use std::{
     sync::Arc,
 };
 
-use engine_support::{Script, open, temp_dir, wait_calls};
+use engine_support::{Script, btw_running, open, temp_dir, wait_calls};
 use j3_core::app::App;
 use j3_protocol::v2::entities::Attachment;
 use serde_json::{Value, json};
@@ -713,6 +713,163 @@ async fn v2_attachment_upload_download_and_send() {
         user["attachments"],
         json!([serde_json::to_value(&attachment).unwrap()])
     );
+
+    env.finish().await;
+}
+
+#[tokio::test]
+async fn v2_file_attachment_reaches_omp_as_a_mention() {
+    let mut env = Env::new("file-attachment").await;
+
+    let body = b"remember the milk";
+    let size = body.len().to_string();
+    let uploaded = http(
+        env.addr,
+        "POST",
+        "/api/v1/attachments?name=my%20%22notes%22.txt",
+        &[("content-type", "text/plain"), ("content-length", &size)],
+        body,
+    )
+    .await;
+    assert_eq!(uploaded.status, 201);
+    let attachment: Attachment = serde_json::from_value(uploaded.json()).unwrap();
+
+    let project_id = env.project().await;
+    let created = env
+        .ws
+        .ok(
+            "threads.create",
+            json!({"projectId": project_id, "model": model(), "text": "summarize",
+                   "attachments": [attachment.id]}),
+        )
+        .await;
+    let thread_id = created["thread"]["id"].as_str().unwrap().to_owned();
+
+    // omp gets the file as an `@"path"` mention after the text, and no image.
+    wait_calls(&env.script, "prompt", |calls| {
+        calls.iter().any(|call| call.starts_with("prompt:"))
+    })
+    .await;
+    let calls = env.script.calls();
+    let prompt = calls.iter().find(|c| c.starts_with("prompt:")).unwrap();
+    let mention = prompt
+        .strip_prefix("prompt:summarize\n\n@\"")
+        .and_then(|rest| rest.strip_suffix("\":0"))
+        .unwrap_or_else(|| panic!("no mention in {prompt:?}"));
+    // The path ends in the upload's name (its quotes replaced: they would
+    // end the mention) and holds the upload's bytes.
+    assert!(mention.ends_with("/my _notes_.txt"), "{mention}");
+    assert!(Path::new(mention).is_absolute(), "{mention}");
+    assert_eq!(std::fs::read(mention).unwrap(), body);
+
+    // The conversation keeps the text as typed, with the attachment beside it.
+    let snapshot = env
+        .ws
+        .ok("threads.get", json!({"threadId": thread_id}))
+        .await;
+    let user = snapshot["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["kind"] == "user")
+        .unwrap();
+    assert_eq!(user["text"], "summarize");
+    assert_eq!(user["attachments"][0]["name"], "my \"notes\".txt");
+
+    env.ws
+        .ok("attachments.delete", json!({"attachmentId": attachment.id}))
+        .await;
+    assert!(!Path::new(mention).exists());
+
+    env.finish().await;
+}
+
+#[tokio::test]
+async fn v2_btw_streams_the_answer_beside_the_turn() {
+    let mut env = Env::new("btw").await;
+    let project_id = env.project().await;
+    let thread_id = env.running_thread(&project_id, "work").await;
+
+    let refused = env
+        .ws
+        .err("btw.ask", json!({"threadId": thread_id, "question": "  "}))
+        .await;
+    assert_eq!(refused["code"], "rejected");
+    let missing = env
+        .ws
+        .err("btw.ask", json!({"threadId": "nope", "question": "why?"}))
+        .await;
+    assert_eq!(missing["code"], "not_found");
+
+    let ask = env
+        .ws
+        .watch(
+            "btw.ask",
+            json!({"threadId": thread_id, "question": " why? "}),
+        )
+        .await;
+    let started = env.ws.item(ask).await;
+    assert_eq!(
+        started,
+        json!({"type": "record", "record": {"id": "btw-1", "turns": [
+            {"question": "why?", "answer": "", "status": "running"}]}})
+    );
+    assert!(env.script.calls().contains(&"btw:why?:".to_owned()));
+
+    // Deltas of another topic are not this stream's.
+    env.script
+        .emit(json!({"type": "btw_delta", "recordId": "btw-0", "delta": "no"}));
+    env.script
+        .emit(json!({"type": "btw_delta", "recordId": "btw-1", "delta": "Because."}));
+    assert_eq!(
+        env.ws.item(ask).await,
+        json!({"type": "delta", "recordId": "btw-1", "append": "Because."})
+    );
+    let mut done = btw_running("why?");
+    done["answer"] = json!("Because.");
+    done["status"] = json!("complete");
+    env.script
+        .emit(json!({"type": "btw_record", "record": done}));
+    let finished = env.ws.item(ask).await;
+    assert_eq!(finished["record"]["turns"][0]["status"], "complete");
+    assert_eq!(finished["record"]["turns"][0]["answer"], "Because.");
+    assert_eq!(env.ws.ended(ask).await["t"], "end");
+    // Its stream is over, so nothing is left to cancel.
+    assert!(
+        !env.script
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("btw_cancel"))
+    );
+
+    // A follow-up names its topic; cancelling the call cancels it in omp.
+    let follow_up = env
+        .ws
+        .watch(
+            "btw.ask",
+            json!({"threadId": thread_id, "question": "and then?", "recordId": "btw-1"}),
+        )
+        .await;
+    env.ws.item(follow_up).await;
+    assert!(
+        env.script
+            .calls()
+            .contains(&"btw:and then?:btw-1".to_owned())
+    );
+    env.ws.send(json!({"t": "cancel", "id": follow_up})).await;
+    assert_eq!(env.ws.ended(follow_up).await["error"]["code"], "cancelled");
+    wait_calls(&env.script, "btw_cancel", |calls| {
+        calls.contains(&"btw_cancel:btw-1".to_owned())
+    })
+    .await;
+
+    // The turn was left alone throughout.
+    let snapshot = env
+        .ws
+        .ok("threads.get", json!({"threadId": thread_id}))
+        .await;
+    assert_eq!(snapshot["thread"]["status"], "running");
+    assert_eq!(snapshot["turns"].as_array().unwrap().len(), 1);
 
     env.finish().await;
 }

@@ -94,10 +94,16 @@ final class ComposerTextView: UITextView, ComposerEditing {
     }
 
     /// Installs the keys that only apply while the completion menu is open.
+    /// Called from a SwiftUI update: reloading the input views resizes the
+    /// keyboard's tracking area, which renders SwiftUI again, so it waits for
+    /// the update to end.
     func setCompletionOpen(_ open: Bool) {
         guard open != completionOpen else { return }
         completionOpen = open
-        if isFirstResponder { reloadInputViews() }
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.isFirstResponder else { return }
+            self.reloadInputViews()
+        }
     }
 
     // MARK: Keys

@@ -1,6 +1,7 @@
 import Foundation
 import Observation
 import UIKit
+import UniformTypeIdentifiers
 
 /// What the composer's text view offers its model: the draft it holds and the
 /// edit that accepting a completion makes.
@@ -13,8 +14,8 @@ protocol ComposerEditing: AnyObject {
     func focus()
 }
 
-/// One image in the composer's attachment strip: uploading, uploaded, or
-/// failed with the reason.
+/// One image or file in the composer's attachment strip: uploading, uploaded,
+/// or failed with the reason.
 struct ComposerUpload: Identifiable {
     enum State: Equatable {
         case uploading
@@ -24,6 +25,7 @@ struct ComposerUpload: Identifiable {
 
     let id = UUID()
     var name: String
+    /// An image's preview; nil for any other file.
     var thumbnail: UIImage?
     var state: State
 
@@ -34,8 +36,22 @@ struct ComposerUpload: Identifiable {
     var isUploading: Bool { state == .uploading }
 }
 
-/// The composer's state: the draft with its chips, the images uploaded for the
-/// next message, the model and thinking level, and the completion menu.
+/// A `/btw` draft: omp answers its question beside the thread instead of
+/// taking it as a message.
+enum SideQuestion {
+    /// The question of the draft `text` (blank while none is typed); nil for
+    /// any other draft.
+    static func question(in text: String) -> String? {
+        guard text.hasPrefix("/btw") else { return nil }
+        let rest = text.dropFirst(4)
+        guard rest.first?.isWhitespace ?? true else { return nil }
+        return rest.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
+/// The composer's state: the draft with its chips, the images and files
+/// uploaded for the next message, the model and thinking level, and the
+/// completion menu.
 @MainActor @Observable
 final class ComposerModel {
     /// The model the next message asks for.
@@ -62,8 +78,8 @@ final class ComposerModel {
 
     var catalog: Catalog? { context?.catalog }
     var returnSends: Bool { context?.returnSends ?? true }
-    /// True when the message has non-blank text or an uploaded image, and no
-    /// image is still uploading.
+    /// True when the message has non-blank text or an uploaded attachment,
+    /// and none is still uploading.
     var canSend: Bool {
         guard !isUploading else { return false }
         return !Draft.isBlank(parts) || uploads.contains { $0.attachment != nil }
@@ -73,7 +89,7 @@ final class ComposerModel {
     var isEmpty: Bool { Draft.serialize(parts).isEmpty }
 
     /// The message the draft makes, then an empty composer; nil when there is
-    /// nothing to send or an image is still uploading.
+    /// nothing to send or an attachment is still uploading.
     func take() -> ComposerMessage? {
         guard canSend else { return nil }
         let message = ComposerMessage(
@@ -81,10 +97,18 @@ final class ComposerModel {
             attachments: uploads.compactMap(\.attachment),
             model: model
         )
+        clear()
+        return message
+    }
+
+    /// The question of a `/btw` draft (`SideQuestion`); nil for any other.
+    var sideQuestion: String? { SideQuestion.question(in: Draft.serialize(parts)) }
+
+    /// Empties the draft and the attachment strip.
+    func clear() {
         parts = []
         uploads = []
         closeCompletion()
-        return message
     }
 
     /// Replaces the draft with `text`, as plain text: tokens in it stay text.
@@ -205,21 +229,78 @@ final class ComposerModel {
         }
     }
 
-    // MARK: Images
+    // MARK: Attachments
+
+    /// Files up to 50 MiB upload (`POST /api/v1/attachments`).
+    nonisolated static let maxFileBytes = 50 * 1024 * 1024
+
+    enum FileFailure: LocalizedError {
+        case unreadable
+        case tooLarge
+
+        var errorDescription: String? {
+            switch self {
+            case .unreadable: "The file couldn't be read."
+            case .tooLarge: "The file is larger than 50 MB."
+            }
+        }
+    }
+
+    /// Uploads one file from the document picker. An image goes the way of a
+    /// picked photo; omp reads any other file as an `@` mention the server
+    /// adds to the message.
+    func addFile(_ url: URL) {
+        let name = url.lastPathComponent
+        let type = UTType(filenameExtension: url.pathExtension)
+        let read = Task.detached(priority: .userInitiated) { () throws -> Data in
+            let scoped = url.startAccessingSecurityScopedResource()
+            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+            let size = try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+            guard size <= Self.maxFileBytes else { throw FileFailure.tooLarge }
+            guard let data = try? Data(contentsOf: url) else { throw FileFailure.unreadable }
+            return data
+        }
+        if type?.conforms(to: .image) == true {
+            Task { @MainActor [weak self] in
+                guard let data = try? await read.value else { return }
+                self?.addImage(data, baseName: (name as NSString).deletingPathExtension, numbered: false)
+            }
+            return
+        }
+        let upload = ComposerUpload(name: name, thumbnail: nil, state: .uploading)
+        uploads.append(upload)
+        let id = upload.id
+        let mimeType = type?.preferredMIMEType ?? "application/octet-stream"
+        uploadTasks[id] = Task { @MainActor [weak self] in
+            await self?.finish(id) { context in
+                let data = try await read.value
+                return try await context.upload(name: name, mimeType: mimeType, data: data)
+            }
+        }
+    }
 
     /// Encodes and uploads one picked or pasted image; the strip shows it
-    /// while it uploads and its reason when it fails.
-    func addImage(_ data: Data, baseName: String) {
-        imageNumber += 1
+    /// while it uploads and its reason when it fails. `numbered` names it
+    /// `baseName` and its count (photos and pastes have no name of their own).
+    func addImage(_ data: Data, baseName: String, numbered: Bool = true) {
+        if numbered { imageNumber += 1 }
         let upload = ComposerUpload(
-            name: "\(baseName) \(imageNumber)",
+            name: numbered ? "\(baseName) \(imageNumber)" : baseName,
             thumbnail: ImageEncoder.thumbnail(data, side: 56),
             state: .uploading
         )
         uploads.append(upload)
         let name = upload.name
         uploadTasks[upload.id] = Task { @MainActor [weak self] in
-            await self?.upload(upload.id, data: data, baseName: name)
+            await self?.finish(upload.id) { context in
+                let encoded = try await Task.detached(priority: .userInitiated) {
+                    try ImageEncoder.encode(data, baseName: name)
+                }.value
+                try Task.checkCancellation()
+                return try await context.upload(
+                    name: encoded.name, mimeType: encoded.mimeType, data: encoded.data
+                )
+            }
         }
     }
 
@@ -229,16 +310,14 @@ final class ComposerModel {
         uploads.removeAll { $0.id == id }
     }
 
-    private func upload(_ id: UUID, data: Data, baseName: String) async {
+    /// Runs `send` for upload `id` and records how it ended, unless the
+    /// upload was removed meanwhile.
+    private func finish(
+        _ id: UUID, _ send: @MainActor (any ComposerContext) async throws -> Attachment
+    ) async {
         do {
             guard let context else { throw ClientError.Disconnected }
-            let encoded = try await Task.detached(priority: .userInitiated) {
-                try ImageEncoder.encode(data, baseName: baseName)
-            }.value
-            guard !Task.isCancelled else { return }
-            let attachment = try await context.upload(
-                name: encoded.name, mimeType: encoded.mimeType, data: encoded.data
-            )
+            let attachment = try await send(context)
             guard !Task.isCancelled else { return }
             update(id) { $0.state = .uploaded(attachment) }
         } catch {

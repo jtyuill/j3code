@@ -2,7 +2,9 @@
 //! images omp's tools return.
 //!
 //! Layout: `dir/<id>.json` holds the metadata declared at upload; `dir/<id>`
-//! holds the bytes. Ids are `[a-z0-9_-]` strings and the only capability
+//! holds the bytes; `dir/<id>.d/<name>` links to the bytes under the upload's
+//! file name once omp is to read the file ([`AttachmentStore::named_path`]).
+//! Ids are `[a-z0-9_-]` strings and the only capability
 //! needed to read the bytes; there is no auth. Host image files of a
 //! project (`projects.imageUrl`) are served through in-memory grants: a
 //! random id that maps to the file's path until it expires.
@@ -114,6 +116,32 @@ impl AttachmentStore {
         };
         let bytes = fs::read(self.dir.join(attachment_id)).await?;
         Ok((bytes, meta.mime_type))
+    }
+
+    /// A path to upload `attachment_id` ending in its file name, for an omp
+    /// `@"path"` mention: omp picks how to read a file (PDF, document,
+    /// video…) by its extension, and the model sees the name. A hard link to
+    /// the bytes, or a copy where the filesystem has none.
+    pub(crate) async fn named_path(&self, attachment_id: &str) -> io::Result<PathBuf> {
+        let Some(meta) = self.meta(attachment_id).await? else {
+            return Err(not_found(attachment_id));
+        };
+        let dir = std::path::absolute(self.dir.join(format!("{attachment_id}.d")))?;
+        let path = dir.join(mention_name(&meta.name));
+        if fs::try_exists(&path).await? {
+            return Ok(path);
+        }
+        fs::create_dir_all(&dir).await?;
+        let bytes = self.dir.join(attachment_id);
+        match fs::hard_link(&bytes, &path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => return Err(error),
+            Err(_) => {
+                fs::copy(&bytes, &path).await?;
+            }
+        }
+        Ok(path)
     }
 
     /// Stores an image a tool returned as attachment `attachment_id`.
@@ -327,7 +355,10 @@ impl AttachmentStore {
                 Err(error) => return Err(error),
             }
         }
-        Ok(())
+        match fs::remove_dir_all(self.dir.join(format!("{attachment_id}.d"))).await {
+            Err(error) if error.kind() != ErrorKind::NotFound => Err(error),
+            _ => Ok(()),
+        }
     }
 
     /// The wire entity of an uploaded attachment, None if it is unknown or
@@ -342,6 +373,25 @@ impl AttachmentStore {
             mime_type: stored.mime_type,
             size: stored.size,
         }))
+    }
+}
+
+/// An upload's file name as the last component of an `@"path"` mention:
+/// path separators, control characters and `"` (which would end the
+/// mention) become `_`.
+fn mention_name(name: &str) -> String {
+    let name: String = name
+        .trim()
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | '"' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect();
+    match name.as_str() {
+        "" | "." | ".." => "file".to_owned(),
+        _ => name,
     }
 }
 

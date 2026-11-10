@@ -17,8 +17,9 @@ use j3_core::{
     omp::{
         OmpLauncher,
         omp_rpc::{
-            AvailableSlashCommand, Event, ExtensionUiResponse, GoalOp, GoalResult, ImageContent,
-            PromptAck, RpcNotification, SessionState, SubagentMessages, ThinkingLevel,
+            AvailableSlashCommand, BtwHistoryRecord, Event, ExtensionUiResponse, GoalOp,
+            GoalResult, ImageContent, PromptAck, RpcNotification, SessionState, SubagentMessages,
+            ThinkingLevel,
         },
     },
     store::random_hex,
@@ -70,6 +71,12 @@ impl Script {
                 "message": {"role": "assistant"}, "assistantMessageEvent": event}));
         }
     }
+}
+
+/// omp's record of side question `question` as it starts: topic `btw-1`.
+pub fn btw_running(question: &str) -> Value {
+    json!({"id": "btw-1", "leafId": null, "question": question, "answer": "",
+        "status": "running", "createdAt": 1, "updatedAt": 1})
 }
 
 pub struct FakeSession(pub Arc<Script>);
@@ -188,6 +195,26 @@ impl AgentSession for FakeSession {
                 .unwrap(),
             )
         })
+    }
+
+    fn btw(
+        &self,
+        question: String,
+        record_id: Option<String>,
+    ) -> BoxFuture<'_, j3_core::engine::session::Result<BtwHistoryRecord>> {
+        self.0.record(format!(
+            "btw:{question}:{}",
+            record_id.as_deref().unwrap_or_default()
+        ));
+        Box::pin(async move { Ok(serde_json::from_value(btw_running(&question)).unwrap()) })
+    }
+
+    fn btw_cancel(
+        &self,
+        record_id: String,
+    ) -> BoxFuture<'_, j3_core::engine::session::Result<bool>> {
+        self.0.record(format!("btw_cancel:{record_id}"));
+        Box::pin(async { Ok(true) })
     }
 
     fn respond_ui(&self, response: ExtensionUiResponse) -> j3_core::engine::session::Result<()> {

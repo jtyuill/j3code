@@ -79,6 +79,10 @@ async fn call(app: &App, method: &str, params: Value) -> Reply {
                 Err(error) => Reply::Err(error),
             }
         }
+        m::BTW_ASK => match decode::<m::BtwAskParams>(params).and_then(|p| inner.btw_ask(p)) {
+            Ok(items) => stream(INITIAL_WINDOW, items),
+            Err(error) => Reply::Err(error),
+        },
         m::TERMINAL_ATTACH => {
             match decode::<m::AttachParams>(params)
                 .and_then(|params| inner.terminal_attach(&params))

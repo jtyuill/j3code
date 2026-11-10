@@ -119,6 +119,12 @@ impl Script {
     }
 }
 
+/// omp's record of the side question `question` (topic `btw-1`).
+pub fn btw_record(question: &str, answer: &str, status: &str) -> Value {
+    json!({"id": "btw-1", "leafId": null, "question": question, "answer": answer,
+        "status": status, "createdAt": 1, "updatedAt": 1})
+}
+
 fn goal_refused(error: &str) -> omp::Error {
     omp::Error::Rpc(omp_rpc::Error::Command {
         command: "goal".into(),
@@ -258,6 +264,25 @@ impl AgentSession for FakeSession {
                         "timestamp": 2}]}))
             .unwrap())
         })
+    }
+
+    fn btw(
+        &self,
+        question: String,
+        record_id: Option<String>,
+    ) -> BoxFuture<'_, Result<omp_rpc::BtwHistoryRecord>> {
+        self.script.record(format!(
+            "btw:{question}:{}",
+            record_id.as_deref().unwrap_or_default()
+        ));
+        Box::pin(async move {
+            Ok(serde_json::from_value(btw_record(&question, "", "running")).unwrap())
+        })
+    }
+
+    fn btw_cancel(&self, record_id: String) -> BoxFuture<'_, Result<bool>> {
+        self.script.record(format!("btw_cancel:{record_id}"));
+        Box::pin(async { Ok(true) })
     }
 
     fn respond_ui(&self, response: ExtensionUiResponse) -> Result<()> {

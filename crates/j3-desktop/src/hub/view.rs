@@ -454,8 +454,9 @@ fn tool_row(
 
 /// User and assistant text as markdown, with TeX math typeset when the setting is on.
 /// A memo keyed by thread and entry, versioned by the source (a reset transcript reuses
-/// indices), keeps all but entries with formulas (whose images load later).
-fn markdown(s: &J3, ui: &Ui, key: &ThreadKey, id: &str, source: &str) -> El {
+/// indices), keeps all but entries with formulas (whose images load later). Also draws the
+/// side-question card's answers (`thread::btw`).
+pub(crate) fn markdown(s: &J3, ui: &Ui, key: &ThreadKey, id: &str, source: &str) -> El {
     let k = ui.k;
     let math_on = s.prefs.ui().math_rendering;
     let build = || {

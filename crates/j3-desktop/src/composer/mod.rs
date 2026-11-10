@@ -1,16 +1,16 @@
 //! The composer (spec §7): the message draft of one thread or of the new-thread surface.
-//! Multi-line text, pasted or dropped images (uploaded as they are added), one model and
+//! Multi-line text, pasted or dropped images and files (uploaded as they are added), one model and
 //! thinking picker, the usage gauge, `/`, `^` and `@` completion, `^model` mentions shown as
 //! chips (the submitted text stays the typed `^slug`), magic keywords painted with omp's
 //! gradient, omp's word prediction as ghost text and dictation into the draft. Submitting sends
 //! to the thread (queued behind an active run) or launches the new thread.
 //!
 //! The pieces live in submodules by capability: [`draft`] (editing rules), [`menu`]
-//! (completions), [`images`], [`picker`], [`usage`], [`mic`] and [`view`].
+//! (completions), [`attachments`], [`picker`], [`usage`], [`mic`] and [`view`].
 
+mod attachments;
 mod draft;
 pub mod fixture;
-mod images;
 mod menu;
 mod mic;
 mod picker;
@@ -39,8 +39,11 @@ use crate::{
     models::{self, ModelChoice},
     prediction::{Ghost, Provisional},
     sidebar::ThreadKey,
+    thread::btw,
 };
-use images::PendingImage;
+use attachments::PendingAttachment;
+#[cfg(test)]
+pub(crate) use attachments::Upload;
 use mic::Dictation;
 use picker::PickerState;
 
@@ -79,7 +82,7 @@ impl ComposerKey {
 }
 
 /// What a submit hands its destination: the trimmed text (mentions as typed `^slug`), the
-/// uploaded images' attachment ids and the chosen model with its thinking level.
+/// uploads' attachment ids and the chosen model with its thinking level.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Submission {
     pub text: String,
@@ -95,8 +98,8 @@ pub struct ComposerState {
     pub error: Option<String>,
     /// A send is on its way.
     pub busy: bool,
-    pub images: Vec<PendingImage>,
-    next_image: u64,
+    pub attachments: Vec<PendingAttachment>,
+    next_attachment: u64,
     /// The model the user picked, by slug; `None` follows the thread's or project's
     /// preference.
     model: Option<String>,
@@ -315,16 +318,16 @@ impl J3 {
         });
     }
 
-    /// Whether `key`'s composer has anything to send: text or an image.
+    /// Whether `key`'s composer has anything to send: text or an attachment.
     pub(crate) fn composer_has_draft(&self, key: &ComposerKey) -> bool {
         self.composers
             .get(key)
-            .is_some_and(|c| !c.edit.text.trim().is_empty() || !c.images.is_empty())
+            .is_some_and(|c| !c.edit.text.trim().is_empty() || !c.attachments.is_empty())
     }
 
     /// Sends `key`'s draft (Enter, the Send/Queue button): to its thread, queued behind an
     /// active turn, or as the first message of a new thread. Refused while sending or
-    /// dictating, with nothing to send, while an image uploads or after one failed, and
+    /// dictating, with nothing to send, while an attachment uploads or after one failed, and
     /// without a model.
     pub fn submit_composer(&mut self, key: &ComposerKey, tx: &mut Tx) {
         let Some(composer) = self.composers.get(key) else {
@@ -334,10 +337,14 @@ impl J3 {
             return;
         }
         let text = plain_text(&composer.edit).trim().to_owned();
-        if text.is_empty() && composer.images.is_empty() {
+        if text.is_empty() && composer.attachments.is_empty() {
             return;
         }
-        let attachments = match images::attachments(&composer.images) {
+        if self.submit_btw(key, &text) {
+            return;
+        }
+        let composer = &self.composers[key];
+        let attachments = match attachments::attachments(&composer.attachments) {
             Ok(attachments) => attachments,
             Err(refusal) => {
                 self.composer(key).error = Some(refusal.to_owned());
@@ -365,6 +372,38 @@ impl J3 {
         }
     }
 
+    /// Takes a `/btw question` draft as a side question (`thread::btw`) instead of a
+    /// message, where the server answers them: omp answers it beside the thread. Refused
+    /// without a question, with attachments (a side question is text) and before the thread
+    /// exists. False for any other draft.
+    fn submit_btw(&mut self, key: &ComposerKey, text: &str) -> bool {
+        let Some(question) = btw::question(text) else {
+            return false;
+        };
+        if !self
+            .envs
+            .get(key.env())
+            .is_some_and(|env| env.has_capability(btw::CAPABILITY))
+        {
+            return false;
+        }
+        let refusal = match key {
+            ComposerKey::NewThread { .. } => Some("Start the thread first, then ask /btw."),
+            ComposerKey::Thread(_) if question.is_empty() => Some("Type a question after /btw."),
+            ComposerKey::Thread(_) if !self.composers[key].attachments.is_empty() => {
+                Some("A side question takes no attachments.")
+            }
+            ComposerKey::Thread(_) => None,
+        };
+        if let Some(refusal) = refusal {
+            self.composer(key).error = Some(refusal.to_owned());
+        } else if let ComposerKey::Thread(thread) = key {
+            self.ask_btw(thread, question.to_owned());
+            self.finish_composer(key, Ok(()));
+        }
+        true
+    }
+
     /// Sends a submission to `thread`: started, or queued behind its active turn.
     fn send_to_thread(&mut self, thread: ThreadKey, submission: Submission) {
         let key = ComposerKey::Thread(thread.clone());
@@ -390,7 +429,7 @@ impl J3 {
         });
     }
 
-    /// The last submission of `key` was sent (clears the draft, its images, menu and
+    /// The last submission of `key` was sent (clears the draft, its attachments, menu and
     /// prediction) or failed (keeps the draft, shows the error).
     pub fn finish_composer(&mut self, key: &ComposerKey, result: Result<(), String>) {
         let composer = self.composer(key);
@@ -398,7 +437,7 @@ impl J3 {
         match result {
             Ok(()) => {
                 composer.error = None;
-                composer.images.clear();
+                composer.attachments.clear();
                 composer.close_completions();
                 composer.ghost = None;
                 composer.provisional = None;
@@ -409,7 +448,7 @@ impl J3 {
     }
 
     /// Drops the composers whose environment, thread or project is gone (never the main
-    /// one, nor one still sending), releasing their images, usage watches and microphone.
+    /// one, nor one still sending), releasing their attachments, usage watches and microphone.
     /// Runs when an environment changes or goes.
     pub(crate) fn prune_composers(&mut self, tx: &mut Tx) {
         let main = self.main_composer_key();

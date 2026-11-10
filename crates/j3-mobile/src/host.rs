@@ -7,13 +7,13 @@ use std::sync::{
 };
 
 use j3_client::{
-    Connection,
+    Connection, apply_btw,
     entities::{Answer, Attachment, ModelRef, Project, ThreadMode},
     methods::{
-        AnswerParams, BrowseParams, BrowseResult, CreateGoalParams, CreateProjectParams,
-        CreateThreadParams, DeleteThreadParams, DismissParams, EntriesResult, EntryKind,
-        QueueEditParams, QueueEntryParams, RefreshParams, RenameThreadParams, SearchEntriesParams,
-        SendParams, SetModeParams, StopParams, ThreadParams, TranscriptParams,
+        AnswerParams, BrowseParams, BrowseResult, BtwAskParams, BtwRecord, CreateGoalParams,
+        CreateProjectParams, CreateThreadParams, DeleteThreadParams, DismissParams, EntriesResult,
+        EntryKind, QueueEditParams, QueueEntryParams, RefreshParams, RenameThreadParams,
+        SearchEntriesParams, SendParams, SetModeParams, StopParams, ThreadParams, TranscriptParams,
     },
 };
 use tokio::{sync::watch, task::AbortHandle};
@@ -43,10 +43,23 @@ pub trait ThreadListener: Send + Sync {
     fn thread_changed(&self, snapshot: ThreadSnapshot);
 }
 
-/// A running `Host::watch` or `Host::watch_thread`. Calls stop on
-/// `cancel()` or when the object is released; a call already under way
-/// finishes. A thread subscription also ends the server-side
-/// `threads.watch` once no other subscription of that thread is alive.
+/// Receives the answer to one side question (`Host::ask_btw`); called like
+/// `HostListener`.
+#[uniffi::export(with_foreign)]
+pub trait BtwListener: Send + Sync {
+    /// The whole topic: as the question starts, as its answer grows, and
+    /// as it ends.
+    fn btw_changed(&self, topic: BtwRecord);
+    /// The last call: the question is over. `error` says why it could not
+    /// be answered; a topic whose last turn failed carries its own.
+    fn btw_ended(&self, error: Option<String>);
+}
+
+/// A running `Host::watch`, `Host::watch_thread` or `Host::ask_btw`. Calls
+/// stop on `cancel()` or when the object is released; a call already under
+/// way finishes. A thread subscription also ends the server-side
+/// `threads.watch` once no other subscription of that thread is alive, and
+/// a side question is cancelled.
 #[derive(uniffi::Object)]
 pub struct Subscription {
     cancelled: Arc<AtomicBool>,
@@ -492,6 +505,51 @@ impl Host {
         Ok(done.sequence)
     }
 
+    // ---- side questions ----
+
+    /// Asks omp a side question about `thread_id` (`/btw`): it answers
+    /// beside whatever the thread is doing and the conversation keeps no
+    /// trace of it. `record_id` continues an earlier topic. The answer goes
+    /// to `listener`; cancelling the subscription cancels the question.
+    pub fn ask_btw(
+        &self,
+        thread_id: String,
+        question: String,
+        record_id: Option<String>,
+        listener: Arc<dyn BtwListener>,
+    ) -> Arc<Subscription> {
+        let mut run = self.connection.btw_ask(BtwAskParams {
+            thread_id,
+            question,
+            record_id,
+        });
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&cancelled);
+        let task = RUNTIME.spawn(async move {
+            let mut topic = None;
+            let error = loop {
+                match run.next().await {
+                    Some(Ok(item)) => apply_btw(&mut topic, item),
+                    Some(Err(error)) => break Some(ClientError::from(error).to_string()),
+                    None => break None,
+                }
+                if flag.load(Ordering::Acquire) {
+                    return;
+                }
+                if let Some(topic) = &topic {
+                    listener.btw_changed(topic.clone());
+                }
+            };
+            if !flag.load(Ordering::Acquire) {
+                listener.btw_ended(error);
+            }
+        });
+        Arc::new(Subscription {
+            cancelled,
+            task: task.abort_handle(),
+        })
+    }
+
     // ---- subagents and attachments ----
 
     /// A subagent's transcript from byte `from_byte`; pass the result's
@@ -513,8 +571,10 @@ impl Host {
         Ok(page.into())
     }
 
-    /// Uploads a file (an image from the photo picker or the pasteboard)
-    /// for `create_thread`, `send` and `edit_queued`.
+    /// Uploads a file (an image from the photo picker or the pasteboard, or
+    /// any file from the document picker) for `create_thread`, `send` and
+    /// `edit_queued`. omp sees an image inline and reads any other file as
+    /// an `@` mention.
     pub async fn upload_attachment(
         &self,
         name: String,

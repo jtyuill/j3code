@@ -25,7 +25,7 @@ use crate::{
 };
 
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(120);
-/// Stream items buffered between the socket and a [`GitRun`] or
+/// Stream items buffered between the socket and a [`GitRun`], [`BtwRun`] or
 /// [`TerminalSession`] consumer; beyond it the stream stops acking.
 const STREAM_BUFFER: usize = 16;
 
@@ -136,6 +136,35 @@ impl GitRun {
     /// always last.
     pub async fn next(&mut self) -> Option<Result<GitRunItem, Error>> {
         self.0.rx.recv().await
+    }
+}
+
+/// A running `btw.ask`. Dropping it cancels the side question.
+pub struct BtwRun(Items<BtwItem>);
+
+impl BtwRun {
+    /// The next item, from any executor: the topic as it starts, the
+    /// answer's text as it grows, then the finished topic. `None` once the
+    /// stream ended; a failure is always last.
+    pub async fn next(&mut self) -> Option<Result<BtwItem, Error>> {
+        self.0.rx.recv().await
+    }
+}
+
+/// Applies a `btw.ask` item to the topic a client shows: a `record`
+/// replaces it, a `delta` grows its last answer.
+pub fn apply_btw(topic: &mut Option<BtwRecord>, item: BtwItem) {
+    match item {
+        BtwItem::Record { record } => *topic = Some(record),
+        BtwItem::Delta { record_id, append } => {
+            if let Some(turn) = topic
+                .as_mut()
+                .filter(|topic| topic.id == record_id)
+                .and_then(|topic| topic.turns.last_mut())
+            {
+                turn.answer.push_str(&append);
+            }
+        }
     }
 }
 
@@ -277,6 +306,11 @@ impl Connection {
     pub fn git_run(&self, mut params: GitRunParams) -> GitRun {
         params.command_id.get_or_insert_with(new_id);
         GitRun(Items::start(&self.inner.shared, GIT_RUN, encode(&params)))
+    }
+
+    /// Asks a side question (`btw.ask`) on the connection's runtime.
+    pub fn btw_ask(&self, params: BtwAskParams) -> BtwRun {
+        BtwRun(Items::start(&self.inner.shared, BTW_ASK, encode(&params)))
     }
 
     /// Attaches to a thread's terminal (`terminal.attach`) on the

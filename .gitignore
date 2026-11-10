@@ -2,3 +2,7 @@
 /result
 /.direnv
 node_modules/
+.DS_Store
+/apps/ios/build/
+/apps/ios/J3Code.xcodeproj/
+/apps/ios/J3Code/Info.plist

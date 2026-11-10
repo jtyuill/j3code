@@ -29,9 +29,9 @@ use j3_core::{
     store::random_hex,
 };
 use j3_mobile::{
-    Answer, ClientError, ConnectionStatus, Host, HostListener, HostSnapshot, ItemKind, ItemStatus,
-    ModelRef, RequestStatus, Subscription, ThinkingLevel, ThreadListener, ThreadSnapshot,
-    ThreadStatus, ThreadSync, TurnStatus,
+    Answer, BtwListener, BtwRecord, BtwStatus, ClientError, ConnectionStatus, Host, HostListener,
+    HostSnapshot, ItemKind, ItemStatus, ModelRef, RequestStatus, Subscription, ThinkingLevel,
+    ThreadListener, ThreadSnapshot, ThreadStatus, ThreadSync, TurnStatus,
 };
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, watch};
@@ -98,6 +98,12 @@ impl Script {
             json!({"type": "text_end", "contentIndex": 0, "content": content}),
         );
     }
+}
+
+/// omp's record of the side question `question` (topic `btw-1`).
+fn aside(question: &str, answer: &str, status: &str) -> Value {
+    json!({"id": "btw-1", "leafId": null, "question": question, "answer": answer,
+        "status": status, "createdAt": 1, "updatedAt": 1})
 }
 
 struct FakeSession(Arc<Script>);
@@ -209,6 +215,25 @@ impl AgentSession for FakeSession {
                 .unwrap(),
             )
         })
+    }
+
+    fn btw(
+        &self,
+        question: String,
+        _: Option<String>,
+    ) -> BoxFuture<'_, j3_core::engine::session::Result<omp_rpc::BtwHistoryRecord>> {
+        self.0.record(format!("btw:{question}"));
+        Box::pin(
+            async move { Ok(serde_json::from_value(aside(&question, "", "running")).unwrap()) },
+        )
+    }
+
+    fn btw_cancel(
+        &self,
+        record_id: String,
+    ) -> BoxFuture<'_, j3_core::engine::session::Result<bool>> {
+        self.0.record(format!("btw_cancel:{record_id}"));
+        Box::pin(async { Ok(true) })
     }
 
     fn respond_ui(&self, response: ExtensionUiResponse) -> j3_core::engine::session::Result<()> {
@@ -360,6 +385,30 @@ impl HostListener for Recorder<HostSnapshot> {
 impl ThreadListener for Recorder<ThreadSnapshot> {
     fn thread_changed(&self, snapshot: ThreadSnapshot) {
         self.receive(snapshot);
+    }
+}
+
+/// A side question's topic as last received, and how it ended.
+#[derive(Clone, Default, PartialEq, Debug)]
+struct Aside {
+    topic: Option<BtwRecord>,
+    ended: Option<Option<String>>,
+}
+
+impl BtwListener for Recorder<Aside> {
+    fn btw_changed(&self, topic: BtwRecord) {
+        self.receive(Aside {
+            topic: Some(topic),
+            ended: None,
+        });
+    }
+
+    fn btw_ended(&self, error: Option<String>) {
+        let topic = self.last.borrow().clone().and_then(|aside| aside.topic);
+        self.receive(Aside {
+            topic,
+            ended: Some(error),
+        });
     }
 }
 
@@ -668,6 +717,68 @@ async fn dropping_a_subscription_stops_callbacks() {
             .as_ref()
             .is_some_and(|s| assistant_text(s).is_empty())
     );
+
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ask_btw_streams_the_answer_and_cancels() {
+    let server = TestServer::start("btw").await;
+    let (host, _recorder, _subscription) = connected(&server).await;
+    let project_id = project(&host, &server).await;
+    let (thread_id, _thread, _watch) = create_running(&host, &server, &project_id, "work").await;
+
+    let recorder = Recorder::<Aside>::new();
+    let ask = host.ask_btw(thread_id.clone(), "why?".into(), None, recorder.clone());
+    recorder
+        .wait("the running topic", |a| a.topic.is_some())
+        .await;
+    server
+        .script
+        .emit(json!({"type": "btw_delta", "recordId": "btw-1", "delta": "Be"}));
+    server
+        .script
+        .emit(json!({"type": "btw_delta", "recordId": "btw-1", "delta": "cause."}));
+    let growing = recorder
+        .wait("the growing answer", |a| {
+            a.topic
+                .as_ref()
+                .is_some_and(|t| t.turns[0].answer == "Because.")
+        })
+        .await;
+    assert_eq!(growing.topic.unwrap().turns[0].status, BtwStatus::Running);
+    server
+        .script
+        .emit(json!({"type": "btw_record", "record": aside("why?", "Because.", "complete")}));
+    let done = recorder.wait("the end", |a| a.ended.is_some()).await;
+    assert_eq!(done.ended, Some(None));
+    let topic = done.topic.unwrap();
+    assert_eq!(topic.id, "btw-1");
+    assert_eq!(topic.turns[0].status, BtwStatus::Complete);
+    drop(ask);
+
+    // A refused question ends with the server's reason and no topic.
+    let refused = Recorder::<Aside>::new();
+    let _ask = host.ask_btw(thread_id.clone(), " ".into(), None, refused.clone());
+    let ended = refused.wait("the refusal", |a| a.ended.is_some()).await;
+    assert_eq!(ended.topic, None);
+    assert_eq!(
+        ended.ended,
+        Some(Some("Type a question after /btw.".into()))
+    );
+
+    // Cancelling the subscription cancels the question in omp.
+    let cancelled = Recorder::<Aside>::new();
+    let ask = host.ask_btw(thread_id, "still there?".into(), None, cancelled.clone());
+    cancelled
+        .wait("the running topic", |a| a.topic.is_some())
+        .await;
+    ask.cancel();
+    wait_calls(&server.script, "btw_cancel", |calls| {
+        calls.iter().any(|c| c == "btw_cancel:btw-1")
+    })
+    .await;
+    assert_eq!(cancelled.last.borrow().as_ref().unwrap().ended, None);
 
     server.stop().await;
 }

@@ -49,7 +49,7 @@ mod types;
 use std::sync::LazyLock;
 
 pub use error::ClientError;
-pub use host::{Host, HostListener, Subscription, ThreadListener};
+pub use host::{BtwListener, Host, HostListener, Subscription, ThreadListener};
 pub use types::*;
 
 /// Worker threads of the library runtime: the socket, its supervisor and

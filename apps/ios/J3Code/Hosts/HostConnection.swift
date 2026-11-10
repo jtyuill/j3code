@@ -13,6 +13,8 @@ final class HostConnection: Identifiable {
     nonisolated let id: UUID
     var status: ConnectionStatus { snapshot?.status ?? .connecting }
     var catalog: Catalog? { snapshot?.catalog }
+    /// The server answers side questions (`/btw`).
+    var answersSideQuestions: Bool { snapshot?.info?.capabilities.contains("btw") ?? false }
     var projects: [Project] { snapshot?.projects ?? [] }
     var threads: [ThreadRow] { snapshot?.threads ?? [] }
     var name: String { saved.name }

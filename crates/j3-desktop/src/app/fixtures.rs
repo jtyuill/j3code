@@ -389,7 +389,7 @@ fn connection_state(
             name: name.to_owned(),
             protocol: 2,
             version: "0.9.0".to_owned(),
-            capabilities: ["terminal", "git", "files", "usage", "goals"]
+            capabilities: ["terminal", "git", "files", "usage", "goals", "btw"]
                 .map(String::from)
                 .into(),
             platform: "linux".to_owned(),

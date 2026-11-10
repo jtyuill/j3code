@@ -1,6 +1,7 @@
 import SwiftUI
 
-/// One thread: the feed, open requests, the queue and the composer.
+/// One thread: the feed, open requests, the queue and the composer, and the
+/// side question's sheet.
 struct ThreadScreen: View {
     @Environment(AppModel.self) private var app
     @Bindable var model: ThreadModel
@@ -29,6 +30,13 @@ struct ThreadScreen: View {
         }
         .sheet(item: $renaming) { target in
             NavigationStack { RenameThreadView(target: target) }
+        }
+        .sheet(isPresented: Binding(
+            get: { model.sideAnswer != nil },
+            set: { if !$0 { model.closeSideAnswer() } }
+        )) {
+            NavigationStack { SideAnswerSheet(model: model) }
+                .presentationDetents([.medium, .large])
         }
     }
 
@@ -201,5 +209,86 @@ private struct GoalSheet: View {
                 .disabled(objective.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }
+    }
+}
+
+/// A side question (`/btw`) over its answer as it streams, with its
+/// follow-ups and a field to ask the next one. Closing the sheet cancels a
+/// question still being answered and ends the topic.
+private struct SideAnswerSheet: View {
+    let model: ThreadModel
+    @State private var followUp = ""
+
+    var body: some View {
+        let answer = model.sideAnswer
+        ScrollView {
+            VStack(alignment: .leading, spacing: 10) {
+                ForEach(Array((answer?.topic?.turns ?? []).enumerated()), id: \.offset) { _, turn in
+                    question(turn.question)
+                    if !turn.answer.isEmpty {
+                        MarkdownView(text: turn.answer, host: model.host)
+                    }
+                    switch turn.status {
+                    case .error: note(turn.error ?? "omp could not answer.", failed: true)
+                    case .cancelled: note("Cancelled", failed: false)
+                    case .running, .complete: EmptyView()
+                    }
+                }
+                if let asked = answer?.asked {
+                    question(asked)
+                }
+                if let error = answer?.error {
+                    note(error, failed: true)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding()
+        }
+        // A growing answer keeps its newest lines in view.
+        .defaultScrollAnchor(.bottom)
+        .safeAreaInset(edge: .bottom) { followUpField(running: answer?.isRunning ?? false) }
+        .navigationTitle("Side question")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .cancellationAction) {
+                Button("Close") { model.closeSideAnswer() }
+                    .accessibilityIdentifier("side-answer-close")
+            }
+            if answer?.isRunning == true {
+                ToolbarItem(placement: .topBarTrailing) { ProgressView() }
+            }
+        }
+    }
+
+    private func followUpField(running: Bool) -> some View {
+        let text = followUp.trimmingCharacters(in: .whitespacesAndNewlines)
+        return HStack(alignment: .bottom, spacing: 8) {
+            TextField("Follow up", text: $followUp, axis: .vertical)
+                .lineLimit(1...4)
+                .accessibilityIdentifier("side-answer-follow-up")
+            Button {
+                model.askSideQuestion(text)
+                followUp = ""
+            } label: {
+                Image(systemName: "arrow.up.circle.fill").font(.title2)
+            }
+            .disabled(text.isEmpty || running)
+            .accessibilityLabel("Ask")
+        }
+        .padding(.horizontal)
+        .padding(.vertical, 8)
+        .background(.bar)
+    }
+
+    private func question(_ text: String) -> some View {
+        Text(text)
+            .font(.subheadline.weight(.semibold))
+            .textSelection(.enabled)
+    }
+
+    private func note(_ text: String, failed: Bool) -> some View {
+        Text(text)
+            .font(.caption)
+            .foregroundStyle(failed ? Color(.systemRed) : .secondary)
     }
 }

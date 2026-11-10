@@ -56,6 +56,7 @@ pub const GOALS_RESUME: &str = "goals.resume";
 pub const GOALS_DROP: &str = "goals.drop";
 pub const SUBAGENTS_STOP: &str = "subagents.stop";
 pub const SUBAGENTS_TRANSCRIPT: &str = "subagents.transcript";
+pub const BTW_ASK: &str = "btw.ask";
 pub const GIT_STATUS: &str = "git.status";
 pub const GIT_PULL: &str = "git.pull";
 pub const GIT_RUN: &str = "git.run";
@@ -113,6 +114,7 @@ pub const METHODS: &[&str] = &[
     GOALS_DROP,
     SUBAGENTS_STOP,
     SUBAGENTS_TRANSCRIPT,
+    BTW_ASK,
     GIT_STATUS,
     GIT_PULL,
     GIT_RUN,
@@ -710,6 +712,56 @@ pub enum TranscriptEntry {
     Error {
         text: String,
     },
+}
+
+// ---- btw ----
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BtwAskParams {
+    pub thread_id: String,
+    pub question: String,
+    /// The topic this question follows up on; absent starts a new topic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_id: Option<String>,
+}
+
+/// Items of the `btw.ask` stream (wire.md §5.13).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum BtwItem {
+    /// The whole topic: first, and on every status change.
+    Record { record: BtwRecord },
+    /// Text appended to the answer of the topic's last turn.
+    #[serde(rename_all = "camelCase")]
+    Delta { record_id: String, append: String },
+}
+
+/// A side-question topic: the question and its follow-ups, oldest first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BtwRecord {
+    pub id: String,
+    pub turns: Vec<BtwTurn>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BtwTurn {
+    pub question: String,
+    /// Markdown; grows by `delta` items while `running`.
+    pub answer: String,
+    pub status: BtwStatus,
+    /// Why the turn failed (`status` `error`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BtwStatus {
+    Running,
+    Complete,
+    Cancelled,
+    Error,
 }
 
 // ---- git ----

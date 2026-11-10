@@ -9,6 +9,7 @@ struct ComposerView<Actions: View>: View {
     let onSubmit: () -> Void
     @ViewBuilder let actions: () -> Actions
     @State private var picked: [PhotosPickerItem] = []
+    @State private var importingFiles = false
 
     init(model: ComposerModel, onSubmit: @escaping () -> Void, @ViewBuilder actions: @escaping () -> Actions) {
         self.model = model
@@ -53,6 +54,22 @@ struct ComposerView<Actions: View>: View {
             }
             .accessibilityLabel("Add photos")
             .onChange(of: picked) { _, items in load(items) }
+            Button {
+                importingFiles = true
+            } label: {
+                Image(systemName: "paperclip")
+                    .font(.title3)
+                    .foregroundStyle(.secondary)
+            }
+            .accessibilityLabel("Attach files")
+            .accessibilityIdentifier("composer-attach")
+            .fileImporter(
+                isPresented: $importingFiles, allowedContentTypes: [.item], allowsMultipleSelection: true
+            ) { result in
+                if case let .success(urls) = result {
+                    for url in urls { model.addFile(url) }
+                }
+            }
             modelPicker
             thinkingPicker
             Spacer(minLength: 0)
@@ -77,8 +94,8 @@ struct ComposerView<Actions: View>: View {
     private var completionList: some View {
         ScrollView(.vertical, showsIndicators: false) {
             VStack(alignment: .leading, spacing: 0) {
-                ForEach(model.completionRows.indices, id: \.self) { index in
-                    let completion = model.completionRows[index]
+                // The rows by value: a row outliving a shrinking menu must not index into it.
+                ForEach(Array(model.completionRows.enumerated()), id: \.offset) { index, completion in
                     Button {
                         model.accept(completion)
                     } label: {
@@ -142,6 +159,15 @@ struct ComposerView<Actions: View>: View {
                         .scaledToFill()
                 } else {
                     Color(.secondarySystemBackground)
+                    VStack(spacing: 2) {
+                        Image(systemName: "doc")
+                            .foregroundStyle(.secondary)
+                        Text(upload.name)
+                            .font(.caption2)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .padding(.horizontal, 3)
+                    }
                 }
             }
             .frame(width: 56, height: 56)

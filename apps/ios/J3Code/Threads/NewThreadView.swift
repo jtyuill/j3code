@@ -56,6 +56,10 @@ final class NewThreadModel {
             app.alert = "Pick a model first."
             return nil
         }
+        if connection.answersSideQuestions, composer.sideQuestion != nil {
+            app.alert = "Start the thread first, then ask /btw."
+            return nil
+        }
         guard let message = composer.take() else { return nil }
         creating = true
         defer { creating = false }

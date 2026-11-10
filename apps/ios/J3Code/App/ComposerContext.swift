@@ -14,7 +14,7 @@ protocol ComposerContext: AnyObject {
     var returnSends: Bool { get }
     /// `projects.searchEntries` in `projectId`.
     func searchEntries(query: String) async throws -> EntriesResult
-    /// Uploads an image or file for the next message.
+    /// Uploads an image or a file for the next message.
     func upload(name: String, mimeType: String, data: Data) async throws -> Attachment
 }
 

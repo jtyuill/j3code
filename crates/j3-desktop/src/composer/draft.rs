@@ -299,7 +299,8 @@ impl J3 {
 
     /// The keys `key`'s field hears before its editor: ←← in the empty draft opens the
     /// agents hub; while the completion menu is open ↑ ↓ move, Tab and Enter accept and
-    /// Escape closes; while a ghost shows Tab and → take it. True when taken.
+    /// Escape closes; while a ghost shows Tab and → take it; Escape otherwise closes the
+    /// thread's side-question card. True when taken.
     pub(super) fn composer_key(&mut self, key: &ComposerKey, ev: &KeyEvent, tx: &mut Tx) -> bool {
         if matches!(ev.key, Key::Modifier { .. }) {
             return false;
@@ -336,6 +337,10 @@ impl J3 {
         let taken = match ev.key {
             Key::Tab if plain => self.accept_ghost(key, true),
             Key::Right if plain => self.accept_ghost(key, false),
+            Key::Escape if plain => match key {
+                ComposerKey::Thread(thread) => self.close_btw(thread),
+                ComposerKey::NewThread { .. } => false,
+            },
             _ => false,
         };
         if taken {

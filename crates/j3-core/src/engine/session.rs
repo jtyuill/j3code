@@ -11,10 +11,10 @@ use tokio::sync::mpsc;
 use crate::omp::{
     self, OmpLauncher, OmpSession,
     omp_rpc::{
-        AbortCommand, AvailableSlashCommand, CancelSubagentCommand, Command, Event,
-        ExtensionUiResponse, GetAvailableCommandsCommand, GetStateCommand,
-        GetSubagentMessagesCommand, GoalCommand, GoalOp, GoalResult, ImageContent, PromptAck,
-        PromptCommand, SessionState, SetModelCommand, SetSessionNameCommand,
+        AbortCommand, AvailableSlashCommand, BtwCancelCommand, BtwCommand, BtwHistoryRecord,
+        CancelSubagentCommand, Command, Event, ExtensionUiResponse, GetAvailableCommandsCommand,
+        GetStateCommand, GetSubagentMessagesCommand, GoalCommand, GoalOp, GoalResult, ImageContent,
+        PromptAck, PromptCommand, SessionState, SetModelCommand, SetSessionNameCommand,
         SetSubagentSubscriptionCommand, SetThinkingLevelCommand, SteerCommand, SubagentMessages,
         SubagentSubscriptionLevel, ThinkingLevel,
     },
@@ -50,6 +50,16 @@ pub trait AgentSession: Send + Sync + 'static {
     fn cancel_subagent(&self, subagent_id: String) -> BoxFuture<'_, Result<bool>>;
     /// omp `get_subagent_messages` for one subagent's whole transcript.
     fn subagent_messages(&self, subagent_id: String) -> BoxFuture<'_, Result<SubagentMessages>>;
+    /// omp `btw`: starts a side question, or a follow-up in topic
+    /// `record_id`. The record as it starts running; the answer follows as
+    /// `btw_delta` and `btw_record` events.
+    fn btw(
+        &self,
+        question: String,
+        record_id: Option<String>,
+    ) -> BoxFuture<'_, Result<BtwHistoryRecord>>;
+    /// omp `btw_cancel` for topic `record_id`; false when it is not running.
+    fn btw_cancel(&self, record_id: String) -> BoxFuture<'_, Result<bool>>;
     fn respond_ui(&self, response: ExtensionUiResponse) -> Result<()>;
     /// omp `set_session_name`: the title `omp --resume` lists the session by.
     fn set_session_name(&self, _name: String) -> BoxFuture<'_, Result<()>> {
@@ -164,6 +174,23 @@ impl AgentSession for Omp {
             subagent_id: Some(subagent_id),
             session_file: None,
             from_byte: None,
+        }))
+    }
+
+    fn btw(
+        &self,
+        question: String,
+        record_id: Option<String>,
+    ) -> BoxFuture<'_, Result<BtwHistoryRecord>> {
+        Box::pin(self.0.call(BtwCommand {
+            question,
+            record_id,
+        }))
+    }
+
+    fn btw_cancel(&self, record_id: String) -> BoxFuture<'_, Result<bool>> {
+        Box::pin(self.0.call(BtwCancelCommand {
+            record_id: Some(record_id),
         }))
     }
 

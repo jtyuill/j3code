@@ -1,8 +1,8 @@
 import XCTest
 
 /// The simulator smoke test (`contrib/ios/smoke.sh`): connects to a
-/// `j3-test-server` through the deep link, opens its thread, sends a prompt
-/// and answers the scripted omp's question.
+/// `j3-test-server` through the deep link, opens its thread, sends a prompt,
+/// answers the scripted omp's question and asks a side question (`/btw`).
 ///
 /// The server's URL comes from `J3_SMOKE_URL` (`TEST_RUNNER_J3_SMOKE_URL`
 /// for `xcodebuild test`); without it the test is skipped.
@@ -45,6 +45,18 @@ final class SmokeUITests: XCTestCase {
         blue.tap()
         XCTAssertTrue(text(app, containing: "You picked blue.").waitForExistence(timeout: wait), "the answer reached omp")
         XCTAssertFalse(app.buttons["option-blue"].exists, "the request closed")
+
+        // A `/btw` draft is answered in its own sheet and is not a message.
+        composer.tap()
+        composer.typeText("/btw is it lunchtime")
+        app.buttons["send"].firstMatch.tap()
+        XCTAssertTrue(
+            text(app, containing: "Aside: is it lunchtime").waitForExistence(timeout: wait), "the side answer"
+        )
+        XCTAssertFalse(text(app, containing: "Echo: /btw").exists, "the thread did not get the question")
+        app.buttons["side-answer-close"].firstMatch.tap()
+        XCTAssertTrue(composer.waitForExistence(timeout: wait), "the sheet closed")
+        XCTAssertFalse(text(app, containing: "Aside: is it lunchtime").exists, "the answer went with it")
     }
 
     /// Read-only tour of a real server (`J3_BROWSE_URL`): connects, opens the
