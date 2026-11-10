@@ -206,8 +206,9 @@ async fn download(
 }
 
 /// Serves attachment (or granted project image) `attachment_id` with
-/// single-range `Range` support. Images are served inline, other files as
-/// downloads with a sandboxing CSP.
+/// single-range `Range` support. Images are served inline (sandboxed, so an
+/// SVG opened in a browser runs no script), other files as downloads with a
+/// sandboxing CSP.
 async fn serve_attachment(
     attachments: &AttachmentStore,
     method: &Method,
@@ -236,7 +237,10 @@ async fn serve_attachment(
     set(header::ACCEPT_RANGES, "bytes");
     set(header::ETAG, &etag);
     match stored.kind {
-        AttachmentKind::Image => set(header::CONTENT_TYPE, &stored.mime_type),
+        AttachmentKind::Image => {
+            set(header::CONTENT_TYPE, &stored.mime_type);
+            set(header::CONTENT_SECURITY_POLICY, "sandbox");
+        }
         AttachmentKind::File => {
             let content_type = if is_safe_download_mime_type(&stored.mime_type) {
                 stored.mime_type.as_str()

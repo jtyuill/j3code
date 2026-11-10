@@ -239,7 +239,7 @@ fn expand_home(path: &str, home: &str) -> PathBuf {
 pub enum ImageFileError {
     /// A relative path that climbs out of the workspace root.
     OutsideRoot,
-    /// Not a raster image the clients render, or larger than an upload.
+    /// Not an image the clients render, or larger than an upload.
     NotImage,
     /// Nothing (or no regular file) at the resolved path.
     NotFound(PathBuf),
@@ -247,8 +247,8 @@ pub enum ImageFileError {
 
 /// The host image file `requested` names, as `workspace-file` assets see
 /// it: relative to `root` (and resolving inside it), or absolute like
-/// `projects.readFile`. Only GIF, JPEG, PNG and WebP files up to the image
-/// upload limit qualify; returns the path and its MIME type.
+/// `projects.readFile`. Only GIF, JPEG, PNG, WebP and SVG files up to the
+/// image upload limit qualify; returns the path and its MIME type.
 pub fn image_file(root: &str, requested: &str) -> Result<(PathBuf, &'static str), ImageFileError> {
     let requested = requested.trim();
     let extension = Path::new(requested)
@@ -260,6 +260,7 @@ pub fn image_file(root: &str, requested: &str) -> Result<(PathBuf, &'static str)
         Some("jpg" | "jpeg") => "image/jpeg",
         Some("gif") => "image/gif",
         Some("webp") => "image/webp",
+        Some("svg") => "image/svg+xml",
         _ => return Err(ImageFileError::NotImage),
     };
     let (target, root) = if Path::new(requested).is_absolute() {

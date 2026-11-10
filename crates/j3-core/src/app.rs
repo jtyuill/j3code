@@ -989,7 +989,7 @@ impl Inner {
                 }
                 files::ImageFileError::NotImage => Error::new(
                     ErrorCode::TooLarge,
-                    "Only GIF, JPEG, PNG and WebP images up to 10 MiB can be shown.",
+                    "Only GIF, JPEG, PNG, WebP and SVG images up to 10 MiB can be shown.",
                 )
                 .with_data(json!({"limit": crate::attachments::MAX_IMAGE_BYTES})),
                 files::ImageFileError::NotFound(_) => Error::not_found("file", &requested),
