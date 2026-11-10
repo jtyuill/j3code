@@ -43,6 +43,7 @@ pub fn view(s: &J3, cx: &mut Cx<J3>) -> El {
         shell(s, cx, &mut ui)
     };
     crate::dialogs::view(s, cx, &mut ui);
+    crate::viewer::view(s, cx, &mut ui);
     crate::toasts::view(s, &mut ui);
     let body = col()
         .key("workspace")

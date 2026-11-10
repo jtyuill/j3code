@@ -338,11 +338,13 @@ fn display_formula(tex: &str, image: &Image, density: f32, width: f32) -> Option
 fn natural_size(alt: &str, image: &Image, density: f32) -> Option<El> {
     let [w, h] = image.size()?;
     let picture = crate::images::fitted(image, w as f32 / density, h as f32 / density, 4.0);
-    Some(
-        picture
-            .role("image")
-            .label(if alt.is_empty() { "Image preview" } else { alt }),
-    )
+    let label = if alt.is_empty() { "Image preview" } else { alt };
+    Some(crate::viewer::opens(
+        picture.role("image").label(label),
+        image,
+        density,
+        label,
+    ))
 }
 
 /// A top-level paragraph holding formulas: `source` (markdown, each formula a placeholder)

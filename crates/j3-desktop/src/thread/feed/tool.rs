@@ -123,7 +123,7 @@ pub fn view(s: &J3, cx: &Ctx, item: &Item) -> El {
     if expandable {
         let (key, toggled) = (cx.key.clone(), id.clone());
         header = header
-            .hover(k.alpha(k.c.hover, 0.5))
+            .hover(crate::theme::row_hover(k))
             .cursor(rune::Cursor::Pointer)
             .on_press(move |s: &mut J3| s.toggle_feed_row(&key, &toggled));
     }
@@ -202,8 +202,9 @@ fn output_image(s: &J3, cx: &Ctx, item_id: &str, index: usize, attachment: &str)
                 let density = s.images.density(&image);
                 let (w, h) = (w as f32 / density, h as f32 / density);
                 let fit = (MAX_OUTPUT_IMAGE_HEIGHT / h).min(1.0);
-                decorate(crate::images::fitted(&image, w * fit, h * fit, 0.0))
-                    .label("Tool output image")
+                let picture = decorate(crate::images::fitted(&image, w * fit, h * fit, 0.0))
+                    .label("Tool output image");
+                crate::viewer::opens(picture, &image, density, "Tool output image")
             }
             _ => {
                 cx.wait(&image);

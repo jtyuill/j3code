@@ -79,6 +79,13 @@ impl Status {
     }
 }
 
+/// The hover fill of a feed row's header: half the theme's hover, since the feed's rows sit
+/// close together and are passed over constantly. (`Kit::alpha` sets a colour's opacity; the
+/// theme's hover is translucent already, so its own opacity is what is halved.)
+pub fn row_hover(k: &Kit) -> Color {
+    k.alpha(k.c.hover, k.c.hover.a * 0.5)
+}
+
 /// The kit for `dark`, with `ui`'s font sizes, for the blend mode of the window building the
 /// view. Cached until the inputs change, so a view can call it every frame.
 pub fn kit(dark: bool, ui: &UiSettings) -> Rc<Kit> {

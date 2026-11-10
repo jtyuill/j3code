@@ -48,3 +48,4 @@ pub mod ui_settings;
 #[cfg(test)]
 mod ui_tests;
 pub mod usage;
+pub mod viewer;

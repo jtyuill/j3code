@@ -110,7 +110,12 @@ fn attachment_thumbnail(s: &J3, cx: &Ctx, id: &str, attachment: &Attachment) -> 
             if !image.is_ready() {
                 cx.wait(&image);
             }
-            frame.pixels_fit(image.pixels(), rune::SurfaceFit::Fill)
+            let frame = frame.pixels_fit(image.pixels(), rune::SurfaceFit::Fill);
+            if image.is_ready() {
+                crate::viewer::opens(frame, &image, s.images.density(&image), &name)
+            } else {
+                frame
+            }
         }
         ImageLoad::Loading => frame.child(Spinner::new().size(12.0).build(k)),
         ImageLoad::Failed => frame.padding(4.0).child(
@@ -150,7 +155,7 @@ pub fn reasoning(s: &J3, cx: &Ctx, item: &Item, reasoning: &str, streaming: bool
         .px(4.0)
         .ml(-4.0)
         .radius(k.radius.sm)
-        .hover(k.alpha(k.c.hover, 0.5))
+        .hover(crate::theme::row_hover(k))
         .cursor(rune::Cursor::Pointer)
         .on_press(move |s: &mut J3| s.toggle_feed_row(&key, &toggled));
     let body = (expanded && !reasoning.trim().is_empty()).then(|| {

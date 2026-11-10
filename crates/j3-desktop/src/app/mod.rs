@@ -120,6 +120,8 @@ pub struct J3 {
     /// At most one modal dialog.
     pub dialogs: DialogState,
     pub toasts: Toasts,
+    /// The chat picture open over the window, if any (`viewer`).
+    pub viewer: Option<crate::viewer::Viewer>,
     pub terminals: HashMap<ThreadKey, Drawer>,
     pub files: HashMap<ThreadKey, FilePane>,
     pub git: HashMap<ThreadKey, GitControl>,
@@ -158,6 +160,7 @@ impl J3 {
             settings: SettingsState::default(),
             dialogs: DialogState::default(),
             toasts: Toasts::default(),
+            viewer: None,
             terminals: HashMap::new(),
             files: HashMap::new(),
             git: HashMap::new(),
@@ -280,9 +283,12 @@ pub fn poll(s: &mut J3, t: f64, tx: &mut Tx) -> bool {
     changed
 }
 
-/// Keys the focused control passed on (or every key while nothing has focus): the sidebar
-/// toggle (⇧⌘B), then the binding table in the key's context.
+/// Keys the focused control passed on (or every key while nothing has focus): the open
+/// image viewer's, else the sidebar toggle (⇧⌘B), then the binding table in the key's context.
 pub fn on_key(s: &mut J3, ev: &KeyEvent, tx: &mut Tx) -> bool {
+    if s.viewer_key(ev, tx) {
+        return true;
+    }
     if rune_kit::shell::is_sidebar_toggle(ev) && !s.route.settings {
         s.sidebar.pane.toggle();
         return true;
