@@ -24,9 +24,8 @@ pub fn view(s: &J3, cx: &mut Cx<J3>, ui: &mut Ui, key: &ThreadKey) -> El {
         return col();
     };
     let k = ui.k;
-    let dark = cx.system_dark();
-    drawer.dark.set(dark);
-    let palette = Palette::new(k, dark);
+    drawer.dark.set(cx.system_dark());
+    let palette = Palette::new(k);
     // The chat above keeps some room.
     let room = cx
         .layout_size("thread-main")

@@ -1,5 +1,5 @@
-//! The terminal's colours: the 16 ANSI colours for the appearance, xterm's 6×6×6 cube and
-//! grey ramp, then foreground, background and cursor from the kit; what a program set with
+//! The terminal's colours: the theme's 16 ANSI colours, xterm's 6×6×6 cube and grey ramp,
+//! then foreground, background and cursor from the kit; what a program set with
 //! OSC 4/10/11/12 wins. Cell colours (`vte` named, indexed or true colour) resolve here.
 
 use alacritty_terminal::{
@@ -11,17 +11,6 @@ use rune::{
     color::{srgb_decode, srgb_encode},
 };
 use rune_kit::Kit;
-
-/// The ANSI colours on a dark background (normal then bright), sRGB.
-const DARK: [u32; 16] = [
-    0x3b3b3b, 0xf14c4c, 0x23d18b, 0xe5c07b, 0x3b8eea, 0xd670d6, 0x29b8db, 0xd4d4d4, //
-    0x8a8a8a, 0xff6b6b, 0x5ae0a8, 0xf5d68f, 0x6fb0ff, 0xe39ae3, 0x5fd3ee, 0xf5f5f5,
-];
-/// The ANSI colours on a light background, sRGB.
-const LIGHT: [u32; 16] = [
-    0x1e1e1e, 0xc72e2e, 0x0e8a4f, 0x9a7400, 0x0451a5, 0xa626a4, 0x0e7f9c, 0x6e6e6e, //
-    0x5a5a5a, 0xe03c3c, 0x14a85f, 0xb58b00, 0x2a6fd6, 0xbc3fbc, 0x1596b8, 0x8a8a8a,
-];
 
 /// The colours a frame of the terminal draws with.
 #[derive(Clone, Copy, Debug, PartialEq, Hash)]
@@ -36,11 +25,10 @@ pub struct Palette {
 }
 
 impl Palette {
-    /// The palette for `k`'s appearance (`dark`).
-    pub fn new(k: &Kit, dark: bool) -> Self {
-        let table = if dark { &DARK } else { &LIGHT };
+    /// The palette of `k`'s theme.
+    pub fn new(k: &Kit) -> Self {
         Self {
-            ansi: table.map(hex),
+            ansi: crate::theme::ansi(k),
             foreground: k.c.text_base,
             background: k.c.bg_base,
             cursor: k.c.text_base,
@@ -108,14 +96,6 @@ pub fn dimmed(color: Color) -> Color {
     color.alpha(color.a * 0.7)
 }
 
-fn hex(rgb: u32) -> Color {
-    from_rgb(Rgb {
-        r: (rgb >> 16) as u8,
-        g: (rgb >> 8) as u8,
-        b: rgb as u8,
-    })
-}
-
 /// An sRGB byte triple as a (linear) Rune colour.
 pub fn from_rgb(rgb: Rgb) -> Color {
     let channel = |v: u8| srgb_decode(f32::from(v) / 255.0);
@@ -142,7 +122,7 @@ mod tests {
     use super::*;
 
     fn palette() -> Palette {
-        Palette::new(rune_theme_opencode::kit(true), true)
+        Palette::new(rune_theme_opencode::kit(true))
     }
 
     #[test]

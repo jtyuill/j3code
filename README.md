@@ -45,6 +45,10 @@ See [PLAN.md](PLAN.md) for design decisions and [docs/protocol/wire.md](docs/pro
 
 Screenshots are rendered headlessly from the offline fixture scenes in `crates/j3-desktop/src/app/fixtures.rs` (see [CONTRIBUTING.md](CONTRIBUTING.md)).
 
+## Themes
+
+Settings › General › Theme picks one: System (Light or Dark, following the OS), or Tokyo Night, Storm, Moon or Day. A theme is one JSON file; your own go in `<config dir>/j3/themes/`. [docs/themes.md](docs/themes.md) has the format and how to check and preview a theme from the command line.
+
 ## Layout
 
 | Path | Contents |

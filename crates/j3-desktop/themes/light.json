@@ -1,0 +1,10 @@
+{
+  "name": "Light",
+  "appearance": "light",
+  "terminal": {
+    "ansi": [
+      "#1e1e1e", "#c72e2e", "#0e8a4f", "#9a7400", "#0451a5", "#a626a4", "#0e7f9c", "#6e6e6e",
+      "#5a5a5a", "#e03c3c", "#14a85f", "#b58b00", "#2a6fd6", "#bc3fbc", "#1596b8", "#8a8a8a"
+    ]
+  }
+}

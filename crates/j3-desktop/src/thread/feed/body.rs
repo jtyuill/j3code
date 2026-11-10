@@ -6,7 +6,7 @@
 //! toggle) closes the block.
 
 use rune::{El, TextStyle, col, rich, row, text};
-use rune_kit::{Kit, syntax::SyntaxTheme};
+use rune_kit::Kit;
 
 use super::lines;
 use crate::{
@@ -43,7 +43,7 @@ pub fn view(
 }
 
 fn content(k: &Kit, body: &ToolBody, limit: usize, expanded: bool, failed: bool) -> El {
-    let theme = SyntaxTheme::from_kit(k);
+    let theme = crate::theme::syntax(k);
     let status = Status::of(k);
     match body {
         ToolBody::Command { command, output } => {

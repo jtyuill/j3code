@@ -1,0 +1,39 @@
+{
+  "name": "Tokyo Night",
+  "appearance": "dark",
+  "background": "#1a1b26",
+  "foreground": "#c0caf5",
+  "accent": "#7aa2f7",
+  "status": {
+    "success": "#9ece6a",
+    "warning": "#e0af68",
+    "danger": "#f7768e",
+    "info": "#7dcfff"
+  },
+  "tokens": {
+    "page": "#16161e",
+    "bg_deep": "#16161e",
+    "text_muted": "#a9b1d6",
+    "text_faint": "#737aa2",
+    "icon_muted": "#a9b1d6",
+    "icon_faint": "#737aa2",
+    "border_focus": "#7aa2f7"
+  },
+  "syntax": {
+    "keyword": "#bb9af7",
+    "string": "#9ece6a",
+    "number": "#ff9e64",
+    "comment": "#565f89",
+    "type": "#2ac3de",
+    "function": "#7aa2f7",
+    "property": "#73daca",
+    "punctuation": "#89ddff",
+    "parameter": "#e0af68"
+  },
+  "terminal": {
+    "ansi": [
+      "#15161e", "#f7768e", "#9ece6a", "#e0af68", "#7aa2f7", "#bb9af7", "#7dcfff", "#a9b1d6",
+      "#414868", "#f7768e", "#9ece6a", "#e0af68", "#7aa2f7", "#bb9af7", "#7dcfff", "#c0caf5"
+    ]
+  }
+}

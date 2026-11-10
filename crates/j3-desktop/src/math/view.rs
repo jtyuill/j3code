@@ -167,7 +167,7 @@ impl Doc {
             let version = (
                 source,
                 look.streaming,
-                k.dark,
+                crate::theme::stamp(k),
                 ink,
                 sizes,
                 self.images,
@@ -290,7 +290,7 @@ fn gap(before: &Block, next: &Block) -> f32 {
 /// `source` through rune-kit's `Markdown`, its images (display formulas among them) from
 /// `images`, each with the device pixels per point it draws at for its natural size.
 fn markdown(source: &str, images: Rc<HashMap<String, (Image, f32)>>, look: Look) -> El {
-    let mut style = rune_kit::MarkdownStyle::from_kit(look.k);
+    let mut style = crate::theme::markdown(look.k);
     if look.ink != look.k.c.text_base {
         style = style.text(look.ink);
     }

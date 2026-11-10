@@ -460,12 +460,16 @@ pub(crate) fn markdown(s: &J3, ui: &Ui, key: &ThreadKey, id: &str, source: &str)
     let k = ui.k;
     let math_on = s.prefs.ui().math_rendering;
     let build = || {
+        let style = crate::theme::markdown(k);
         if !math_on {
-            return Markdown::new(source).selectable(true).build(k);
+            return Markdown::new(source).style(style).selectable(true).build(k);
         }
         let prepared = math::prepare(source);
         if prepared.formulas.is_empty() {
-            return Markdown::new(prepared.source).selectable(true).build(k);
+            return Markdown::new(prepared.source)
+                .style(style)
+                .selectable(true)
+                .build(k);
         }
         let ink = k.c.text_base;
         let size = k.ty.body.size;
@@ -479,6 +483,7 @@ pub(crate) fn markdown(s: &J3, ui: &Ui, key: &ThreadKey, id: &str, source: &str)
             })
             .collect();
         Markdown::new(prepared.source)
+            .style(style)
             .images(move |src| images.get(math::parse_src(src)?)?.clone())
             .selectable(true)
             .build(k)
@@ -495,7 +500,7 @@ pub(crate) fn markdown(s: &J3, ui: &Ui, key: &ThreadKey, id: &str, source: &str)
         (
             hasher.finish(),
             math_on,
-            k.dark,
+            crate::theme::stamp(k),
             ui.m.rem.to_bits(),
             ui.m.code.to_bits(),
         ),

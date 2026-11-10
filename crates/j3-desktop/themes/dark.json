@@ -1,0 +1,10 @@
+{
+  "name": "Dark",
+  "appearance": "dark",
+  "terminal": {
+    "ansi": [
+      "#3b3b3b", "#f14c4c", "#23d18b", "#e5c07b", "#3b8eea", "#d670d6", "#29b8db", "#d4d4d4",
+      "#8a8a8a", "#ff6b6b", "#5ae0a8", "#f5d68f", "#6fb0ff", "#e39ae3", "#5fd3ee", "#f5f5f5"
+    ]
+  }
+}

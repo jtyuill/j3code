@@ -424,7 +424,7 @@ mod tests {
         t.screen
             .resize(super::super::GridSize { cols: 12, rows: 3 });
         t.screen.feed(bytes.as_bytes());
-        let palette = Palette::new(rune_theme_opencode::kit(true), true);
+        let palette = Palette::new(rune_theme_opencode::kit(true));
         let (rows, cursor) = model(&t, &palette, CellMetrics::new(12.0), focused);
         (palette, rows, cursor)
     }
@@ -462,7 +462,7 @@ mod tests {
             cols: 150,
             rows: 12,
         });
-        let palette = Palette::new(rune_theme_opencode::kit(true), true);
+        let palette = Palette::new(rune_theme_opencode::kit(true));
         let (rows, _) = model(&t, &palette, CellMetrics::new(12.0), true);
         let run = &rows[1].runs[0];
         assert_eq!(rows[1].runs.len(), 1);

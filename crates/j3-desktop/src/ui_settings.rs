@@ -77,6 +77,10 @@ pub struct UiSettings {
     /// Widest the conversation text and composer get, in rem. Narrower
     /// columns are easier to read.
     pub text_measure: f32,
+    /// The theme's id (`theme::library`: `tokyo-night`, or a file of the user's themes
+    /// directory without `.json`); `None` is Light or Dark, following the system.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub theme: Option<String>,
     /// Interface font family; `None` is the system font.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ui_font: Option<String>,
@@ -121,6 +125,7 @@ impl Default for UiSettings {
             math_rendering: true,
             expanded_shelves: Vec::new(),
             text_measure: DEFAULT_TEXT_MEASURE,
+            theme: None,
             ui_font: None,
             mono_font: None,
             interface_font_size: DEFAULT_INTERFACE_FONT_SIZE,
@@ -343,6 +348,7 @@ mod tests {
             math_rendering: false,
             expanded_shelves: Vec::new(),
             text_measure: 42.,
+            theme: Some("tokyo-night".into()),
             ui_font: Some("Inter".into()),
             mono_font: None,
             interface_font_size: 15.,
@@ -368,7 +374,7 @@ mod tests {
             value,
             json!({"workflow": "herdr", "workingShelf": false, "statusIndicators": "symbols",
                 "agentOrder": "attention", "toasts": false, "sounds": true, "mathRendering": false,
-                "expandedShelves": ["settled"], "textMeasure": 42.0, "uiFont": "Inter",
+                "expandedShelves": ["settled"], "textMeasure": 42.0, "theme": "tokyo-night", "uiFont": "Inter",
                 "interfaceFontSize": 15.0, "codeFontSize": 13.0, "terminalFontSize": 12.0,
                 "favoriteModels": ["a/one"], "usageInline": ["anthropic"],
                 "dictationModel": "small.en", "deviceName": "revolver", "zoom": 1.25})

@@ -20,6 +20,9 @@ use crate::{
     },
 };
 
+/// The theme picker's first option: Light or Dark, following the system.
+const SYSTEM_THEME: &str = "__system__";
+
 /// The font pickers' first option: no family chosen.
 const DEFAULT_FONT: &str = "__default__";
 
@@ -196,8 +199,59 @@ fn zoom_label(zoom: f32) -> String {
     format!("{:.0}%", zoom * 100.0)
 }
 
-/// Zoom, the two font families and the font sizes.
+/// The theme: Light or Dark by the system appearance, or one theme by name.
+fn theme_picker(s: &J3, ui: &mut Ui) -> El {
+    let chosen = s.prefs.ui().theme.as_deref();
+    let mut options = vec![ComboboxOption::new(SYSTEM_THEME, "System")];
+    options.extend(
+        crate::theme::library::list()
+            .iter()
+            .map(|(id, name)| ComboboxOption::new(id, name)),
+    );
+    // A chosen theme whose file is gone still reads as chosen (the system's shows meanwhile).
+    if let Some(id) = chosen
+        && !options.iter().any(|o| o.id == id)
+    {
+        options.push(ComboboxOption::new(id, format!("{id} (missing)")));
+    }
+    Combobox::new("theme", &s.settings.theme, &options, theme_state)
+        .label("Theme")
+        .current(Some(chosen.unwrap_or(SYSTEM_THEME)))
+        .search_placeholder("Search themes")
+        .empty_message("No themes match")
+        .width(240.0)
+        .max_height(320.0)
+        .on_choose(|s: &mut J3, id: &str, tx: &mut Tx| {
+            let theme = (id != SYSTEM_THEME).then(|| id.to_owned());
+            s.update_ui(|ui| ui.theme = theme, tx);
+        })
+        .build(ui.k, ui.layer)
+}
+
+fn theme_state(s: &mut J3) -> &mut ComboboxState {
+    &mut s.settings.theme
+}
+
+/// Where themes come from, and which of the user's files didn't load.
+fn theme_description() -> String {
+    let mut description = String::from("System follows your light or dark appearance.");
+    if let Some(dir) = crate::theme::library::dir() {
+        description.push_str(&format!(
+            " Your own themes are JSON files in {}, read when Settings opens.",
+            dir.display()
+        ));
+    }
+    // The whole reason (it may list every key a section takes) is `j3 --check-theme`'s.
+    for error in crate::theme::library::errors() {
+        let reason = error.split(';').next().unwrap_or(&error);
+        description.push_str(&format!(" Not loaded: {reason}."));
+    }
+    description
+}
+
+/// The theme, zoom, the two font families and the font sizes.
 fn appearance(s: &J3, ui: &mut Ui) -> El {
+    let theme = theme_picker(s, ui);
     let k = ui.k;
     let prefs = s.prefs.ui();
     let levels: Vec<String> = ZOOM_LEVELS.iter().map(|&z| zoom_label(z)).collect();
@@ -250,6 +304,7 @@ fn appearance(s: &J3, ui: &mut Ui) -> El {
     let k = ui.k;
     Group::new("settings-appearance")
         .title("Appearance")
+        .row(item(k, "theme", "Theme", Some(&theme_description()), theme))
         .row(item(
             k,
             "zoom",

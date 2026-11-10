@@ -72,6 +72,7 @@ pub struct SettingsState {
     pub page: Page,
     /// The zoom listbox is open.
     pub zoom_open: bool,
+    pub theme: ComboboxState,
     pub ui_font: ComboboxState,
     pub mono_font: ComboboxState,
     pub speech_model: ComboboxState,
@@ -85,6 +86,9 @@ impl J3 {
     pub fn open_settings(&mut self, page: Page, tx: &mut Tx) {
         self.settings.archived.clear();
         self.settings.zoom_open = false;
+        self.settings.theme.close();
+        // Theme files written since the last look are on offer.
+        crate::theme::library::reload();
         self.settings.ui_font.close();
         self.settings.mono_font.close();
         self.settings.speech_model.close();

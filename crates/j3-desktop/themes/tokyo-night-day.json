@@ -1,0 +1,39 @@
+{
+  "name": "Tokyo Night Day",
+  "appearance": "light",
+  "background": "#e1e2e7",
+  "foreground": "#3760bf",
+  "accent": "#2e7de9",
+  "status": {
+    "success": "#587539",
+    "warning": "#8c6c3e",
+    "danger": "#f52a65",
+    "info": "#007197"
+  },
+  "tokens": {
+    "page": "#d0d5e3",
+    "bg_deep": "#d0d5e3",
+    "text_muted": "#6172b0",
+    "text_faint": "#848cb5",
+    "icon_muted": "#6172b0",
+    "icon_faint": "#848cb5",
+    "border_focus": "#2e7de9"
+  },
+  "syntax": {
+    "keyword": "#9854f1",
+    "string": "#587539",
+    "number": "#b15c00",
+    "comment": "#848cb5",
+    "type": "#188092",
+    "function": "#2e7de9",
+    "property": "#387068",
+    "punctuation": "#006a83",
+    "parameter": "#8c6c3e"
+  },
+  "terminal": {
+    "ansi": [
+      "#b4b5b9", "#f52a65", "#587539", "#8c6c3e", "#2e7de9", "#9854f1", "#007197", "#6172b0",
+      "#a1a6c5", "#f52a65", "#587539", "#8c6c3e", "#2e7de9", "#9854f1", "#007197", "#3760bf"
+    ]
+  }
+}

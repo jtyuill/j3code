@@ -541,7 +541,7 @@ impl J3 {
                 }
                 TerminalItem::Output { data } => {
                     let k = crate::theme::kit(dark, self.prefs.ui());
-                    terminal.feed(&data, &Palette::new(&k, dark), cell, zoom);
+                    terminal.feed(&data, &Palette::new(&k), cell, zoom);
                 }
                 TerminalItem::Exited {
                     exit_code,

@@ -6,10 +6,7 @@ use std::{borrow::Cow, ops::Range};
 
 use j3_client::{Error, envelope::ErrorCode, methods::ReadFileResult};
 use rune::{El, GrowthSpec, ScrollSpec, TextStyle, Tx, col, el, icon, row, text};
-use rune_kit::{
-    IconButton, IconButtonVariant, Spinner,
-    syntax::{Highlight, SyntaxTheme},
-};
+use rune_kit::{IconButton, IconButtonVariant, Spinner, syntax::Highlight};
 
 use super::FilePane;
 use crate::{
@@ -183,7 +180,7 @@ pub(super) fn format_size(bytes: u64) -> String {
 }
 
 /// The preview: breadcrumb bar, then the file, a spinner or a notice.
-pub(super) fn view(s: &J3, preview: &Preview, ui: &Ui, key: &ThreadKey) -> El {
+pub(super) fn view(preview: &Preview, ui: &Ui, key: &ThreadKey) -> El {
     let k = ui.k;
     let status = Status::of(k);
     let notice = |label: String, color| {
@@ -217,7 +214,7 @@ pub(super) fn view(s: &J3, preview: &Preview, ui: &Ui, key: &ThreadKey) -> El {
                     .clone()
                     .map(|truncated| notice(truncated, status.muted)),
             )
-            .child(code_view(s, code, &preview.path, ui, key)),
+            .child(code_view(code, &preview.path, ui, key)),
         Body::Binary => notice("Binary file; there is no preview.".to_owned(), status.muted),
         Body::Failed(error) => notice(error.clone(), status.danger),
     };
@@ -291,7 +288,7 @@ fn breadcrumb(path: &str, ui: &Ui, key: &ThreadKey) -> El {
 }
 
 /// The file's lines, virtualised, with a line-number gutter; long lines scroll sideways.
-fn code_view(s: &J3, code: &Code, path: &str, ui: &Ui, key: &ThreadKey) -> El {
+fn code_view(code: &Code, path: &str, ui: &Ui, key: &ThreadKey) -> El {
     let k = ui.k;
     let font = TextStyle {
         line_height: (k.ty.mono.size * 1.5).round(),
@@ -302,7 +299,7 @@ fn code_view(s: &J3, code: &Code, path: &str, ui: &Ui, key: &ThreadKey) -> El {
     let digits = code.lines.len().to_string().len();
     let gutter = (digits as f32 * advance + 20.0).ceil();
     let width = gutter + code.columns as f32 * advance + 24.0;
-    let theme = SyntaxTheme::from_kit(&crate::theme::kit(k.dark, s.prefs.ui()));
+    let theme = crate::theme::syntax(k);
     let (text_c, number_c) = (k.c.text_base, k.c.text_faint);
     let rows_key = key.clone();
     let lines = col()

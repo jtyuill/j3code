@@ -1,16 +1,25 @@
-//! Appearance (spec §8.9): the rune-kit [`Kit`] from `rune_theme_opencode` for the system
-//! appearance, with the user's interface and code font sizes applied; [`Metrics`] (zoom,
-//! font sizes, rem, text measure) and the status colours the sidebar and feed use.
+//! Appearance (spec §8.9): the rune-kit [`Kit`] of the chosen theme ([`library`]: Light or
+//! Dark by the system appearance, or one theme by name; `docs/themes.md`), with the user's
+//! interface and code font sizes applied; the theme's code and terminal colours;
+//! [`Metrics`] (zoom, font sizes, rem, text measure) and the status colours the sidebar and
+//! feed use.
 //!
 //! Zoom scales the whole window (`app::view` draws the root under `El::scale(zoom)`), so
 //! views lay out in unzoomed points. Font sizes scale the kit's text styles: the kit's own
 //! sizes are the defaults (interface 16, code 12), and a larger setting scales every style
 //! in proportion. Font families go through `Tx::set_font_families` ([`apply_families`]).
 
-use std::{cell::RefCell, rc::Rc};
+pub mod file;
+pub mod library;
+
+use std::{
+    cell::RefCell,
+    hash::{DefaultHasher, Hash, Hasher},
+    rc::Rc,
+};
 
 use rune::{Color, TextStyle, Tx};
-use rune_kit::Kit;
+use rune_kit::{Kit, MarkdownStyle, syntax::SyntaxTheme};
 
 use crate::ui_settings::{DEFAULT_CODE_FONT_SIZE, DEFAULT_INTERFACE_FONT_SIZE, UiSettings};
 
@@ -86,35 +95,118 @@ pub fn row_hover(k: &Kit) -> Color {
     k.alpha(k.c.hover, k.c.hover.a * 0.5)
 }
 
-/// The kit for `dark`, with `ui`'s font sizes, for the blend mode of the window building the
-/// view. Cached until the inputs change, so a view can call it every frame.
-pub fn kit(dark: bool, ui: &UiSettings) -> Rc<Kit> {
-    type Key = (bool, bool, u32, u32);
-    thread_local! {
-        static CACHE: RefCell<Option<(Key, Rc<Kit>)>> = const { RefCell::new(None) };
-    }
-    let key = (
-        dark,
-        rune::theme::blends_srgb(),
+/// The theme on screen: what [`kit`] built last, and what it was built from.
+struct Shown {
+    generation: u64,
+    /// The theme asked for by name (`J3_THEME`, else the setting).
+    choice: Option<String>,
+    /// `choice` names a theme, so the system appearance doesn't matter.
+    fixed: bool,
+    srgb: bool,
+    sizes: (u32, u32),
+    kit: Rc<Kit>,
+    syntax: SyntaxTheme,
+    ansi: [Color; 16],
+    stamp: u64,
+}
+
+thread_local! {
+    static SHOWN: RefCell<Option<Shown>> = const { RefCell::new(None) };
+}
+
+/// The kit of `ui`'s theme (Light or Dark by `system_dark` when it names none), with `ui`'s
+/// font sizes, for the blend mode of the window building the view. Cached until the inputs
+/// change, so a view can call it every frame. A view holding only a kit passes its `dark`.
+pub fn kit(system_dark: bool, ui: &UiSettings) -> Rc<Kit> {
+    let choice = library::forced().or(ui.theme.as_deref());
+    let generation = library::generation();
+    let srgb = rune::theme::blends_srgb();
+    let sizes = (
         ui.interface_font_size().to_bits(),
         ui.code_font_size().to_bits(),
     );
-    CACHE.with_borrow_mut(|cache| {
-        if let Some((cached, kit)) = cache.as_ref()
-            && *cached == key
+    SHOWN.with_borrow_mut(|shown| {
+        if let Some(s) = shown.as_ref()
+            && s.generation == generation
+            && s.choice.as_deref() == choice
+            && s.srgb == srgb
+            && s.sizes == sizes
+            && (s.fixed || s.kit.dark == system_dark)
         {
-            return kit.clone();
+            return s.kit.clone();
         }
-        let mut kit = rune_theme_opencode::kit(dark).clone();
+        let chosen = choice.and_then(library::get);
+        let fixed = chosen.is_some();
+        let entry = chosen.unwrap_or_else(|| builtin(system_dark));
+        let mut kit = entry.theme.kit();
         scale_type(
             &mut kit,
             ui.interface_font_size() / DEFAULT_INTERFACE_FONT_SIZE,
             ui.code_font_size() / DEFAULT_CODE_FONT_SIZE,
         );
+        let syntax = entry.theme.syntax(&kit);
+        let ansi = entry.theme.ansi.unwrap_or_else(|| builtin_ansi(kit.dark));
+        let stamp = stamp_of(&kit, &syntax);
         let kit = Rc::new(kit);
-        *cache = Some((key, kit.clone()));
+        *shown = Some(Shown {
+            generation,
+            choice: choice.map(str::to_owned),
+            fixed,
+            srgb,
+            sizes,
+            kit: kit.clone(),
+            syntax,
+            ansi,
+            stamp,
+        });
         kit
     })
+}
+
+/// The built-in Light or Dark theme.
+fn builtin(dark: bool) -> std::sync::Arc<library::Entry> {
+    library::get(if dark { library::DARK } else { library::LIGHT })
+        .expect("Light and Dark are built in")
+}
+
+fn builtin_ansi(dark: bool) -> [Color; 16] {
+    builtin(dark)
+        .theme
+        .ansi
+        .expect("Light and Dark name their terminal colours")
+}
+
+fn stamp_of(k: &Kit, syntax: &SyntaxTheme) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    (k.dark, &k.c, syntax).hash(&mut hasher);
+    hasher.finish()
+}
+
+/// `f` over the theme on screen when `k` is its kit ([`kit`]'s), else `None` (a kit built
+/// some other way, as tests do).
+fn shown<R>(k: &Kit, f: impl FnOnce(&Shown) -> R) -> Option<R> {
+    SHOWN.with_borrow(|shown| shown.as_ref().filter(|s| std::ptr::eq(&*s.kit, k)).map(f))
+}
+
+/// The code colours of `k`'s theme.
+pub fn syntax(k: &Kit) -> SyntaxTheme {
+    shown(k, |s| s.syntax).unwrap_or_else(|| SyntaxTheme::from_kit(k))
+}
+
+/// The terminal's 16 ANSI colours (normal then bright) in `k`'s theme.
+pub fn ansi(k: &Kit) -> [Color; 16] {
+    shown(k, |s| s.ansi).unwrap_or_else(|| builtin_ansi(k.dark))
+}
+
+/// A number that changes when `k`'s colours do: the part of a `memo` version that follows
+/// the theme.
+pub fn stamp(k: &Kit) -> u64 {
+    shown(k, |s| s.stamp).unwrap_or_else(|| stamp_of(k, &SyntaxTheme::from_kit(k)))
+}
+
+/// How markdown looks in `k`'s theme: the kit's tokens, with the theme's code colours.
+pub fn markdown(k: &Kit) -> MarkdownStyle {
+    MarkdownStyle::from_kit(k).syntax_theme(syntax(k))
 }
 
 /// Scales every text style of `k`: sans styles by `ui`, monospace by `mono`.
@@ -163,6 +255,38 @@ pub fn apply_families(ui: &UiSettings, tx: &mut Tx) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_named_theme_ignores_the_system_appearance() {
+        let system = UiSettings::default();
+        let (light, dark) = (kit(false, &system), kit(true, &system));
+        assert!(!light.dark && dark.dark);
+        assert_eq!(dark.c.bg_base, rune_theme_opencode::kit(true).c.bg_base);
+        let dark_stamp = stamp(&dark);
+
+        let tokyo = UiSettings {
+            theme: Some("tokyo-night".into()),
+            ..UiSettings::default()
+        };
+        let k = kit(false, &tokyo);
+        assert!(k.dark);
+        assert_eq!(k.c.bg_base, rune::color::hex("#1a1b26").unwrap());
+        // The same kit whichever appearance a caller passes, so its colours are found.
+        assert!(Rc::ptr_eq(&k, &kit(true, &tokyo)));
+        assert_eq!(ansi(&k)[1], rune::color::hex("#f7768e").unwrap());
+        assert_eq!(
+            syntax(&k).color(rune_kit::syntax::Syntax::Keyword),
+            rune::color::hex("#bb9af7").unwrap()
+        );
+        assert_ne!(stamp(&k), dark_stamp);
+
+        // A theme that is gone: the system's.
+        let gone = UiSettings {
+            theme: Some("no-such-theme".into()),
+            ..UiSettings::default()
+        };
+        assert!(!kit(false, &gone).dark && kit(true, &gone).dark);
+    }
 
     #[test]
     fn default_sizes_keep_the_kits_type() {

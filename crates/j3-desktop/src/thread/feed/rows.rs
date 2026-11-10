@@ -138,7 +138,10 @@ pub fn reasoning(s: &J3, cx: &Ctx, item: &Item, reasoning: &str, streaming: bool
         let now = s.clock.t;
         memo(
             format!("thinking-{id}"),
-            (k.dark, k.ty.text_small_medium.size.to_bits()),
+            (
+                crate::theme::stamp(k),
+                k.ty.text_small_medium.size.to_bits(),
+            ),
             || shimmer(k, "Thinking…", now),
         )
         .key(format!("thinking-{id}"))

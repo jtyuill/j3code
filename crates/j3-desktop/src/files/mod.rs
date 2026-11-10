@@ -330,7 +330,7 @@ pub fn view(s: &J3, _cx: &mut Cx<J3>, ui: &mut Ui, key: &ThreadKey) -> El {
             .min_h(0.0)
             .child(tree.h(pane.tree_height).shrink())
             .child(
-                preview::view(s, preview, ui, key)
+                preview::view(preview, ui, key)
                     .grow(1.0)
                     .min_h(0.0)
                     .border_sides([1.0, 0.0, 0.0, 0.0], k.c.border_muted),

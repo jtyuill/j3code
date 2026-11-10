@@ -1,0 +1,39 @@
+{
+  "name": "Tokyo Night Moon",
+  "appearance": "dark",
+  "background": "#222436",
+  "foreground": "#c8d3f5",
+  "accent": "#82aaff",
+  "status": {
+    "success": "#c3e88d",
+    "warning": "#ffc777",
+    "danger": "#ff757f",
+    "info": "#86e1fc"
+  },
+  "tokens": {
+    "page": "#1e2030",
+    "bg_deep": "#1e2030",
+    "text_muted": "#828bb8",
+    "text_faint": "#737aa2",
+    "icon_muted": "#828bb8",
+    "icon_faint": "#737aa2",
+    "border_focus": "#82aaff"
+  },
+  "syntax": {
+    "keyword": "#c099ff",
+    "string": "#c3e88d",
+    "number": "#ff966c",
+    "comment": "#636da6",
+    "type": "#65bcff",
+    "function": "#82aaff",
+    "property": "#4fd6be",
+    "punctuation": "#89ddff",
+    "parameter": "#ffc777"
+  },
+  "terminal": {
+    "ansi": [
+      "#1b1d2b", "#ff757f", "#c3e88d", "#ffc777", "#82aaff", "#c099ff", "#86e1fc", "#828bb8",
+      "#444a73", "#ff757f", "#c3e88d", "#ffc777", "#82aaff", "#c099ff", "#86e1fc", "#c8d3f5"
+    ]
+  }
+}

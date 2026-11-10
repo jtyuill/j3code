@@ -10,10 +10,42 @@ use j3_desktop::{
     preferences::Preferences,
     services::Services,
     speech::SpeechEngine,
+    theme::library as themes,
 };
 use tracing_subscriber::EnvFilter;
 
+/// `j3 --check-theme <file>…`: says whether each theme file loads and why not, then exits
+/// (1 when one doesn't). `docs/themes.md`.
+fn check_themes() {
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() != Some("--check-theme") {
+        return;
+    }
+    let mut failed = false;
+    let mut checked = 0;
+    for file in args {
+        checked += 1;
+        match themes::read(std::path::Path::new(&file)) {
+            Ok(theme) => println!(
+                "{file}: ok ({}, {})",
+                theme.name,
+                if theme.dark { "dark" } else { "light" }
+            ),
+            Err(e) => {
+                failed = true;
+                eprintln!("{file}: {e}");
+            }
+        }
+    }
+    if checked == 0 {
+        eprintln!("usage: j3 --check-theme <file.json>…");
+        failed = true;
+    }
+    std::process::exit(i32::from(failed));
+}
+
 fn main() {
+    check_themes();
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
@@ -34,6 +66,17 @@ fn main() {
     let config_path = environments::config_path()
         .inspect_err(|e| tracing::warn!("{e}"))
         .ok();
+    // The user's themes sit beside `desktop.json`; `J3_THEME` (an id or a theme file) shows
+    // one theme whatever the setting says, for previews (`--snap`).
+    if let Some(config) = &config_path {
+        themes::install(config.with_file_name("themes"));
+    }
+    if let Ok(theme) = std::env::var("J3_THEME")
+        && let Err(e) = themes::force(&theme)
+    {
+        eprintln!("J3_THEME: {e}");
+        std::process::exit(1);
+    }
     // The server reports this computer's name, so the setting is read before it starts.
     let hostname = gethostname::gethostname().to_string_lossy().into_owned();
     let label = device::name(
