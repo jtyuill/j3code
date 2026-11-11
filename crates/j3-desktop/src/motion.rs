@@ -5,8 +5,9 @@
 //!   streaming in, switching to a thread or the new-thread surface, a list refiltering under
 //!   the field being typed in): no motion. Every change lands in the frame it happens.
 //! - **Frequent** (tool rows arriving in a live turn, expanding a row, toggling the terminal or
-//!   the file pane): at most a short fade or glide under [`QUICK`] that never holds content
-//!   back — layout is final at once, only presentation catches up.
+//!   the file pane): at most a short fade or glide that never holds content back — layout
+//!   is final at once, only presentation catches up. Feed rows and the sent-message scroll no
+//!   longer animate.
 //! - **Occasional** (menus, popovers, cards above the composer): Rune's and the kit's short
 //!   defaults (0.2–0.25 s).
 //! - **Rare** (dialogs, settings, the agents hub, toasts): keep the kit's and Rune's fuller
@@ -14,16 +15,3 @@
 //!
 //! Rune animates by default (a 0.3 s spring on layout and colour, a 0.3 s fade on every
 //! element mounted after the first frame), so constant and frequent surfaces opt out here.
-
-use rune::{Spring, SpringPair, Transition};
-
-/// Frequent motion: a crisp, critically damped glide that reads as a response, not a wait.
-pub const QUICK: Spring = Spring::new(0.18, 0.0);
-
-/// A feed row arriving whole: a short fade in, a shorter fade out.
-pub const ARRIVE: SpringPair = SpringPair::new(Spring::new(0.16, 0.0), Spring::new(0.12, 0.0));
-
-/// How a feed row that arrives complete (a tool call, a notice, a sent message) enters.
-pub fn arrive() -> Transition {
-    Transition::opacity().springs(ARRIVE)
-}

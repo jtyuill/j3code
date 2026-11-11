@@ -16,11 +16,8 @@
 //! Activity rows sit on one rail (`rail`): a glyph column whose hairline joins consecutive
 //! activity rows.
 //!
-//! Motion follows `crate::motion`: tool calls arrive constantly in a live turn, so a row
-//! that arrives complete fades in quickly while its height glides open on a short spring of
-//! its own — no clipped unroll, no speed-capped climb in stages as its output lands.
-//! Streaming text doesn't move at all: each block lands, at its full height, in the frame it
-//! arrives.
+//! Motion follows `crate::motion`: nothing in the feed animates. Tool calls and streaming text
+//! land, at their full height, in the frame they arrive.
 
 mod anchor;
 mod body;
@@ -55,7 +52,6 @@ use crate::{
     icons,
     images::ImageLoad,
     math::view::{Look, doc},
-    motion,
     sidebar::ThreadKey,
     theme::{self, Metrics, Status},
 };
@@ -419,7 +415,7 @@ fn build_row(s: &J3, key: &ThreadKey, visible: &[usize], i: usize, dark: bool, s
         above: on_rail && previous.is_some_and(is_activity),
         below: on_rail && next.is_some_and(is_activity),
     };
-    // Text that streams in lands at once; everything else arrives whole on a short glide.
+    // Feed rows never animate: every change lands in the frame it arrives.
     let running = item.status == ItemStatus::Running;
     let streams = match &item.kind {
         ItemKind::Text(_) => true,
@@ -454,11 +450,7 @@ fn build_row(s: &J3, key: &ThreadKey, visible: &[usize], i: usize, dark: bool, s
             .items_center()
             .pt(if on_rail { 0.0 } else { top })
             .child(inner);
-        let row = if streams {
-            row.instant_changes()
-        } else {
-            row.fold_glide(motion::QUICK).transition(motion::arrive())
-        };
+        let row = row.instant_changes();
         match label {
             Some(label) => row.label(label),
             None => row,

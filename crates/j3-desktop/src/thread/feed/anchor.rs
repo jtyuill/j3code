@@ -17,7 +17,7 @@ use j3_client::{ThreadSync, ThreadView, entities::ItemKind};
 use rune::{Cx, Tx};
 
 use super::{END_PAD, FeedUi};
-use crate::{app::J3, feed::is_hidden, motion, sidebar::ThreadKey};
+use crate::{app::J3, feed::is_hidden, sidebar::ThreadKey};
 
 /// Space between the viewport's top and a held message.
 pub const PROMPT_TOP: f32 = 24.0;
@@ -213,8 +213,7 @@ impl J3 {
             && now < anchor.aim_until
         {
             if (scroll - held.offset).abs() > 0.5 {
-                // A request arriving mid-glide keeps its speed, so renewing it is one motion.
-                tx.scroll_to_with(VIEWPORT, 0.0, held.offset, motion::QUICK);
+                tx.scroll_to_instant(VIEWPORT, 0.0, held.offset);
                 tx.wake_after(Duration::from_millis(16));
             } else {
                 anchor.aim_until = 0.0;
