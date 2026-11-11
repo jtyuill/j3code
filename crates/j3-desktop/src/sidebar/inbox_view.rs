@@ -106,7 +106,7 @@ pub fn view(s: &J3, cx: &mut Cx<J3>, ui: &mut Ui) -> El {
             .child(shelf_header(
                 Shelf::Working,
                 "Working",
-                rows.working_count,
+                Some(rows.working_count),
                 &c,
             ))
             .child(
@@ -122,7 +122,7 @@ pub fn view(s: &J3, cx: &mut Cx<J3>, ui: &mut Ui) -> El {
             .child(shelf_header(
                 Shelf::Snoozed,
                 "Snoozed",
-                rows.snoozed_count,
+                Some(rows.snoozed_count),
                 &c,
             ))
             .child(
@@ -138,7 +138,7 @@ pub fn view(s: &J3, cx: &mut Cx<J3>, ui: &mut Ui) -> El {
         shelves = shelves.child(shelf_header(
             Shelf::Settled,
             "Settled",
-            rows.settled_count,
+            None,
             &c,
         ));
         let mut settled = col()
@@ -389,19 +389,24 @@ fn boundary(label: &'static str, target: &'static str, c: &Ctx) -> El {
 
 /// A shelf's header: chevron, title and count; a click folds it (saved in
 /// `ui.expandedShelves`). The Settled header takes drops.
-fn shelf_header(shelf: Shelf, title: &'static str, count: usize, c: &Ctx) -> El {
+fn shelf_header(shelf: Shelf, title: &'static str, count: Option<usize>, c: &Ctx) -> El {
     let key = match shelf {
         Shelf::Working => "shelf-working",
         Shelf::Snoozed => "shelf-snoozed",
         Shelf::Settled => SHELF_SETTLED,
     };
-    let header = SidebarHeader::new(title)
-        .count(count)
+    let mut header = SidebarHeader::new(title);
+    let mut label = title.to_owned();
+    if let Some(count) = count {
+        header = header.count(count);
+        label = format!("{title} {count}");
+    }
+    let header = header
         .collapsed(!c.rows.is_expanded(shelf))
         .on_toggle(move |s: &mut J3, tx: &mut Tx| s.toggle_shelf(shelf, tx))
         .build(c.k)
         .key(key)
-        .label(format!("{title} {count}"))
+        .label(label)
         .mt(8.0);
     if shelf == Shelf::Settled {
         dnd::drop_target(header, key.to_owned(), c.over == Some(key), c.k)
