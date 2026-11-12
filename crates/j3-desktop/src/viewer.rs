@@ -226,7 +226,12 @@ impl J3 {
         let Some(viewer) = self.viewer.as_mut() else {
             return false;
         };
-        let plain = ev.mods == Mods::default() || ev.mods == Mods { shift: true, ..Mods::default() };
+        let plain = ev.mods == Mods::default()
+            || ev.mods
+                == Mods {
+                    shift: true,
+                    ..Mods::default()
+                };
         match &ev.key {
             Key::Escape => self.viewer = None,
             Key::Text(key) if plain => match key.as_str() {
@@ -548,8 +553,7 @@ mod tests {
         assert_eq!(picture(&app), fitted);
 
         // A click on the picture keeps it open; one beside it closes.
-        app.rt
-            .pointer_down(fitted[0] + 5.0, fitted[1] + 5.0);
+        app.rt.pointer_down(fitted[0] + 5.0, fitted[1] + 5.0);
         app.rt.pointer_up(fitted[0] + 5.0, fitted[1] + 5.0);
         app.frame();
         assert!(app.rt.state.viewer.is_some());

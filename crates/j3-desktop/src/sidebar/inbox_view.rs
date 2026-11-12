@@ -135,12 +135,7 @@ pub fn view(s: &J3, cx: &mut Cx<J3>, ui: &mut Ui) -> El {
     }
     // The Settled shelf is always there: a drop target even while empty.
     if rows.has_projects {
-        shelves = shelves.child(shelf_header(
-            Shelf::Settled,
-            "Settled",
-            None,
-            &c,
-        ));
+        shelves = shelves.child(shelf_header(Shelf::Settled, "Settled", None, &c));
         let mut settled = col()
             .key(SETTLED_LIST)
             .w_full()

@@ -44,9 +44,7 @@ use j3_client::{
     entities::{Item, ItemKind, ItemStatus, NoticeLevel},
     methods::StopSubagentParams,
 };
-use rune::{
-    Color, Cx, El, GrowthSpec, Image, ScrollSpec, Spring, Tx, col, el, icon, memo, text,
-};
+use rune::{Color, Cx, El, GrowthSpec, Image, ScrollSpec, Spring, Tx, col, el, icon, memo, text};
 use rune_kit::{Kit, Spinner};
 
 use crate::{

@@ -146,7 +146,11 @@ fn field(s: &J3, cx: &mut Cx<J3>, ui: &Ui, key: &ComposerKey, edit: &TextEdit) -
         .w_full()
         .color(k.c.text_base)
         .placeholder(
-            if running { "Queue a message…" } else { "Send a message…" },
+            if running {
+                "Queue a message…"
+            } else {
+                "Send a message…"
+            },
             k.c.text_faint,
         )
         .caret(k.c.text_base, k.selection())
