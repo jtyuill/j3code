@@ -48,7 +48,7 @@ fn inbox_sections_settle_and_advance_pin_and_reorder() {
     // The Settled shelf sits below Active.
     let shelf = app.element("shelf-settled").expect("the Settled shelf");
     assert!(shelf.rect[1] > app.top_of("Alpha, Done"));
-    assert_eq!(shelf.label.as_deref(), Some("Settled 1"));
+    assert_eq!(shelf.label.as_deref(), Some("Settled"));
     let settled = app.shell_thread(&gamma);
     assert!(settled.is_some_and(|thread| thread.triage.settled_at.is_some()));
 
@@ -87,7 +87,7 @@ fn inbox_sections_settle_and_advance_pin_and_reorder() {
     app.drag_to(&thread_row(&beta), "shelf-settled");
     app.until("Beta settles", |h| {
         h.in_scope("inbox-settled", "Beta, Settled").is_some()
-            && h.label_of("shelf-settled").as_deref() == Some("Settled 1")
+            && h.label_of("shelf-settled").as_deref() == Some("Settled")
     });
 }
 
