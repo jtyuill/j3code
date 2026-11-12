@@ -16,10 +16,11 @@
 //! Activity rows sit on one rail (`rail`): a glyph column whose hairline joins consecutive
 //! activity rows.
 //!
-//! Motion follows `crate::motion`: nothing in the feed animates. The stack and the chat
-//! column around it land every change at once (`instant_changes`, which a growth stack reads
-//! from itself, not from its rows), so tool calls and streaming text arrive at their full
-//! height, unfaded, in the frame they arrive; colours land with them.
+//! Motion follows `crate::motion`: nothing in the feed moves. The stack and the chat column
+//! around it land every change at once (`instant_changes`, which a growth stack reads from
+//! itself, not from its rows), so tool calls and text arrive at their full height in the
+//! frame they arrive; colours land with them. A streaming reply is drawn as far as it has
+//! arrived, and the words new to it fade in where they stand (`motion::WORD_FADE`).
 
 mod anchor;
 mod body;
@@ -54,6 +55,7 @@ use crate::{
     icons,
     images::ImageLoad,
     math::view::{Look, doc},
+    motion,
     sidebar::ThreadKey,
     theme::{self, Metrics, Status},
 };
@@ -258,6 +260,7 @@ impl Ctx<'_> {
             width: self.width,
             streaming,
             math: self.math,
+            reveal: motion::WORD_FADE,
         }
     }
 }
@@ -460,17 +463,7 @@ fn build_row(s: &J3, key: &ThreadKey, visible: &[usize], i: usize, dark: bool, s
         }
     };
     let expanded = cx.expanded(&item.id);
-    // A streaming reply shows only its blocks that have ended (`feed::settled_blocks`), so its
-    // row changes once a paragraph, not once a token: it is versioned by what it shows.
-    let shown = match &item.kind {
-        ItemKind::Text(message) if running => Some(feed::settled_blocks(&message.text)),
-        _ => None,
-    };
-    let version = shown.map_or(thread.feed.revision(&item.id), |shown| {
-        let mut hasher = DefaultHasher::new();
-        shown.hash(&mut hasher);
-        hasher.finish()
-    });
+    let version = thread.feed.revision(&item.id);
     let base = (
         version,
         top.to_bits(),
@@ -489,8 +482,7 @@ fn build_row(s: &J3, key: &ThreadKey, visible: &[usize], i: usize, dark: bool, s
     match &item.kind {
         ItemKind::Text(message) => {
             let look = cx.look(k.c.text_base, running);
-            let text = shown.unwrap_or(&message.text);
-            let doc = doc(s, &key.env, cx.project_id(), text, look);
+            let doc = doc(s, &key.env, cx.project_id(), &message.text, look);
             cx.wait_all(&doc.wait);
             return memo(id, (base, doc.images), || {
                 frame(doc.view(s, &format!("md-{}", item.id), look))

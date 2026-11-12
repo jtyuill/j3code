@@ -183,6 +183,74 @@ fn the_feed_keeps_following_the_reply_after_a_wheel_scroll_at_the_bottom() {
 }
 
 #[test]
+fn streamed_words_fade_in_while_the_row_is_already_at_its_height() {
+    let mut app = scene();
+    let key = open_thread_key();
+    let mut state = thread_state();
+    let template = state
+        .items
+        .iter()
+        .find(|item| matches!(item.kind, ItemKind::Text(_)))
+        .cloned()
+        .unwrap();
+    let mut grow = |app: &mut TestApp, text: &str| {
+        let mut reply = template.clone();
+        reply.id = "ti-streaming".into();
+        reply.ordinal = state.items.last().map_or(1, |last| last.ordinal + 1);
+        if let ItemKind::Text(message) = &mut reply.kind {
+            message.text = text.into();
+        }
+        state.items.retain(|item| item.id != "ti-streaming");
+        state.items.push(reply);
+        let (key, next) = (key.clone(), Arc::new(state.clone()));
+        app.rt.update(move |s, tx| s.thread_changed(&key, next, tx));
+    };
+    grow(&mut app, "The reply");
+    // A picture finishing its decode lands its commit at once (`poll_feed`), words with it.
+    for _ in 0..600 {
+        app.settle(90);
+        if app.rt.state.threads[&key].feed.wait.borrow().is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(!app.rt.animating, "nothing moves at rest");
+
+    // Mid-word and mid-paragraph: the text shows as far as it has arrived.
+    let longer = format!(
+        "The reply {}and an unfinished wo",
+        "keeps going ".repeat(40)
+    );
+    grow(&mut app, &longer);
+    app.frame();
+    let row = |app: &TestApp| {
+        app.rt
+            .elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some("feed-ti-streaming"))
+            .expect("the reply is mounted")
+    };
+    let first = row(&app);
+    assert!(
+        (first.rect[3] - first.target[3]).abs() < 0.5 && first.rect[3] > 60.0,
+        "the row is at its full height in the frame the text arrives: {} of {}",
+        first.rect[3],
+        first.target[3]
+    );
+    assert!(
+        app.rt.elements().into_iter().any(|e| e
+            .text
+            .as_deref()
+            .is_some_and(|shown| shown.ends_with("and an unfinished wo"))),
+        "the unfinished word shows"
+    );
+    assert!(app.rt.animating, "the new words are fading in");
+    app.settle(240);
+    assert!(!app.rt.animating, "and the fade ends");
+    assert_eq!(row(&app).rect[3], first.rect[3], "nothing moved meanwhile");
+}
+
+#[test]
 fn an_expanded_row_is_forgotten_once_its_item_leaves_the_feed() {
     let mut app = scene();
     let key = open_thread_key();

@@ -58,8 +58,7 @@ fn new_thread_launches_from_the_composer_and_streams_the_reply() {
     app.until("the thread opens", |h| h.feed_row("Say hi").is_some());
     assert_eq!(app.draft(), "");
 
-    // Streaming text reaches the feed a block at a time: a paragraph shows once it has ended,
-    // the rest once the reply does.
+    // Streaming text reaches the feed as it arrives, an unfinished paragraph and word too.
     app.script.emit(json!({"type": "agent_start"}));
     app.until("the row says Working", |h| h.in_sidebar("Say hi, Working"));
     app.script
@@ -68,8 +67,8 @@ fn new_thread_launches_from_the_composer_and_streams_the_reply() {
         "m1",
         json!({"type": "text_delta", "contentIndex": 0, "delta": "Hello there.\n\nAnd mo"}),
     );
-    app.until("the first paragraph shows, the second waits", |h| {
-        h.feed_shows("Hello there.") && !h.feed_shows("And mo")
+    app.until("the reply shows as far as it has arrived", |h| {
+        h.feed_shows("Hello there.") && h.feed_shows("And mo") && !h.feed_shows("And more.")
     });
     app.script.text(
         "m1",

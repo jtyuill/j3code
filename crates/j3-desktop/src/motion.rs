@@ -7,9 +7,11 @@
 //!   motion. Every change lands in the frame it happens.
 //! - **Arriving on its own** (everything a turn brings: reply text, tool rows, their status,
 //!   the cards above the composer and the room they take from the feed; the header's git
-//!   control following the repository): no motion either. Nobody asked for the change, so
-//!   nothing should move under the reader. The chat column (`thread::layout`), the feed's
-//!   stack and the header's trailing group are `instant_changes`.
+//!   control following the repository): nothing moves. Nobody asked for the change, so
+//!   nothing shifts under the reader. The chat column (`thread::layout`), the feed's stack
+//!   and the header's trailing group are `instant_changes`. The one presentation left is a
+//!   streaming reply's newest words fading in ([`WORD_FADE`]) in their final places: layout
+//!   is final in the frame the words arrive, only their ink catches up.
 //! - **Frequent** (toggling the terminal or the file pane): no motion.
 //! - **Occasional** (menus, popovers): Rune's and the kit's short defaults (0.2–0.25 s).
 //! - **Rare** (dialogs, settings, the agents hub, toasts): keep the kit's and Rune's fuller
@@ -19,3 +21,7 @@
 //! mounted after the first frame), so everything but the last two opts out. `instant_changes`
 //! lands an element's subtree but not its own entrance, and a growth stack takes it from the
 //! stack, not its rows: mark the container whose contents change.
+
+/// Seconds a streamed word takes to fade in. Rune staggers the words of one chunk in reading
+/// order (20 ms apart, down to 5.5 ms when many wait), so text writes left to right.
+pub const WORD_FADE: f32 = 0.3;

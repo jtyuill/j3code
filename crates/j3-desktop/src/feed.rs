@@ -825,41 +825,6 @@ pub fn answer_text(answer: &Answer) -> String {
         .join(", ")
 }
 
-/// The part of a streaming reply that has arrived as whole blocks: everything before the last
-/// blank line outside a code fence, so a paragraph, list, table or code block shows once it
-/// has ended and never word by word. Empty until the first block ends.
-pub fn settled_blocks(text: &str) -> &str {
-    // The open fence's character and length (```` ``` ```` or `~~~`, three or more).
-    let mut fence: Option<(char, usize)> = None;
-    let mut settled = 0;
-    let mut at = 0;
-    for line in text.split_inclusive('\n') {
-        let start = at;
-        at += line.len();
-        if !line.ends_with('\n') {
-            // The last line is still arriving.
-            break;
-        }
-        let trimmed = line.trim();
-        let run = |c: char| trimmed.chars().take_while(|&x| x == c).count();
-        match fence {
-            Some((c, len)) => {
-                if run(c) >= len && trimmed.trim_start_matches(c).is_empty() {
-                    fence = None;
-                }
-            }
-            None => {
-                if let Some(c) = ['`', '~'].into_iter().find(|&c| run(c) >= 3) {
-                    fence = Some((c, run(c)));
-                } else if trimmed.is_empty() {
-                    settled = start;
-                }
-            }
-        }
-    }
-    text[..settled].trim_end()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1322,29 +1287,5 @@ mod tests {
         assert!(!is_activity(&reply));
         assert_eq!(subagent_status_label(ItemStatus::Cancelled), "Stopped");
         assert_eq!(subagent_status_label(ItemStatus::Completed), "Done");
-    }
-
-    #[test]
-    fn a_streaming_reply_shows_its_blocks_once_they_end() {
-        // Nothing until the first block ends, however much of it has arrived.
-        assert_eq!(settled_blocks("A first para"), "");
-        assert_eq!(
-            settled_blocks("A first paragraph.\nStill the same one.\n"),
-            ""
-        );
-        // A blank line ends a block; the next one waits for its own.
-        assert_eq!(settled_blocks("One.\n\nTwo is still"), "One.");
-        assert_eq!(settled_blocks("One.\n\n- a\n- b\n\n"), "One.\n\n- a\n- b");
-        // Blank lines inside a code fence don't end it; the fence ends with its closer.
-        let code = "Intro.\n\n```rust\nfn a() {}\n\nfn b() {}\n";
-        assert_eq!(settled_blocks(code), "Intro.");
-        let closed = "Intro.\n\n```rust\nfn a() {}\n\nfn b() {}\n```\n\nNext";
-        assert_eq!(
-            settled_blocks(closed),
-            "Intro.\n\n```rust\nfn a() {}\n\nfn b() {}\n```"
-        );
-        // A shorter run of the fence's character doesn't close it; tildes fence too.
-        let tildes = "~~~~\n~~~\n\nstill code\n~~~~\n\n";
-        assert_eq!(settled_blocks(tildes), tildes.trim_end());
     }
 }

@@ -50,6 +50,9 @@ pub struct Look<'a> {
     pub streaming: bool,
     /// Typeset math (the `math_rendering` preference); off, the markdown draws as written.
     pub math: bool,
+    /// Seconds a word takes to fade in when it arrives in text already on screen
+    /// (`El::reveal`); text that mounts whole draws at once.
+    pub reveal: f32,
 }
 
 /// One message's markdown, cut into parts and with its images resolved.
@@ -167,6 +170,7 @@ impl Doc {
             let version = (
                 source,
                 look.streaming,
+                look.reveal.to_bits(),
                 crate::theme::stamp(k),
                 ink,
                 sizes,
@@ -299,6 +303,7 @@ fn markdown(source: &str, images: Rc<HashMap<String, (Image, f32)>>, look: Look)
     Markdown::new(source)
         .style(style)
         .streaming(look.streaming)
+        .reveal(look.reveal)
         .selectable(true)
         .images(move |src| images.get(src).map(|(image, _)| image.clone()))
         .image_frame(move |picture, frame| {
@@ -381,7 +386,8 @@ fn paragraph(s: &J3, source: &str, formulas: &[Formula], look: Look) -> El {
         .exact_lines()
         .w_full()
         .selectable(true)
-        .selection_color(k.selection());
+        .selection_color(k.selection())
+        .reveal(look.reveal);
     for &(a, b, style) in &inl.spans {
         match style {
             Style::Strike => e = e.strike(a, b, None),
