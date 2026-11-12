@@ -193,7 +193,7 @@ fn terminal_view(
     let id = terminal.id.clone();
     let grid = render::grid(terminal, palette, cell, focused);
     let (column, line) = render::cursor_at(terminal).map_or((0, 0), |(c, l, _)| (c, l));
-    let composing = terminal.edit.preedit.is_some();
+    let composing = terminal.edit.preedit().is_some();
     let cols = usize::from(terminal.screen.size().cols);
     let field_width = if composing {
         (cols.saturating_sub(column).max(1)) as f32 * cell.width

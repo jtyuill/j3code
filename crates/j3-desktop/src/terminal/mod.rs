@@ -213,7 +213,7 @@ impl Terminal {
     /// text), so Rune takes it as a new request even when the field was focused when it last
     /// left the screen; a composition in progress keeps its model.
     fn request_focus(&mut self) {
-        if self.edit.preedit.is_none() {
+        if self.edit.preedit().is_none() {
             self.edit = TextEdit::new("");
         }
         self.edit.focused = true;

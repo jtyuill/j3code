@@ -137,7 +137,7 @@ impl J3 {
 
     /// The search field's keys: ↑ ↓ move, Enter chooses, Escape closes.
     fn picker_key(&mut self, key: &ComposerKey, ev: &rune::KeyEvent, tx: &mut Tx) -> bool {
-        if self.composer(key).picker.search.preedit.is_some() {
+        if self.composer(key).picker.search.preedit().is_some() {
             return false;
         }
         let rows = self.picker_rows(key);

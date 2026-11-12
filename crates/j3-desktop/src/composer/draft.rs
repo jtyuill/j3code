@@ -121,7 +121,7 @@ pub(super) fn splice(edit: &mut TextEdit, range: Range<usize>, with: &str, pill:
 /// (`!` and `$` drafts). Nothing changes while an IME composition is open. True when the
 /// draft changed.
 pub(super) fn sync_mentions(edit: &mut TextEdit, choices: &[ModelChoice]) -> bool {
-    if edit.preedit.is_some() {
+    if edit.preedit().is_some() {
         return false;
     }
     if !j3_text::mention::allowed(&edit.text) {

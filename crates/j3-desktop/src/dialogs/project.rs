@@ -82,7 +82,7 @@ impl ProjectPicker {
     pub fn suggestion(&self) -> Option<String> {
         let edit = &self.path;
         let end = edit.text.len();
-        if edit.preedit.is_some() || edit.anchor != end || edit.focus != end {
+        if edit.preedit().is_some() || edit.anchor != end || edit.focus != end {
             return None;
         }
         let dir = dir_part(&edit.text);

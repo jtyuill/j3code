@@ -22,10 +22,12 @@
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
 
       # Rune on Linux: winit's Wayland/X11 windowing (xkbcommon keymaps; the X11 libraries it
-      # opens at runtime) and wgpu's Vulkan rendering (loaded at runtime). Text needs no system
-      # library; Rune asks `fc-match` for the monospace family.
+      # opens at runtime), wgpu's Vulkan rendering (loaded at runtime), and fontconfig, which
+      # Rune dlopens to find installed fonts by family name (the chosen interface and code
+      # fonts) and fallbacks; `fc-list` (on PATH) lists the CJK font files.
       linuxGuiLibs =
         pkgs: with pkgs; [
+          fontconfig.lib
           libxkbcommon
           vulkan-loader
           wayland
