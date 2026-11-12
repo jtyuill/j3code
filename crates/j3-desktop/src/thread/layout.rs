@@ -71,6 +71,9 @@ pub fn view(s: &J3, cx: &mut Cx<J3>, ui: &mut Ui, key: &ThreadKey) -> El {
 /// The feed, then the cards and the composer in a column at the text measure. When the
 /// chat is short (a tall drawer, a long questionnaire) the feed gives way first, then the
 /// cards scroll; the composer keeps its size.
+///
+/// Nothing in the column moves (`crate::motion`): what a turn brings — rows, cards, the room
+/// they take from the feed — lands in the frame it arrives.
 fn chat(s: &J3, cx: &mut Cx<J3>, ui: &mut Ui, key: &ThreadKey) -> El {
     let feed = super::feed::view(s, cx, ui, key);
     let mut bottom = col()
@@ -122,6 +125,7 @@ fn chat(s: &J3, cx: &mut Cx<J3>, ui: &mut Ui, key: &ThreadKey) -> El {
         .w_full()
         .grow(1.0)
         .min_h(0.0)
+        .instant_changes()
         .child(
             col()
                 .key("chat-feed")

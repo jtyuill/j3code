@@ -16,8 +16,10 @@
 //! Activity rows sit on one rail (`rail`): a glyph column whose hairline joins consecutive
 //! activity rows.
 //!
-//! Motion follows `crate::motion`: nothing in the feed animates. Tool calls and streaming text
-//! land, at their full height, in the frame they arrive.
+//! Motion follows `crate::motion`: nothing in the feed animates. The stack and the chat
+//! column around it land every change at once (`instant_changes`, which a growth stack reads
+//! from itself, not from its rows), so tool calls and streaming text arrive at their full
+//! height, unfaded, in the frame they arrive; colours land with them.
 
 mod anchor;
 mod body;
@@ -42,7 +44,9 @@ use j3_client::{
     entities::{Item, ItemKind, ItemStatus, NoticeLevel},
     methods::StopSubagentParams,
 };
-use rune::{Color, Cx, El, GrowthSpec, Image, ScrollSpec, Tx, col, el, icon, memo, text};
+use rune::{
+    Color, Cx, El, GrowthSpec, Image, ScrollSpec, Spring, Tx, col, el, icon, memo, text,
+};
 use rune_kit::{Kit, Spinner};
 
 use crate::{
@@ -366,6 +370,9 @@ pub fn view(s: &J3, cx: &mut Cx<J3>, ui: &mut Ui, key: &ThreadKey) -> El {
                 .w_full()
                 .pt(END_PAD)
                 .pb(END_PAD + tail)
+                // Rows would otherwise grow open from nothing on the stack's spring.
+                .instant_changes()
+                .motion(Spring::NONE)
                 .growth(GrowthSpec::default())
                 .virtual_rows(
                     count,
@@ -415,7 +422,6 @@ fn build_row(s: &J3, key: &ThreadKey, visible: &[usize], i: usize, dark: bool, s
         above: on_rail && previous.is_some_and(is_activity),
         below: on_rail && next.is_some_and(is_activity),
     };
-    // Feed rows never animate: every change lands in the frame it arrives.
     let running = item.status == ItemStatus::Running;
     let streams = match &item.kind {
         ItemKind::Text(_) => true,
@@ -450,7 +456,6 @@ fn build_row(s: &J3, key: &ThreadKey, visible: &[usize], i: usize, dark: bool, s
             .items_center()
             .pt(if on_rail { 0.0 } else { top })
             .child(inner);
-        let row = row.instant_changes();
         match label {
             Some(label) => row.label(label),
             None => row,

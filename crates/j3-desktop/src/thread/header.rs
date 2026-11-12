@@ -2,7 +2,7 @@
 //! pane and terminal toggles, the git control and the thread actions menu (Rename…, Set
 //! goal… while there's no goal, Archive, Delete…).
 
-use rune::{Cx, Tx, text};
+use rune::{Cx, Tx, row, text};
 use rune_kit::{
     ControlSize, IconButton, IconButtonVariant, Menu, MenuItem, Placement, shell::Toolbar,
 };
@@ -38,7 +38,10 @@ pub fn title(s: &J3, key: &ThreadKey) -> String {
         .unwrap_or_else(|| "Thread".to_owned())
 }
 
-/// The header: title leading; Files, Terminal, git and the actions menu trailing.
+/// The header: title leading; Files, Terminal, git and the actions menu trailing. The
+/// trailing controls are one group that never moves (`crate::motion`): the git control comes
+/// and goes with the repository's status and changes width with its label, on its own time,
+/// and the buttons beside it land in their new places with it.
 pub fn toolbar(s: &J3, cx: &mut Cx<J3>, ui: &mut Ui, key: &ThreadKey) -> Toolbar {
     let k = ui.k;
     let files_open = s.files.get(key).is_some_and(|pane| pane.open);
@@ -79,10 +82,17 @@ pub fn toolbar(s: &J3, cx: &mut Cx<J3>, ui: &mut Ui, key: &ThreadKey) -> Toolbar
                 .truncate()
                 .min_w(0.0),
         )
-        .trailing(files)
-        .trailing(terminal)
-        .trailing(git)
-        .trailing(actions)
+        .trailing(
+            row()
+                .key("thread-tools")
+                .gap(4.0)
+                .center_y()
+                .instant_changes()
+                .child(files)
+                .child(terminal)
+                .child(git)
+                .child(actions),
+        )
 }
 
 /// What a thread action menu item runs.
