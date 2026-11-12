@@ -2,7 +2,7 @@
 //! pane and terminal toggles, the git control and the thread actions menu (Rename…, Set
 //! goal… while there's no goal, Archive, Delete…).
 
-use rune::{Cx, Tx, row, text};
+use rune::{Cx, Tx, row, spacer, text};
 use rune_kit::{
     ControlSize, IconButton, IconButtonVariant, Menu, MenuItem, Placement, shell::Toolbar,
 };
@@ -38,10 +38,18 @@ pub fn title(s: &J3, key: &ThreadKey) -> String {
         .unwrap_or_else(|| "Thread".to_owned())
 }
 
-/// The header: title leading; Files, Terminal, git and the actions menu trailing. The
-/// trailing controls are one group that never moves (`crate::motion`): the git control comes
-/// and goes with the repository's status and changes width with its label, on its own time,
-/// and the buttons beside it land in their new places with it.
+/// A width no window reaches: the header's row asks for it and shrinks to the band.
+const BAND: f32 = 100_000.0;
+/// The gaps the kit's band keeps around its (here empty) spacer and trailing slot.
+const BAND_GAPS: f32 = 16.0;
+
+/// The header: the title, then Files, Terminal, git and the actions menu at the far end,
+/// all in one row that fills the band from the kit's leading slot. Nothing in it moves
+/// (`crate::motion`): the git control comes and goes with the repository's status and
+/// changes width with its label, on its own time, and the buttons beside it land in their
+/// new places with it. The kit's trailing slot would spring its own frame to each new
+/// width and carry the controls along, so they aren't in it; this row's frame only follows
+/// the window.
 pub fn toolbar(s: &J3, cx: &mut Cx<J3>, ui: &mut Ui, key: &ThreadKey) -> Toolbar {
     let k = ui.k;
     let files_open = s.files.get(key).is_some_and(|pane| pane.open);
@@ -73,26 +81,35 @@ pub fn toolbar(s: &J3, cx: &mut Cx<J3>, ui: &mut Ui, key: &ThreadKey) -> Toolbar
     );
     let git = crate::git::view(s, cx, ui, key);
     let actions = actions_menu(s, ui, key);
-    Toolbar::new()
-        .leading(
-            text(title(s, key))
-                .key("thread-title")
-                .font(k.ty.ui_medium)
-                .color(k.c.text_base)
-                .truncate()
-                .min_w(0.0),
-        )
-        .trailing(
-            row()
-                .key("thread-tools")
-                .gap(4.0)
-                .center_y()
-                .instant_changes()
-                .child(files)
-                .child(terminal)
-                .child(git)
-                .child(actions),
-        )
+    Toolbar::new().leading(
+        row()
+            .key("thread-bar")
+            .w(BAND)
+            .shrink()
+            .min_w(0.0)
+            .mr(-BAND_GAPS)
+            .center_y()
+            .instant_changes()
+            .child(
+                text(title(s, key))
+                    .key("thread-title")
+                    .font(k.ty.ui_medium)
+                    .color(k.c.text_base)
+                    .truncate()
+                    .min_w(0.0),
+            )
+            .child(spacer().min_w(BAND_GAPS))
+            .child(
+                row()
+                    .key("thread-tools")
+                    .gap(4.0)
+                    .center_y()
+                    .child(files)
+                    .child(terminal)
+                    .child(git)
+                    .child(actions),
+            ),
+    )
 }
 
 /// What a thread action menu item runs.

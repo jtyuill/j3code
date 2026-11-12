@@ -292,6 +292,30 @@ pub fn breakdown(snapshot: &Usage, provider: &str) -> Option<String> {
     })
 }
 
+/// Whose usage `provider`'s limits in `snapshot` are, for the popover's subtitle and the
+/// button's tooltip. Limits belong to the provider account, not to the device omp runs on, so
+/// the account's email names them; only Anthropic's so far, the others still read `env`
+/// (the environment's name), as does an account that reports no email. Several accounts are
+/// counted: each lists its own email over its limits.
+pub fn owner(snapshot: Option<&Usage>, provider: &str, env: &str) -> String {
+    if provider != "anthropic" {
+        return env.to_owned();
+    }
+    let mut emails: Vec<&str> = snapshot
+        .iter()
+        .flat_map(|snapshot| &snapshot.accounts)
+        .filter(|account| account.provider == provider)
+        .filter_map(|account| account.account.as_ref()?.email.as_deref())
+        .filter(|email| !email.is_empty())
+        .collect();
+    emails.dedup();
+    match emails.as_slice() {
+        [] => env.to_owned(),
+        [email] => (*email).to_owned(),
+        several => format!("{} accounts", several.len()),
+    }
+}
+
 /// The limit's label, with its window when the label doesn't name it
 /// ("Gemini · Weekly", but just "Claude 5 Hour").
 pub fn limit_title(limit: &UsageLimit) -> String {
@@ -340,6 +364,37 @@ mod tests {
             remaining(time::Duration::minutes(2 * 1_440 + 4 * 60 + 30)),
             "2d 4h"
         );
+    }
+
+    #[test]
+    fn anthropic_usage_is_named_by_its_account_and_the_rest_by_the_environment() {
+        let account = |provider: &str, email: Option<&str>| {
+            serde_json::json!({
+                "provider": provider, "limits": [],
+                "account": email.map(|email| serde_json::json!({"email": email})),
+            })
+        };
+        let snapshot = |accounts: Vec<serde_json::Value>| -> Usage {
+            serde_json::from_value(serde_json::json!({
+                "generatedAt": "2026-11-09T11:18:00.000Z", "accounts": accounts,
+            }))
+            .unwrap()
+        };
+        let one = snapshot(vec![
+            account("anthropic", Some("me@example.com")),
+            account("openai-codex", Some("other@example.com")),
+        ]);
+        assert_eq!(owner(Some(&one), "anthropic", "shieldy"), "me@example.com");
+        assert_eq!(owner(Some(&one), "openai-codex", "shieldy"), "shieldy");
+        let two = snapshot(vec![
+            account("anthropic", Some("me@example.com")),
+            account("anthropic", Some("work@example.com")),
+        ]);
+        assert_eq!(owner(Some(&two), "anthropic", "shieldy"), "2 accounts");
+        // No email reported, or nothing fetched yet: the environment.
+        let bare = snapshot(vec![account("anthropic", None)]);
+        assert_eq!(owner(Some(&bare), "anthropic", "shieldy"), "shieldy");
+        assert_eq!(owner(None, "anthropic", "shieldy"), "shieldy");
     }
 
     #[test]

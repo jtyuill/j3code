@@ -114,6 +114,7 @@ impl J3 {
         self.route.settings = false;
         self.settings.zoom_open = false;
         self.focus_sidebar(tx);
+        self.poll_place(tx);
     }
 
     /// Lists the installed font families off the UI thread (once Settings opens).

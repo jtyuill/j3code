@@ -184,6 +184,7 @@ impl J3 {
             }
         });
         self.route.main = Main::Thread(key);
+        self.poll_place(tx);
     }
 
     /// Subscribes to `key`'s thread unless it already is; a cached thread keeps its state

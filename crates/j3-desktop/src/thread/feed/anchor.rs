@@ -29,7 +29,7 @@ pub const REST_DELAY: f64 = 1.0;
 /// land; until then the glide rides that end.
 const AIM_FOR: f64 = 3.0;
 /// The feed's scroll viewport: `rune_kit::scroll_bar` keys it `feed` inside `feed-area`.
-const VIEWPORT: &str = "feed-area/feed";
+pub(super) const VIEWPORT: &str = "feed-area/feed";
 /// Points the drawn reply must run past the view's bottom before the room goes, so the reader
 /// isn't left standing at the new end (which would start following on its own).
 const OVERFLOW: f32 = 8.0;

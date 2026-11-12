@@ -228,6 +228,7 @@ impl J3 {
             hub.open = false;
         }
         self.focus_composer(tx);
+        self.poll_place(tx);
     }
 
     /// Selects subagent `id` in `key`'s hub, its transcript from the top.

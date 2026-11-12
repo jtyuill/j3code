@@ -136,6 +136,8 @@ pub struct J3 {
     /// The open thread's completion last visited because it finished while open, so a
     /// completion is acknowledged once.
     pub(crate) visited_completion: Option<(ThreadKey, String)>,
+    /// The thread whose feed was on screen last frame (`thread::feed::place`).
+    pub(crate) feed_shown: Option<ThreadKey>,
     /// Font families from `desktop.json` applied (first poll).
     fonts_applied: bool,
 }
@@ -171,6 +173,7 @@ impl J3 {
             window_active: true,
             clock: Clock::new(OffsetDateTime::now_utc()),
             visited_completion: None,
+            feed_shown: None,
             fonts_applied: false,
             services,
         }

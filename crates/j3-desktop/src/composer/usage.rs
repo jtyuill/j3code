@@ -40,12 +40,16 @@ pub(super) fn view(s: &J3, ui: &mut Ui, key: &ComposerKey) -> El {
         }
         store::peak(snapshot, provider).map(|peak| format!("{:.0}%", peak * 100.))
     });
+    // On the environment's host, or for the account the limits belong to (`store::owner`).
     let help = match (&provider, env) {
-        (Some(provider), Some(env)) => format!(
-            "{} usage limits on {}",
-            logos::provider_name(provider),
-            env.label()
-        ),
+        (Some(provider), Some(env)) => {
+            let owner = store::owner(s.usage.snapshot(key.env()), provider, env.label());
+            format!(
+                "{} usage limits {} {owner}",
+                logos::provider_name(provider),
+                if owner == env.label() { "on" } else { "for" },
+            )
+        }
         _ => "Usage limits".to_owned(),
     };
     let open = s.composers.get(key).is_some_and(|c| c.usage_open);
@@ -80,12 +84,13 @@ pub(super) fn view(s: &J3, ui: &mut Ui, key: &ComposerKey) -> El {
     popover.build(k, ui.layer)
 }
 
-/// The popover's panel: provider, environment and freshness, the last error, then the
-/// provider's limits per account.
+/// The popover's panel: provider, whose usage it is (`store::owner`) and freshness, the last
+/// error, then the provider's limits per account.
 fn panel(s: &J3, ui: &Ui, key: &ComposerKey, provider: &str) -> El {
     let k = ui.k;
     let env_key = key.env();
     let env_label = s.envs.get(env_key).map_or("", |env| env.label());
+    let owner = store::owner(s.usage.snapshot(env_key), provider, env_label);
     let now = s.clock.now;
     let pending = s.usage.is_pending(env_key);
     let snapshot = s.usage.snapshot(env_key);
@@ -129,7 +134,8 @@ fn panel(s: &J3, ui: &Ui, key: &ComposerKey, provider: &str) -> El {
             row()
                 .gap(8.0)
                 .child(
-                    text(env_label)
+                    text(owner)
+                        .key("usage-owner")
                         .font(k.ty.text_xsmall)
                         .color(k.c.text_muted)
                         .grow(1.0)

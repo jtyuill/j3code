@@ -5,9 +5,13 @@ use std::sync::Arc;
 
 use j3_client::entities::{ItemKind, ItemStatus, ToolDetail};
 
-use crate::app::{
-    fixtures::{Scene, open_thread_key, thread_state},
-    testing::TestApp,
+use crate::{
+    app::{
+        Main,
+        fixtures::{Scene, open_thread_key, thread_state},
+        testing::TestApp,
+    },
+    settings::Page,
 };
 
 fn scene() -> TestApp {
@@ -288,4 +292,140 @@ fn an_expanded_row_is_forgotten_once_its_item_leaves_the_feed() {
     app.rt.update(move |s, tx| s.thread_changed(&k, next, tx));
     app.settle(10);
     assert!(!app.rt.state.threads[&key].feed.is_expanded(&id));
+}
+
+/// The row at the top of the view (its key) and where its top stands under the viewport's.
+fn top_row(app: &TestApp) -> (String, f32) {
+    let all = app.rt.elements();
+    let view = all
+        .iter()
+        .find(|e| e.key.as_deref() == Some("feed"))
+        .expect("the feed scrolls")
+        .rect;
+    all.into_iter()
+        .filter(|e| {
+            e.path
+                .ends_with(&format!("feed-rows/{}", e.key.as_deref().unwrap_or("?")))
+        })
+        .filter(|e| e.rect[1] + e.rect[3] > view[1] + 1.0)
+        .min_by(|a, b| a.rect[1].total_cmp(&b.rect[1]))
+        .map(|e| (e.key.unwrap(), e.rect[1] - view[1]))
+        .expect("a row is in view")
+}
+
+/// The thread scene in a window tall enough that the cards above the composer leave the
+/// feed a few hundred points.
+fn tall_scene() -> TestApp {
+    let mut app = TestApp::with_scene(Scene::Thread);
+    app.rt.set_viewport((1280.0, 2000.0), 1.0);
+    app
+}
+
+/// Frames with pauses: the scene's pictures decode on other threads.
+fn rest(app: &mut TestApp) {
+    for _ in 0..60 {
+        app.frame();
+        std::thread::sleep(std::time::Duration::from_millis(3));
+    }
+}
+
+#[test]
+fn a_feed_that_leaves_the_screen_comes_back_where_the_reader_was() {
+    for zoom in [1.0, 1.25] {
+        let mut app = tall_scene();
+        app.rt
+            .update(move |s, tx| s.update_ui(|ui| ui.zoom = zoom, tx));
+        rest(&mut app);
+        let key = open_thread_key();
+        let view = app.rt.presented("feed").expect("the feed scrolls").0;
+        let (x, y) = (view[0] + view[2] / 2.0, view[1] + view[3] / 2.0);
+        // Up the feed, a row running out of the top of the view.
+        app.rt.wheel(x, y, 700.0);
+        rest(&mut app);
+        let before = top_row(&app);
+        assert_eq!(app.rt.scroll_at_bottom("feed"), Some(false));
+        assert!(
+            before.1 < -1.0,
+            "zoom {zoom}: a row is cut by the top: {before:?}"
+        );
+
+        type Leave = fn(&mut crate::app::J3, &mut rune::Tx);
+        let ways: [(&str, Leave, Leave); 2] = [
+            (
+                "Settings",
+                |s, tx| s.open_settings(Page::General, tx),
+                |s, tx| s.close_settings(tx),
+            ),
+            (
+                "another surface",
+                |s, _| s.route.main = Main::NewThread,
+                |s, tx| s.open_thread(open_thread_key(), tx),
+            ),
+        ];
+        for (way, leave, back) in ways {
+            app.rt.update(leave);
+            rest(&mut app);
+            assert!(app.rt.find("feed-rows").is_none(), "{way} covers the feed");
+            app.rt.update(back);
+            rest(&mut app);
+            let after = top_row(&app);
+            assert_eq!(
+                after.0, before.0,
+                "zoom {zoom}, {way}: the same row is on top"
+            );
+            assert!(
+                (after.1 - before.1).abs() <= 1.0,
+                "zoom {zoom}, {way}: it stands where it did: {} then, {} now",
+                before.1,
+                after.1
+            );
+        }
+
+        // A reader at the end comes back to the end.
+        app.rt
+            .update(move |s, tx| s.jump_to_feed_end(&open_thread_key(), tx));
+        rest(&mut app);
+        assert_eq!(app.rt.scroll_at_bottom("feed"), Some(true));
+        app.rt.update(|s, tx| s.open_settings(Page::General, tx));
+        rest(&mut app);
+        app.rt.update(|s, tx| s.close_settings(tx));
+        rest(&mut app);
+        assert_eq!(app.rt.scroll_at_bottom("feed"), Some(true), "zoom {zoom}");
+        assert!(app.rt.state.threads[&key].feed.place.is_none());
+    }
+}
+
+#[test]
+fn the_jump_button_shows_away_from_the_end_and_goes_there_at_once() {
+    let mut app = tall_scene();
+    rest(&mut app);
+    assert!(app.rt.find("feed-jump").is_none(), "at the end: no button");
+    let view = app.rt.presented("feed").expect("the feed scrolls").0;
+    let (x, y) = (view[0] + view[2] / 2.0, view[1] + view[3] / 2.0);
+    app.rt.wheel(x, y, 900.0);
+    rest(&mut app);
+    assert_eq!(app.rt.scroll_at_bottom("feed"), Some(false));
+
+    // The strip the button sits in doesn't take the wheel from the feed under it.
+    let (bx, by) = app
+        .rt
+        .find("feed-jump")
+        .expect("away from the end: the button");
+    let before = top_row(&app);
+    app.rt.wheel(bx + 120.0, by, 300.0);
+    rest(&mut app);
+    assert_ne!(top_row(&app), before, "the feed scrolls under the strip");
+
+    let (bx, by) = app.rt.find("feed-jump").expect("still away");
+    app.rt.pointer_down(bx, by);
+    app.rt.pointer_up(bx, by);
+    app.frame();
+    app.frame();
+    assert_eq!(
+        app.rt.scroll_at_bottom("feed"),
+        Some(true),
+        "one press, no glide"
+    );
+    rest(&mut app);
+    assert!(app.rt.find("feed-jump").is_none());
 }

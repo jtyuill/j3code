@@ -7,7 +7,10 @@
 //! states), its expansion and the state of the images it draws, so a streaming reply rebuilds
 //! its own row only. The viewport sticks to the bottom: it follows a streaming reply, and a
 //! wheel scroll that ends at the bottom keeps following — except while a message sent here is
-//! held at the top for its reply to write down under it (`anchor`).
+//! held at the top for its reply to write down under it (`anchor`). A reader away from the
+//! end gets a button over the feed's bottom edge that goes back to it at once, and finds the
+//! feed where they left it after another thread, Settings or the agents hub was on screen
+//! (`place`).
 //!
 //! Rows space themselves in one rhythm per turn: 44 points before a user message (a new
 //! turn), 24 after it, 4 between consecutive activity rows (tools, reasoning, plan updates,
@@ -25,6 +28,7 @@
 mod anchor;
 mod body;
 mod lines;
+mod place;
 mod rail;
 mod rows;
 #[cfg(test)]
@@ -71,6 +75,9 @@ const ACTIVITY_GAP: f32 = 4.0;
 const WITHIN_TURN_GAP: f32 = 16.0;
 /// Space at the feed's ends.
 const END_PAD: f32 = 8.0;
+/// The jump-to-latest button's size and its space above the feed's bottom edge.
+const JUMP_SIZE: f32 = 32.0;
+const JUMP_INSET: f32 = 12.0;
 
 /// A thread's feed UI state, kept in its `ThreadUi`.
 #[derive(Default)]
@@ -89,6 +96,18 @@ pub struct FeedUi {
     /// The viewport's vertical scroll offset, its largest offset and its height, as it last
     /// drew.
     scroll: Rc<Cell<[f32; 3]>>,
+    /// Where each built row last drew, by item id (`place`).
+    rects: RefCell<HashMap<String, place::Drawn>>,
+    /// Where the viewport last drew.
+    view_rect: place::Drawn,
+    /// The items whose rows are in view, top first.
+    in_view: RefCell<Vec<String>>,
+    /// Where the reader was when the feed last left the screen; None at its end.
+    place: Option<place::Place>,
+    /// Until when (clock seconds) the feed, back on screen, is brought to `place`.
+    returning: Option<f64>,
+    /// The viewport doesn't show the feed's end.
+    away: bool,
 }
 
 #[derive(Default)]
@@ -140,6 +159,9 @@ impl FeedUi {
         self.expanded
             .borrow_mut()
             .retain(|id| feed.iter().any(|item| item.id == *id));
+        self.rects
+            .borrow_mut()
+            .retain(|id, _| rows.revisions.contains_key(id));
         rows.visible = visible.clone();
         rows.state = Some(state.clone());
         visible
@@ -187,7 +209,8 @@ impl J3 {
     /// Before a frame: true when an image a feed row waits on finished decoding, so the
     /// rows showing it draw again. The open thread's rows take their new heights at once: an
     /// image or formula decoding is not text arriving, so the feed doesn't glide to its end.
-    /// Also moves the open thread's held message along (`anchor`).
+    /// Also moves the open thread's held message along (`anchor`) and keeps each feed's
+    /// place while it is off screen (`place`).
     pub(crate) fn poll_feed(&mut self, tx: &mut Tx) -> bool {
         let open = self.open_thread_key();
         let mut changed = false;
@@ -202,6 +225,7 @@ impl J3 {
                 }
             }
         }
+        self.poll_place(tx);
         if let Some(open) = &open {
             changed |= self.poll_anchor(open, tx);
         }
@@ -351,6 +375,8 @@ pub fn view(s: &J3, cx: &mut Cx<J3>, ui: &mut Ui, key: &ThreadKey) -> El {
     let tail = thread.feed.tail(viewport_rect, last_rect);
     let follow = thread.feed.anchor().is_none_or(|anchor| !anchor.holds());
     let (key_of, visible_of) = (key.clone(), visible.clone());
+    let (seen_key, seen_rows) = (key.clone(), visible.clone());
+    let (end_key, jump_key) = (key.clone(), key.clone());
     let build_key = key.clone();
     let build = move |s: &J3, i: usize| build_row(s, &build_key, &visible, i, dark, scale);
     let scrolled = thread.feed.scroll.clone();
@@ -365,6 +391,12 @@ pub fn view(s: &J3, cx: &mut Cx<J3>, ui: &mut Ui, key: &ThreadKey) -> El {
             stick_bottom: follow,
         })
         .on_scroll_offset(move |at| scrolled.set([at.offset[1], at.max[1], at.viewport[1]]))
+        .drawn_rect_into(&thread.feed.view_rect.0)
+        .on_at_bottom(move |s: &mut J3, at_end| {
+            if let Some(thread) = s.threads.get_mut(&end_key) {
+                thread.feed.away = !at_end;
+            }
+        })
         .child(
             col()
                 .key("feed-rows")
@@ -388,12 +420,51 @@ pub fn view(s: &J3, cx: &mut Cx<J3>, ui: &mut Ui, key: &ThreadKey) -> El {
                     },
                     build,
                 )
-                .virtual_rows_version(version),
+                .virtual_rows_version(version)
+                // Bookkeeping for `place`: the view doesn't read it.
+                .on_visible_rows(move |s: &mut J3, rows| {
+                    if let Some(thread) = s.threads.get(&seen_key) {
+                        let items = &thread.state.items;
+                        *thread.feed.in_view.borrow_mut() = seen_rows
+                            .get(rows)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|&ix| items.get(ix).map(|item| item.id.clone()))
+                            .collect();
+                    }
+                    false
+                }),
         );
-    rune_kit::scroll_bar(k, "feed-area", "feed", viewport)
+    let feed = rune_kit::scroll_bar(k, "feed-area", "feed", viewport)
         .w_full()
         .grow(1.0)
-        .min_h(0.0)
+        .min_h(0.0);
+    let framed = col().w_full().grow(1.0).min_h(0.0).child(feed);
+    if !thread.feed.is_away() {
+        return framed;
+    }
+    // Away from the end: one press goes back to it, at once.
+    let jump = rune::row()
+        .key("feed-jump")
+        .role("button")
+        .label("Jump to latest")
+        .help("Jump to latest")
+        .size(JUMP_SIZE, JUMP_SIZE)
+        .center()
+        .radius(999.0)
+        .fill(k.c.bg_base)
+        .border(1.0, k.c.border_base)
+        .hover(k.c.hover)
+        .child(icon(&icons::ARROW_DOWN, 16.0).color(k.c.text_base))
+        .on_press_tx(move |s: &mut J3, tx: &mut Tx| s.jump_to_feed_end(&jump_key, tx));
+    // Centred by a strip of no height, so only the button takes the pointer from the feed.
+    framed.child(
+        rune::row()
+            .pin(Some(0.0), None, Some(0.0), Some(JUMP_INSET + JUMP_SIZE))
+            .h(0.0)
+            .justify_center()
+            .child(jump),
+    )
 }
 
 /// Row `i` of the visible rows `visible` of `key`'s feed.
@@ -445,6 +516,7 @@ fn build_row(s: &J3, key: &ThreadKey, visible: &[usize], i: usize, dark: bool, s
         ItemKind::Text(message) => Some(message.text.clone()),
         _ => None,
     };
+    let drawn = thread.feed.row_rect(&item.id);
     let frame = move |content: El| {
         // The measure is the text's width; the side padding sits outside it.
         let inner = el()
@@ -453,6 +525,7 @@ fn build_row(s: &J3, key: &ThreadKey, visible: &[usize], i: usize, dark: bool, s
             .px(16.0)
             .child(content);
         let row = col()
+            .drawn_rect_into(&drawn)
             .w_full()
             .items_center()
             .pt(if on_rail { 0.0 } else { top })

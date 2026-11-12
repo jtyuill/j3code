@@ -211,3 +211,53 @@ fn a_running_action_keeps_the_control_without_a_status() {
     app.frame();
     assert!(app.rt.find("git-quick-action").is_none());
 }
+
+#[test]
+fn the_header_controls_land_in_place_when_the_control_arrives_or_resizes() {
+    let mut app = TestApp::with_scene(Scene::Thread);
+    // The scene's pictures finish decoding first: each lands its commit at once.
+    for _ in 0..100 {
+        app.frame();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let key = open_thread_key();
+    assert!(app.rt.find("git-quick-action").is_none());
+    // Drawn where the layout puts them, in the first frame after a change.
+    let at_rest = |app: &TestApp, what: &str| {
+        for part in [
+            "git-quick-action",
+            "git-menu",
+            "toggle-files",
+            "thread-actions",
+        ] {
+            let e = app
+                .rt
+                .elements()
+                .into_iter()
+                .find(|e| e.key.as_deref() == Some(part))
+                .unwrap_or_else(|| panic!("{part} is drawn"));
+            for side in 0..4 {
+                assert!(
+                    (e.rect[side] - e.target[side]).abs() < 0.5,
+                    "{what}: {part} is drawn at {:?}, laid out at {:?}",
+                    e.rect,
+                    e.target
+                );
+            }
+        }
+    };
+
+    // The status arrives after the thread opened.
+    let arrive = key.clone();
+    app.rt
+        .update(move |s, _| fixtures::install(s, &arrive, false));
+    app.frame();
+    at_rest(&app, "the control arrives");
+
+    // An action starts: a narrower label.
+    let busy = key.clone();
+    app.rt
+        .update(move |s, _| s.git.get_mut(&busy).unwrap().running = true);
+    app.frame();
+    at_rest(&app, "the label changes");
+}
